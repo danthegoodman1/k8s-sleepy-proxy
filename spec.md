@@ -14,7 +14,8 @@ Controller = wake/sleep orchestrator
 Sidecar = local traffic/idleness observer
 ```
 
-When a tenant sleeps, delete its `StatefulSet`, `Service`, and optional `SleepyProxy` CR. When traffic returns, recreate them from the external DB.
+When a tenant sleeps, delete its `StatefulSet` and `Service`. When traffic
+returns, recreate them from the external DB.
 
 ---
 
@@ -81,7 +82,7 @@ Responsibilities:
 POST /wake/:tenantId
   load tenant through TenantStore
   use TenantStore compare-and-swap to transition Cold -> Waking
-  create SleepyProxy CR or directly create Service + StatefulSet
+  create Service + StatefulSet
   wait until backend is ready
   mark Running through TenantStore
   return backend DNS
@@ -90,7 +91,7 @@ POST /sleep/:tenantId
   validate sidecar request
   use TenantStore compare-and-swap to mark Draining
   remove tenant from LB routing
-  delete StatefulSet + Service + SleepyProxy
+  delete StatefulSet + Service
   mark Cold through TenantStore
 
 GET /state/:tenantId
@@ -104,38 +105,7 @@ For the PoC, `/watch` can be Server-Sent Events or skipped in favor of polling.
 
 ---
 
-### 3. Optional `SleepyProxy` CRD
-
-Use this only as a temporary Kubernetes projection of the DB record.
-
-```yaml
-apiVersion: sleepy.example.com/v1alpha1
-kind: SleepyProxy
-metadata:
-  name: tenant-a
-spec:
-  tenantId: tenant-a
-  image: ghcr.io/acme/app:v1
-  upstreamPort: 9000
-  idleSeconds: 900
-status:
-  phase: Waking
-  ready: false
-  backend: sleepy-tenant-a.default.svc.cluster.local:80
-```
-
-Controller reconciles `SleepyProxy` into:
-
-```text
-Service/sleepy-tenant-a
-StatefulSet/sleepy-tenant-a
-```
-
-For a simpler PoC, skip the CRD and have the controller create/delete `Service` and `StatefulSet` directly from `TenantStore` records.
-
----
-
-### 4. Generated StatefulSet
+### 3. Generated StatefulSet
 
 One replica max.
 
@@ -161,7 +131,7 @@ sleepy-tenant-a.default.svc.cluster.local:80 -> sidecar :8080
 
 ---
 
-### 5. Sidecar proxy
+### 4. Sidecar proxy
 
 Responsibilities:
 
@@ -189,7 +159,7 @@ PoC sidecar can be a simple HTTP reverse proxy.
 
 ---
 
-### 6. Load balancer
+### 5. Load balancer
 
 Always-on process outside the sleeping workload path.
 
@@ -270,8 +240,7 @@ On sleep:
 2. stop routing new traffic
 3. delete StatefulSet
 4. delete Service
-5. delete SleepyProxy CR if used
-6. mark tenant Cold through TenantStore
+5. mark tenant Cold through TenantStore
 ```
 
 ---
@@ -285,7 +254,6 @@ single namespace
 single controller replica
 Postgres DB
 HTTP only
-no CRD, if direct Service/StatefulSet creation is faster
 simple shared token auth between LB/sidecar/controller
 one pod per tenant
 no PVCs
