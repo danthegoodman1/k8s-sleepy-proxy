@@ -34,6 +34,7 @@ func (s *MemoryStore) GetTenant(_ context.Context, id string) (sleepy.Tenant, er
 func (s *MemoryStore) UpsertTenant(_ context.Context, t sleepy.Tenant) (sleepy.Tenant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	t = sleepy.ApplyTenantDefaults(t)
 	if old, ok := s.tenants[t.TenantID]; ok {
 		t.State = old.State
 		t.Backend = old.Backend

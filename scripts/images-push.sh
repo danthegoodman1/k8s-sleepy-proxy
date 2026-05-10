@@ -18,7 +18,7 @@ if [[ -d "$HOME/.docker/cli-plugins" && ! -e "$DOCKER_CONFIG_DIR/cli-plugins" ]]
 fi
 export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
 
-for target in controller lb sidecar echo; do
+for target in controller lb tcplb sidecar tcpsidecar echo; do
   image="$REGISTRY/sleepy-controller:$target"
   echo "Building and pushing $image"
   docker buildx build \

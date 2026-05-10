@@ -34,6 +34,8 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 CREATE TABLE IF NOT EXISTS tenants (
   tenant_id text PRIMARY KEY,
   image text NOT NULL,
+  kind text NOT NULL DEFAULT 'echo',
+  protocol text NOT NULL DEFAULT 'http',
   upstream_port integer NOT NULL,
   public_host text NOT NULL DEFAULT '',
   idle_seconds integer NOT NULL,
@@ -43,6 +45,9 @@ CREATE TABLE IF NOT EXISTS tenants (
   backend text,
   failure_reason text
 );
+
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'echo';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS protocol text NOT NULL DEFAULT 'http';
 
 CREATE INDEX IF NOT EXISTS tenants_state_idx ON tenants(state);
 `)
@@ -58,21 +63,24 @@ func (s *PostgresStore) UpsertTenant(ctx context.Context, t sleepy.Tenant) (slee
 	if t.LastActiveAt.IsZero() {
 		t.LastActiveAt = time.Now().UTC()
 	}
+	t = sleepy.ApplyTenantDefaults(t)
 	row := s.db.QueryRowContext(ctx, `
 INSERT INTO tenants (
-  tenant_id, image, upstream_port, public_host, idle_seconds, state, last_active_at, generation
+  tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state, last_active_at, generation
 ) VALUES (
-  $1, $2, $3, $4, $5, 'Cold', $6, 1
+  $1, $2, $3, $4, $5, $6, $7, 'Cold', $8, 1
 )
 ON CONFLICT (tenant_id) DO UPDATE SET
   image = EXCLUDED.image,
+  kind = EXCLUDED.kind,
+  protocol = EXCLUDED.protocol,
   upstream_port = EXCLUDED.upstream_port,
   public_host = EXCLUDED.public_host,
   idle_seconds = EXCLUDED.idle_seconds,
   generation = tenants.generation + 1
-RETURNING tenant_id, image, upstream_port, public_host, idle_seconds, state,
+RETURNING tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason
-`, t.TenantID, t.Image, t.UpstreamPort, t.PublicHost, t.IdleSeconds, t.LastActiveAt)
+`, t.TenantID, t.Image, t.Kind, t.Protocol, t.UpstreamPort, t.PublicHost, t.IdleSeconds, t.LastActiveAt)
 	return scanTenant(row)
 }
 
@@ -81,7 +89,7 @@ func (s *PostgresStore) CompareAndSwapState(ctx context.Context, id string, gene
 UPDATE tenants
 SET state = $4, generation = generation + 1, failure_reason = NULL
 WHERE tenant_id = $1 AND generation = $2 AND state = $3
-RETURNING tenant_id, image, upstream_port, public_host, idle_seconds, state,
+RETURNING tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason
 `, id, generation, fromState, toState)
 	t, err := scanTenant(row)
@@ -103,7 +111,7 @@ func (s *PostgresStore) MarkRunning(ctx context.Context, id string, generation i
 UPDATE tenants
 SET state = 'Running', backend = $3, failure_reason = NULL, generation = generation + 1, last_active_at = now()
 WHERE tenant_id = $1 AND generation = $2 AND state = 'Waking'
-RETURNING tenant_id, image, upstream_port, public_host, idle_seconds, state,
+RETURNING tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason
 `, id, generation, backend)
 	t, err := scanTenant(row)
@@ -118,7 +126,7 @@ func (s *PostgresStore) MarkFailed(ctx context.Context, id string, generation in
 UPDATE tenants
 SET state = 'Failed', backend = NULL, failure_reason = $3, generation = generation + 1
 WHERE tenant_id = $1 AND generation = $2
-RETURNING tenant_id, image, upstream_port, public_host, idle_seconds, state,
+RETURNING tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason
 `, id, generation, reason)
 	t, err := scanTenant(row)
@@ -133,7 +141,7 @@ func (s *PostgresStore) MarkCold(ctx context.Context, id string, generation int6
 UPDATE tenants
 SET state = 'Cold', backend = NULL, failure_reason = NULL, generation = generation + 1
 WHERE tenant_id = $1 AND generation = $2
-RETURNING tenant_id, image, upstream_port, public_host, idle_seconds, state,
+RETURNING tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason
 `, id, generation)
 	t, err := scanTenant(row)
@@ -148,7 +156,7 @@ func (s *PostgresStore) TouchTenant(ctx context.Context, id string, lastActiveAt
 UPDATE tenants
 SET last_active_at = $2
 WHERE tenant_id = $1
-RETURNING tenant_id, image, upstream_port, public_host, idle_seconds, state,
+RETURNING tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason
 `, id, lastActiveAt)
 	return scanTenant(row)
@@ -159,7 +167,7 @@ type scanner interface {
 }
 
 func tenantSelectSQL() string {
-	return `SELECT tenant_id, image, upstream_port, public_host, idle_seconds, state,
+	return `SELECT tenant_id, image, kind, protocol, upstream_port, public_host, idle_seconds, state,
   last_active_at, generation, backend, failure_reason FROM tenants`
 }
 
@@ -169,6 +177,8 @@ func scanTenant(row scanner) (sleepy.Tenant, error) {
 	err := row.Scan(
 		&t.TenantID,
 		&t.Image,
+		&t.Kind,
+		&t.Protocol,
 		&t.UpstreamPort,
 		&t.PublicHost,
 		&t.IdleSeconds,
@@ -184,6 +194,7 @@ func scanTenant(row scanner) (sleepy.Tenant, error) {
 	if err != nil {
 		return sleepy.Tenant{}, err
 	}
+	t = sleepy.ApplyTenantDefaults(t)
 	if backend.Valid {
 		t.Backend = backend.String
 	}

@@ -78,6 +78,8 @@ spec:
                   key: auth-token
             - name: SIDECAR_IMAGE
               value: __SIDECAR_IMAGE__
+            - name: TCP_SIDECAR_IMAGE
+              value: __TCP_SIDECAR_IMAGE__
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
@@ -182,6 +184,59 @@ spec:
       targetPort: http
 ---
 apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sleepy-tcp-lb
+  namespace: sleepy-system
+  labels:
+    app.kubernetes.io/name: sleepy-tcp-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sleepy-tcp-lb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sleepy-tcp-lb
+    spec:
+      imagePullSecrets:
+        - name: docr-pull-secret
+      containers:
+        - name: tcplb
+          image: __TCP_LB_IMAGE__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5432
+              name: pg
+          env:
+            - name: AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sleepy-secrets
+                  key: auth-token
+            - name: CONTROLLER_URL
+              value: http://sleepy-controller.sleepy-system.svc.cluster.local:8080
+            - name: WAKE_TIMEOUT_SECONDS
+              value: "120"
+            - name: CACHE_TTL_SECONDS
+              value: "5"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sleepy-tcp-lb
+  namespace: sleepy-system
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: sleepy-tcp-lb
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+---
+apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: sleepy-image-cache
@@ -210,16 +265,30 @@ spec:
           imagePullPolicy: Always
           command: ["/lb"]
           args: ["--cache-warm"]
+        - name: cache-tcp-lb
+          image: __TCP_LB_IMAGE__
+          imagePullPolicy: Always
+          command: ["/tcplb"]
+          args: ["--cache-warm"]
         - name: cache-sidecar
           image: __SIDECAR_IMAGE__
           imagePullPolicy: Always
           command: ["/sidecar"]
+          args: ["--cache-warm"]
+        - name: cache-tcp-sidecar
+          image: __TCP_SIDECAR_IMAGE__
+          imagePullPolicy: Always
+          command: ["/tcpsidecar"]
           args: ["--cache-warm"]
         - name: cache-echo
           image: __ECHO_IMAGE__
           imagePullPolicy: Always
           command: ["/echo"]
           args: ["--cache-warm"]
+        - name: cache-postgres
+          image: __POSTGRES_IMAGE__
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c", "true"]
       containers:
         - name: hold
           image: __ECHO_IMAGE__

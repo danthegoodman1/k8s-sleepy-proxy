@@ -67,15 +67,18 @@ func (s *Server) handleUpsertTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t.TenantID = tenantID
+	t = sleepy.ApplyTenantDefaults(t)
 	if t.Image == "" {
 		http.Error(w, "image is required", http.StatusBadRequest)
 		return
 	}
-	if t.UpstreamPort == 0 {
-		t.UpstreamPort = 9000
+	if t.Protocol != sleepy.ProtocolHTTP && t.Protocol != sleepy.ProtocolTCP {
+		http.Error(w, "protocol must be http or tcp", http.StatusBadRequest)
+		return
 	}
-	if t.IdleSeconds == 0 {
-		t.IdleSeconds = 30
+	if t.Kind != sleepy.KindEcho && t.Kind != sleepy.KindPostgres {
+		http.Error(w, "kind must be echo or postgres", http.StatusBadRequest)
+		return
 	}
 	if t.IdleSeconds < 5 {
 		http.Error(w, "idleSeconds must be at least 5", http.StatusBadRequest)

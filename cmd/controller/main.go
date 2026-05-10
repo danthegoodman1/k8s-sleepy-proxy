@@ -26,6 +26,7 @@ func main() {
 	databaseURL := sleepy.MustEnv("DATABASE_URL")
 	authToken := sleepy.MustEnv("AUTH_TOKEN")
 	sidecarImage := sleepy.MustEnv("SIDECAR_IMAGE")
+	tcpSidecarImage := sleepy.MustEnv("TCP_SIDECAR_IMAGE")
 	namespace := sleepy.Env("NAMESPACE", "sleepy-system")
 	listenAddr := sleepy.Env("LISTEN_ADDR", ":8080")
 	secretName := sleepy.Env("SECRET_NAME", "sleepy-secrets")
@@ -49,7 +50,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	kube, err := controller.NewKubernetesManager(namespace, sidecarImage, controllerURL, secretName, volume)
+	kube, err := controller.NewKubernetesManager(namespace, sidecarImage, tcpSidecarImage, controllerURL, secretName, volume)
 	if err != nil {
 		log.Fatal(err)
 	}

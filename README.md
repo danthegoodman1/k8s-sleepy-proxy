@@ -29,6 +29,8 @@ make deploy
 make seed-tenant
 make demo
 make demo-archil
+make seed-postgres-tenant
+make demo-postgres
 ```
 
 The demo sends requests with:
@@ -76,6 +78,41 @@ make demo-archil
 The `/incr` route increments `/data/count.txt` and calls `fsync()` before
 responding. The demo checks cold `/incr`, hot `/incr`, sleep cleanup, then cold
 `/incr` again to confirm the count continues from the same Archil disk.
+
+## Postgres TCP Demo
+
+The Postgres demo adds a second LoadBalancer on port `5432`. It routes plain
+Postgres TCP by reading the startup packet and using the requested database or
+user as the tenant id. The tenant runs `postgres:18` on the same Archil PVC,
+mounted at `/var/lib/postgresql/data` with `PGDATA` in a subdirectory.
+
+```sh
+make seed-postgres-tenant
+make demo-postgres
+kubectl --kubeconfig .generated/kubeconfig -n sleepy-system logs -f deployment/sleepy-tcp-lb
+```
+
+The demo increments a table, prints millisecond-level connect/query/total
+timings, verifies hot increments against the LB memory cache, waits for the TCP
+sidecar to sleep and remove the workload, then wakes Postgres again and verifies
+the row continues from the previous value.
+
+Observed timings from the live PoC in DigitalOcean `sfo3`, using one DOKS node,
+the public TCP LoadBalancer, Postgres 18, and an existing Archil-backed PVC:
+
+| Path | Connect | Query | Total | TCP LB route |
+| --- | ---: | ---: | ---: | ---: |
+| Cold wake | 8181.221ms | 63.733ms | 8244.955ms | `controller_wake` |
+| Warm 1 | 114.524ms | 58.507ms | 173.032ms | `memory_cache`, 7.470ms |
+| Warm 2 | 108.746ms | 49.533ms | 158.280ms | `memory_cache`, 7.681ms |
+| Warm 3 | 108.738ms | 55.853ms | 164.591ms | `memory_cache`, 5.274ms |
+| Cold wake after sleep | 8164.863ms | 65.066ms | 8229.929ms | `controller_wake` |
+
+The practical read: cold starts from an already initialized Archil disk were
+about 8.2s, warm fresh client connections through the public TCP LoadBalancer
+were about 109-115ms, and LB memory-cache routing itself was about 5-8ms. The
+first-ever Postgres boot on an empty disk is slower because `initdb` has to
+initialize the data directory.
 
 ## Destroy
 

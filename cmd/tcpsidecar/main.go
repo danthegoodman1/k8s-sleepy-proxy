@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -22,8 +22,8 @@ type sidecar struct {
 	tenantID      string
 	controllerURL string
 	authToken     string
+	upstreamAddr  string
 	idleAfter     time.Duration
-	proxy         *httputil.ReverseProxy
 	client        *http.Client
 	active        atomic.Int64
 	lastTrafficNS atomic.Int64
@@ -39,47 +39,67 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	tenantID := sleepy.MustEnv("TENANT_ID")
-	upstreamPort := sleepy.Env("UPSTREAM_PORT", "9000")
-	upstreamURL := sleepy.Env("UPSTREAM_URL", "http://127.0.0.1:"+upstreamPort)
-	target, err := url.Parse(upstreamURL)
-	if err != nil {
-		log.Fatal(err)
-	}
+	upstreamPort := sleepy.Env("UPSTREAM_PORT", "5432")
 	idleSeconds, _ := strconv.Atoi(sleepy.Env("IDLE_SECONDS", "30"))
 	if idleSeconds < 5 {
 		idleSeconds = 5
 	}
-	sc := &sidecar{
-		tenantID:      tenantID,
+	s := &sidecar{
+		tenantID:      sleepy.MustEnv("TENANT_ID"),
 		controllerURL: sleepy.MustEnv("CONTROLLER_URL"),
 		authToken:     sleepy.MustEnv("AUTH_TOKEN"),
+		upstreamAddr:  sleepy.Env("UPSTREAM_ADDR", "127.0.0.1:"+upstreamPort),
 		idleAfter:     time.Duration(idleSeconds) * time.Second,
-		proxy:         httputil.NewSingleHostReverseProxy(target),
 		client:        &http.Client{Timeout: 10 * time.Second},
 		logger:        logger,
 	}
-	sc.lastTrafficNS.Store(time.Now().UnixNano())
+	s.lastTrafficNS.Store(time.Now().UnixNano())
+	go s.sleepLoop()
 
-	go sc.sleepLoop()
-
-	listenAddr := sleepy.Env("LISTEN_ADDR", ":8080")
-	logger.Info("sidecar listening", "addr", listenAddr, "tenant", tenantID, "upstream", upstreamURL, "idleAfter", sc.idleAfter.String())
-	log.Fatal(http.ListenAndServe(listenAddr, sc))
+	listenAddr := sleepy.Env("LISTEN_ADDR", ":"+upstreamPort)
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	logger.Info("tcp sidecar listening", "addr", listenAddr, "tenant", s.tenantID, "upstream", s.upstreamAddr, "idleAfter", s.idleAfter.String())
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			logger.Error("accept", "err", err)
+			continue
+		}
+		go s.proxy(conn)
+	}
 }
 
-func (s *sidecar) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+func (s *sidecar) proxy(client net.Conn) {
 	s.active.Add(1)
 	s.touch()
 	defer func() {
 		s.touch()
 		s.active.Add(-1)
+		_ = client.Close()
 	}()
-	s.proxy.ServeHTTP(w, r)
+
+	upstream, err := net.DialTimeout("tcp", s.upstreamAddr, 10*time.Second)
+	if err != nil {
+		s.logger.Error("dial upstream", "tenant", s.tenantID, "upstream", s.upstreamAddr, "err", err)
+		return
+	}
+	defer upstream.Close()
+
+	done := make(chan struct{}, 2)
+	go copyAndClose(upstream, client, done)
+	go copyAndClose(client, upstream, done)
+	<-done
+}
+
+func copyAndClose(dst net.Conn, src net.Conn, done chan<- struct{}) {
+	_, _ = io.Copy(dst, src)
+	if tcp, ok := dst.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+	done <- struct{}{}
 }
 
 func (s *sidecar) touch() {
@@ -117,7 +137,7 @@ func (s *sidecar) requestSleep(lastTrafficAt time.Time) error {
 		TenantID:          s.tenantID,
 		ActiveConnections: int(s.active.Load()),
 		LastTrafficAt:     lastTrafficAt.UTC(),
-		Reason:            "idle_timeout",
+		Reason:            "tcp_idle_timeout",
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, s.controllerURL+"/sleep/"+s.tenantID, bytes.NewReader(body))

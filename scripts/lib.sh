@@ -6,6 +6,7 @@ GENERATED_DIR="$ROOT_DIR/.generated"
 TF_DIR="$ROOT_DIR/infra/terraform"
 KUBECONFIG_FILE="$GENERATED_DIR/kubeconfig"
 AUTH_TOKEN_FILE="$GENERATED_DIR/auth-token"
+POSTGRES_PASSWORD_FILE="$GENERATED_DIR/postgres-password"
 HELM_VERSION="${HELM_VERSION:-v3.15.4}"
 
 load_env() {
@@ -176,17 +177,34 @@ auth_token() {
   tr -d '\n' < "$AUTH_TOKEN_FILE"
 }
 
+postgres_password() {
+  ensure_generated
+  if [[ ! -f "$POSTGRES_PASSWORD_FILE" ]]; then
+    openssl rand -hex 18 > "$POSTGRES_PASSWORD_FILE"
+    chmod 600 "$POSTGRES_PASSWORD_FILE"
+  fi
+  tr -d '\n' < "$POSTGRES_PASSWORD_FILE"
+}
+
 render_manifest() {
   local registry="$1"
   local repo="$registry/sleepy-controller"
+  local postgres_image="${POSTGRES_IMAGE:-postgres:18}"
   sed \
     -e "s|__CONTROLLER_IMAGE__|$repo:controller|g" \
     -e "s|__LB_IMAGE__|$repo:lb|g" \
+    -e "s|__TCP_LB_IMAGE__|$repo:tcplb|g" \
     -e "s|__SIDECAR_IMAGE__|$repo:sidecar|g" \
+    -e "s|__TCP_SIDECAR_IMAGE__|$repo:tcpsidecar|g" \
     -e "s|__ECHO_IMAGE__|$repo:echo|g" \
+    -e "s|__POSTGRES_IMAGE__|$postgres_image|g" \
     "$ROOT_DIR/deploy/k8s.yaml.tpl" > "$GENERATED_DIR/k8s.yaml"
 }
 
 lb_ip() {
   kube -n sleepy-system get svc sleepy-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+}
+
+tcp_lb_ip() {
+  kube -n sleepy-system get svc sleepy-tcp-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 }

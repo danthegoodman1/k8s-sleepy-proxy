@@ -14,6 +14,12 @@ const (
 	StateRunning  = "Running"
 	StateDraining = "Draining"
 	StateFailed   = "Failed"
+
+	ProtocolHTTP = "http"
+	ProtocolTCP  = "tcp"
+
+	KindEcho     = "echo"
+	KindPostgres = "postgres"
 )
 
 var (
@@ -26,6 +32,8 @@ var (
 type Tenant struct {
 	TenantID      string    `json:"tenantId"`
 	Image         string    `json:"image"`
+	Kind          string    `json:"kind"`
+	Protocol      string    `json:"protocol"`
 	UpstreamPort  int       `json:"upstreamPort"`
 	PublicHost    string    `json:"publicHost"`
 	IdleSeconds   int       `json:"idleSeconds"`
@@ -34,6 +42,27 @@ type Tenant struct {
 	Generation    int64     `json:"generation"`
 	Backend       string    `json:"backend,omitempty"`
 	FailureReason string    `json:"failureReason,omitempty"`
+}
+
+func ApplyTenantDefaults(t Tenant) Tenant {
+	if t.Kind == "" {
+		t.Kind = KindEcho
+	}
+	if t.Protocol == "" {
+		t.Protocol = ProtocolHTTP
+	}
+	if t.Kind == KindPostgres {
+		t.Protocol = ProtocolTCP
+		if t.UpstreamPort == 0 {
+			t.UpstreamPort = 5432
+		}
+	} else if t.UpstreamPort == 0 {
+		t.UpstreamPort = 9000
+	}
+	if t.IdleSeconds == 0 {
+		t.IdleSeconds = 30
+	}
+	return t
 }
 
 type TenantStore interface {

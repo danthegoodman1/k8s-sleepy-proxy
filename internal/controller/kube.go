@@ -28,15 +28,16 @@ type TenantVolumeConfig struct {
 }
 
 type KubernetesManager struct {
-	client        kubernetes.Interface
-	namespace     string
-	sidecarImage  string
-	controllerURL string
-	secretName    string
-	volume        TenantVolumeConfig
+	client          kubernetes.Interface
+	namespace       string
+	sidecarImage    string
+	tcpSidecarImage string
+	controllerURL   string
+	secretName      string
+	volume          TenantVolumeConfig
 }
 
-func NewKubernetesManager(namespace, sidecarImage, controllerURL, secretName string, volume TenantVolumeConfig) (*KubernetesManager, error) {
+func NewKubernetesManager(namespace, sidecarImage, tcpSidecarImage, controllerURL, secretName string, volume TenantVolumeConfig) (*KubernetesManager, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		kubeconfig := os.Getenv("KUBECONFIG")
@@ -53,12 +54,13 @@ func NewKubernetesManager(namespace, sidecarImage, controllerURL, secretName str
 		return nil, err
 	}
 	return &KubernetesManager{
-		client:        client,
-		namespace:     namespace,
-		sidecarImage:  sidecarImage,
-		controllerURL: controllerURL,
-		secretName:    secretName,
-		volume:        volume.withDefaults(),
+		client:          client,
+		namespace:       namespace,
+		sidecarImage:    sidecarImage,
+		tcpSidecarImage: tcpSidecarImage,
+		controllerURL:   controllerURL,
+		secretName:      secretName,
+		volume:          volume.withDefaults(),
 	}, nil
 }
 
@@ -113,7 +115,15 @@ func (m *KubernetesManager) EnsureTenant(ctx context.Context, t sleepy.Tenant) (
 
 	name := sleepy.WorkloadName(t.TenantID)
 	labels := sleepy.TenantLabels(t.TenantID)
-	backend := fmt.Sprintf("%s.%s.svc.cluster.local:80", name, m.namespace)
+	servicePort := int32(80)
+	targetPort := intstr.FromInt(8080)
+	portName := "http"
+	if t.Protocol == sleepy.ProtocolTCP {
+		servicePort = int32(t.UpstreamPort)
+		targetPort = intstr.FromInt(15432)
+		portName = "tcp"
+	}
+	backend := fmt.Sprintf("%s.%s.svc.cluster.local:%d", name, m.namespace, servicePort)
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -124,12 +134,13 @@ func (m *KubernetesManager) EnsureTenant(ctx context.Context, t sleepy.Tenant) (
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
 			Ports: []corev1.ServicePort{{
-				Name:       "http",
-				Port:       80,
+				Name:       portName,
+				Port:       servicePort,
 				TargetPort: intstr.FromInt(8080),
 			}},
 		},
 	}
+	svc.Spec.Ports[0].TargetPort = targetPort
 	existingSvc, err := m.client.CoreV1().Services(m.namespace).Get(ctx, name, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
@@ -175,40 +186,8 @@ func (m *KubernetesManager) EnsureTenant(ctx context.Context, t sleepy.Tenant) (
 						Name: "docr-pull-secret",
 					}},
 					Containers: []corev1.Container{
-						{
-							Name:  "app",
-							Image: t.Image,
-							Env: []corev1.EnvVar{{
-								Name:  "DATA_DIR",
-								Value: m.volume.MountPath,
-							}},
-							VolumeMounts: m.tenantVolumeMounts(),
-							Ports: []corev1.ContainerPort{{
-								Name:          "app",
-								ContainerPort: int32(t.UpstreamPort),
-							}},
-						},
-						{
-							Name:  "sleepy-sidecar",
-							Image: m.sidecarImage,
-							Env: []corev1.EnvVar{
-								{Name: "TENANT_ID", Value: t.TenantID},
-								{Name: "UPSTREAM_PORT", Value: fmt.Sprintf("%d", t.UpstreamPort)},
-								{Name: "IDLE_SECONDS", Value: fmt.Sprintf("%d", t.IdleSeconds)},
-								{Name: "CONTROLLER_URL", Value: m.controllerURL},
-								{
-									Name: "AUTH_TOKEN",
-									ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-										LocalObjectReference: corev1.LocalObjectReference{Name: m.secretName},
-										Key:                  "auth-token",
-									}},
-								},
-							},
-							Ports: []corev1.ContainerPort{{
-								Name:          "http",
-								ContainerPort: 8080,
-							}},
-						},
+						m.appContainer(t),
+						m.sidecarContainer(t),
 					},
 				},
 			},
@@ -234,6 +213,86 @@ func (m *KubernetesManager) EnsureTenant(ctx context.Context, t sleepy.Tenant) (
 	return backend, nil
 }
 
+func (m *KubernetesManager) appContainer(t sleepy.Tenant) corev1.Container {
+	c := corev1.Container{
+		Name:         "app",
+		Image:        t.Image,
+		Env:          []corev1.EnvVar{{Name: "DATA_DIR", Value: m.volume.MountPath}},
+		VolumeMounts: m.tenantVolumeMounts(t),
+		Ports: []corev1.ContainerPort{{
+			Name:          "app",
+			ContainerPort: int32(t.UpstreamPort),
+		}},
+	}
+	if t.Kind == sleepy.KindPostgres {
+		c.Env = []corev1.EnvVar{
+			{Name: "POSTGRES_USER", Value: "postgres"},
+			{
+				Name: "POSTGRES_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: m.secretName},
+					Key:                  "postgres-password",
+				}},
+			},
+			{Name: "POSTGRES_DB", Value: t.TenantID},
+			{Name: "PGDATA", Value: "/var/lib/postgresql/data/pgdata"},
+		}
+		c.VolumeMounts = m.tenantVolumeMounts(t)
+		c.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{
+					"pg_isready",
+					"-h", "127.0.0.1",
+					"-p", fmt.Sprintf("%d", t.UpstreamPort),
+					"-U", "postgres",
+					"-d", t.TenantID,
+				}},
+			},
+			PeriodSeconds:    2,
+			FailureThreshold: 30,
+		}
+	}
+	return c
+}
+
+func (m *KubernetesManager) sidecarContainer(t sleepy.Tenant) corev1.Container {
+	image := m.sidecarImage
+	name := "sleepy-sidecar"
+	port := int32(8080)
+	portName := "http"
+	if t.Protocol == sleepy.ProtocolTCP {
+		image = m.tcpSidecarImage
+		name = "sleepy-tcp-sidecar"
+		port = 15432
+		portName = "tcp"
+	}
+	env := []corev1.EnvVar{
+		{Name: "TENANT_ID", Value: t.TenantID},
+		{Name: "UPSTREAM_PORT", Value: fmt.Sprintf("%d", t.UpstreamPort)},
+		{Name: "IDLE_SECONDS", Value: fmt.Sprintf("%d", t.IdleSeconds)},
+		{Name: "CONTROLLER_URL", Value: m.controllerURL},
+		{
+			Name: "AUTH_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: m.secretName},
+				Key:                  "auth-token",
+			}},
+		},
+	}
+	if t.Protocol == sleepy.ProtocolTCP {
+		env = append(env, corev1.EnvVar{Name: "LISTEN_ADDR", Value: ":15432"})
+	}
+	return corev1.Container{
+		Name:  name,
+		Image: image,
+		Env:   env,
+		Ports: []corev1.ContainerPort{{
+			Name:          portName,
+			ContainerPort: port,
+		}},
+	}
+}
+
 func (m *KubernetesManager) tenantPVC(t sleepy.Tenant) *corev1.PersistentVolumeClaim {
 	storageClass := m.volume.StorageClassName
 	labels := sleepy.TenantLabels(t.TenantID)
@@ -256,13 +315,17 @@ func (m *KubernetesManager) tenantPVC(t sleepy.Tenant) *corev1.PersistentVolumeC
 	}
 }
 
-func (m *KubernetesManager) tenantVolumeMounts() []corev1.VolumeMount {
+func (m *KubernetesManager) tenantVolumeMounts(t sleepy.Tenant) []corev1.VolumeMount {
 	if !m.volume.Enabled {
 		return nil
 	}
+	mountPath := m.volume.MountPath
+	if t.Kind == sleepy.KindPostgres {
+		mountPath = "/var/lib/postgresql/data"
+	}
 	return []corev1.VolumeMount{{
 		Name:      m.volume.ClaimName,
-		MountPath: m.volume.MountPath,
+		MountPath: mountPath,
 	}}
 }
 
