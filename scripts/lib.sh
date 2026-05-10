@@ -76,6 +76,7 @@ render_manifest() {
     -e "s|__CONTROLLER_IMAGE__|$repo:controller|g" \
     -e "s|__LB_IMAGE__|$repo:lb|g" \
     -e "s|__SIDECAR_IMAGE__|$repo:sidecar|g" \
+    -e "s|__ECHO_IMAGE__|$repo:echo|g" \
     "$ROOT_DIR/deploy/k8s.yaml.tpl" > "$GENERATED_DIR/k8s.yaml"
 }
 

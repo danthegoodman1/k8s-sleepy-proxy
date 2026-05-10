@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,12 @@ import (
 )
 
 func main() {
+	cacheWarm := flag.Bool("cache-warm", false, "exit immediately after image pull")
+	flag.Parse()
+	if *cacheWarm {
+		return
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	databaseURL := sleepy.MustEnv("DATABASE_URL")

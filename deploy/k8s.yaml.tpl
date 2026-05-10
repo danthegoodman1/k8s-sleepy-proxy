@@ -56,6 +56,8 @@ spec:
         app.kubernetes.io/name: sleepy-controller
     spec:
       serviceAccountName: sleepy-controller
+      imagePullSecrets:
+        - name: docr-pull-secret
       containers:
         - name: controller
           image: __CONTROLLER_IMAGE__
@@ -125,6 +127,8 @@ spec:
       labels:
         app.kubernetes.io/name: sleepy-lb
     spec:
+      imagePullSecrets:
+        - name: docr-pull-secret
       containers:
         - name: lb
           image: __LB_IMAGE__
@@ -166,3 +170,51 @@ spec:
     - name: http
       port: 80
       targetPort: http
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sleepy-image-cache
+  namespace: sleepy-system
+  labels:
+    app.kubernetes.io/name: sleepy-image-cache
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sleepy-image-cache
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sleepy-image-cache
+    spec:
+      imagePullSecrets:
+        - name: docr-pull-secret
+      initContainers:
+        - name: cache-controller
+          image: __CONTROLLER_IMAGE__
+          imagePullPolicy: Always
+          command: ["/controller"]
+          args: ["--cache-warm"]
+        - name: cache-lb
+          image: __LB_IMAGE__
+          imagePullPolicy: Always
+          command: ["/lb"]
+          args: ["--cache-warm"]
+        - name: cache-sidecar
+          image: __SIDECAR_IMAGE__
+          imagePullPolicy: Always
+          command: ["/sidecar"]
+          args: ["--cache-warm"]
+        - name: cache-echo
+          image: __ECHO_IMAGE__
+          imagePullPolicy: Always
+          command: ["/echo"]
+          args: ["--cache-warm"]
+      containers:
+        - name: hold
+          image: __ECHO_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/echo"]
+          env:
+            - name: LISTEN_ADDR
+              value: ":9000"

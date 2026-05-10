@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,12 @@ import (
 )
 
 func main() {
+	cacheWarm := flag.Bool("cache-warm", false, "exit immediately after image pull")
+	flag.Parse()
+	if *cacheWarm {
+		return
+	}
+
 	listenAddr := sleepy.Env("LISTEN_ADDR", ":9000")
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

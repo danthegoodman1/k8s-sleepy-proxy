@@ -78,7 +78,7 @@ func TestResolveBackendReturnsFailedAsUnavailable(t *testing.T) {
 		wakeTimeout:   time.Millisecond,
 		cache:         map[string]cacheEntry{},
 	}
-	state, err := s.resolveBackend(t.Context(), "tenant-a")
+	state, _, err := s.resolveBackend(t.Context(), "tenant-a")
 	if err == nil {
 		t.Fatalf("expected error, got state %+v", state)
 	}

@@ -36,6 +36,30 @@ The demo sends requests with:
 curl -H "TENANT: tenant-a" http://<sleepy-lb-ip>/hello
 ```
 
+## Watch Cold vs Hot Routing
+
+The deploy includes a `sleepy-image-cache` DaemonSet that pre-pulls the
+controller, LB, sidecar, and echo images onto every node. Tenant pods use the
+same DOCR pull secret and default `IfNotPresent` image pulls, so cold tenant
+starts should use the node-local image cache.
+
+```sh
+kubectl --kubeconfig .generated/kubeconfig -n sleepy-system logs -f deployment/sleepy-lb
+kubectl --kubeconfig .generated/kubeconfig -n sleepy-system logs -f deployment/sleepy-controller
+```
+
+The LB logs `source=controller_wake` for a DB-backed cold wake and
+`source=memory_cache` for a hot in-memory route.
+
+```sh
+curl -fsS -w '\ntime_total=%{time_total}\n' -H 'TENANT: tenant-a' http://<sleepy-lb-ip>/cold
+curl -fsS -w '\ntime_total=%{time_total}\n' -H 'TENANT: tenant-a' http://<sleepy-lb-ip>/hot
+kubectl --kubeconfig .generated/kubeconfig -n sleepy-system describe pod sleepy-tenant-a-0
+```
+
+In the pod events, look for `already present on machine` for both the echo app
+and sidecar images.
+
 ## Destroy
 
 ```sh

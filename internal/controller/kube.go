@@ -107,6 +107,9 @@ func (m *KubernetesManager) EnsureTenant(ctx context.Context, t sleepy.Tenant) (
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: []corev1.LocalObjectReference{{
+						Name: "docr-pull-secret",
+					}},
 					Containers: []corev1.Container{
 						{
 							Name:  "app",

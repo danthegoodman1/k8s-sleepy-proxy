@@ -114,6 +114,8 @@ func (s *Server) handleWake(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	started := time.Now()
+	s.logger.Info("wake requested", "tenant", tenantID)
 	ctx, cancel := context.WithTimeout(r.Context(), s.wakeTimeout)
 	defer cancel()
 
@@ -127,6 +129,7 @@ func (s *Server) handleWake(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("wake complete", "tenant", tenantID, "state", t.State, "backend", t.Backend, "duration", time.Since(started).String())
 	sleepy.WriteJSON(w, http.StatusOK, sleepy.ToStateResponse(t))
 }
 
@@ -176,6 +179,8 @@ func (s *Server) wake(ctx context.Context, tenantID string) (sleepy.Tenant, erro
 }
 
 func (s *Server) createAndMarkRunning(ctx context.Context, t sleepy.Tenant) (sleepy.Tenant, error) {
+	started := time.Now()
+	s.logger.Info("tenant workload creating", "tenant", t.TenantID, "image", t.Image, "generation", t.Generation)
 	backend, err := s.kube.EnsureTenant(ctx, t)
 	if err != nil {
 		_, _ = s.store.MarkFailed(ctx, t.TenantID, t.Generation, err.Error())
@@ -185,7 +190,12 @@ func (s *Server) createAndMarkRunning(ctx context.Context, t sleepy.Tenant) (sle
 		_, _ = s.store.MarkFailed(ctx, t.TenantID, t.Generation, err.Error())
 		return sleepy.Tenant{}, err
 	}
-	return s.store.MarkRunning(ctx, t.TenantID, t.Generation, backend)
+	running, err := s.store.MarkRunning(ctx, t.TenantID, t.Generation, backend)
+	if err != nil {
+		return sleepy.Tenant{}, err
+	}
+	s.logger.Info("tenant workload running", "tenant", t.TenantID, "backend", backend, "duration", time.Since(started).String())
+	return running, nil
 }
 
 func (s *Server) waitForRunning(ctx context.Context, tenantID string) (sleepy.Tenant, error) {
@@ -255,6 +265,8 @@ func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
 		sleepy.WriteJSON(w, http.StatusOK, sleepy.ToStateResponse(t))
 		return
 	}
+	started := time.Now()
+	s.logger.Info("sleep requested", "tenant", tenantID, "reason", req.Reason, "activeConnections", req.ActiveConnections)
 	draining, ok, err := s.store.CompareAndSwapState(r.Context(), tenantID, t.Generation, sleepy.StateRunning, sleepy.StateDraining)
 	if err != nil {
 		s.logger.Error("mark draining", "tenant", tenantID, "err", err)
@@ -277,5 +289,6 @@ func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("sleep complete", "tenant", tenantID, "duration", time.Since(started).String())
 	sleepy.WriteJSON(w, http.StatusOK, sleepy.ToStateResponse(cold))
 }

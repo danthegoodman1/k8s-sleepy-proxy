@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"log/slog"
@@ -35,6 +36,12 @@ type server struct {
 }
 
 func main() {
+	cacheWarm := flag.Bool("cache-warm", false, "exit immediately after image pull")
+	flag.Parse()
+	if *cacheWarm {
+		return
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	s := &server{
 		controllerURL: sleepy.Env("CONTROLLER_URL", "http://sleepy-controller.sleepy-system.svc.cluster.local:8080"),
@@ -65,7 +72,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := s.resolveBackend(r.Context(), tenantID)
+	started := time.Now()
+	state, source, err := s.resolveBackend(r.Context(), tenantID)
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -79,6 +87,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tenant unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	s.logInfo("lb route", "tenant", tenantID, "source", source, "backend", state.Backend, "method", r.Method, "path", r.URL.Path, "resolveDuration", time.Since(started).String())
 	target, _ := url.Parse("http://" + state.Backend)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := proxy.Director
@@ -95,34 +104,38 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-func (s *server) resolveBackend(ctx context.Context, tenantID string) (sleepy.StateResponse, error) {
+func (s *server) resolveBackend(ctx context.Context, tenantID string) (sleepy.StateResponse, string, error) {
 	if cached, ok := s.cached(tenantID); ok && cached.State == sleepy.StateRunning && cached.Backend != "" {
-		return cached, nil
+		return cached, "memory_cache", nil
 	}
 	state, err := s.state(ctx, tenantID)
 	if err != nil {
-		return sleepy.StateResponse{}, err
+		return sleepy.StateResponse{}, "", err
 	}
 	switch state.State {
 	case sleepy.StateRunning:
 		s.putCache(state)
-		return state, nil
+		return state, "controller_state", nil
 	case sleepy.StateCold, sleepy.StateFailed:
 		ctx, cancel := context.WithTimeout(ctx, s.wakeTimeout)
 		defer cancel()
 		state, err = s.wake(ctx, tenantID)
 		if err != nil {
-			return sleepy.StateResponse{}, err
+			return sleepy.StateResponse{}, "", err
 		}
 		if state.State != sleepy.StateRunning || state.Backend == "" {
-			return state, fmt.Errorf("wake returned %s: %s", state.State, state.FailureReason)
+			return state, "", fmt.Errorf("wake returned %s: %s", state.State, state.FailureReason)
 		}
 		s.putCache(state)
-		return state, nil
+		return state, "controller_wake", nil
 	case sleepy.StateWaking, sleepy.StateDraining:
-		return s.pollRunning(ctx, tenantID)
+		state, err := s.pollRunning(ctx, tenantID)
+		if err != nil {
+			return sleepy.StateResponse{}, "", err
+		}
+		return state, "controller_poll", nil
 	default:
-		return sleepy.StateResponse{}, fmt.Errorf("unknown tenant state %q", state.State)
+		return sleepy.StateResponse{}, "", fmt.Errorf("unknown tenant state %q", state.State)
 	}
 }
 
@@ -190,6 +203,7 @@ func (s *server) cached(tenantID string) (sleepy.StateResponse, bool) {
 	defer s.mu.Unlock()
 	entry, ok := s.cache[tenantID]
 	if !ok || time.Now().After(entry.expires) {
+		delete(s.cache, tenantID)
 		return sleepy.StateResponse{}, false
 	}
 	return entry.state, true
@@ -205,4 +219,10 @@ func (s *server) evict(tenantID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.cache, tenantID)
+}
+
+func (s *server) logInfo(msg string, args ...any) {
+	if s.logger != nil {
+		s.logger.Info(msg, args...)
+	}
 }

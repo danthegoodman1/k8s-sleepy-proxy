@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"log/slog"
@@ -31,6 +32,12 @@ type sidecar struct {
 }
 
 func main() {
+	cacheWarm := flag.Bool("cache-warm", false, "exit immediately after image pull")
+	flag.Parse()
+	if *cacheWarm {
+		return
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	tenantID := sleepy.MustEnv("TENANT_ID")
 	upstreamPort := sleepy.Env("UPSTREAM_PORT", "9000")
