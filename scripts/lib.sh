@@ -6,6 +6,7 @@ GENERATED_DIR="$ROOT_DIR/.generated"
 TF_DIR="$ROOT_DIR/infra/terraform"
 KUBECONFIG_FILE="$GENERATED_DIR/kubeconfig"
 AUTH_TOKEN_FILE="$GENERATED_DIR/auth-token"
+HELM_VERSION="${HELM_VERSION:-v3.15.4}"
 
 load_env() {
   if [[ ! -f "$ROOT_DIR/.env.local" ]]; then
@@ -31,6 +32,112 @@ load_env() {
       export TF_VAR_registry_name="$registry_name"
     fi
   fi
+}
+
+helm_bin() {
+  if command -v helm >/dev/null 2>&1; then
+    command -v helm
+    return
+  fi
+
+  local bin="$GENERATED_DIR/bin/helm"
+  if [[ -x "$bin" ]]; then
+    echo "$bin"
+    return
+  fi
+
+  ensure_generated
+  mkdir -p "$GENERATED_DIR/bin" "$GENERATED_DIR/helm"
+  local os arch platform archive url
+  case "$(uname -s)" in
+    Darwin) os="darwin" ;;
+    Linux) os="linux" ;;
+    *) echo "unsupported OS for automatic Helm install: $(uname -s)" >&2; exit 1 ;;
+  esac
+  case "$(uname -m)" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64) arch="amd64" ;;
+    *) echo "unsupported arch for automatic Helm install: $(uname -m)" >&2; exit 1 ;;
+  esac
+  platform="$os-$arch"
+  archive="$GENERATED_DIR/helm/helm-$HELM_VERSION-$platform.tar.gz"
+  url="https://get.helm.sh/helm-$HELM_VERSION-$platform.tar.gz"
+  echo "Downloading Helm $HELM_VERSION for $platform..." >&2
+  curl -fsSL "$url" -o "$archive"
+  tar -xzf "$archive" -C "$GENERATED_DIR/helm"
+  cp "$GENERATED_DIR/helm/$platform/helm" "$bin"
+  chmod +x "$bin"
+  echo "$bin"
+}
+
+helm_cmd() {
+  HELM_CACHE_HOME="$GENERATED_DIR/helm/cache" \
+  HELM_CONFIG_HOME="$GENERATED_DIR/helm/config" \
+  HELM_DATA_HOME="$GENERATED_DIR/helm/data" \
+    "$(helm_bin)" "$@"
+}
+
+helm_kube() {
+  helm_cmd --kubeconfig "$KUBECONFIG_FILE" "$@"
+}
+
+archil_controlplane_url() {
+  case "$1" in
+    aws-us-east-1) echo "https://control.green.us-east-1.aws.prod.archil.com" ;;
+    aws-us-west-2) echo "https://control.green.us-west-2.aws.prod.archil.com" ;;
+    aws-eu-west-1) echo "https://control.green.eu-west-1.aws.prod.archil.com" ;;
+    gcp-us-central1) echo "https://control.blue.us-central1.gcp.prod.archil.com" ;;
+    *) echo "unsupported ARCHIL_REGION: $1" >&2; exit 1 ;;
+  esac
+}
+
+ensure_archil_csi() {
+  if [[ -z "${ARCHIL_API_KEY:-}" ]]; then
+    echo "ARCHIL_API_KEY is required in .env.local for the Archil CSI driver" >&2
+    exit 1
+  fi
+  local region="${ARCHIL_REGION:-aws-us-west-2}"
+  local api_key="$ARCHIL_API_KEY"
+  if [[ "$api_key" != key-* ]]; then
+    api_key="key-$api_key"
+  fi
+  local csi_api_key="${ARCHIL_API_KEY#key-}"
+  local controlplane_url="${ARCHIL_CONTROLPLANE_URL:-$(archil_controlplane_url "$region")}"
+  local status
+  status="$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: $api_key" "$controlplane_url/api/disks?limit=1" || true)"
+  if [[ "$status" != "200" ]]; then
+    echo "ARCHIL_API_KEY was not accepted by $region ($controlplane_url returned HTTP $status)" >&2
+    exit 1
+  fi
+  kube create namespace archil-system --dry-run=client -o yaml | kube apply -f -
+  kube -n archil-system create secret generic archil-controlplane-api-key \
+    --from-literal=api-key="$csi_api_key" \
+    --dry-run=client -o yaml | kube apply -f -
+  helm_kube upgrade --install archil-csi-driver \
+    oci://registry-1.docker.io/archildata/csi-driver-chart \
+    --namespace archil-system \
+    --create-namespace \
+    --set controller.enabled=true \
+    --set controller.region="$region" \
+    --set-string controller.controlplaneURL="$controlplane_url" \
+    --set storageClass.enabled=true \
+    --set storageClass.name=archil \
+    --set storageClass.region="$region" \
+    --set storageClass.nodeAuthType=token \
+    --set storageClass.volumeBindingMode=Immediate \
+    --wait \
+    --timeout 5m
+  kube -n archil-system rollout restart deployment/archil-csi-controller
+  kube -n archil-system rollout status deployment/archil-csi-controller --timeout=180s
+  kube -n archil-system rollout status daemonset/archil-csi-node --timeout=180s
+}
+
+uninstall_archil_csi() {
+  if [[ ! -f "$KUBECONFIG_FILE" ]]; then
+    return
+  fi
+  helm_kube uninstall archil-csi-driver --namespace archil-system >/dev/null 2>&1 || true
+  kube delete namespace archil-system --ignore-not-found=true || true
 }
 
 tf() {

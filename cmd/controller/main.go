@@ -31,6 +31,14 @@ func main() {
 	secretName := sleepy.Env("SECRET_NAME", "sleepy-secrets")
 	controllerURL := sleepy.Env("CONTROLLER_URL_FOR_SIDECAR", "http://sleepy-controller.sleepy-system.svc.cluster.local:8080")
 	wakeTimeout := sleepy.EnvDurationSeconds("WAKE_TIMEOUT_SECONDS", 120*time.Second)
+	volume := controller.TenantVolumeConfig{
+		Enabled:          true,
+		ClaimName:        sleepy.Env("TENANT_VOLUME_CLAIM_NAME", "data"),
+		MountPath:        sleepy.Env("TENANT_VOLUME_MOUNT_PATH", "/data"),
+		StorageClassName: sleepy.Env("TENANT_VOLUME_STORAGE_CLASS", "archil"),
+		Size:             sleepy.Env("TENANT_VOLUME_SIZE", "1Gi"),
+		ProvisionTimeout: sleepy.EnvDurationSeconds("TENANT_VOLUME_PROVISION_TIMEOUT_SECONDS", 60*time.Second),
+	}
 
 	tenantStore, err := store.NewPostgresStore(databaseURL)
 	if err != nil {
@@ -41,7 +49,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	kube, err := controller.NewKubernetesManager(namespace, sidecarImage, controllerURL, secretName)
+	kube, err := controller.NewKubernetesManager(namespace, sidecarImage, controllerURL, secretName, volume)
 	if err != nil {
 		log.Fatal(err)
 	}

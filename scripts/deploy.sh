@@ -21,6 +21,8 @@ fi
 
 render_manifest "$REGISTRY"
 
+ensure_archil_csi
+
 kube create namespace sleepy-system --dry-run=client -o yaml | kube apply -f -
 kube -n sleepy-system create secret generic sleepy-secrets \
   --from-literal=database-url="$DB_URL" \

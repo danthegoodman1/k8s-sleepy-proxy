@@ -16,6 +16,12 @@ import (
 type fakeKube struct {
 	created int
 	deleted int
+	volumes int
+}
+
+func (k *fakeKube) EnsureTenantVolume(context.Context, sleepy.Tenant) error {
+	k.volumes++
+	return nil
 }
 
 func (k *fakeKube) EnsureTenant(context.Context, sleepy.Tenant) (string, error) {

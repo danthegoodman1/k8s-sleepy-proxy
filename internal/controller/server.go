@@ -13,6 +13,7 @@ import (
 )
 
 type KubeManager interface {
+	EnsureTenantVolume(context.Context, sleepy.Tenant) error
 	EnsureTenant(context.Context, sleepy.Tenant) (string, error)
 	WaitReady(context.Context, string, time.Duration) error
 	DeleteTenant(context.Context, string) error
@@ -83,6 +84,11 @@ func (s *Server) handleUpsertTenant(w http.ResponseWriter, r *http.Request) {
 	saved, err := s.store.UpsertTenant(r.Context(), t)
 	if err != nil {
 		s.logger.Error("upsert tenant", "tenant", tenantID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.kube.EnsureTenantVolume(r.Context(), saved); err != nil {
+		s.logger.Error("ensure tenant volume", "tenant", tenantID, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

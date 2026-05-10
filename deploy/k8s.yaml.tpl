@@ -16,7 +16,7 @@ metadata:
   namespace: sleepy-system
 rules:
   - apiGroups: [""]
-    resources: ["services", "pods"]
+    resources: ["services", "pods", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
@@ -88,6 +88,16 @@ spec:
               value: http://sleepy-controller.sleepy-system.svc.cluster.local:8080
             - name: WAKE_TIMEOUT_SECONDS
               value: "120"
+            - name: TENANT_VOLUME_STORAGE_CLASS
+              value: archil
+            - name: TENANT_VOLUME_CLAIM_NAME
+              value: data
+            - name: TENANT_VOLUME_MOUNT_PATH
+              value: /data
+            - name: TENANT_VOLUME_SIZE
+              value: 1Gi
+            - name: TENANT_VOLUME_PROVISION_TIMEOUT_SECONDS
+              value: "90"
           readinessProbe:
             httpGet:
               path: /healthz

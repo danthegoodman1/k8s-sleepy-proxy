@@ -10,7 +10,7 @@ Postgres when traffic returns.
 - Docker with buildx
 - kubectl
 - Go, for local tests
-- `.env.local` containing `DO_API_KEY=...`
+- `.env.local` containing `DO_API_KEY=...` and `ARCHIL_API_KEY=...`
 
 `doctl` is not required.
 
@@ -28,6 +28,7 @@ make images-push
 make deploy
 make seed-tenant
 make demo
+make demo-archil
 ```
 
 The demo sends requests with:
@@ -59,6 +60,22 @@ kubectl --kubeconfig .generated/kubeconfig -n sleepy-system describe pod sleepy-
 
 In the pod events, look for `already present on machine` for both the echo app
 and sidecar images.
+
+## Archil Disk Demo
+
+`make deploy` installs the Archil CSI driver with token-based dynamic
+provisioning and creates the `archil` StorageClass. Registering a tenant creates
+its PVC immediately; the tenant StatefulSet also declares that same
+volumeClaimTemplate and mounts it at `/data`.
+
+```sh
+make seed-tenant
+make demo-archil
+```
+
+The `/incr` route increments `/data/count.txt` and calls `fsync()` before
+responding. The demo checks cold `/incr`, hot `/incr`, sleep cleanup, then cold
+`/incr` again to confirm the count continues from the same Archil disk.
 
 ## Destroy
 

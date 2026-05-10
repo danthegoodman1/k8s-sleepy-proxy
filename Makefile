@@ -1,4 +1,4 @@
-.PHONY: test infra-up images-push deploy seed-tenant demo destroy
+.PHONY: test infra-up images-push deploy seed-tenant demo demo-archil destroy
 
 test:
 	go test ./...
@@ -17,6 +17,9 @@ seed-tenant:
 
 demo:
 	./scripts/demo.sh
+
+demo-archil:
+	./scripts/demo-archil.sh
 
 destroy:
 	./scripts/destroy.sh
