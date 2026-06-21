@@ -5,12 +5,13 @@ use crate::{
     ids::Generation,
     instance::{
         CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-        InstanceRecord, InstanceState,
+        DeleteInstanceRequest, GetInstanceRequest, InstanceRecord, InstanceState,
     },
     route::RouteBindingRecord,
     store::{StoreError, StoreResult},
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
+        WorkloadClassVersionRef,
     },
 };
 
@@ -29,9 +30,18 @@ pub(crate) async fn create_instance(
     store: &PostgresStore,
     request: CreateInstanceRequest,
 ) -> StoreResult<CreateInstanceResult> {
-    let fingerprint = idempotency::create_instance_fingerprint(&request)?;
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    let workload_class =
+        load_workload_class_version_from_client(&transaction, &request.workload_class)
+            .await?
+            .ok_or(StoreError::NotFound {
+                resource: "workload class version",
+            })?;
+    let request = request
+        .validate_values_against(&workload_class)
+        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+    let fingerprint = idempotency::create_instance_fingerprint(&request)?;
     let idempotency_key = request.idempotency_key.as_str();
     let instance_id = request.instance_id.as_str();
     let inserted = transaction
@@ -62,7 +72,6 @@ pub(crate) async fn create_instance(
         return Ok(result);
     }
 
-    ensure_workload_class_version_exists(&transaction, &request).await?;
     let instance = insert_instance(&transaction, &request).await?;
     let route_bindings = insert_route_bindings(&transaction, &request).await?;
 
@@ -133,23 +142,34 @@ pub(crate) async fn load_workload_class_version(
     request: LoadWorkloadClassVersionRequest,
 ) -> StoreResult<Option<WorkloadClassVersion>> {
     let client = store.client().await?;
-    let class_id = request.reference.class_id.as_str();
-    let version = generation_to_i64(request.reference.version)?;
-    let row = client
-        .query_opt(
-            "
-            SELECT class_id, version, template_generation, default_values, value_schema
-            FROM workload_class_versions
-            WHERE class_id = $1 AND version = $2
-            ",
-            &[&class_id, &version],
+
+    load_workload_class_version_from_client(&client, &request.reference).await
+}
+
+pub(crate) async fn get_instance(
+    store: &PostgresStore,
+    request: GetInstanceRequest,
+) -> StoreResult<Option<InstanceRecord>> {
+    let client = store.client().await?;
+
+    load_instance(&client, request.instance_id.as_str()).await
+}
+
+pub(crate) async fn delete_instance(
+    store: &PostgresStore,
+    request: DeleteInstanceRequest,
+) -> StoreResult<bool> {
+    let client = store.client().await?;
+    let instance_id = request.instance_id.as_str();
+    let deleted = client
+        .execute(
+            "DELETE FROM instances WHERE instance_id = $1",
+            &[&instance_id],
         )
         .await
         .map_err(map_postgres_error)?;
 
-    row.as_ref()
-        .map(workload_class_version_from_row)
-        .transpose()
+    Ok(deleted > 0)
 }
 
 pub(crate) async fn compare_and_swap_instance_state(
@@ -254,32 +274,27 @@ async fn replay_create_instance(
     load_create_instance_result(client, &resource_id, true).await
 }
 
-async fn ensure_workload_class_version_exists(
+async fn load_workload_class_version_from_client(
     client: &impl GenericClient,
-    request: &CreateInstanceRequest,
-) -> StoreResult<()> {
-    let class_id = request.workload_class.class_id.as_str();
-    let version = generation_to_i64(request.workload_class.version)?;
-    let exists = client
+    reference: &WorkloadClassVersionRef,
+) -> StoreResult<Option<WorkloadClassVersion>> {
+    let class_id = reference.class_id.as_str();
+    let version = generation_to_i64(reference.version)?;
+    let row = client
         .query_opt(
             "
-            SELECT 1
+            SELECT class_id, version, template_generation, default_values, value_schema
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",
             &[&class_id, &version],
         )
         .await
-        .map_err(map_postgres_error)?
-        .is_some();
+        .map_err(map_postgres_error)?;
 
-    if exists {
-        Ok(())
-    } else {
-        Err(StoreError::NotFound {
-            resource: "workload class version",
-        })
-    }
+    row.as_ref()
+        .map(workload_class_version_from_row)
+        .transpose()
 }
 
 async fn insert_instance(

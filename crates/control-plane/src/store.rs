@@ -7,7 +7,7 @@ use crate::{
     },
     instance::{
         CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-        InstanceRecord,
+        DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{MaterializationRecord, RecordMaterializationRequest},
     route::{RouteDependencyLookup, RouteDependencySet, RouteIdentity, RouteResolution},
@@ -24,6 +24,16 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: CreateInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>>;
+
+    fn get_instance<'a>(
+        &'a self,
+        request: GetInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>>;
+
+    fn delete_instance<'a>(
+        &'a self,
+        request: DeleteInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>>;
 
     fn create_workload_class_version<'a>(
         &'a self,

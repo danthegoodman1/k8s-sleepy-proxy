@@ -22,7 +22,8 @@ pub use ids::{
 };
 pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-    InstanceRecord, InstanceState, InstanceValues, StateTransitionReason,
+    DeleteInstanceRequest, GetInstanceRequest, InstanceRecord, InstanceState, InstanceValues,
+    StateTransitionReason,
 };
 pub use materialization::{
     BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,

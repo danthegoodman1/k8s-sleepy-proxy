@@ -1,12 +1,23 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
 use bytes::{BufMut, BytesMut};
 use control_plane::api::{
-    operator_grpc_server_builder, operator_grpc_service, operator_grpc_web_server_builder,
+    operator_grpc_server_builder, operator_grpc_service, operator_grpc_service_with_store,
+    operator_grpc_web_server_builder,
     pb::{
         operator_control_plane_server::OperatorControlPlane, CreateInstanceRequest,
-        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, InstanceState, ProtocolRoute,
-        RouteHostKind, WorkloadValueFieldRule, WorkloadValueSchema,
+        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
+        GetInstanceRequest, GetRouteBindingRequest, Instance, InstanceState, ProtocolRoute,
+        RouteHostKind, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
     },
-    OperatorApiPlaceholder, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
+    OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
+};
+use control_plane::{
+    ControlPlaneStore, CreateInstanceResult, Generation, InstanceRecord,
+    InstanceState as DomainInstanceState, StoreError, StoreFuture, StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -77,12 +88,135 @@ async fn placeholder_methods_are_explicitly_unimplemented() {
     assert!(error.message().contains("transport is scaffolded"));
 }
 
+#[tokio::test]
+async fn store_backed_instance_methods_create_get_and_delete_instances() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let service = StoreBackedOperatorApi::new(store);
+
+    let created = service
+        .create_instance(tonic::Request::new(CreateInstanceRequest {
+            idempotency_key: "create-instance-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-1".to_owned(),
+                version: 7,
+            }),
+            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+        }))
+        .await
+        .expect("create instance succeeds")
+        .into_inner();
+
+    assert_eq!(created.instance_id, "instance-1");
+    assert_eq!(created.generation, 0);
+    assert_eq!(created.state, InstanceState::Cold as i32);
+    assert_eq!(
+        created
+            .workload_class
+            .as_ref()
+            .expect("workload class is returned")
+            .version,
+        7
+    );
+
+    let loaded = service
+        .get_instance(tonic::Request::new(GetInstanceRequest {
+            instance_id: "instance-1".to_owned(),
+        }))
+        .await
+        .expect("get instance succeeds")
+        .into_inner();
+    assert_eq!(loaded, created);
+
+    let deleted = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-1".to_owned(),
+        }))
+        .await
+        .expect("delete instance succeeds")
+        .into_inner();
+    assert!(deleted.deleted);
+
+    let missing = service
+        .get_instance(tonic::Request::new(GetInstanceRequest {
+            instance_id: "instance-1".to_owned(),
+        }))
+        .await
+        .expect_err("deleted instance no longer loads");
+    assert_eq!(missing.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn store_backed_api_keeps_out_of_scope_methods_explicitly_unimplemented() {
+    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+
+    let error = service
+        .get_route_binding(tonic::Request::new(GetRouteBindingRequest::default()))
+        .await
+        .expect_err("route binding APIs are deferred to a later phase");
+
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert!(error.message().contains("transport is scaffolded"));
+}
+
+#[tokio::test]
+async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
+    let response = operator_grpc_service_with_store(Arc::new(FakeInstanceStore::default()))
+        .oneshot(grpc_create_instance_request(
+            CreateInstanceRequest {
+                idempotency_key: "create-instance-transport".to_owned(),
+                instance_id: "instance-transport".to_owned(),
+                workload_class: Some(WorkloadClassVersionRef {
+                    class_id: "class-transport".to_owned(),
+                    version: 3,
+                }),
+                values: [("tenant".to_owned(), "transport".to_owned())].into(),
+            },
+            "application/grpc",
+            Version::HTTP_2,
+        ))
+        .await
+        .expect("native gRPC request should route through store-backed service");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| headers.get("grpc-status"))
+        .expect("successful gRPC status is returned");
+
+    assert_eq!(status, "0");
+
+    let created = decode_grpc_instance_response(collected.to_bytes().as_ref());
+    assert_eq!(created.instance_id, "instance-transport");
+    assert_eq!(created.state, InstanceState::Cold as i32);
+    assert_eq!(created.generation, 0);
+    assert_eq!(created.values["tenant"], "transport");
+}
+
 #[test]
 fn native_grpc_server_can_be_constructed_with_operator_service() {
     let _router = operator_grpc_server_builder().add_service(operator_grpc_service());
 
     assert_eq!(
         <control_plane::api::server::OperatorGrpcService as NamedService>::NAME,
+        OPERATOR_SERVICE_NAME
+    );
+}
+
+#[test]
+fn native_grpc_server_can_be_constructed_with_store_backed_operator_service() {
+    let _router = operator_grpc_server_builder().add_service(operator_grpc_service_with_store(
+        Arc::new(FakeInstanceStore::default()),
+    ));
+
+    assert_eq!(
+        <control_plane::api::server::StoreBackedOperatorGrpcService as NamedService>::NAME,
         OPERATOR_SERVICE_NAME
     );
 }
@@ -182,10 +316,16 @@ fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
 }
 
 fn grpc_request(content_type: &'static str, version: Version) -> Request<Body> {
+    grpc_create_instance_request(CreateInstanceRequest::default(), content_type, version)
+}
+
+fn grpc_create_instance_request(
+    request: CreateInstanceRequest,
+    content_type: &'static str,
+    version: Version,
+) -> Request<Body> {
     let mut message = BytesMut::new();
-    CreateInstanceRequest::default()
-        .encode(&mut message)
-        .expect("request encodes");
+    request.encode(&mut message).expect("request encodes");
 
     let mut frame = BytesMut::with_capacity(5 + message.len());
     frame.put_u8(0);
@@ -199,4 +339,144 @@ fn grpc_request(content_type: &'static str, version: Version) -> Request<Body> {
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::new(Full::new(frame.freeze())))
         .expect("request builds")
+}
+
+fn decode_grpc_instance_response(bytes: &[u8]) -> Instance {
+    assert_eq!(bytes.first(), Some(&0), "gRPC message is uncompressed");
+    let length = u32::from_be_bytes(
+        bytes[1..5]
+            .try_into()
+            .expect("gRPC response frame has a length prefix"),
+    ) as usize;
+    Instance::decode(&bytes[5..5 + length]).expect("instance response decodes")
+}
+
+#[derive(Default)]
+struct FakeInstanceStore {
+    instances: Mutex<BTreeMap<String, InstanceRecord>>,
+}
+
+impl ControlPlaneStore for FakeInstanceStore {
+    fn create_instance<'a>(
+        &'a self,
+        request: control_plane::CreateInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
+        Box::pin(async move {
+            let instance = InstanceRecord {
+                id: request.instance_id,
+                workload_class: request.workload_class,
+                values: request.values,
+                state: DomainInstanceState::Cold,
+                generation: Generation::new(0),
+            };
+            self.instances
+                .lock()
+                .expect("fake store lock is available")
+                .insert(instance.id.as_str().to_owned(), instance.clone());
+
+            Ok(CreateInstanceResult {
+                instance,
+                route_bindings: Vec::new(),
+                idempotency_replayed: false,
+            })
+        })
+    }
+
+    fn get_instance<'a>(
+        &'a self,
+        request: control_plane::GetInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .instances
+                .lock()
+                .expect("fake store lock is available")
+                .get(request.instance_id.as_str())
+                .cloned())
+        })
+    }
+
+    fn delete_instance<'a>(
+        &'a self,
+        request: control_plane::DeleteInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            Ok(self
+                .instances
+                .lock()
+                .expect("fake store lock is available")
+                .remove(request.instance_id.as_str())
+                .is_some())
+        })
+    }
+
+    fn create_workload_class_version<'a>(
+        &'a self,
+        _request: control_plane::CreateWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn load_workload_class_version<'a>(
+        &'a self,
+        _request: control_plane::LoadWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::WorkloadClassVersion>>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn resolve_route<'a>(
+        &'a self,
+        _identity: control_plane::RouteIdentity,
+    ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn compare_and_swap_instance_state<'a>(
+        &'a self,
+        _request: control_plane::CompareAndSwapInstanceStateRequest,
+    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn record_materialization<'a>(
+        &'a self,
+        _request: control_plane::RecordMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::MaterializationRecord>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn lookup_route_dependencies<'a>(
+        &'a self,
+        _request: control_plane::RouteDependencyLookup,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteDependencySet>>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn put_http01_challenge<'a>(
+        &'a self,
+        _request: control_plane::PutHttp01ChallengeRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn resolve_http01_challenge<'a>(
+        &'a self,
+        _key: control_plane::Http01ChallengeKey,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn delete_http01_challenge<'a>(
+        &'a self,
+        _request: control_plane::DeleteHttp01ChallengeRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn expire_http01_challenges<'a>(
+        &'a self,
+        _request: control_plane::ExpireHttp01ChallengesRequest,
+    ) -> StoreFuture<'a, StoreResult<usize>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
 }

@@ -6,13 +6,13 @@ use std::{
 
 use control_plane::{
     BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest, ControlPlaneStore,
-    CreateInstanceRequest, CreateWorkloadClassVersionRequest, ExpireHttp01ChallengesRequest,
-    Generation, Http01ChallengeKey, IdempotencyKey, InstanceId, InstanceState,
-    MaterializationState, MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig,
-    ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest, RenderedObjectRef,
-    RouteBindingSpec, RouteDependencyLookup, RouteHost, RouteIdentity, RouteResolution,
-    StateTransitionReason, StoreError, WorkloadClassId, WorkloadClassVersion,
-    WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+    CreateInstanceRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
+    ExpireHttp01ChallengesRequest, Generation, GetInstanceRequest, Http01ChallengeKey,
+    IdempotencyKey, InstanceId, InstanceState, MaterializationState, MaterializationTarget,
+    PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest,
+    RecordMaterializationRequest, RenderedObjectRef, RouteBindingSpec, RouteDependencyLookup,
+    RouteHost, RouteIdentity, RouteResolution, StateTransitionReason, StoreError, WorkloadClassId,
+    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -122,6 +122,36 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .expect("v1 still loads after v2 is created");
     assert_eq!(loaded_v1_after_v2, class);
 
+    let missing_required = store
+        .create_instance(CreateInstanceRequest::new(
+            IdempotencyKey::new("idem-missing-required").expect("valid idempotency key"),
+            InstanceId::new("instance-missing-required").expect("valid instance ID"),
+            class.reference.clone(),
+        ))
+        .await
+        .expect_err("missing required instance values are rejected");
+    assert!(matches!(
+        missing_required,
+        StoreError::InvalidArgument { .. }
+    ));
+
+    let unknown_value = store
+        .create_instance(
+            create_instance_request(
+                "idem-unknown-value",
+                "instance-unknown-value",
+                class.reference.clone(),
+                vec![],
+            )
+            .with_values(BTreeMap::from([
+                ("extra".to_owned(), "value".to_owned()),
+                ("tenant".to_owned(), "instance-unknown-value".to_owned()),
+            ])),
+        )
+        .await
+        .expect_err("unknown instance values are rejected when schema disallows them");
+    assert!(matches!(unknown_value, StoreError::InvalidArgument { .. }));
+
     let create = create_instance_request(
         "idem-create-a",
         "instance-a",
@@ -135,13 +165,51 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     assert_eq!(created.instance.id.as_str(), "instance-a");
     assert_eq!(created.instance.state, InstanceState::Cold);
     assert_eq!(created.instance.generation, Generation::new(0));
+    assert_eq!(
+        created.instance.values,
+        BTreeMap::from([
+            ("image".to_owned(), "example/app:1".to_owned()),
+            ("tenant".to_owned(), "instance-a".to_owned()),
+        ])
+    );
     assert_eq!(created.route_bindings.len(), 2);
     assert!(!created.idempotency_replayed);
+    let loaded_created = store
+        .get_instance(GetInstanceRequest::new(
+            InstanceId::new("instance-a").expect("valid instance ID"),
+        ))
+        .await?
+        .expect("created instance loads through public store API");
+    assert_eq!(loaded_created, created.instance);
 
     let replayed = store.create_instance(create.clone()).await?;
     assert!(replayed.idempotency_replayed);
     assert_eq!(replayed.instance, created.instance);
     assert_eq!(replayed.route_bindings, created.route_bindings);
+
+    let explicit_default_replay = create.clone().with_values(BTreeMap::from([
+        ("image".to_owned(), "example/app:1".to_owned()),
+        ("tenant".to_owned(), "instance-a".to_owned()),
+    ]));
+    let replayed_with_explicit_default = store.create_instance(explicit_default_replay).await?;
+    assert!(replayed_with_explicit_default.idempotency_replayed);
+    assert_eq!(replayed_with_explicit_default.instance, created.instance);
+    assert_eq!(
+        replayed_with_explicit_default.route_bindings,
+        created.route_bindings
+    );
+
+    let changed_values_conflict = store
+        .create_instance(create.clone().with_values(BTreeMap::from([(
+            "tenant".to_owned(),
+            "different-tenant".to_owned(),
+        )])))
+        .await
+        .expect_err("same idempotency key with different canonical values conflicts");
+    assert!(matches!(
+        changed_values_conflict,
+        StoreError::IdempotencyConflict
+    ));
 
     let conflict = store
         .create_instance(create_instance_request(
@@ -181,6 +249,32 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     assert_eq!(
         recovered_after_rollback.instance.id.as_str(),
         "instance-rollback"
+    );
+
+    let delete_target = store
+        .create_instance(create_instance_request(
+            "idem-delete",
+            "instance-delete",
+            class.reference.clone(),
+            vec![],
+        ))
+        .await?;
+    assert_eq!(delete_target.instance.generation, Generation::new(0));
+    assert!(
+        store
+            .delete_instance(DeleteInstanceRequest::new(
+                delete_target.instance.id.clone()
+            ))
+            .await?
+    );
+    assert!(store
+        .get_instance(GetInstanceRequest::new(delete_target.instance.id.clone()))
+        .await?
+        .is_none());
+    assert!(
+        !store
+            .delete_instance(DeleteInstanceRequest::new(delete_target.instance.id))
+            .await?
     );
 
     let initial_resolution = store

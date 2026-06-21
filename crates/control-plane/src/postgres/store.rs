@@ -5,7 +5,7 @@ use crate::{
     },
     instance::{
         CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-        InstanceRecord,
+        DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{MaterializationRecord, RecordMaterializationRequest},
     route::{RouteDependencyLookup, RouteDependencySet, RouteIdentity, RouteResolution},
@@ -23,6 +23,20 @@ impl ControlPlaneStore for PostgresStore {
         request: CreateInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
         Box::pin(async move { instance_ops::create_instance(self, request).await })
+    }
+
+    fn get_instance<'a>(
+        &'a self,
+        request: GetInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
+        Box::pin(async move { instance_ops::get_instance(self, request).await })
+    }
+
+    fn delete_instance<'a>(
+        &'a self,
+        request: DeleteInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move { instance_ops::delete_instance(self, request).await })
     }
 
     fn create_workload_class_version<'a>(
