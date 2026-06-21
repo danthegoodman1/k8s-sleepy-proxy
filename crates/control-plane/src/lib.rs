@@ -5,6 +5,7 @@ pub mod config;
 pub mod http01;
 pub mod ids;
 pub mod instance;
+pub mod manifest;
 pub mod materialization;
 pub mod postgres;
 pub mod route;
@@ -24,6 +25,19 @@ pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
     DeleteInstanceRequest, GetInstanceRequest, InstanceRecord, InstanceState, InstanceValues,
     StateTransitionReason,
+};
+pub use manifest::{
+    render_manifests, ApplyOrder, Container, ContainerPort, ContainerPortTemplate,
+    ContainerTemplate, CsiPersistentVolumeSource, Deployment, DeploymentSpec, EnvVar,
+    EnvVarTemplate, KubernetesObject, LabelSelector, ManifestRenderError, ManifestTemplate,
+    ObjectMeta, PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeClaim,
+    PersistentVolumeClaimRef, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
+    PersistentVolumeSpec, PodSpec, PodTemplateMetadata, PodTemplateSpec, PodVolume,
+    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Service, ServicePort,
+    ServicePortTemplate, ServiceSpec, ServiceTemplate, StatefulSet, StatefulSetSpec, TemplateText,
+    TemplateTextPart, VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
+    WorkloadTemplate,
 };
 pub use materialization::{
     BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
