@@ -2,13 +2,16 @@ use serde_json::{json, Value};
 
 use crate::{
     instance::CreateInstanceRequest,
-    route::{ProtocolRoute, RouteBindingSpec, RouteHostKind, RouteIdentity},
+    route::{
+        CreateRouteBindingRequest, ProtocolRoute, RouteBindingSpec, RouteHostKind, RouteIdentity,
+    },
     store::{StoreError, StoreResult},
 };
 
 use super::mapping;
 
 pub(crate) const CREATE_INSTANCE_OPERATION: &str = "create_instance";
+pub(crate) const CREATE_ROUTE_BINDING_OPERATION: &str = "create_route_binding";
 
 pub(crate) fn create_instance_fingerprint(request: &CreateInstanceRequest) -> StoreResult<Value> {
     let route_bindings = request
@@ -26,6 +29,21 @@ pub(crate) fn create_instance_fingerprint(request: &CreateInstanceRequest) -> St
         },
         "values": request.values,
         "route_bindings": route_bindings,
+    }))
+}
+
+pub(crate) fn create_route_binding_fingerprint(
+    request: &CreateRouteBindingRequest,
+) -> StoreResult<Value> {
+    let spec = RouteBindingSpec::new(request.identity.clone(), request.protocol);
+    mapping::validate_route_protocol(&spec)?;
+
+    Ok(json!({
+        "operation": CREATE_ROUTE_BINDING_OPERATION,
+        "route_binding_id": request.route_binding_id.as_str(),
+        "instance_id": request.instance_id.as_str(),
+        "identity": route_identity_fingerprint(&request.identity),
+        "protocol": protocol_fingerprint(request.protocol),
     }))
 }
 
@@ -78,11 +96,14 @@ pub(crate) fn idempotency_conflict() -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::create_instance_fingerprint;
+    use super::{create_instance_fingerprint, create_route_binding_fingerprint};
     use crate::{
-        ids::{Generation, IdempotencyKey, InstanceId, WorkloadClassId},
+        ids::{Generation, IdempotencyKey, InstanceId, RouteBindingId, WorkloadClassId},
         instance::CreateInstanceRequest,
-        route::{PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost, RouteIdentity},
+        route::{
+            CreateRouteBindingRequest, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost,
+            RouteIdentity,
+        },
         workload::WorkloadClassVersionRef,
     };
 
@@ -109,6 +130,35 @@ mod tests {
         assert_eq!(
             fingerprint["route_bindings"][0]["identity"]["host"]["host"],
             "app.example.com"
+        );
+    }
+
+    #[test]
+    fn create_route_binding_fingerprint_uses_canonical_route_identity() {
+        let first = CreateRouteBindingRequest::new(
+            IdempotencyKey::new("key-1").expect("valid key"),
+            RouteBindingId::new("route-1").expect("valid route ID"),
+            InstanceId::new("instance-1").expect("valid instance ID"),
+            RouteIdentity::Http {
+                host: RouteHost::exact("App.Example.COM.").expect("valid host"),
+                path: Some(PathPrefix::new("/api").expect("valid prefix")),
+            },
+            ProtocolRoute::Http,
+        );
+        let second = CreateRouteBindingRequest::new(
+            IdempotencyKey::new("key-1").expect("valid key"),
+            RouteBindingId::new("route-1").expect("valid route ID"),
+            InstanceId::new("instance-1").expect("valid instance ID"),
+            RouteIdentity::Http {
+                host: RouteHost::exact("app.example.com").expect("valid host"),
+                path: Some(PathPrefix::new("/api").expect("valid prefix")),
+            },
+            ProtocolRoute::Http,
+        );
+
+        assert_eq!(
+            create_route_binding_fingerprint(&first).expect("fingerprint builds"),
+            create_route_binding_fingerprint(&second).expect("fingerprint builds")
         );
     }
 }

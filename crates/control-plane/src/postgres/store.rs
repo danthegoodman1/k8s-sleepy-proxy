@@ -8,7 +8,11 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{MaterializationRecord, RecordMaterializationRequest},
-    route::{RouteDependencyLookup, RouteDependencySet, RouteIdentity, RouteResolution},
+    route::{
+        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
+        RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteIdentity,
+        RouteResolution,
+    },
     store::{ControlPlaneStore, StoreFuture, StoreResult},
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -51,6 +55,27 @@ impl ControlPlaneStore for PostgresStore {
         request: LoadWorkloadClassVersionRequest,
     ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
         Box::pin(async move { instance_ops::load_workload_class_version(self, request).await })
+    }
+
+    fn create_route_binding<'a>(
+        &'a self,
+        request: CreateRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
+        Box::pin(async move { route_ops::create_route_binding(self, request).await })
+    }
+
+    fn get_route_binding<'a>(
+        &'a self,
+        request: GetRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>> {
+        Box::pin(async move { route_ops::get_route_binding(self, request).await })
+    }
+
+    fn delete_route_binding<'a>(
+        &'a self,
+        request: DeleteRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move { route_ops::delete_route_binding(self, request).await })
     }
 
     fn resolve_route<'a>(

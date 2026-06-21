@@ -31,9 +31,9 @@ pub use materialization::{
 };
 pub use postgres::PostgresStore;
 pub use route::{
-    CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec,
-    RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost, RouteHostKind, RouteIdentity,
-    RouteResolution,
+    CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
+    PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteDependencyLookup,
+    RouteDependencySet, RouteEntry, RouteHost, RouteHostKind, RouteIdentity, RouteResolution,
 };
 pub use store::{ControlPlaneStore, StoreError, StoreFuture, StoreResult};
 pub use workload::{

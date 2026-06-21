@@ -10,7 +10,11 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{MaterializationRecord, RecordMaterializationRequest},
-    route::{RouteDependencyLookup, RouteDependencySet, RouteIdentity, RouteResolution},
+    route::{
+        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
+        RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteIdentity,
+        RouteResolution,
+    },
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
     },
@@ -44,6 +48,21 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: LoadWorkloadClassVersionRequest,
     ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>>;
+
+    fn create_route_binding<'a>(
+        &'a self,
+        request: CreateRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>>;
+
+    fn get_route_binding<'a>(
+        &'a self,
+        request: GetRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>>;
+
+    fn delete_route_binding<'a>(
+        &'a self,
+        request: DeleteRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>>;
 
     fn resolve_route<'a>(
         &'a self,

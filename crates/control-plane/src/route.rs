@@ -1,7 +1,7 @@
 use std::{error::Error, fmt, time::Duration};
 
 use crate::{
-    ids::{BackendGeneration, Generation, InstanceId, RouteBindingId},
+    ids::{BackendGeneration, Generation, IdempotencyKey, InstanceId, RouteBindingId},
     instance::InstanceState,
     materialization::BackendEndpoint,
 };
@@ -29,6 +29,25 @@ pub struct RouteBindingRecord {
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
     pub protocol: ProtocolRoute,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateRouteBindingRequest {
+    pub idempotency_key: IdempotencyKey,
+    pub route_binding_id: RouteBindingId,
+    pub instance_id: InstanceId,
+    pub identity: RouteIdentity,
+    pub protocol: ProtocolRoute,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetRouteBindingRequest {
+    pub route_binding_id: RouteBindingId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteRouteBindingRequest {
+    pub route_binding_id: RouteBindingId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +117,40 @@ pub struct InvalidPathPrefix {
 impl RouteBindingSpec {
     pub fn new(identity: RouteIdentity, protocol: ProtocolRoute) -> Self {
         Self { identity, protocol }
+    }
+}
+
+impl CreateRouteBindingRequest {
+    pub fn new(
+        idempotency_key: IdempotencyKey,
+        route_binding_id: RouteBindingId,
+        instance_id: InstanceId,
+        identity: RouteIdentity,
+        protocol: ProtocolRoute,
+    ) -> Self {
+        Self {
+            idempotency_key,
+            route_binding_id,
+            instance_id,
+            identity,
+            protocol,
+        }
+    }
+
+    pub fn spec(&self) -> RouteBindingSpec {
+        RouteBindingSpec::new(self.identity.clone(), self.protocol)
+    }
+}
+
+impl GetRouteBindingRequest {
+    pub fn new(route_binding_id: RouteBindingId) -> Self {
+        Self { route_binding_id }
+    }
+}
+
+impl DeleteRouteBindingRequest {
+    pub fn new(route_binding_id: RouteBindingId) -> Self {
+        Self { route_binding_id }
     }
 }
 

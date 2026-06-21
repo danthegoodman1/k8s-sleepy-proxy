@@ -49,6 +49,7 @@ message CreateWorkloadClassVersionRequest {
   uint64 version = 3;
   map<string, string> default_values = 4;
   WorkloadValueSchema value_schema = 5;
+  uint64 template_generation = 6;
 }
 
 message GetWorkloadClassVersionRequest {

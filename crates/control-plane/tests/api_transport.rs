@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{BufMut, BytesMut};
@@ -8,10 +9,14 @@ use control_plane::api::{
     operator_grpc_server_builder, operator_grpc_service, operator_grpc_service_with_store,
     operator_grpc_web_server_builder,
     pb::{
-        operator_control_plane_server::OperatorControlPlane, CreateInstanceRequest,
-        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
-        GetInstanceRequest, GetRouteBindingRequest, Instance, InstanceState, ProtocolRoute,
-        RouteHostKind, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+        operator_control_plane_server::OperatorControlPlane, route_identity, CreateInstanceRequest,
+        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteHttp01ChallengeRequest,
+        DeleteInstanceRequest, DeleteRouteBindingRequest, ExpireHttp01ChallengesRequest,
+        GetInstanceRequest, GetRouteBindingRequest, GetWorkloadClassVersionRequest,
+        Http01ChallengeKey, HttpRouteIdentity, Instance, InstanceState, ProtocolRoute,
+        PutHttp01ChallengeRequest, ResolveHttp01ChallengeRequest, RouteBinding, RouteHost,
+        RouteHostKind, RouteIdentity, SniRouteIdentity, WorkloadClassVersionRef,
+        WorkloadValueFieldRule, WorkloadValueSchema,
     },
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
@@ -58,6 +63,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
             .into(),
             allow_extra: false,
         }),
+        template_generation: 1,
     };
 
     assert_eq!(request.values["tenant"], "acme");
@@ -147,16 +153,140 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 }
 
 #[tokio::test]
-async fn store_backed_api_keeps_out_of_scope_methods_explicitly_unimplemented() {
+async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
 
-    let error = service
-        .get_route_binding(tonic::Request::new(GetRouteBindingRequest::default()))
+    let created_class = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-class-1".to_owned(),
+            class_id: "class-1".to_owned(),
+            version: 1,
+            default_values: [("image".to_owned(), "example/app:1".to_owned())].into(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: [(
+                    "tenant".to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )]
+                .into(),
+                allow_extra: false,
+            }),
+            template_generation: 9,
+        }))
         .await
-        .expect_err("route binding APIs are deferred to a later phase");
+        .expect("create workload class succeeds")
+        .into_inner();
+    assert_eq!(created_class.template_generation, 9);
 
-    assert_eq!(error.code(), Code::Unimplemented);
-    assert!(error.message().contains("transport is scaffolded"));
+    let loaded_class = service
+        .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "class-1".to_owned(),
+                version: 1,
+            }),
+        }))
+        .await
+        .expect("get workload class succeeds")
+        .into_inner();
+    assert_eq!(loaded_class, created_class);
+
+    let created_route = service
+        .create_route_binding(tonic::Request::new(CreateRouteBindingRequest {
+            idempotency_key: "create-route-1".to_owned(),
+            route_binding_id: "route-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            identity: Some(http_identity("App.Example.COM.", Some("/api"))),
+            protocol: ProtocolRoute::Http as i32,
+        }))
+        .await
+        .expect("create route binding succeeds")
+        .into_inner();
+    assert_eq!(created_route.route_binding_id, "route-1");
+    let http = match created_route
+        .identity
+        .as_ref()
+        .and_then(|identity| identity.kind.as_ref())
+        .expect("route identity returned")
+    {
+        route_identity::Kind::Http(http) => http,
+        route_identity::Kind::Sni(_) => panic!("expected HTTP route"),
+    };
+    assert_eq!(
+        http.host.as_ref().expect("host returned").host,
+        "app.example.com"
+    );
+
+    let loaded_route = service
+        .get_route_binding(tonic::Request::new(GetRouteBindingRequest {
+            route_binding_id: "route-1".to_owned(),
+        }))
+        .await
+        .expect("get route binding succeeds")
+        .into_inner();
+    assert_eq!(loaded_route, created_route);
+    let deleted_route = service
+        .delete_route_binding(tonic::Request::new(DeleteRouteBindingRequest {
+            route_binding_id: "route-1".to_owned(),
+        }))
+        .await
+        .expect("delete route binding succeeds")
+        .into_inner();
+    assert!(deleted_route.deleted);
+
+    let expires_at = UNIX_EPOCH + Duration::from_secs(4_102_444_800);
+    let challenge_key = Http01ChallengeKey {
+        host: "Acme.Example.COM.".to_owned(),
+        token: "token-a".to_owned(),
+    };
+    let put_challenge = service
+        .put_http01_challenge(tonic::Request::new(PutHttp01ChallengeRequest {
+            key: Some(challenge_key.clone()),
+            key_authorization: "key-auth-a".to_owned(),
+            expires_at_unix_millis: 4_102_444_800_000,
+        }))
+        .await
+        .expect("put HTTP-01 challenge succeeds")
+        .into_inner();
+    assert_eq!(
+        put_challenge.key.as_ref().expect("key returned").host,
+        "acme.example.com"
+    );
+
+    let resolved = service
+        .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
+            key: Some(challenge_key.clone()),
+        }))
+        .await
+        .expect("resolve HTTP-01 challenge succeeds")
+        .into_inner()
+        .challenge
+        .expect("challenge resolves");
+    assert_eq!(resolved.key_authorization, "key-auth-a");
+
+    let expired = service
+        .expire_http01_challenges(tonic::Request::new(ExpireHttp01ChallengesRequest {
+            now_unix_millis: 1,
+            limit: Some(10),
+        }))
+        .await
+        .expect("expire HTTP-01 challenges succeeds")
+        .into_inner();
+    assert_eq!(expired.expired, 0);
+
+    let deleted = service
+        .delete_http01_challenge(tonic::Request::new(DeleteHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "acme.example.com".to_owned(),
+                token: "token-a".to_owned(),
+            }),
+        }))
+        .await
+        .expect("delete HTTP-01 challenge succeeds")
+        .into_inner();
+    assert!(deleted.deleted);
+    assert!(expires_at > SystemTime::now());
 }
 
 #[tokio::test]
@@ -197,6 +327,55 @@ async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
     assert_eq!(created.state, InstanceState::Cold as i32);
     assert_eq!(created.generation, 0);
     assert_eq!(created.values["tenant"], "transport");
+}
+
+#[tokio::test]
+async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
+    let response = operator_grpc_service_with_store(Arc::new(FakeInstanceStore::default()))
+        .oneshot(grpc_create_route_binding_request(
+            CreateRouteBindingRequest {
+                idempotency_key: "create-route-transport".to_owned(),
+                route_binding_id: "route-transport".to_owned(),
+                instance_id: "instance-transport".to_owned(),
+                identity: Some(sni_identity("DB.Example.COM.")),
+                protocol: ProtocolRoute::TlsSni as i32,
+            },
+            "application/grpc",
+            Version::HTTP_2,
+        ))
+        .await
+        .expect("native gRPC request should route through store-backed service");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| headers.get("grpc-status"))
+        .expect("successful gRPC status is returned");
+
+    assert_eq!(status, "0");
+
+    let created = decode_grpc_route_binding_response(collected.to_bytes().as_ref());
+    assert_eq!(created.route_binding_id, "route-transport");
+    assert_eq!(created.protocol, ProtocolRoute::TlsSni as i32);
+    let sni = match created
+        .identity
+        .as_ref()
+        .and_then(|identity| identity.kind.as_ref())
+        .expect("route identity returned")
+    {
+        route_identity::Kind::Sni(sni) => sni,
+        route_identity::Kind::Http(_) => panic!("expected SNI route"),
+    };
+    assert_eq!(
+        sni.host.as_ref().expect("host returned").host,
+        "db.example.com"
+    );
 }
 
 #[test]
@@ -324,6 +503,33 @@ fn grpc_create_instance_request(
     content_type: &'static str,
     version: Version,
 ) -> Request<Body> {
+    grpc_unary_request(
+        request,
+        "/sleepypods.controlplane.v1.OperatorControlPlane/CreateInstance",
+        content_type,
+        version,
+    )
+}
+
+fn grpc_create_route_binding_request(
+    request: CreateRouteBindingRequest,
+    content_type: &'static str,
+    version: Version,
+) -> Request<Body> {
+    grpc_unary_request(
+        request,
+        "/sleepypods.controlplane.v1.OperatorControlPlane/CreateRouteBinding",
+        content_type,
+        version,
+    )
+}
+
+fn grpc_unary_request<M: Message>(
+    request: M,
+    uri: &'static str,
+    content_type: &'static str,
+    version: Version,
+) -> Request<Body> {
     let mut message = BytesMut::new();
     request.encode(&mut message).expect("request encodes");
 
@@ -335,25 +541,59 @@ fn grpc_create_instance_request(
     Request::builder()
         .version(version)
         .method("POST")
-        .uri("/sleepypods.controlplane.v1.OperatorControlPlane/CreateInstance")
+        .uri(uri)
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::new(Full::new(frame.freeze())))
         .expect("request builds")
 }
 
 fn decode_grpc_instance_response(bytes: &[u8]) -> Instance {
+    decode_grpc_message(bytes)
+}
+
+fn decode_grpc_route_binding_response(bytes: &[u8]) -> RouteBinding {
+    decode_grpc_message(bytes)
+}
+
+fn decode_grpc_message<M: Message + Default>(bytes: &[u8]) -> M {
     assert_eq!(bytes.first(), Some(&0), "gRPC message is uncompressed");
     let length = u32::from_be_bytes(
         bytes[1..5]
             .try_into()
             .expect("gRPC response frame has a length prefix"),
     ) as usize;
-    Instance::decode(&bytes[5..5 + length]).expect("instance response decodes")
+    M::decode(&bytes[5..5 + length]).expect("gRPC response decodes")
+}
+
+fn http_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
+    RouteIdentity {
+        kind: Some(route_identity::Kind::Http(HttpRouteIdentity {
+            host: Some(RouteHost {
+                kind: RouteHostKind::Exact as i32,
+                host: host.to_owned(),
+            }),
+            path_prefix: path_prefix.map(str::to_owned),
+        })),
+    }
+}
+
+fn sni_identity(host: &str) -> RouteIdentity {
+    RouteIdentity {
+        kind: Some(route_identity::Kind::Sni(SniRouteIdentity {
+            host: Some(RouteHost {
+                kind: RouteHostKind::Exact as i32,
+                host: host.to_owned(),
+            }),
+        })),
+    }
 }
 
 #[derive(Default)]
 struct FakeInstanceStore {
     instances: Mutex<BTreeMap<String, InstanceRecord>>,
+    workload_classes: Mutex<BTreeMap<(String, u64), control_plane::WorkloadClassVersion>>,
+    route_bindings: Mutex<BTreeMap<String, control_plane::RouteBindingRecord>>,
+    http01: Mutex<BTreeMap<(String, String), control_plane::Http01ChallengeRecord>>,
 }
 
 impl ControlPlaneStore for FakeInstanceStore {
@@ -412,16 +652,87 @@ impl ControlPlaneStore for FakeInstanceStore {
 
     fn create_workload_class_version<'a>(
         &'a self,
-        _request: control_plane::CreateWorkloadClassVersionRequest,
+        request: control_plane::CreateWorkloadClassVersionRequest,
     ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let workload_class = request.workload_class_version;
+            let key = (
+                workload_class.reference.class_id.as_str().to_owned(),
+                workload_class.reference.version.get(),
+            );
+            self.workload_classes
+                .lock()
+                .expect("fake store lock is available")
+                .insert(key, workload_class.clone());
+
+            Ok(workload_class)
+        })
     }
 
     fn load_workload_class_version<'a>(
         &'a self,
-        _request: control_plane::LoadWorkloadClassVersionRequest,
+        request: control_plane::LoadWorkloadClassVersionRequest,
     ) -> StoreFuture<'a, StoreResult<Option<control_plane::WorkloadClassVersion>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let key = (
+                request.reference.class_id.as_str().to_owned(),
+                request.reference.version.get(),
+            );
+            Ok(self
+                .workload_classes
+                .lock()
+                .expect("fake store lock is available")
+                .get(&key)
+                .cloned())
+        })
+    }
+
+    fn create_route_binding<'a>(
+        &'a self,
+        request: control_plane::CreateRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::RouteBindingRecord>> {
+        Box::pin(async move {
+            let record = control_plane::RouteBindingRecord {
+                id: request.route_binding_id,
+                instance_id: request.instance_id,
+                identity: request.identity,
+                protocol: request.protocol,
+            };
+            self.route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .insert(record.id.as_str().to_owned(), record.clone());
+
+            Ok(record)
+        })
+    }
+
+    fn get_route_binding<'a>(
+        &'a self,
+        request: control_plane::GetRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteBindingRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .get(request.route_binding_id.as_str())
+                .cloned())
+        })
+    }
+
+    fn delete_route_binding<'a>(
+        &'a self,
+        request: control_plane::DeleteRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            Ok(self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .remove(request.route_binding_id.as_str())
+                .is_some())
+        })
     }
 
     fn resolve_route<'a>(
@@ -454,29 +765,79 @@ impl ControlPlaneStore for FakeInstanceStore {
 
     fn put_http01_challenge<'a>(
         &'a self,
-        _request: control_plane::PutHttp01ChallengeRequest,
+        request: control_plane::PutHttp01ChallengeRequest,
     ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let record = control_plane::Http01ChallengeRecord::new(
+                request.key().clone(),
+                request.key_authorization().to_owned(),
+                request.expires_at(),
+                UNIX_EPOCH,
+            )
+            .expect("service parsed a valid HTTP-01 challenge");
+            let key = (
+                record.key().host().as_str().to_owned(),
+                record.key().token().to_owned(),
+            );
+            self.http01
+                .lock()
+                .expect("fake store lock is available")
+                .insert(key, record.clone());
+
+            Ok(record)
+        })
     }
 
     fn resolve_http01_challenge<'a>(
         &'a self,
-        _key: control_plane::Http01ChallengeKey,
+        key: control_plane::Http01ChallengeKey,
     ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            Ok(self
+                .http01
+                .lock()
+                .expect("fake store lock is available")
+                .get(&(key.host().as_str().to_owned(), key.token().to_owned()))
+                .cloned()
+                .filter(|record| record.expires_at() > SystemTime::now()))
+        })
     }
 
     fn delete_http01_challenge<'a>(
         &'a self,
-        _request: control_plane::DeleteHttp01ChallengeRequest,
+        request: control_plane::DeleteHttp01ChallengeRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            Ok(self
+                .http01
+                .lock()
+                .expect("fake store lock is available")
+                .remove(&(
+                    request.key().host().as_str().to_owned(),
+                    request.key().token().to_owned(),
+                ))
+                .is_some())
+        })
     }
 
     fn expire_http01_challenges<'a>(
         &'a self,
-        _request: control_plane::ExpireHttp01ChallengesRequest,
+        request: control_plane::ExpireHttp01ChallengesRequest,
     ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let mut records = self.http01.lock().expect("fake store lock is available");
+            let expired_keys = records
+                .iter()
+                .filter(|(_, record)| record.expires_at() <= request.now)
+                .take(request.limit.unwrap_or(usize::MAX))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            let expired = expired_keys.len();
+            for key in expired_keys {
+                records.remove(&key);
+            }
+
+            Ok(expired)
+        })
     }
 }

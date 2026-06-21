@@ -629,6 +629,79 @@ mod tests {
     }
 
     #[test]
+    fn exact_host_beats_wildcard_even_when_wildcard_has_longer_path() {
+        let exact = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: None,
+        };
+        let wildcard = RouteIdentity::Http {
+            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+        };
+        let lookup = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1/users").expect("valid prefix")),
+        };
+
+        assert!(route_matches(&exact, &lookup) > route_matches(&wildcard, &lookup));
+    }
+
+    #[test]
+    fn more_specific_wildcard_suffix_beats_broader_wildcard() {
+        let broad = RouteIdentity::Http {
+            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
+            path: None,
+        };
+        let specific = RouteIdentity::Http {
+            host: RouteHost::wildcard_suffix("customer.example.com").expect("valid host"),
+            path: None,
+        };
+        let lookup = RouteIdentity::Http {
+            host: RouteHost::exact("app.customer.example.com").expect("valid host"),
+            path: None,
+        };
+
+        assert!(route_matches(&specific, &lookup) > route_matches(&broad, &lookup));
+    }
+
+    #[test]
+    fn longest_path_prefix_wins_within_selected_host_rule() {
+        let short = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api").expect("valid prefix")),
+        };
+        let long = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+        };
+        let lookup = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1/users").expect("valid prefix")),
+        };
+
+        assert!(route_matches(&long, &lookup) > route_matches(&short, &lookup));
+    }
+
+    #[test]
+    fn sni_routes_support_exact_and_wildcard_matching() {
+        let exact = RouteIdentity::Sni {
+            host: RouteHost::exact("db.example.com").expect("valid host"),
+        };
+        let wildcard = RouteIdentity::Sni {
+            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
+        };
+        let lookup = RouteIdentity::Sni {
+            host: RouteHost::exact("db.example.com").expect("valid host"),
+        };
+        let miss = RouteIdentity::Sni {
+            host: RouteHost::exact("example.com").expect("valid host"),
+        };
+
+        assert!(route_matches(&exact, &lookup) > route_matches(&wildcard, &lookup));
+        assert!(route_matches(&wildcard, &miss).is_none());
+    }
+
+    #[test]
     fn route_protocol_validation_rejects_mismatched_identity() {
         let spec = RouteBindingSpec::new(
             RouteIdentity::Sni {
