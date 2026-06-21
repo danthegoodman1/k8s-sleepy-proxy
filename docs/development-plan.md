@@ -25,6 +25,7 @@ Use four test layers:
 
 1. Unit tests for pure logic:
    - route key normalization
+   - opaque subscription ID handling
    - wildcard and longest-prefix matching
    - state-machine transitions
    - template value validation
@@ -138,7 +139,7 @@ generic SQL abstraction. It should include methods for:
 - resolving route identity to route entries
 - compare-and-swap instance state transitions by generation
 - recording materialization state and backend generation
-- route snapshot reads and opaque watch cursors
+- route resolution and dependency lookup for active proxy subscriptions
 - HTTP-01 challenge put, resolve, delete, expiry, and GC
 
 Start with Postgres only. Future providers such as MySQL should implement the
@@ -149,17 +150,29 @@ querying unless there is a portable fallback.
 Provider-specific durability semantics should not leak into the control-plane
 API or proxy protocol. Database-specific features may be used as latency
 optimizations inside one store provider, but correctness must come from portable
-state, transactions, uniqueness constraints, idempotency keys, generation
-checks, and provider-owned watch cursors.
+state, transactions, uniqueness constraints, idempotency keys, and generation
+checks.
 
-Watch cursors should be opaque to proxies and to most control-plane code. The
-store provider owns how route/materialization changes are ordered and resumed.
-Postgres might use a change table sequence, FoundationDB could use
-versionstamps, and other providers may use partition-local cursors or force full
-snapshot resyncs when precise deltas are not available. The watch API should
-only promise that a cursor can either resume changes or be rejected with a
-resync-required response. Do not require a global monotonic route version in the
-public store semantics.
+V1 route propagation should be lazy and subscription-based. `SubscribeRoute`
+handles cache misses on the `Subscribe` stream: it resolves the identity,
+registers the proxy as actively interested in the returned route entry, and
+returns either `RouteResolved` with an opaque `subscription_id` or `RouteMiss`
+with a negative-cache policy. The proxy stores the subscription ID with the local
+cache entry and uses it only to apply targeted messages from `Subscribe`.
+
+`Subscribe` should be a bidirectional stream. Proxy-to-control-plane messages
+subscribe route identities or unsubscribe opaque subscription IDs;
+control-plane-to-proxy messages return lookup results and deliver targeted
+invalidations or updates. The control plane should create the subscription before
+sending `RouteResolved`, so there is no separate resolve-then-add race in the
+proxy protocol.
+
+Polling, provider change streams, versions, ordering keys, and cursors are
+control-plane internals. The store provider may use whatever mechanism fits its
+durability model, but the proxy protocol must not expose or require a global
+monotonic route version, durable global route preload, or resumable cursor.
+Reconnect behavior should rebuild through lazy `SubscribeRoute`, not cursor-based
+resync.
 
 ## Milestone 3: Frontline Route Resolution
 
@@ -170,11 +183,13 @@ Scope:
 
 - Host/SNI/path identity extraction.
 - Canonical route key generation.
+- Opaque subscription ID storage and invalidation handling.
 - Exact host and SNI lookup.
 - Wildcard host lookup.
 - Longest path-prefix matching.
-- Route snapshot and opaque-cursor watch handling.
-- `ResolveRoute` fallback on local miss.
+- Bounded local route cache and `Subscribe` subscribe/unsubscribe stream
+  handling.
+- `SubscribeRoute` fallback on local miss.
 - `WakeInstance` flow when a route is Cold or missing a backend.
 - Stale generation rejection.
 - HTTP-01 challenge lookup through `ResolveHTTP01Challenge`.
@@ -182,18 +197,28 @@ Scope:
 Sub-phases:
 
 - 3A: Route key normalization and local exact/wildcard/path-prefix matcher.
-- 3B: Route snapshot, opaque-cursor watch stream, reconnect, and full resync.
-- 3C: `ResolveRoute` fallback, miss handling, and negative caching.
-- 3D: `WakeInstance` flow, Waking wait behavior, and stale generation
+- 3B: Bounded local route cache, cache TTLs, and negative caching.
+- 3C: `SubscribeRoute` cache-miss path, `RouteResolved`/`RouteMiss` handling,
+  and opaque subscription ID storage.
+- 3D: `Subscribe` bidirectional stream with `Unsubscribe` input and
+  subscription-targeted invalidations.
+- 3E: `WakeInstance` flow, Waking wait behavior, and stale generation
   rejection.
-- 3E: HTTP/1.1, HTTP/2, h2c gRPC, and WebSocket forwarding.
-- 3F: HTTPS termination, SNI certificate selection, and TLS/SNI passthrough.
-- 3G: HTTP-01 challenge interception and `ResolveHTTP01Challenge` lookup.
+- 3F: HTTP/1.1, HTTP/2, h2c gRPC, and WebSocket forwarding.
+- 3G: HTTPS termination, SNI certificate selection, and TLS/SNI passthrough.
+- 3H: HTTP-01 challenge interception and `ResolveHTTP01Challenge` lookup.
 
 Done when:
 
 - Fake-control-plane integration tests cover cold wake, hot route, miss, stale
-  generation, route update, and watch reconnect/resync.
+  generation, targeted route update, targeted invalidation, and stream
+  reconnect.
+- Subscription tests cover route subscription, miss responses without
+  subscription IDs, unsubscribe, idempotent duplicate unsubscribe, and
+  invalidation after resolve.
+- Stream reconnect tests prove the proxy does not rely on public cursors and can
+  resubscribe kept identities or rebuild stale cache entries through lazy
+  `SubscribeRoute`.
 - Protocol tests cover HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
   termination, SNI passthrough, and HTTP-01.
 - Unknown Host/SNI negative caching protects the fake control plane from repeat
@@ -269,9 +294,9 @@ Wire the control plane, frontline proxy, sidecar, and materializer together.
 Scope:
 
 - Create instance through control-plane API.
-- Publish route snapshot to frontline proxy.
+- Resolve route lazily through the frontline proxy.
 - Cold request wakes instance.
-- Hot request routes from local snapshot.
+- Hot request routes from local cache.
 - Sidecar reports idle.
 - Control plane drains and sleeps materialization.
 - Custom host and wildcard host route to the right instance.
@@ -308,7 +333,8 @@ Scope:
   drain duration, active streams, and materialization failures.
 - Structured logs with instance ID, route ID, generation, and cluster.
 - Backoff and retry policies.
-- Proxy watch reconnect and full resync.
+- Proxy `Subscribe` stream reconnect and cache rebuild through lazy
+  `SubscribeRoute`, without proxy-visible versions or cursors.
 - Control-plane restart recovery from database state.
 - Load tests for route lookup and hot proxy path.
 - Soak tests for repeated wake/sleep cycles.
@@ -317,7 +343,8 @@ Sub-phases:
 
 - 7A: Metrics, tracing, and structured log fields.
 - 7B: Control-plane restart recovery during wake, sleep, and delete.
-- 7C: Proxy watch reconnect, route resync, and stale backend recovery.
+- 7C: Proxy `Subscribe` reconnect, lazy cache rebuild, and stale backend
+  recovery.
 - 7D: Load tests for route lookup and hot proxy path.
 - 7E: kind wake/sleep soak tests and leaked-object detection.
 - 7F: Operator-facing runbook and metric name documentation.
