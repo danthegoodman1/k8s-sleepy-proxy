@@ -1,0 +1,84 @@
+# Proxy Hot-Path Latency Budgets
+
+Milestone 1F adds benchmark harnesses and deterministic allocation checks for
+the proxy-core primitives that future frontline and sidecar binaries will call
+on hot routing paths. The numbers are budgets and regression signals, not hard
+CI latency gates yet, because local and CI hosts vary too much for stable
+wall-clock assertions.
+
+Run the harness with:
+
+```sh
+cargo bench -p proxy-core --bench proxy_primitives
+```
+
+For a quick compile-and-smoke run:
+
+```sh
+cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measurement-time 1 --warm-up-time 1
+```
+
+## Budget Principles
+
+- Hot forwarding paths must not perform control-plane calls, database access,
+  global locking, per-request client construction additions, unbounded
+  allocation, or heavy instrumentation.
+- Cold wake latency is intentionally separate from hot routing latency. Waking a
+  workload can be slower; forwarding to an already resolved backend should stay
+  local and predictable.
+- Benchmarks should use in-memory transports where possible and loopback only
+  when a real socket is the behavior under test. They should not depend on
+  external services or sleep as a timing mechanism.
+- Allocation-sensitive tests guard deterministic pure/helper paths. Network
+  benchmark timings are observational and should not fail CI on wall-clock
+  noise.
+
+## Measured Paths
+
+| Path | Harness | Budget intent |
+| --- | --- | --- |
+| TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip` | Measure bidirectional copy overhead without external network variance. |
+| HTTP helper work | `http/prepare_reverse_proxy_request`, `http/strip_hop_by_hop_headers` | Keep request URI rewrite and hop-by-hop header cleanup bounded and simple. |
+| WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Exercise frame relay over in-memory WebSocket streams without an external service. |
+| TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded before TLS routing decisions are added. |
+| Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. |
+| Observability helpers | `observability/label_as_str_and_outcome_mapping` | Keep label and outcome mapping low-cardinality and allocation-free. |
+
+## Provisional Latency Budgets
+
+These initial budgets are intentionally conservative relative to the 1F smoke
+run. They are review thresholds for future regressions, not CI pass/fail gates.
+If a future change exceeds one of these budgets, the change should either reduce
+the overhead, update the benchmark workload, or document why the new cost is
+expected.
+
+| Path | Benchmark | Initial budget |
+| --- | --- | --- |
+| TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip` | <= 10 us per 4 KiB in-memory round trip |
+| HTTP request rewrite | `http/prepare_reverse_proxy_request` | <= 2 us per request |
+| HTTP hop-by-hop header cleanup | `http/strip_hop_by_hop_headers` | <= 2 us per header map |
+| WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | <= 50 us per 1 KiB in-memory binary round trip |
+| TLS ClientHello/SNI parse, single record | `tls/parse_client_hello_sni_single_record` | <= 1 us per complete ClientHello |
+| TLS ClientHello/SNI parse, fragmented records | `tls/parse_client_hello_sni_fragmented_records` | <= 2 us per fragmented ClientHello |
+| Admission acquire/release | `admission/try_acquire_release` | <= 500 ns per steady-state permit |
+| Active connection track/release | `accounting/track_release` | <= 500 ns per steady-state guard |
+| Observability label/outcome helpers | `observability/label_as_str_and_outcome_mapping` | <= 50 ns per mapping batch |
+
+## Allocation Budgets
+
+The deterministic allocation tests in `allocation_hot_paths.rs` enforce these
+initial budgets. Setup allocations are outside the measured closures; the
+budgets describe steady-state helper behavior.
+
+| Path | Test label | Allocation budget |
+| --- | --- | --- |
+| Observability label helpers | `observability labels` | 0 allocations |
+| Active connection track/release | `active connection track/release` | 0 allocations after setup warm-up |
+| Admission acquire/release | `admission try_acquire/release` | 0 allocations after setup warm-up |
+| HTTP upstream URI rewrite | `upstream request URI rewrite` | <= 2 allocations |
+| HTTP static hop-by-hop cleanup | `strip static hop-by-hop headers` | 0 allocations |
+| TLS ClientHello/SNI parse | `TLS ClientHello SNI parse` | <= 16 allocations for a complete SNI ClientHello |
+
+Local route-key lookup benchmarks become mandatory when Milestone 3A introduces
+route-key and matcher primitives. Phase 1F intentionally does not invent those
+production types.
