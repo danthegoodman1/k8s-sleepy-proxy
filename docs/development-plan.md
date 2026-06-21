@@ -95,6 +95,10 @@ Introduce the durable model behind the control-plane API.
 
 Scope:
 
+- Domain-specific `ControlPlaneStore` trait for persistence operations and
+  transactional invariants.
+- Postgres as the first store provider.
+- Control-plane config for selecting the store provider.
 - `WorkloadClass` with immutable versions.
 - `Instance` pinned to a `WorkloadClass` version.
 - `RouteBinding` for host, wildcard host, SNI, and optional path prefix.
@@ -105,24 +109,43 @@ Scope:
 
 Sub-phases:
 
-- 2A: Database schema, migrations, and typed store interfaces.
-- 2B: `WorkloadClass` versioning, schema validation, and immutable version
+- 2A: Domain-specific `ControlPlaneStore` trait and provider config shape.
+- 2B: Postgres schema, migrations, and store implementation.
+- 2C: `WorkloadClass` versioning, schema validation, and immutable version
   behavior.
-- 2C: `Instance` APIs, value validation, generation fields, and idempotent
+- 2D: `Instance` APIs, value validation, generation fields, and idempotent
   create/update behavior.
-- 2D: `RouteBinding` model, host/SNI/path/wildcard resolver, and uniqueness
+- 2E: `RouteBinding` model, host/SNI/path/wildcard resolver, and uniqueness
   constraints.
-- 2E: Instance state machine with generation/CAS transitions.
-- 2F: HTTP-01 challenge store with put, resolve, delete, expiry, and GC.
-- 2G: Structured manifest renderer for Deployment, StatefulSet, Service, PV,
+- 2F: Instance state machine with generation/CAS transitions.
+- 2G: HTTP-01 challenge store with put, resolve, delete, expiry, and GC.
+- 2H: Structured manifest renderer for Deployment, StatefulSet, Service, PV,
   and PVC.
 
 Done when:
 
 - Database migrations and store tests pass against a real test database.
+- The control plane can construct the configured store provider.
 - State-machine tests cover wake, running, draining, failed, retry, and delete.
 - Manifest rendering tests cover Deployment, StatefulSet, Service, PV, and PVC.
 - WorkloadClass version updates cannot mutate existing pinned instances.
+
+The store trait should express domain operations rather than generic CRUD or a
+generic SQL abstraction. It should include methods for:
+
+- creating instances transactionally with route bindings and idempotency keys
+- loading and validating pinned `WorkloadClass` versions
+- resolving route identity to route entries
+- compare-and-swap instance state transitions by generation
+- recording materialization state and backend generation
+- route snapshot version reads and watch cursors
+- HTTP-01 challenge put, resolve, delete, expiry, and GC
+
+Start with Postgres only. Future providers such as MySQL should implement the
+same trait behind control-plane config. Avoid making public store semantics rely
+on Postgres-only behavior such as `LISTEN/NOTIFY`, partial indexes, or JSONB
+querying unless there is a portable fallback. Use explicit route/materialization
+versions so watch and resync behavior can work across providers.
 
 ## Milestone 3: Frontline Route Resolution
 
