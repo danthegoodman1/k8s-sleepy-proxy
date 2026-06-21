@@ -1,8 +1,9 @@
-# Development Plan
+# SleepyPods Development Plan
 
-This plan turns the production north star into implementation milestones. Each
-milestone should have integration coverage, and Kubernetes behavior should be
-verified with kind-based end-to-end tests before it is considered done.
+This plan turns the SleepyPods production north star into implementation
+milestones. Each milestone should have integration coverage, and Kubernetes
+behavior should be verified with kind-based end-to-end tests before it is
+considered done.
 
 ## Implementation Principles
 

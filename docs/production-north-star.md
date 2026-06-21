@@ -1,6 +1,6 @@
-# Production North Star
+# SleepyPods Production North Star
 
-This project should evolve from a Kubernetes PoC into a control-plane-driven
+SleepyPods should evolve from a Kubernetes PoC into a control-plane-driven
 sleepy workload platform. Kubernetes remains the execution substrate, but the
 durable product model lives in the control plane database.
 
