@@ -4,6 +4,21 @@ This plan turns the production north star into implementation milestones. Each
 milestone should have integration coverage, and Kubernetes behavior should be
 verified with kind-based end-to-end tests before it is considered done.
 
+## Implementation Principles
+
+- Prefer the simplest implementation that satisfies the current milestone and
+  its tests.
+- Keep code surface area small. Scalability and maintainability should come from
+  clear boundaries, predictable state machines, and fewer moving parts before
+  they come from clever abstractions.
+- Add abstractions only when repeated behavior or testability makes the benefit
+  concrete.
+- Do not defer useful comments. Comments should explain protocol edge cases,
+  lifecycle invariants, reconciliation assumptions, and places where a future
+  maintainer could otherwise make a dangerous simplification.
+- Keep each sub-phase reviewable. A phase is not done until the narrowest useful
+  integration test proves the behavior works.
+
 ## Testing Strategy
 
 Use four test layers:
