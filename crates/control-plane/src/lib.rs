@@ -6,6 +6,7 @@ pub mod http01;
 pub mod ids;
 pub mod instance;
 pub mod materialization;
+pub mod postgres;
 pub mod route;
 pub mod store;
 pub mod workload;
@@ -27,6 +28,7 @@ pub use materialization::{
     BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
     RecordMaterializationRequest, RenderedObjectRef,
 };
+pub use postgres::PostgresStore;
 pub use route::{
     CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec,
     RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost, RouteHostKind, RouteIdentity,

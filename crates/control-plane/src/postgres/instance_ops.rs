@@ -1,0 +1,353 @@
+use deadpool_postgres::GenericClient;
+use serde_json::Value;
+
+use crate::{
+    ids::Generation,
+    instance::{
+        CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
+        InstanceRecord, InstanceState,
+    },
+    route::RouteBindingRecord,
+    store::{StoreError, StoreResult},
+    workload::{LoadWorkloadClassVersionRequest, WorkloadClassVersion},
+};
+
+use super::{
+    connection::PostgresStore,
+    error::map_postgres_error,
+    idempotency::{self, CREATE_INSTANCE_OPERATION},
+    mapping::{
+        self, generation_to_i64, instance_from_row, instance_state_to_db, protocol_to_db,
+        route_binding_from_row, route_identity_parts, values_to_json,
+        workload_class_version_from_row,
+    },
+};
+
+pub(crate) async fn create_instance(
+    store: &PostgresStore,
+    request: CreateInstanceRequest,
+) -> StoreResult<CreateInstanceResult> {
+    let fingerprint = idempotency::create_instance_fingerprint(&request)?;
+    let mut client = store.client().await?;
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    let idempotency_key = request.idempotency_key.as_str();
+    let instance_id = request.instance_id.as_str();
+    let inserted = transaction
+        .execute(
+            "
+            INSERT INTO idempotency_records (
+                idempotency_key,
+                operation,
+                request_fingerprint,
+                resource_id
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            ",
+            &[
+                &idempotency_key,
+                &CREATE_INSTANCE_OPERATION,
+                &fingerprint,
+                &instance_id,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    if inserted == 0 {
+        let result = replay_create_instance(&transaction, idempotency_key, &fingerprint).await?;
+        transaction.commit().await.map_err(map_postgres_error)?;
+        return Ok(result);
+    }
+
+    ensure_workload_class_version_exists(&transaction, &request).await?;
+    let instance = insert_instance(&transaction, &request).await?;
+    let route_bindings = insert_route_bindings(&transaction, &request).await?;
+
+    transaction.commit().await.map_err(map_postgres_error)?;
+
+    Ok(CreateInstanceResult {
+        instance,
+        route_bindings,
+        idempotency_replayed: false,
+    })
+}
+
+pub(crate) async fn load_workload_class_version(
+    store: &PostgresStore,
+    request: LoadWorkloadClassVersionRequest,
+) -> StoreResult<Option<WorkloadClassVersion>> {
+    let client = store.client().await?;
+    let class_id = request.reference.class_id.as_str();
+    let version = generation_to_i64(request.reference.version)?;
+    let row = client
+        .query_opt(
+            "
+            SELECT class_id, version, template_generation, default_values
+            FROM workload_class_versions
+            WHERE class_id = $1 AND version = $2
+            ",
+            &[&class_id, &version],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.as_ref()
+        .map(workload_class_version_from_row)
+        .transpose()
+}
+
+pub(crate) async fn compare_and_swap_instance_state(
+    store: &PostgresStore,
+    request: CompareAndSwapInstanceStateRequest,
+) -> StoreResult<InstanceRecord> {
+    let client = store.client().await?;
+    let instance_id = request.instance_id.as_str();
+    let expected_generation = generation_to_i64(request.expected_generation)?;
+    let next_generation = generation_to_i64(request.expected_generation.next())?;
+    let next_state = instance_state_to_db(request.next_state);
+    let row = client
+        .query_opt(
+            "
+            UPDATE instances
+            SET state = $2,
+                generation = $3,
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1 AND generation = $4
+            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
+            ",
+            &[
+                &instance_id,
+                &next_state,
+                &next_generation,
+                &expected_generation,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    if let Some(row) = row {
+        return instance_from_row(&row);
+    }
+
+    let actual = client
+        .query_opt(
+            "SELECT generation FROM instances WHERE instance_id = $1",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let Some(row) = actual else {
+        return Err(StoreError::NotFound {
+            resource: "instance",
+        });
+    };
+    let actual_generation: i64 = row.get("generation");
+
+    Err(StoreError::GenerationConflict {
+        expected: request.expected_generation,
+        actual: Generation::new(
+            u64::try_from(actual_generation)
+                .map_err(|_| StoreError::internal("stored instance generation was negative"))?,
+        ),
+    })
+}
+
+pub(crate) async fn load_instance(
+    client: &impl GenericClient,
+    instance_id: &str,
+) -> StoreResult<Option<InstanceRecord>> {
+    let row = client
+        .query_opt(
+            "
+            SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
+            FROM instances
+            WHERE instance_id = $1
+            ",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.as_ref().map(instance_from_row).transpose()
+}
+
+async fn replay_create_instance(
+    client: &impl GenericClient,
+    idempotency_key: &str,
+    fingerprint: &Value,
+) -> StoreResult<CreateInstanceResult> {
+    let row = client
+        .query_one(
+            "
+            SELECT operation, request_fingerprint, resource_id
+            FROM idempotency_records
+            WHERE idempotency_key = $1
+            ",
+            &[&idempotency_key],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let operation: String = row.get("operation");
+    let stored_fingerprint: Value = row.get("request_fingerprint");
+    let resource_id: String = row.get("resource_id");
+
+    if operation != CREATE_INSTANCE_OPERATION || stored_fingerprint != *fingerprint {
+        return Err(idempotency::idempotency_conflict());
+    }
+
+    load_create_instance_result(client, &resource_id, true).await
+}
+
+async fn ensure_workload_class_version_exists(
+    client: &impl GenericClient,
+    request: &CreateInstanceRequest,
+) -> StoreResult<()> {
+    let class_id = request.workload_class.class_id.as_str();
+    let version = generation_to_i64(request.workload_class.version)?;
+    let exists = client
+        .query_opt(
+            "
+            SELECT 1
+            FROM workload_class_versions
+            WHERE class_id = $1 AND version = $2
+            ",
+            &[&class_id, &version],
+        )
+        .await
+        .map_err(map_postgres_error)?
+        .is_some();
+
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound {
+            resource: "workload class version",
+        })
+    }
+}
+
+async fn insert_instance(
+    client: &impl GenericClient,
+    request: &CreateInstanceRequest,
+) -> StoreResult<InstanceRecord> {
+    let instance_id = request.instance_id.as_str();
+    let workload_class_id = request.workload_class.class_id.as_str();
+    let workload_class_version = generation_to_i64(request.workload_class.version)?;
+    let values = values_to_json(&request.values)?;
+    let state = instance_state_to_db(InstanceState::Cold);
+    let generation = generation_to_i64(Generation::new(0))?;
+    let row = client
+        .query_one(
+            "
+            INSERT INTO instances (
+                instance_id,
+                workload_class_id,
+                workload_class_version,
+                values,
+                state,
+                generation
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
+            ",
+            &[
+                &instance_id,
+                &workload_class_id,
+                &workload_class_version,
+                &values,
+                &state,
+                &generation,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    instance_from_row(&row)
+}
+
+async fn insert_route_bindings(
+    client: &impl GenericClient,
+    request: &CreateInstanceRequest,
+) -> StoreResult<Vec<RouteBindingRecord>> {
+    let mut route_bindings = Vec::with_capacity(request.route_bindings.len());
+    for (index, spec) in request.route_bindings.iter().enumerate() {
+        mapping::validate_route_protocol(spec)?;
+        let route_binding_id = format!("{}:route:{}", request.instance_id.as_str(), index + 1);
+        let instance_id = request.instance_id.as_str();
+        let parts = route_identity_parts(&spec.identity);
+        let protocol = protocol_to_db(spec.protocol);
+        let path_prefix = parts.path_prefix.as_deref();
+        let row = client
+            .query_one(
+                "
+                INSERT INTO route_bindings (
+                    route_binding_id,
+                    instance_id,
+                    identity_key,
+                    identity_kind,
+                    host_kind,
+                    host,
+                    path_prefix,
+                    protocol
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+                ",
+                &[
+                    &route_binding_id,
+                    &instance_id,
+                    &parts.key,
+                    &parts.identity_kind,
+                    &parts.host_kind,
+                    &parts.host,
+                    &path_prefix,
+                    &protocol,
+                ],
+            )
+            .await
+            .map_err(map_postgres_error)?;
+        route_bindings.push(route_binding_from_row(&row)?);
+    }
+
+    Ok(route_bindings)
+}
+
+async fn load_create_instance_result(
+    client: &impl GenericClient,
+    instance_id: &str,
+    replayed: bool,
+) -> StoreResult<CreateInstanceResult> {
+    let instance = load_instance(client, instance_id)
+        .await?
+        .ok_or(StoreError::NotFound {
+            resource: "instance",
+        })?;
+    let route_bindings = load_route_bindings_for_instance(client, instance_id).await?;
+
+    Ok(CreateInstanceResult {
+        instance,
+        route_bindings,
+        idempotency_replayed: replayed,
+    })
+}
+
+async fn load_route_bindings_for_instance(
+    client: &impl GenericClient,
+    instance_id: &str,
+) -> StoreResult<Vec<RouteBindingRecord>> {
+    let rows = client
+        .query(
+            "
+            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            FROM route_bindings
+            WHERE instance_id = $1
+            ORDER BY route_binding_id
+            ",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    rows.iter().map(route_binding_from_row).collect()
+}
