@@ -51,6 +51,7 @@ Use four test layers:
    - HTTP/1.1
    - HTTP/2
    - h2c gRPC
+   - gRPC-Web for operator-facing control-plane APIs
    - WebSockets
    - TLS termination
    - TLS/SNI passthrough
@@ -127,6 +128,8 @@ Scope:
 
 - Domain-specific `ControlPlaneStore` trait for persistence operations and
   transactional invariants.
+- Protobuf-defined control-plane API exposed over native gRPC and gRPC-Web for
+  operator-facing methods.
 - Postgres as the first store provider.
 - Control-plane config for selecting the store provider.
 - `WorkloadClass` with immutable versions.
@@ -140,16 +143,18 @@ Scope:
 Sub-phases:
 
 - 2A: Domain-specific `ControlPlaneStore` trait and provider config shape.
-- 2B: Postgres schema, migrations, and store implementation.
-- 2C: `WorkloadClass` versioning, schema validation, and immutable version
+- 2B: Protobuf service definitions, native gRPC server, and gRPC-Web transport
+  for operator-facing APIs.
+- 2C: Postgres schema, migrations, and store implementation.
+- 2D: `WorkloadClass` versioning, schema validation, and immutable version
   behavior.
-- 2D: `Instance` APIs, value validation, generation fields, and idempotent
+- 2E: `Instance` APIs, value validation, generation fields, and idempotent
   create/update behavior.
-- 2E: `RouteBinding` model, host/SNI/path/wildcard resolver, and uniqueness
+- 2F: `RouteBinding` model, host/SNI/path/wildcard resolver, and uniqueness
   constraints.
-- 2F: Instance state machine with generation/CAS transitions.
-- 2G: HTTP-01 challenge store with put, resolve, delete, expiry, and GC.
-- 2H: Structured manifest renderer for Deployment, StatefulSet, Service, PV,
+- 2G: Instance state machine with generation/CAS transitions.
+- 2H: HTTP-01 challenge store with put, resolve, delete, expiry, and GC.
+- 2I: Structured manifest renderer for Deployment, StatefulSet, Service, PV,
   and PVC.
 
 Done when:
@@ -160,6 +165,13 @@ Done when:
   generation failures, materialization generation updates, and provider config
   errors.
 - The control plane can construct the configured store provider.
+- Native gRPC and gRPC-Web integration tests exercise the same operator-facing
+  APIs for workload classes, instances, route bindings, and HTTP-01 challenges.
+- gRPC-Web tests cover CORS/preflight behavior when enabled, metadata/auth
+  propagation, structured error mapping, and V8-compatible generated clients or
+  request encoding.
+- Tests document that proxy `Subscribe` is native gRPC-only in V1 and is not
+  exposed as a gRPC-Web bidirectional stream.
 - State-machine tests cover wake, running, draining, failed, retry, and delete.
 - State-machine tests cover concurrent wake calls, sleep while waking, delete
   while waking or draining, failed wake retry, stale sidecar reports, and stale
@@ -392,8 +404,8 @@ Sub-phases:
 - 6B: StatefulSet with static PV/PVC templates cold wake, hot route, mounted
   write/read, idle drain, sleep, and re-wake with data continuity.
 - 6C: Custom host, wildcard host, SNI, and optional path-prefix routing.
-- 6D: Protocol matrix: HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
-  termination, and SNI passthrough.
+- 6D: Protocol matrix: HTTP/1.1, HTTP/2, h2c gRPC, gRPC-Web control-plane
+  access, WebSockets, TLS termination, and SNI passthrough.
 - 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior.
 - 6F: Failure-path matrix: wake timeout, bad route, missing PVC binding, bad
   volume template, stale proxy generation, and control-plane restart.
@@ -406,8 +418,8 @@ Done when:
 - kind E2E passes for stateless Deployment.
 - kind E2E passes for StatefulSet with static PV/PVC templates, intended binding,
   mounted write/read, sleep, re-wake, and data continuity.
-- kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
-  termination, and SNI passthrough.
+- kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, gRPC-Web control-plane access,
+  WebSockets, TLS termination, and SNI passthrough.
 - Failure-path E2E covers wake timeout, bad route, missing PVC binding, bad
   volume template, and stale proxy generation.
 - Lifecycle-race E2E proves generation checks prevent stale sidecar reports,
@@ -512,7 +524,8 @@ Done when:
   drain, delete, and route/domain changes.
 - An operator can install, configure, monitor, back up, upgrade, and troubleshoot
   the platform from docs alone.
-- API and protocol docs match the protobuf/Rust types and contain no stale RPCs.
+- API and protocol docs match the protobuf/Rust types, native gRPC service,
+  gRPC-Web operator surface, and contain no stale RPCs.
 - Documentation is concise: prefer short task-oriented files, stable headings,
   examples, and explicit invariants over broad narrative prose.
 - Contributor and agent-facing guidance calls out source-of-truth files,

@@ -134,6 +134,14 @@ The database is the source of truth for route bindings, instances, and
 materializations. Live proxy update delivery is a control-plane responsibility,
 not a direct database responsibility.
 
+The control-plane API should be defined once with protobuf and exposed through
+both native gRPC and gRPC-Web for operator-facing APIs. gRPC-Web support lets
+browser and other V8-based environments interact with the control plane without
+native gRPC transport support. Keep the proxy/control-plane `Subscribe` stream on
+native gRPC in V1 because it is bidirectional; gRPC-Web should cover unary and
+server-streaming operator APIs unless a future WebSocket-based proxy protocol is
+explicitly added.
+
 Template rendering should be structured and constrained. Prefer typed `WorkloadClass` fields plus limited substitution from validated
 `Instance.values` over arbitrary text templating or user-supplied executable
 logic. Store a rendered generation hash so the controller can reject stale
@@ -398,8 +406,9 @@ storage mode explicitly adds that ownership.
 ## Implementation Direction
 
 1. Introduce the control-plane resource model in the DB: `WorkloadClass`,
-  `Instance`, `RouteBinding`, and `Materialization`.
-2. Move tenant creation behind a versioned control-plane API.
+   `Instance`, `RouteBinding`, and `Materialization`.
+2. Move tenant creation behind a versioned protobuf control-plane API exposed
+   through native gRPC and gRPC-Web for operator clients.
 3. Replace header-only routing with route identity extraction for Host and SNI.
 4. Add a route subscription API that resolves cache misses on the stream,
    targets later updates by opaque subscription ID, and keeps watch cursors,
