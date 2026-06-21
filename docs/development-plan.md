@@ -30,11 +30,15 @@ Use four test layers:
    - state-machine transitions
    - template value validation
    - structured manifest rendering
+   - PV/PVC field rendering, including names, labels, access modes, capacity,
+     reclaim policy, volume source, and instance value substitution
 
 2. Component integration tests:
    - proxy components against fake control-plane services
    - control plane against a real test database
    - Kubernetes materializer against a real or fake API server where useful
+   - Kubernetes object assertions for PV/PVC binding intent, owner labels,
+     generation labels, and workload volume mounts
 
 3. Protocol integration tests:
    - HTTP/1.1
@@ -51,12 +55,17 @@ Use four test layers:
    - deploy control plane, frontline proxy, sidecar, and demo workloads
    - create `WorkloadClass`, `Instance`, and `RouteBinding`
    - verify cold wake, hot routing, drain/sleep, and re-wake
-   - verify PV/PVC materialization before workload creation
+   - verify PV/PVC materialization before workload creation, intended binding,
+     pod mount behavior, and data continuity across sleep/re-wake
    - verify custom host/SNI routing and HTTP-01 challenge lookup
 
 The kind suite is a release gate. Unit and component tests are not enough for
 this project because most failures will happen at Kubernetes object lifecycle,
 networking, and readiness boundaries.
+
+Each milestone should name the important success, failure, reconnect, timeout,
+and race cases before implementation starts. Avoid broad "works end to end"
+claims without assertions for the state that makes the behavior correct.
 
 ## Milestone 1: Rust Proxy Primitives
 
@@ -87,6 +96,12 @@ Done when:
 
 - Unit tests cover accounting, drain, timeout, and SNI parsing.
 - Integration tests proxy TCP streams, HTTP requests, and WebSocket sessions.
+- TCP tests cover byte preservation, half-close behavior, upstream reset, client
+  reset, timeout, and backpressure.
+- HTTP tests cover HTTP/1.1 keep-alive, chunked bodies, large bodies, streaming
+  request/response bodies, HTTP/2 multiplexing, and cancellation.
+- WebSocket tests cover upgrade failure, bidirectional traffic, close frames,
+  peer disconnect, and backpressure.
 - Drain tests prove new work is rejected while existing streams get the grace
   period.
 
@@ -126,8 +141,20 @@ Sub-phases:
 Done when:
 
 - Database migrations and store tests pass against a real test database.
+- Store conformance tests cover idempotency keys, transaction rollback,
+  duplicate route/domain rejection, concurrent create/update conflicts, CAS
+  generation failures, materialization generation updates, and provider config
+  errors.
 - The control plane can construct the configured store provider.
 - State-machine tests cover wake, running, draining, failed, retry, and delete.
+- State-machine tests cover concurrent wake calls, sleep while waking, delete
+  while waking or draining, failed wake retry, stale sidecar reports, and stale
+  materialization updates.
+- Route resolver tests cover host normalization, exact host versus wildcard
+  precedence, wildcard specificity, longest path-prefix match, SNI/custom-domain
+  uniqueness, and misses.
+- HTTP-01 store tests cover put, overwrite/idempotency rules, wrong host/token,
+  expiry, delete, and garbage collection.
 - Manifest rendering tests cover Deployment, StatefulSet, Service, PV, and PVC.
 - WorkloadClass version updates cannot mutate existing pinned instances.
 
@@ -213,14 +240,32 @@ Done when:
 - Fake-control-plane integration tests cover cold wake, hot route, miss, stale
   generation, targeted route update, targeted invalidation, and stream
   reconnect.
+- Route matching tests cover exact host precedence over wildcard, wildcard suffix
+  specificity, longest path-prefix precedence, host case normalization, optional
+  port handling, trailing-dot handling, and wildcard misses.
+- Cache tests cover positive TTL expiry, negative TTL expiry, bounded eviction,
+  `Unsubscribe` on eviction, refresh after invalidation, and stale backend
+  rejection after generation changes.
 - Subscription tests cover route subscription, miss responses without
   subscription IDs, unsubscribe, idempotent duplicate unsubscribe, and
   invalidation after resolve.
+- Subscription tests cover duplicate in-flight `SubscribeRoute` requests for the
+  same identity, route reassignment to another instance, invalidation during
+  wake, and stream backpressure.
 - Stream reconnect tests prove the proxy does not rely on public cursors and can
   resubscribe kept identities or rebuild stale cache entries through lazy
   `SubscribeRoute`.
 - Protocol tests cover HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
   termination, SNI passthrough, and HTTP-01.
+- Protocol tests include chunked and large HTTP bodies, streaming request and
+  response bodies, HTTP/2 multiplexing, h2c gRPC trailers and status propagation,
+  WebSocket close/backpressure, TLS passthrough byte preservation, and TCP
+  half-close behavior.
+- TLS tests cover SNI certificate selection, missing certificate behavior, cert
+  rotation, and passthrough for unknown or non-HTTP TLS traffic.
+- HTTP-01 tests cover wrong host, wrong token, expired challenge, deleted
+  challenge, response content type, and challenge path precedence before normal
+  route resolution.
 - Unknown Host/SNI negative caching protects the fake control plane from repeat
   misses.
 
@@ -248,10 +293,16 @@ Sub-phases:
 
 Done when:
 
-- Integration tests prove active traffic prevents idle reporting.
-- Idle tests prove `ReportIdle` fires after the configured timeout.
+- Integration tests prove active HTTP requests, h2c gRPC streams, WebSockets, and
+  raw TCP connections prevent idle reporting.
+- Idle tests prove `ReportIdle` fires after the configured timeout only after all
+  active requests and connections close.
+- Idle/report tests cover duplicate reports, stale generation reports, control
+  plane rejection, retry/backoff, and sidecar restart.
 - Drain tests prove the sidecar stops accepting new work and lets active work
   finish within the grace period.
+- Drain tests cover SIGTERM, upstream failure, client disconnect, grace expiry
+  with active streams, and forced shutdown after the hard deadline.
 
 ## Milestone 5: Kubernetes Materializer
 
@@ -261,9 +312,15 @@ Scope:
 
 - Render PV, PVC, Service, Deployment, and StatefulSet objects.
 - Apply PV/PVC before workloads and wait for PVC Bound.
+- Validate PV/PVC specs for names, labels, access modes, capacity, reclaim
+  policy, volume source, instance value substitution, and intended binding.
+- Validate workload volume mounts point at the rendered PVC and expected mount
+  path.
 - Inject sidecar into rendered pod templates.
 - Service targets the sidecar port.
 - Sidecar targets the local app port.
+- Validate Service selectors and target ports route to the sidecar, and sidecar
+  upstream configuration can only route to the local app port.
 - Wait for readiness through Pods or EndpointSlices.
 - Delete materialized objects on sleep/delete.
 - Leave backing provider volumes untouched.
@@ -273,19 +330,32 @@ Sub-phases:
 - 5A: Structured object rendering for PV, PVC, Service, Deployment, and
   StatefulSet.
 - 5B: Kubernetes apply/update/delete client and ownership labels.
-- 5C: PV/PVC apply order and PVC Bound wait.
+- 5C: PV/PVC spec correctness, intended binding, apply order, and PVC Bound
+  wait.
 - 5D: Deployment/StatefulSet rendering with sidecar injection.
 - 5E: Service rendering that targets the sidecar port.
 - 5F: Readiness detection through Pods or EndpointSlices.
 - 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs.
-- 5H: kind materialization lifecycle suite.
+- 5H: kind materialization lifecycle suite with a static volume backend.
 
 Done when:
 
 - Component tests validate rendered objects and ordering.
-- kind tests prove cold wake creates PV/PVC before StatefulSet.
+- Component tests validate Service selector/targetPort wiring, sidecar container
+  args/env for the local upstream, and that the generated config cannot proxy
+  back to the Service that targets the sidecar.
+- Component tests validate PV/PVC rendered fields, binding selectors or
+  `volumeName`, ownership/generation labels, and workload volume mounts.
+- kind tests prove cold wake creates PV/PVC before StatefulSet and the PVC binds
+  to the intended PV.
+- kind tests prove the workload can read/write at the expected mount path.
 - kind tests prove sleep deletes workload, Service, PVC, and PV.
-- kind tests prove re-wake recreates manifests from the same instance values.
+- kind tests prove re-wake recreates manifests from the same instance values and
+  preserves data when using the same backing static volume.
+- Failure tests cover missing or bad volume handles, PVCs that never bind, wrong
+  access modes, and stale manifest generation.
+- Readiness tests prove routes are not published until Pods or EndpointSlices are
+  ready, and are withdrawn when the materialization becomes unready.
 
 ## Milestone 6: End-to-End V1
 
@@ -305,23 +375,32 @@ Scope:
 Sub-phases:
 
 - 6A: Stateless Deployment cold wake, hot route, idle drain, sleep, and re-wake.
-- 6B: StatefulSet with static PV/PVC templates cold wake, hot route, idle drain,
-  sleep, and re-wake.
+- 6B: StatefulSet with static PV/PVC templates cold wake, hot route, mounted
+  write/read, idle drain, sleep, and re-wake with data continuity.
 - 6C: Custom host, wildcard host, SNI, and optional path-prefix routing.
 - 6D: Protocol matrix: HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
   termination, and SNI passthrough.
 - 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior.
-- 6F: Failure-path matrix: wake timeout, bad route, missing PVC binding, stale
-  proxy generation, and control-plane restart.
+- 6F: Failure-path matrix: wake timeout, bad route, missing PVC binding, bad
+  volume template, stale proxy generation, and control-plane restart.
+- 6G: Lifecycle race matrix: concurrent wake calls, sleep while waking, delete
+  while waking, delete while draining, failed wake retry, stale sidecar report,
+  and route reassignment during active traffic.
 
 Done when:
 
 - kind E2E passes for stateless Deployment.
-- kind E2E passes for StatefulSet with static PV/PVC templates.
+- kind E2E passes for StatefulSet with static PV/PVC templates, intended binding,
+  mounted write/read, sleep, re-wake, and data continuity.
 - kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
   termination, and SNI passthrough.
-- Failure-path E2E covers wake timeout, bad route, missing PVC binding, and
-  stale proxy generation.
+- Failure-path E2E covers wake timeout, bad route, missing PVC binding, bad
+  volume template, and stale proxy generation.
+- Lifecycle-race E2E proves generation checks prevent stale sidecar reports,
+  stale materializations, and stale proxy cache entries from changing current
+  instance state.
+- Control-plane restart E2E covers restart during wake, sleep, delete, route
+  reassignment, and HTTP-01 challenge handling.
 
 ## Milestone 7: Hardening
 
@@ -352,8 +431,18 @@ Sub-phases:
 Done when:
 
 - Automated tests cover restart during wake, sleep, and delete.
+- Metrics tests assert key counters/histograms and labels for wake latency,
+  route-cache hits/misses, subscribe stream events, invalidations, active
+  streams, drain duration, materialization failures, and HTTP-01 results.
+- Structured log tests or golden assertions cover instance ID, route ID,
+  subscription ID where relevant, generation, cluster, namespace, and error
+  reason on important lifecycle paths.
 - Repeated kind wake/sleep soak passes without leaked Kubernetes objects.
+- Load-test targets for route lookup, hot proxy path, and cold wake latency are
+  defined before 7D starts, and tests fail if those targets regress.
 - Route lookup and hot proxy path meet target latency under load.
+- Retry/backoff tests cover transient database errors, Kubernetes API conflicts,
+  proxy stream disconnects, and materializer reconcile retries.
 - Dashboards or metric names are documented enough for operators to wire up.
 
 ## Milestone 8: Operator and Contributor Documentation
