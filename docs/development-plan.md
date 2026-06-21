@@ -11,6 +11,9 @@ verified with kind-based end-to-end tests before it is considered done.
 - Keep code surface area small. Scalability and maintainability should come from
   clear boundaries, predictable state machines, and fewer moving parts before
   they come from clever abstractions.
+- Avoid "mega files". Split code by responsibility when a file starts combining
+  unrelated protocol, state-machine, persistence, or Kubernetes concerns, while
+  avoiding abstraction for its own sake.
 - Add abstractions only when repeated behavior or testability makes the benefit
   concrete.
 - Do not defer useful comments. Comments should explain protocol edge cases,
@@ -18,6 +21,10 @@ verified with kind-based end-to-end tests before it is considered done.
   maintainer could otherwise make a dangerous simplification.
 - Keep each sub-phase reviewable. A phase is not done until the narrowest useful
   integration test proves the behavior works.
+- Keep production containers small and explicit. The control plane, frontline
+  proxy, and sidecar should use `scratch` final images when practical; if a
+  component needs runtime files such as CA roots, timezone data, passwd/group
+  entries, or certificates, copy in only those files deliberately.
 
 ## Testing Strategy
 
@@ -50,7 +57,8 @@ Use four test layers:
    - HTTP-01 challenge handling
 
 4. kind end-to-end tests:
-   - build local images
+   - build the final production-style images for the control plane, frontline
+     proxy, and sidecar
    - load images into kind
    - deploy control plane, frontline proxy, sidecar, and demo workloads
    - create `WorkloadClass`, `Instance`, and `RouteBinding`
@@ -62,6 +70,12 @@ Use four test layers:
 The kind suite is a release gate. Unit and component tests are not enough for
 this project because most failures will happen at Kubernetes object lifecycle,
 networking, and readiness boundaries.
+
+Container tests must exercise the same final images that operators would run,
+not local binaries or dev-only images. At minimum, test startup, health/readiness,
+TLS/CA access, database and Kubernetes API connectivity, non-root execution, and
+the absence of accidental runtime dependencies such as shells or package
+managers.
 
 Each milestone should name the important success, failure, reconnect, timeout,
 and race cases before implementation starts. Avoid broad "works end to end"
@@ -415,6 +429,7 @@ Scope:
 - Proxy `Subscribe` stream reconnect and cache rebuild through lazy
   `SubscribeRoute`, without proxy-visible versions or cursors.
 - Control-plane restart recovery from database state.
+- Minimal production images for the control plane, frontline proxy, and sidecar.
 - Load tests for route lookup and hot proxy path.
 - Soak tests for repeated wake/sleep cycles.
 
@@ -424,9 +439,10 @@ Sub-phases:
 - 7B: Control-plane restart recovery during wake, sleep, and delete.
 - 7C: Proxy `Subscribe` reconnect, lazy cache rebuild, and stale backend
   recovery.
-- 7D: Load tests for route lookup and hot proxy path.
-- 7E: kind wake/sleep soak tests and leaked-object detection.
-- 7F: Operator-facing runbook and metric name documentation.
+- 7D: Minimal final images and container runtime smoke tests.
+- 7E: Load tests for route lookup and hot proxy path.
+- 7F: kind wake/sleep soak tests and leaked-object detection.
+- 7G: Operator-facing runbook and metric name documentation.
 
 Done when:
 
@@ -443,6 +459,12 @@ Done when:
 - Route lookup and hot proxy path meet target latency under load.
 - Retry/backoff tests cover transient database errors, Kubernetes API conflicts,
   proxy stream disconnects, and materializer reconcile retries.
+- Container tests prove the final control-plane, frontline proxy, and sidecar
+  images start successfully, run as non-root, include only required runtime
+  files, can access required CA certificates, and are the images used by kind E2E
+  and soak tests.
+- Image-size budgets for the three production images are defined before 7D
+  starts, and tests or CI checks fail if they regress without an explicit update.
 - Dashboards or metric names are documented enough for operators to wire up.
 
 ## Milestone 8: Operator and Contributor Documentation
