@@ -4,8 +4,9 @@ use serde_json::Value;
 use crate::{
     ids::Generation,
     instance::{
-        CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-        DeleteInstanceRequest, GetInstanceRequest, InstanceRecord, InstanceState,
+        validate_instance_state_transition, CompareAndSwapInstanceStateRequest,
+        CreateInstanceRequest, CreateInstanceResult, DeleteInstanceRequest, GetInstanceRequest,
+        InstanceRecord, InstanceState,
     },
     route::RouteBindingRecord,
     store::{StoreError, StoreResult},
@@ -176,56 +177,59 @@ pub(crate) async fn compare_and_swap_instance_state(
     store: &PostgresStore,
     request: CompareAndSwapInstanceStateRequest,
 ) -> StoreResult<InstanceRecord> {
-    let client = store.client().await?;
+    let mut client = store.client().await?;
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let instance_id = request.instance_id.as_str();
-    let expected_generation = generation_to_i64(request.expected_generation)?;
+    let current = transaction
+        .query_opt(
+            "
+            SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
+            FROM instances
+            WHERE instance_id = $1
+            FOR UPDATE
+            ",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(row) = current else {
+        return Err(StoreError::NotFound {
+            resource: "instance",
+        });
+    };
+    let current = instance_from_row(&row)?;
+
+    if current.generation != request.expected_generation {
+        return Err(StoreError::GenerationConflict {
+            expected: request.expected_generation,
+            actual: current.generation,
+        });
+    }
+
+    validate_instance_state_transition(current.state, request.next_state, &request.reason)
+        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+
     let next_generation = generation_to_i64(request.expected_generation.next())?;
     let next_state = instance_state_to_db(request.next_state);
-    let row = client
-        .query_opt(
+    let row = transaction
+        .query_one(
             "
             UPDATE instances
             SET state = $2,
                 generation = $3,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
-            WHERE instance_id = $1 AND generation = $4
+            WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
-            &[
-                &instance_id,
-                &next_state,
-                &next_generation,
-                &expected_generation,
-            ],
+            &[&instance_id, &next_state, &next_generation],
         )
         .await
         .map_err(map_postgres_error)?;
+    let updated = instance_from_row(&row)?;
+    transaction.commit().await.map_err(map_postgres_error)?;
 
-    if let Some(row) = row {
-        return instance_from_row(&row);
-    }
-
-    let actual = client
-        .query_opt(
-            "SELECT generation FROM instances WHERE instance_id = $1",
-            &[&instance_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
-    let Some(row) = actual else {
-        return Err(StoreError::NotFound {
-            resource: "instance",
-        });
-    };
-    let actual_generation: i64 = row.get("generation");
-
-    Err(StoreError::GenerationConflict {
-        expected: request.expected_generation,
-        actual: Generation::new(
-            u64::try_from(actual_generation)
-                .map_err(|_| StoreError::internal("stored instance generation was negative"))?,
-        ),
-    })
+    Ok(updated)
 }
 
 pub(crate) async fn load_instance(

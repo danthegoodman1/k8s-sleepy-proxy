@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
     ids::{Generation, IdempotencyKey, InstanceId},
@@ -69,9 +69,103 @@ pub enum StateTransitionReason {
     MaterializationReady,
     SleepRequested,
     IdleReported,
+    DrainCompleted,
     FailureReported(String),
     DeleteRequested,
+    DeleteFinalized,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidStateTransition {
+    pub current: InstanceState,
+    pub next: InstanceState,
+    pub reason: StateTransitionReason,
+}
+
+pub fn validate_instance_state_transition(
+    current: InstanceState,
+    next: InstanceState,
+    reason: &StateTransitionReason,
+) -> Result<(), InvalidStateTransition> {
+    let valid = matches!(
+        (current, next, reason),
+        (
+            InstanceState::Cold,
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested
+        ) | (
+            InstanceState::Cold,
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested
+        ) | (
+            InstanceState::Waking,
+            InstanceState::Running,
+            StateTransitionReason::MaterializationReady
+        ) | (
+            InstanceState::Waking,
+            InstanceState::Failed,
+            StateTransitionReason::FailureReported(_)
+        ) | (
+            InstanceState::Waking,
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested
+        ) | (
+            InstanceState::Running,
+            InstanceState::Draining,
+            StateTransitionReason::SleepRequested | StateTransitionReason::IdleReported
+        ) | (
+            InstanceState::Running,
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested
+        ) | (
+            InstanceState::Draining,
+            InstanceState::Cold,
+            StateTransitionReason::DrainCompleted
+        ) | (
+            InstanceState::Draining,
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested
+        ) | (
+            InstanceState::Draining,
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested
+        ) | (
+            InstanceState::Failed,
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested
+        ) | (
+            InstanceState::Failed,
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested
+        ) | (
+            InstanceState::Deleting,
+            InstanceState::Deleted,
+            StateTransitionReason::DeleteFinalized
+        )
+    );
+
+    if valid {
+        Ok(())
+    } else {
+        Err(InvalidStateTransition {
+            current,
+            next,
+            reason: reason.clone(),
+        })
+    }
+}
+
+impl fmt::Display for InvalidStateTransition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid instance state transition: {:?} -> {:?} for {:?}",
+            self.current, self.next, self.reason
+        )
+    }
+}
+
+impl Error for InvalidStateTransition {}
 
 impl CreateInstanceRequest {
     pub fn new(
@@ -147,7 +241,10 @@ mod tests {
         },
     };
 
-    use super::{CreateInstanceRequest, InstanceValues};
+    use super::{
+        validate_instance_state_transition, CreateInstanceRequest, InstanceState, InstanceValues,
+        StateTransitionReason,
+    };
 
     #[test]
     fn create_instance_validation_applies_schema_defaults() {
@@ -208,6 +305,134 @@ mod tests {
             validated.values,
             values([("image", "example/app:1"), ("tenant", "acme")])
         );
+    }
+
+    #[test]
+    fn instance_state_validator_accepts_lifecycle_edges() {
+        for (current, next, reason) in [
+            (
+                InstanceState::Cold,
+                InstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            ),
+            (
+                InstanceState::Cold,
+                InstanceState::Deleting,
+                StateTransitionReason::DeleteRequested,
+            ),
+            (
+                InstanceState::Waking,
+                InstanceState::Running,
+                StateTransitionReason::MaterializationReady,
+            ),
+            (
+                InstanceState::Waking,
+                InstanceState::Deleting,
+                StateTransitionReason::DeleteRequested,
+            ),
+            (
+                InstanceState::Running,
+                InstanceState::Draining,
+                StateTransitionReason::SleepRequested,
+            ),
+            (
+                InstanceState::Running,
+                InstanceState::Draining,
+                StateTransitionReason::IdleReported,
+            ),
+            (
+                InstanceState::Running,
+                InstanceState::Deleting,
+                StateTransitionReason::DeleteRequested,
+            ),
+            (
+                InstanceState::Draining,
+                InstanceState::Cold,
+                StateTransitionReason::DrainCompleted,
+            ),
+            (
+                InstanceState::Draining,
+                InstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            ),
+            (
+                InstanceState::Draining,
+                InstanceState::Deleting,
+                StateTransitionReason::DeleteRequested,
+            ),
+            (
+                InstanceState::Failed,
+                InstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            ),
+            (
+                InstanceState::Failed,
+                InstanceState::Deleting,
+                StateTransitionReason::DeleteRequested,
+            ),
+            (
+                InstanceState::Deleting,
+                InstanceState::Deleted,
+                StateTransitionReason::DeleteFinalized,
+            ),
+        ] {
+            validate_instance_state_transition(current, next, &reason)
+                .expect("transition should be allowed");
+        }
+
+        validate_instance_state_transition(
+            InstanceState::Waking,
+            InstanceState::Failed,
+            &StateTransitionReason::FailureReported("readiness timeout".to_owned()),
+        )
+        .expect("waking failures should be allowed");
+    }
+
+    #[test]
+    fn instance_state_validator_rejects_nonsensical_edges() {
+        for (current, next, reason) in [
+            (
+                InstanceState::Cold,
+                InstanceState::Running,
+                StateTransitionReason::MaterializationReady,
+            ),
+            (
+                InstanceState::Running,
+                InstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            ),
+            (
+                InstanceState::Failed,
+                InstanceState::Running,
+                StateTransitionReason::MaterializationReady,
+            ),
+            (
+                InstanceState::Deleting,
+                InstanceState::Running,
+                StateTransitionReason::MaterializationReady,
+            ),
+            (
+                InstanceState::Waking,
+                InstanceState::Draining,
+                StateTransitionReason::SleepRequested,
+            ),
+            (
+                InstanceState::Deleted,
+                InstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            ),
+            (
+                InstanceState::Deleting,
+                InstanceState::Deleted,
+                StateTransitionReason::DeleteRequested,
+            ),
+        ] {
+            let error = validate_instance_state_transition(current, next, &reason)
+                .expect_err("transition should be rejected");
+            assert_eq!(error.current, current);
+            assert_eq!(error.next, next);
+            assert_eq!(error.reason, reason);
+        }
     }
 
     fn create_request() -> CreateInstanceRequest {

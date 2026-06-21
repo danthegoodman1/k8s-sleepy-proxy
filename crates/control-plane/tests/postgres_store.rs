@@ -253,6 +253,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     );
 
     exercise_route_bindings(store, class.reference.clone()).await?;
+    exercise_instance_lifecycle(store, class.reference.clone()).await?;
 
     let delete_target = store
         .create_instance(create_instance_request(
@@ -301,16 +302,16 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .await?;
     assert!(matches!(miss, RouteResolution::Miss { .. }));
 
-    let running = store
+    let waking = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
             InstanceId::new("instance-a").expect("valid instance ID"),
             Generation::new(0),
-            InstanceState::Running,
+            InstanceState::Waking,
             StateTransitionReason::WakeRequested,
         ))
         .await?;
-    assert_eq!(running.generation, Generation::new(1));
-    assert_eq!(running.state, InstanceState::Running);
+    assert_eq!(waking.generation, Generation::new(1));
+    assert_eq!(waking.state, InstanceState::Waking);
 
     let stale = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
@@ -340,9 +341,20 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     let pending_record = store.record_materialization(pending).await?;
     assert_eq!(pending_record.state, MaterializationState::Pending);
 
+    let running = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            InstanceId::new("instance-a").expect("valid instance ID"),
+            Generation::new(1),
+            InstanceState::Running,
+            StateTransitionReason::MaterializationReady,
+        ))
+        .await?;
+    assert_eq!(running.generation, Generation::new(2));
+    assert_eq!(running.state, InstanceState::Running);
+
     let mut ready = RecordMaterializationRequest::new(
         InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(1),
+        Generation::new(2),
         target.clone(),
         MaterializationState::Ready,
         BackendGeneration::new(2),
@@ -393,7 +405,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
 
     let mut rewind = RecordMaterializationRequest::new(
         InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(1),
+        Generation::new(2),
         target.clone(),
         MaterializationState::Ready,
         BackendGeneration::new(1),
@@ -430,12 +442,29 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     let draining = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
             InstanceId::new("instance-a").expect("valid instance ID"),
-            Generation::new(1),
+            Generation::new(2),
             InstanceState::Draining,
             StateTransitionReason::SleepRequested,
         ))
         .await?;
-    assert_eq!(draining.generation, Generation::new(2));
+    assert_eq!(draining.generation, Generation::new(3));
+
+    let stale_sidecar_report = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            InstanceId::new("instance-a").expect("valid instance ID"),
+            Generation::new(2),
+            InstanceState::Draining,
+            StateTransitionReason::IdleReported,
+        ))
+        .await
+        .expect_err("stale sidecar idle reports are rejected");
+    match stale_sidecar_report {
+        StoreError::GenerationConflict { expected, actual } => {
+            assert_eq!(expected, Generation::new(2));
+            assert_eq!(actual, Generation::new(3));
+        }
+        other => panic!("expected stale sidecar generation conflict, got {other}"),
+    }
 
     let resolved_after_generation_advance = store
         .resolve_route(RouteIdentity::Http {
@@ -445,7 +474,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .await?;
     match resolved_after_generation_advance {
         RouteResolution::Resolved(entry) => {
-            assert_eq!(entry.instance_generation, Generation::new(2));
+            assert_eq!(entry.instance_generation, Generation::new(3));
             assert_eq!(entry.backend, None);
             assert_eq!(entry.backend_generation, None);
         }
@@ -465,7 +494,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
 
     let mut stale_materialization = RecordMaterializationRequest::new(
         InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(1),
+        Generation::new(2),
         target,
         MaterializationState::Ready,
         BackendGeneration::new(3),
@@ -478,8 +507,8 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .expect_err("stale instance generation materialization is rejected");
     match stale_materialization_error {
         StoreError::GenerationConflict { expected, actual } => {
-            assert_eq!(expected, Generation::new(1));
-            assert_eq!(actual, Generation::new(2));
+            assert_eq!(expected, Generation::new(2));
+            assert_eq!(actual, Generation::new(3));
         }
         other => panic!("expected stale materialization generation conflict, got {other}"),
     }
@@ -541,6 +570,299 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
     assert!(store.resolve_http01_challenge(expired_key).await?.is_none());
 
     Ok(())
+}
+
+async fn exercise_instance_lifecycle(
+    store: &PostgresStore,
+    workload_class: WorkloadClassVersionRef,
+) -> Result<(), StoreError> {
+    let invalid_target = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-lifecycle-invalid",
+        "instance-lifecycle-invalid",
+    )
+    .await?;
+    assert_eq!(invalid_target.instance.generation, Generation::new(0));
+
+    let invalid = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            invalid_target.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Running,
+            StateTransitionReason::MaterializationReady,
+        ))
+        .await
+        .expect_err("cold instances cannot become running directly");
+    assert!(matches!(invalid, StoreError::InvalidArgument { .. }));
+    let after_invalid = store
+        .get_instance(GetInstanceRequest::new(invalid_target.instance.id.clone()))
+        .await?
+        .expect("invalid transition target still exists");
+    assert_eq!(after_invalid.state, InstanceState::Cold);
+    assert_eq!(after_invalid.generation, Generation::new(0));
+
+    let concurrent_target = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-lifecycle-concurrent",
+        "instance-lifecycle-concurrent",
+    )
+    .await?;
+    let wake_a = CompareAndSwapInstanceStateRequest::new(
+        concurrent_target.instance.id.clone(),
+        Generation::new(0),
+        InstanceState::Waking,
+        StateTransitionReason::WakeRequested,
+    );
+    let wake_b = wake_a.clone();
+    let (first, second) = tokio::join!(
+        store.compare_and_swap_instance_state(wake_a),
+        store.compare_and_swap_instance_state(wake_b)
+    );
+    let mut successes = 0;
+    let mut conflicts = 0;
+    for result in [first, second] {
+        match result {
+            Ok(record) => {
+                successes += 1;
+                assert_eq!(record.state, InstanceState::Waking);
+                assert_eq!(record.generation, Generation::new(1));
+            }
+            Err(StoreError::GenerationConflict { expected, actual }) => {
+                conflicts += 1;
+                assert_eq!(expected, Generation::new(0));
+                assert_eq!(actual, Generation::new(1));
+            }
+            Err(other) => panic!("expected wake success or generation conflict, got {other}"),
+        }
+    }
+    assert_eq!(successes, 1);
+    assert_eq!(conflicts, 1);
+
+    let sleep_while_waking = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-lifecycle-sleep-waking",
+        "instance-lifecycle-sleep-waking",
+    )
+    .await?;
+    let waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            sleep_while_waking.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    assert_eq!(waking.generation, Generation::new(1));
+    let sleep_during_wake = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            sleep_while_waking.instance.id.clone(),
+            Generation::new(1),
+            InstanceState::Draining,
+            StateTransitionReason::SleepRequested,
+        ))
+        .await
+        .expect_err("sleep while waking is deterministically rejected");
+    assert!(matches!(
+        sleep_during_wake,
+        StoreError::InvalidArgument { .. }
+    ));
+    let still_waking = store
+        .get_instance(GetInstanceRequest::new(
+            sleep_while_waking.instance.id.clone(),
+        ))
+        .await?
+        .expect("sleep while waking target still exists");
+    assert_eq!(still_waking.state, InstanceState::Waking);
+    assert_eq!(still_waking.generation, Generation::new(1));
+    let deleting_from_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            sleep_while_waking.instance.id,
+            Generation::new(1),
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested,
+        ))
+        .await?;
+    assert_eq!(deleting_from_waking.state, InstanceState::Deleting);
+    assert_eq!(deleting_from_waking.generation, Generation::new(2));
+
+    let drain_target = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-lifecycle-drain-complete",
+        "instance-lifecycle-drain-complete",
+    )
+    .await?;
+    let running = wake_to_running(store, drain_target.instance.id.clone()).await?;
+    assert_eq!(running.generation, Generation::new(2));
+    let draining = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            drain_target.instance.id.clone(),
+            Generation::new(2),
+            InstanceState::Draining,
+            StateTransitionReason::IdleReported,
+        ))
+        .await?;
+    assert_eq!(draining.generation, Generation::new(3));
+    let cold = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            drain_target.instance.id,
+            Generation::new(3),
+            InstanceState::Cold,
+            StateTransitionReason::DrainCompleted,
+        ))
+        .await?;
+    assert_eq!(cold.state, InstanceState::Cold);
+    assert_eq!(cold.generation, Generation::new(4));
+
+    let delete_draining_target = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-lifecycle-delete-draining",
+        "instance-lifecycle-delete-draining",
+    )
+    .await?;
+    wake_to_running(store, delete_draining_target.instance.id.clone()).await?;
+    let draining = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            delete_draining_target.instance.id.clone(),
+            Generation::new(2),
+            InstanceState::Draining,
+            StateTransitionReason::SleepRequested,
+        ))
+        .await?;
+    assert_eq!(draining.generation, Generation::new(3));
+    let deleting_from_draining = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            delete_draining_target.instance.id,
+            Generation::new(3),
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested,
+        ))
+        .await?;
+    assert_eq!(deleting_from_draining.state, InstanceState::Deleting);
+    assert_eq!(deleting_from_draining.generation, Generation::new(4));
+
+    let failed_target = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-lifecycle-failed-retry",
+        "instance-lifecycle-failed-retry",
+    )
+    .await?;
+    store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            failed_target.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let failed = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            failed_target.instance.id.clone(),
+            Generation::new(1),
+            InstanceState::Failed,
+            StateTransitionReason::FailureReported("readiness timeout".to_owned()),
+        ))
+        .await?;
+    assert_eq!(failed.state, InstanceState::Failed);
+    assert_eq!(failed.generation, Generation::new(2));
+    let retry = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            failed_target.instance.id,
+            Generation::new(2),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    assert_eq!(retry.state, InstanceState::Waking);
+    assert_eq!(retry.generation, Generation::new(3));
+
+    let terminal_target = create_lifecycle_instance(
+        store,
+        workload_class,
+        "idem-lifecycle-terminal",
+        "instance-lifecycle-terminal",
+    )
+    .await?;
+    let deleting = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            terminal_target.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested,
+        ))
+        .await?;
+    assert_eq!(deleting.generation, Generation::new(1));
+    let deleted = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            terminal_target.instance.id.clone(),
+            Generation::new(1),
+            InstanceState::Deleted,
+            StateTransitionReason::DeleteFinalized,
+        ))
+        .await?;
+    assert_eq!(deleted.state, InstanceState::Deleted);
+    assert_eq!(deleted.generation, Generation::new(2));
+    let terminal_wake = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            terminal_target.instance.id.clone(),
+            Generation::new(2),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await
+        .expect_err("deleted instances are terminal");
+    assert!(matches!(terminal_wake, StoreError::InvalidArgument { .. }));
+    let still_deleted = store
+        .get_instance(GetInstanceRequest::new(terminal_target.instance.id))
+        .await?
+        .expect("deleted terminal target still exists");
+    assert_eq!(still_deleted.state, InstanceState::Deleted);
+    assert_eq!(still_deleted.generation, Generation::new(2));
+
+    Ok(())
+}
+
+async fn create_lifecycle_instance(
+    store: &PostgresStore,
+    workload_class: WorkloadClassVersionRef,
+    idempotency_key: &str,
+    instance_id: &str,
+) -> Result<control_plane::CreateInstanceResult, StoreError> {
+    store
+        .create_instance(create_instance_request(
+            idempotency_key,
+            instance_id,
+            workload_class,
+            vec![],
+        ))
+        .await
+}
+
+async fn wake_to_running(
+    store: &PostgresStore,
+    instance_id: InstanceId,
+) -> Result<control_plane::InstanceRecord, StoreError> {
+    store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            instance_id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            instance_id,
+            Generation::new(1),
+            InstanceState::Running,
+            StateTransitionReason::MaterializationReady,
+        ))
+        .await
 }
 
 async fn exercise_route_bindings(
