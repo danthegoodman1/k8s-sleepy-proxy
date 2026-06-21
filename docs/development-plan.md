@@ -356,6 +356,58 @@ Done when:
 - Route lookup and hot proxy path meet target latency under load.
 - Dashboards or metric names are documented enough for operators to wire up.
 
+## Milestone 8: Operator and Contributor Documentation
+
+Write concise documentation for the two supported audiences: operators who run
+and use the platform, and contributors who build and change it.
+
+Scope:
+
+- Operator documentation for the resource model, including `WorkloadClass`,
+  `Instance`, `RouteBinding`, custom domains, HTTP-01, storage values, wake,
+  sleep, delete, and expected limitations.
+- Operator task guides for creating a workload class, creating an instance,
+  adding a route, adding a custom domain, attaching an existing volume, and
+  understanding sleep/wake behavior.
+- Operator installation and administration guides for the control plane,
+  frontline proxies, sidecars, database, Kubernetes permissions,
+  TLS/certificate plumbing, metrics, logs, backups, upgrades, and failure
+  recovery.
+- Operator runbooks keyed by observable symptoms, logs, metrics, Kubernetes
+  objects, and control-plane state.
+- Contributor documentation with the smallest useful commands for build, unit
+  tests, protocol tests, kind E2E, and code generation.
+- Agent-facing repository guide with file map, invariants, source-of-truth docs,
+  generated files, test gates, and common task entry points.
+
+Sub-phases:
+
+- 8A: Operator-facing concepts, resource model, and request/lifecycle sequence
+  diagrams.
+- 8B: Operator task guides for workload classes, instances, routes, custom
+  domains, HTTP-01, and existing volumes.
+- 8C: Operator installation, configuration, database, Kubernetes, TLS, metrics,
+  and upgrade guide.
+- 8D: Operator troubleshooting and incident runbooks.
+- 8E: Contributor local development and test guide.
+- 8F: Agent-facing repository guide with file map, invariants, and common task
+  entry points.
+
+Done when:
+
+- An operator can create a workload class, instance, route, custom domain, and
+  existing-volume-backed workload from docs alone.
+- An operator can predict what happens during cold wake, hot route, idle sleep,
+  drain, delete, and route/domain changes.
+- An operator can install, configure, monitor, back up, upgrade, and troubleshoot
+  the platform from docs alone.
+- API and protocol docs match the protobuf/Rust types and contain no stale RPCs.
+- Documentation is concise: prefer short task-oriented files, stable headings,
+  examples, and explicit invariants over broad narrative prose.
+- Contributor and agent-facing guidance calls out source-of-truth files,
+  generated files, commands, test gates, and design constraints without
+  duplicating full specs.
+
 ## Deferred
 
 These should not shape V1 implementation details beyond keeping clear extension
