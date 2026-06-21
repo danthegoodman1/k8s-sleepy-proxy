@@ -36,5 +36,6 @@ pub use route::{
 };
 pub use store::{ControlPlaneStore, StoreError, StoreFuture, StoreResult};
 pub use workload::{
-    LoadWorkloadClassVersionRequest, WorkloadClassVersion, WorkloadClassVersionRef,
+    CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, ValueSchemaError,
+    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
 };

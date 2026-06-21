@@ -22,7 +22,9 @@ use crate::{
         RouteHost, RouteHostKind, RouteIdentity,
     },
     store::{StoreError, StoreResult},
-    workload::{WorkloadClassVersion, WorkloadClassVersionRef},
+    workload::{
+        WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
     let version: i64 = row.get("version");
     let template_generation: i64 = row.get("template_generation");
     let default_values: Value = row.get("default_values");
+    let value_schema: Value = row.get("value_schema");
 
     Ok(WorkloadClassVersion {
         reference: WorkloadClassVersionRef {
@@ -55,6 +58,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
         },
         template_generation: generation_from_i64(template_generation)?,
         default_values: values_from_json(default_values)?,
+        value_schema: value_schema_from_json(value_schema)?,
     })
 }
 
@@ -172,6 +176,63 @@ pub(crate) fn values_from_json(value: Value) -> StoreResult<InstanceValues> {
             "stored instance values were not a string map: {error}"
         ))
     })
+}
+
+pub(crate) fn value_schema_to_json(schema: &WorkloadValueSchema) -> Value {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|(field, rule)| {
+            let mut rule_json = serde_json::Map::new();
+            rule_json.insert("required".to_owned(), Value::Bool(rule.required));
+            if let Some(default) = &rule.default {
+                rule_json.insert("default".to_owned(), Value::String(default.clone()));
+            }
+
+            (field.clone(), Value::Object(rule_json))
+        })
+        .collect();
+
+    json!({
+        "allow_extra": schema.allow_extra,
+        "fields": Value::Object(fields),
+    })
+}
+
+pub(crate) fn value_schema_from_json(value: Value) -> StoreResult<WorkloadValueSchema> {
+    let Value::Object(mut object) = value else {
+        return Err(StoreError::internal(
+            "stored workload value schema was not an object",
+        ));
+    };
+
+    let allow_extra = take_json_bool(&mut object, "allow_extra")?;
+    let fields = match object.remove("fields") {
+        Some(Value::Object(fields)) => fields,
+        _ => {
+            return Err(StoreError::internal(
+                "stored workload value schema fields were not an object",
+            ))
+        }
+    };
+    let mut schema = WorkloadValueSchema::new(allow_extra);
+
+    for (field, value) in fields {
+        let Value::Object(mut rule) = value else {
+            return Err(StoreError::internal(format!(
+                "stored workload value schema field {field:?} was not an object"
+            )));
+        };
+        schema.fields.insert(
+            field,
+            WorkloadValueFieldRule {
+                required: take_json_bool(&mut rule, "required")?,
+                default: take_json_optional_string(&mut rule, "default")?,
+            },
+        );
+    }
+
+    Ok(schema)
 }
 
 pub(crate) fn rendered_objects_to_json(objects: &[RenderedObjectRef]) -> Value {
@@ -498,6 +559,31 @@ fn take_json_string(
         Some(Value::String(value)) => Ok(value),
         _ => Err(StoreError::internal(format!(
             "stored rendered object field {field:?} was not a string"
+        ))),
+    }
+}
+
+fn take_json_optional_string(
+    object: &mut serde_json::Map<String, Value>,
+    field: &'static str,
+) -> StoreResult<Option<String>> {
+    match object.remove(field) {
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
+        _ => Err(StoreError::internal(format!(
+            "stored field {field:?} was not a string"
+        ))),
+    }
+}
+
+fn take_json_bool(
+    object: &mut serde_json::Map<String, Value>,
+    field: &'static str,
+) -> StoreResult<bool> {
+    match object.remove(field) {
+        Some(Value::Bool(value)) => Ok(value),
+        _ => Err(StoreError::internal(format!(
+            "stored field {field:?} was not a boolean"
         ))),
     }
 }

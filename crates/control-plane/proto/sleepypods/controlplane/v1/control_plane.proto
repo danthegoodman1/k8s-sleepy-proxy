@@ -26,10 +26,21 @@ message WorkloadClassVersionRef {
   uint64 version = 2;
 }
 
+message WorkloadValueSchema {
+  map<string, WorkloadValueFieldRule> fields = 1;
+  bool allow_extra = 2;
+}
+
+message WorkloadValueFieldRule {
+  bool required = 1;
+  optional string default_value = 2;
+}
+
 message WorkloadClassVersion {
   WorkloadClassVersionRef reference = 1;
   uint64 template_generation = 2;
   map<string, string> default_values = 3;
+  WorkloadValueSchema value_schema = 4;
 }
 
 message CreateWorkloadClassVersionRequest {
@@ -37,6 +48,7 @@ message CreateWorkloadClassVersionRequest {
   string class_id = 2;
   uint64 version = 3;
   map<string, string> default_values = 4;
+  WorkloadValueSchema value_schema = 5;
 }
 
 message GetWorkloadClassVersionRequest {

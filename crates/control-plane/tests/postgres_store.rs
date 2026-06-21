@@ -6,12 +6,13 @@ use std::{
 
 use control_plane::{
     BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest, ControlPlaneStore,
-    CreateInstanceRequest, ExpireHttp01ChallengesRequest, Generation, Http01ChallengeKey,
-    IdempotencyKey, InstanceId, InstanceState, MaterializationState, MaterializationTarget,
-    PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest,
-    RecordMaterializationRequest, RenderedObjectRef, RouteBindingSpec, RouteDependencyLookup,
-    RouteHost, RouteIdentity, RouteResolution, StateTransitionReason, StoreError, WorkloadClassId,
-    WorkloadClassVersion, WorkloadClassVersionRef,
+    CreateInstanceRequest, CreateWorkloadClassVersionRequest, ExpireHttp01ChallengesRequest,
+    Generation, Http01ChallengeKey, IdempotencyKey, InstanceId, InstanceState,
+    MaterializationState, MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig,
+    ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest, RenderedObjectRef,
+    RouteBindingSpec, RouteDependencyLookup, RouteHost, RouteIdentity, RouteResolution,
+    StateTransitionReason, StoreError, WorkloadClassId, WorkloadClassVersion,
+    WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -72,15 +73,54 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     store.run_migrations().await?;
 
     let class = workload_class("class-a", 1);
-    let seeded = store.seed_workload_class_version(class.clone()).await?;
-    assert_eq!(seeded, class);
+    let created_class = store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
+        .await?;
+    assert_eq!(created_class, class);
     let loaded = store
         .load_workload_class_version(control_plane::LoadWorkloadClassVersionRequest::new(
             class.reference.clone(),
         ))
         .await?
-        .expect("seeded workload class version loads");
+        .expect("created workload class version loads");
     assert_eq!(loaded, class);
+    let duplicate = store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
+        .await?;
+    assert_eq!(duplicate, class);
+
+    let mut changed_class = class.clone();
+    changed_class.template_generation = Generation::new(2);
+    let conflict = store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(changed_class))
+        .await
+        .expect_err("same class/version with different contents is immutable");
+    assert!(matches!(
+        conflict,
+        StoreError::AlreadyExists {
+            resource: "workload class version"
+        }
+    ));
+    let loaded_v1_after_conflict = store
+        .load_workload_class_version(control_plane::LoadWorkloadClassVersionRequest::new(
+            class.reference.clone(),
+        ))
+        .await?
+        .expect("v1 still loads after conflicting create");
+    assert_eq!(loaded_v1_after_conflict, class);
+
+    let class_v2 = workload_class("class-a", 2);
+    let created_v2 = store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class_v2.clone()))
+        .await?;
+    assert_eq!(created_v2, class_v2);
+    let loaded_v1_after_v2 = store
+        .load_workload_class_version(control_plane::LoadWorkloadClassVersionRequest::new(
+            class.reference.clone(),
+        ))
+        .await?
+        .expect("v1 still loads after v2 is created");
+    assert_eq!(loaded_v1_after_v2, class);
 
     let create = create_instance_request(
         "idem-create-a",
@@ -407,13 +447,21 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
 }
 
 fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
+    let image = format!("example/app:{version}");
+
     WorkloadClassVersion {
         reference: WorkloadClassVersionRef::new(
             WorkloadClassId::new(class_id).expect("valid workload class ID"),
             Generation::new(version),
         ),
         template_generation: Generation::new(1),
-        default_values: BTreeMap::from([("image".to_owned(), "example/app:1".to_owned())]),
+        default_values: BTreeMap::from([("image".to_owned(), image.clone())]),
+        value_schema: WorkloadValueSchema::new(false)
+            .with_field("tenant", WorkloadValueFieldRule::required())
+            .with_field(
+                "image",
+                WorkloadValueFieldRule::optional_with_default(image),
+            ),
     }
 }
 

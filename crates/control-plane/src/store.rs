@@ -11,7 +11,9 @@ use crate::{
     },
     materialization::{MaterializationRecord, RecordMaterializationRequest},
     route::{RouteDependencyLookup, RouteDependencySet, RouteIdentity, RouteResolution},
-    workload::{LoadWorkloadClassVersionRequest, WorkloadClassVersion},
+    workload::{
+        CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
+    },
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -22,6 +24,11 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: CreateInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>>;
+
+    fn create_workload_class_version<'a>(
+        &'a self,
+        request: CreateWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>>;
 
     fn load_workload_class_version<'a>(
         &'a self,

@@ -5,11 +5,10 @@ use tokio_postgres::{Config as PgConfig, NoTls};
 
 use crate::{
     config::PostgresStoreConfig,
-    store::{ControlPlaneStore, StoreError, StoreResult},
-    workload::WorkloadClassVersion,
+    store::{StoreError, StoreResult},
 };
 
-use super::{mapping, migrations};
+use super::migrations;
 
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
@@ -41,55 +40,6 @@ impl PostgresStore {
         let client = self.client().await?;
 
         migrations::run(&client).await
-    }
-
-    pub async fn seed_workload_class_version(
-        &self,
-        version: WorkloadClassVersion,
-    ) -> StoreResult<WorkloadClassVersion> {
-        let client = self.client().await?;
-        let class_id = version.reference.class_id.as_str();
-        let version_number = mapping::generation_to_i64(version.reference.version)?;
-        let template_generation = mapping::generation_to_i64(version.template_generation)?;
-        let default_values = mapping::values_to_json(&version.default_values)?;
-        let inserted = client
-            .execute(
-                "
-                INSERT INTO workload_class_versions (
-                    class_id,
-                    version,
-                    template_generation,
-                    default_values
-                )
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (class_id, version) DO NOTHING
-                ",
-                &[
-                    &class_id,
-                    &version_number,
-                    &template_generation,
-                    &default_values,
-                ],
-            )
-            .await
-            .map_err(super::error::map_postgres_error)?;
-
-        let stored = ControlPlaneStore::load_workload_class_version(
-            self,
-            crate::workload::LoadWorkloadClassVersionRequest::new(version.reference.clone()),
-        )
-        .await?
-        .ok_or(StoreError::NotFound {
-            resource: "workload class version",
-        })?;
-
-        if inserted == 0 && stored != version {
-            return Err(StoreError::AlreadyExists {
-                resource: "workload class version",
-            });
-        }
-
-        Ok(stored)
     }
 
     pub(crate) async fn client(&self) -> StoreResult<deadpool_postgres::Client> {

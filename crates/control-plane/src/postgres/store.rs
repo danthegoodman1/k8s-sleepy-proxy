@@ -10,7 +10,9 @@ use crate::{
     materialization::{MaterializationRecord, RecordMaterializationRequest},
     route::{RouteDependencyLookup, RouteDependencySet, RouteIdentity, RouteResolution},
     store::{ControlPlaneStore, StoreFuture, StoreResult},
-    workload::{LoadWorkloadClassVersionRequest, WorkloadClassVersion},
+    workload::{
+        CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
+    },
 };
 
 use super::{connection::PostgresStore, http01_ops, instance_ops, materialization_ops, route_ops};
@@ -21,6 +23,13 @@ impl ControlPlaneStore for PostgresStore {
         request: CreateInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
         Box::pin(async move { instance_ops::create_instance(self, request).await })
+    }
+
+    fn create_workload_class_version<'a>(
+        &'a self,
+        request: CreateWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>> {
+        Box::pin(async move { instance_ops::create_workload_class_version(self, request).await })
     }
 
     fn load_workload_class_version<'a>(

@@ -9,7 +9,9 @@ use crate::{
     },
     route::RouteBindingRecord,
     store::{StoreError, StoreResult},
-    workload::{LoadWorkloadClassVersionRequest, WorkloadClassVersion},
+    workload::{
+        CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
+    },
 };
 
 use super::{
@@ -18,7 +20,7 @@ use super::{
     idempotency::{self, CREATE_INSTANCE_OPERATION},
     mapping::{
         self, generation_to_i64, instance_from_row, instance_state_to_db, protocol_to_db,
-        route_binding_from_row, route_identity_parts, values_to_json,
+        route_binding_from_row, route_identity_parts, value_schema_to_json, values_to_json,
         workload_class_version_from_row,
     },
 };
@@ -73,6 +75,59 @@ pub(crate) async fn create_instance(
     })
 }
 
+pub(crate) async fn create_workload_class_version(
+    store: &PostgresStore,
+    request: CreateWorkloadClassVersionRequest,
+) -> StoreResult<WorkloadClassVersion> {
+    let desired = request.workload_class_version;
+    let client = store.client().await?;
+    let class_id = desired.reference.class_id.as_str();
+    let version = generation_to_i64(desired.reference.version)?;
+    let template_generation = generation_to_i64(desired.template_generation)?;
+    let default_values = values_to_json(&desired.default_values)?;
+    let value_schema = value_schema_to_json(&desired.value_schema);
+    let inserted = client
+        .execute(
+            "
+            INSERT INTO workload_class_versions (
+                class_id,
+                version,
+                template_generation,
+                default_values,
+                value_schema
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (class_id, version) DO NOTHING
+            ",
+            &[
+                &class_id,
+                &version,
+                &template_generation,
+                &default_values,
+                &value_schema,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let stored = load_workload_class_version(
+        store,
+        LoadWorkloadClassVersionRequest::new(desired.reference.clone()),
+    )
+    .await?
+    .ok_or(StoreError::NotFound {
+        resource: "workload class version",
+    })?;
+
+    if inserted == 0 && stored != desired {
+        return Err(StoreError::AlreadyExists {
+            resource: "workload class version",
+        });
+    }
+
+    Ok(stored)
+}
+
 pub(crate) async fn load_workload_class_version(
     store: &PostgresStore,
     request: LoadWorkloadClassVersionRequest,
@@ -83,7 +138,7 @@ pub(crate) async fn load_workload_class_version(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, default_values
+            SELECT class_id, version, template_generation, default_values, value_schema
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",

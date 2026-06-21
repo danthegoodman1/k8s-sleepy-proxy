@@ -8,11 +8,18 @@ pub(crate) struct Migration {
     pub sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_control_plane_store",
-    sql: include_str!("../../migrations/0001_initial_control_plane_store.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_control_plane_store",
+        sql: include_str!("../../migrations/0001_initial_control_plane_store.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "workload_class_value_schema",
+        sql: include_str!("../../migrations/0002_workload_class_value_schema.sql"),
+    },
+];
 
 pub(crate) async fn run(client: &impl GenericClient) -> StoreResult<()> {
     client

@@ -3,7 +3,8 @@ use control_plane::api::{
     operator_grpc_server_builder, operator_grpc_service, operator_grpc_web_server_builder,
     pb::{
         operator_control_plane_server::OperatorControlPlane, CreateInstanceRequest,
-        CreateRouteBindingRequest, InstanceState, ProtocolRoute, RouteHostKind,
+        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, InstanceState, ProtocolRoute,
+        RouteHostKind, WorkloadValueFieldRule, WorkloadValueSchema,
     },
     OperatorApiPlaceholder, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
@@ -30,9 +31,34 @@ fn generated_api_contains_expected_v1_resource_shape() {
         identity: None,
         protocol: ProtocolRoute::Http as i32,
     };
+    let workload_class = CreateWorkloadClassVersionRequest {
+        idempotency_key: "create-class-1".to_owned(),
+        class_id: "class-1".to_owned(),
+        version: 1,
+        default_values: [("image".to_owned(), "example/app:1".to_owned())].into(),
+        value_schema: Some(WorkloadValueSchema {
+            fields: [(
+                "tenant".to_owned(),
+                WorkloadValueFieldRule {
+                    required: true,
+                    default_value: None,
+                },
+            )]
+            .into(),
+            allow_extra: false,
+        }),
+    };
 
     assert_eq!(request.values["tenant"], "acme");
     assert_eq!(route_binding.instance_id, "instance-1");
+    assert!(
+        workload_class
+            .value_schema
+            .as_ref()
+            .expect("value schema is present")
+            .fields["tenant"]
+            .required
+    );
     assert_eq!(InstanceState::Cold as i32, 1);
     assert_eq!(ProtocolRoute::Http as i32, 1);
     assert_eq!(RouteHostKind::WildcardSuffix as i32, 2);
