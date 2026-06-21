@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/control-plane", "crates/proxy-core"]
+members = ["crates/control-plane", "crates/frontline", "crates/proxy-core"]
 resolver = "2"
 
 [workspace.package]
