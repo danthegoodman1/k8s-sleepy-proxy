@@ -59,6 +59,14 @@ Scope:
 - TLS ClientHello/SNI extraction helpers.
 - Shared metrics and tracing conventions.
 
+Sub-phases:
+
+- 1A: TCP stream proxy, active connection accounting, and drain tracker.
+- 1B: HTTP reverse proxy helpers and WebSocket upgrade/proxying.
+- 1C: Timeout, backpressure, structured shutdown, and cancellation behavior.
+- 1D: TLS ClientHello/SNI extraction helpers.
+- 1E: Shared metrics and tracing conventions.
+
 Done when:
 
 - Unit tests cover accounting, drain, timeout, and SNI parsing.
@@ -79,6 +87,20 @@ Scope:
 - HTTP-01 challenge records keyed by `(host, token)`.
 - Instance state machine with generation checks.
 - Structured manifest rendering from `WorkloadClass + Instance.values`.
+
+Sub-phases:
+
+- 2A: Database schema, migrations, and typed store interfaces.
+- 2B: `WorkloadClass` versioning, schema validation, and immutable version
+  behavior.
+- 2C: `Instance` APIs, value validation, generation fields, and idempotent
+  create/update behavior.
+- 2D: `RouteBinding` model, host/SNI/path/wildcard resolver, and uniqueness
+  constraints.
+- 2E: Instance state machine with generation/CAS transitions.
+- 2F: HTTP-01 challenge store with put, resolve, delete, expiry, and GC.
+- 2G: Structured manifest renderer for Deployment, StatefulSet, Service, PV,
+  and PVC.
 
 Done when:
 
@@ -105,6 +127,17 @@ Scope:
 - Stale generation rejection.
 - HTTP-01 challenge lookup through `ResolveHTTP01Challenge`.
 
+Sub-phases:
+
+- 3A: Route key normalization and local exact/wildcard/path-prefix matcher.
+- 3B: Versioned route snapshot, watch stream, reconnect, and full resync.
+- 3C: `ResolveRoute` fallback, miss handling, and negative caching.
+- 3D: `WakeInstance` flow, Waking wait behavior, and stale generation
+  rejection.
+- 3E: HTTP/1.1, HTTP/2, h2c gRPC, and WebSocket forwarding.
+- 3F: HTTPS termination, SNI certificate selection, and TLS/SNI passthrough.
+- 3G: HTTP-01 challenge interception and `ResolveHTTP01Challenge` lookup.
+
 Done when:
 
 - Fake-control-plane integration tests cover cold wake, hot route, miss, stale
@@ -128,6 +161,14 @@ Scope:
 - `ReportIdle` control-plane call.
 - Graceful shutdown behavior when the workload is being deleted.
 
+Sub-phases:
+
+- 4A: Local HTTP forwarding to `127.0.0.1:<app-port>`.
+- 4B: Local TCP forwarding to `127.0.0.1:<app-port>`.
+- 4C: Active request and connection tracking.
+- 4D: Idle detection and `ReportIdle` call.
+- 4E: Drain and graceful shutdown behavior.
+
 Done when:
 
 - Integration tests prove active traffic prevents idle reporting.
@@ -150,6 +191,18 @@ Scope:
 - Delete materialized objects on sleep/delete.
 - Leave backing provider volumes untouched.
 
+Sub-phases:
+
+- 5A: Structured object rendering for PV, PVC, Service, Deployment, and
+  StatefulSet.
+- 5B: Kubernetes apply/update/delete client and ownership labels.
+- 5C: PV/PVC apply order and PVC Bound wait.
+- 5D: Deployment/StatefulSet rendering with sidecar injection.
+- 5E: Service rendering that targets the sidecar port.
+- 5F: Readiness detection through Pods or EndpointSlices.
+- 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs.
+- 5H: kind materialization lifecycle suite.
+
 Done when:
 
 - Component tests validate rendered objects and ordering.
@@ -171,6 +224,18 @@ Scope:
 - Control plane drains and sleeps materialization.
 - Custom host and wildcard host route to the right instance.
 - HTTP-01 challenge insert, resolve, serve, and delete flow works.
+
+Sub-phases:
+
+- 6A: Stateless Deployment cold wake, hot route, idle drain, sleep, and re-wake.
+- 6B: StatefulSet with static PV/PVC templates cold wake, hot route, idle drain,
+  sleep, and re-wake.
+- 6C: Custom host, wildcard host, SNI, and optional path-prefix routing.
+- 6D: Protocol matrix: HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS
+  termination, and SNI passthrough.
+- 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior.
+- 6F: Failure-path matrix: wake timeout, bad route, missing PVC binding, stale
+  proxy generation, and control-plane restart.
 
 Done when:
 
@@ -196,6 +261,15 @@ Scope:
 - Load tests for route lookup and hot proxy path.
 - Soak tests for repeated wake/sleep cycles.
 
+Sub-phases:
+
+- 7A: Metrics, tracing, and structured log fields.
+- 7B: Control-plane restart recovery during wake, sleep, and delete.
+- 7C: Proxy watch reconnect, route resync, and stale backend recovery.
+- 7D: Load tests for route lookup and hot proxy path.
+- 7E: kind wake/sleep soak tests and leaked-object detection.
+- 7F: Operator-facing runbook and metric name documentation.
+
 Done when:
 
 - Automated tests cover restart during wake, sleep, and delete.
@@ -213,4 +287,3 @@ points:
 - StatefulSet scale above one.
 - Managed provider volume creation/deletion.
 - Rich route predicates such as headers, ALPN, or arbitrary expressions.
-
