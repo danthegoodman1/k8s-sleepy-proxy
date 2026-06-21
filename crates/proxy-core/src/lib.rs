@@ -4,6 +4,7 @@ pub mod accounting;
 pub mod admission;
 pub mod drain;
 pub mod http;
+pub mod observability;
 pub mod shutdown;
 pub mod tcp;
 pub mod timeout;
