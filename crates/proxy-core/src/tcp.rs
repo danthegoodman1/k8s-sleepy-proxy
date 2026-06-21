@@ -3,10 +3,10 @@ use std::{error::Error, fmt, io, net::SocketAddr, time::Duration};
 use tokio::{
     io::{self as tokio_io, AsyncRead, AsyncWrite},
     net::TcpStream,
-    time,
 };
 
 use crate::drain::{DrainError, DrainTracker};
+use crate::timeout::with_timeout;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpProxyConfig {
@@ -71,7 +71,7 @@ impl TcpProxy {
         &self,
         upstream_addr: SocketAddr,
     ) -> Result<TcpStream, TcpProxyError> {
-        match time::timeout(
+        match with_timeout(
             self.config.connect_timeout,
             TcpStream::connect(upstream_addr),
         )

@@ -5,9 +5,8 @@ use std::{
     time::Duration,
 };
 
-use tokio::time;
-
 use crate::accounting::{ActiveConnection, ActiveConnectionCounter};
+use crate::timeout::with_timeout;
 
 /// Tracks active sessions and rejects new work once drain starts.
 #[derive(Clone, Debug)]
@@ -97,7 +96,7 @@ impl DrainTracker {
             return Ok(());
         }
 
-        match time::timeout(self.inner.grace_timeout, self.inner.active.wait_for_zero()).await {
+        match with_timeout(self.inner.grace_timeout, self.inner.active.wait_for_zero()).await {
             Ok(()) => Ok(()),
             Err(_) if self.active_count() == 0 => Ok(()),
             Err(_) => Err(DrainError::GraceTimeout {
