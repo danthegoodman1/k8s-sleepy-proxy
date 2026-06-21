@@ -146,6 +146,11 @@ same trait behind control-plane config. Avoid making public store semantics rely
 on Postgres-only behavior such as `LISTEN/NOTIFY`, partial indexes, or JSONB
 querying unless there is a portable fallback. Use explicit route/materialization
 versions so watch and resync behavior can work across providers.
+Provider-specific durability semantics should not leak into the control-plane
+API or proxy protocol. Database-specific features may be used as latency
+optimizations inside one store provider, but correctness must come from portable
+state, transactions, uniqueness constraints, idempotency keys, generation
+checks, and monotonic change versions.
 
 ## Milestone 3: Frontline Route Resolution
 
