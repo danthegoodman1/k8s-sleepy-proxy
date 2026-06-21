@@ -138,19 +138,28 @@ generic SQL abstraction. It should include methods for:
 - resolving route identity to route entries
 - compare-and-swap instance state transitions by generation
 - recording materialization state and backend generation
-- route snapshot version reads and watch cursors
+- route snapshot reads and opaque watch cursors
 - HTTP-01 challenge put, resolve, delete, expiry, and GC
 
 Start with Postgres only. Future providers such as MySQL should implement the
 same trait behind control-plane config. Avoid making public store semantics rely
 on Postgres-only behavior such as `LISTEN/NOTIFY`, partial indexes, or JSONB
-querying unless there is a portable fallback. Use explicit route/materialization
-versions so watch and resync behavior can work across providers.
+querying unless there is a portable fallback.
+
 Provider-specific durability semantics should not leak into the control-plane
 API or proxy protocol. Database-specific features may be used as latency
 optimizations inside one store provider, but correctness must come from portable
 state, transactions, uniqueness constraints, idempotency keys, generation
-checks, and monotonic change versions.
+checks, and provider-owned watch cursors.
+
+Watch cursors should be opaque to proxies and to most control-plane code. The
+store provider owns how route/materialization changes are ordered and resumed.
+Postgres might use a change table sequence, FoundationDB could use
+versionstamps, and other providers may use partition-local cursors or force full
+snapshot resyncs when precise deltas are not available. The watch API should
+only promise that a cursor can either resume changes or be rejected with a
+resync-required response. Do not require a global monotonic route version in the
+public store semantics.
 
 ## Milestone 3: Frontline Route Resolution
 
@@ -164,7 +173,7 @@ Scope:
 - Exact host and SNI lookup.
 - Wildcard host lookup.
 - Longest path-prefix matching.
-- Versioned route snapshot and watch handling.
+- Route snapshot and opaque-cursor watch handling.
 - `ResolveRoute` fallback on local miss.
 - `WakeInstance` flow when a route is Cold or missing a backend.
 - Stale generation rejection.
@@ -173,7 +182,7 @@ Scope:
 Sub-phases:
 
 - 3A: Route key normalization and local exact/wildcard/path-prefix matcher.
-- 3B: Versioned route snapshot, watch stream, reconnect, and full resync.
+- 3B: Route snapshot, opaque-cursor watch stream, reconnect, and full resync.
 - 3C: `ResolveRoute` fallback, miss handling, and negative caching.
 - 3D: `WakeInstance` flow, Waking wait behavior, and stale generation
   rejection.

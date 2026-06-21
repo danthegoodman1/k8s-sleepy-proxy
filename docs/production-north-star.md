@@ -13,9 +13,9 @@ write to it directly.
 - Kubernetes contains only active, warming, or draining materializations.
 Sleeping instances should not require Deployments, StatefulSets, Services,
 PVs, or PVCs to remain in the cluster.
-- Frontline proxies follow an xDS-style model: keep a local versioned route
-snapshot, watch control-plane updates, and call the control plane only for
-misses, wakes, and exceptional paths.
+- Frontline proxies follow an xDS-style model: keep a local route
+  snapshot, watch control-plane updates, and call the control plane only for
+  misses, wakes, and exceptional paths.
 - Workloads are described by reusable classes plus per-instance values, not by
 one permanent Kubernetes manifest per instance.
 
@@ -121,8 +121,8 @@ ResolveRoute(identity)
 PutHTTP01Challenge(host, token, key_authorization, expires_at)
 ResolveHTTP01Challenge(host, token)
 DeleteHTTP01Challenge(host, token)
-WatchRoutes(proxy_id, version)
-WatchMaterializations(cluster_id, version)
+WatchRoutes(proxy_id, cursor)
+WatchMaterializations(cluster_id, cursor)
 ```
 
 The database can use outbox rows, `LISTEN/NOTIFY`, or a queue internally, but
@@ -203,11 +203,13 @@ longest matching path prefix within the selected host rule. Negative resolutions
 should be cached briefly to protect the control plane from arbitrary Host/SNI
 scans.
 
-Route snapshots are versioned. Proxies should bootstrap with a full snapshot or
-assigned shard, then maintain it through a watch stream. After reconnect, a
-proxy asks for changes since its last version and falls back to a full resync if
-the version is too old. Route entries include instance generation so proxies can
-discard stale backends after sleep, delete, route reassignment, or failed wake.
+Route watch ordering uses opaque cursors. Proxies should bootstrap with a full
+snapshot or assigned shard, then maintain it through a watch stream. After
+reconnect, a proxy sends its last accepted cursor. The control plane may return
+deltas after that cursor or require a full resync if the cursor cannot be
+resumed. The proxy stores cursors but never interprets them. Route entries still
+include instance generation so proxies can discard stale backends after sleep,
+delete, route reassignment, or failed wake.
 
 The same model should support:
 
@@ -351,4 +353,3 @@ storage mode explicitly adds that ownership.
 7. Split wake/sleep/delete into explicit reconciled state machines.
 8. Keep the first production scope to `Deployment`, `StatefulSet`, HTTP/1.1,
   HTTP/2, h2c, gRPC, WebSockets, HTTPS termination, SNI passthrough, and  provider-backed durable volumes. Defer HTTP/3/QUIC while preserving protocol  listener boundaries that allow it later.
-
