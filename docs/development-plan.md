@@ -470,7 +470,9 @@ Scope:
   `SubscribeRoute`, without proxy-visible versions or cursors.
 - Control-plane restart recovery from database state.
 - Minimal production images for the control plane, frontline proxy, and sidecar.
-- Load tests for route lookup and hot proxy path.
+- Load tests for route lookup and hot proxy path, including request rate,
+  streaming throughput, and tail latency against same-environment direct-backend
+  baselines.
 - Soak tests for repeated wake/sleep cycles.
 
 Sub-phases:
@@ -480,7 +482,8 @@ Sub-phases:
 - 7C: Proxy `Subscribe` reconnect, lazy cache rebuild, and stale backend
   recovery.
 - 7D: Minimal final images and container runtime smoke tests.
-- 7E: Load tests for route lookup and hot proxy path.
+- 7E: Load tests for route lookup, hot proxy path, HTTP request rate,
+  h2/h2c/gRPC behavior, TCP throughput, and WebSocket throughput.
 - 7F: kind wake/sleep soak tests and leaked-object detection.
 - 7G: Operator-facing runbook and metric name documentation.
 
@@ -496,6 +499,19 @@ Done when:
 - Repeated kind wake/sleep soak passes without leaked Kubernetes objects.
 - Load-test targets for route lookup, hot proxy path, and cold wake latency are
   defined before 7D starts, and tests fail if those targets regress.
+- Proxy load tests run against the same production images used by kind E2E and
+  compare against direct-backend baselines from the same test environment.
+- Hot-cache HTTP/1.1 request rate stays within 20% of direct-backend baseline.
+- Hot-cache h2, h2c, and gRPC request rate stays within 25% of direct-backend
+  baseline.
+- TCP large-stream throughput stays within 10-15% of direct-backend baseline.
+- WebSocket streaming throughput stays within 15-20% of direct-backend baseline.
+- Hot-cache p99 added latency stays below a documented absolute budget where
+  stable, or within 25% of direct-backend baseline where timing is noisy.
+- Once baseline numbers are established, benchmark regressions warn above
+  10-15% and fail above 20-25% unless the change explicitly updates the
+  accepted budget.
+- Hot-cache route handling makes zero control-plane calls under load.
 - Route lookup and hot proxy path meet target latency under load.
 - Retry/backoff tests cover transient database errors, Kubernetes API conflicts,
   proxy stream disconnects, and materializer reconcile retries.
