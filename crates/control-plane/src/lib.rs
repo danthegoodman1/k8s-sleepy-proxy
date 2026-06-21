@@ -1,5 +1,6 @@
 //! Domain model and persistence contract for the SleepyPods control plane.
 
+pub mod api;
 pub mod config;
 pub mod http01;
 pub mod ids;

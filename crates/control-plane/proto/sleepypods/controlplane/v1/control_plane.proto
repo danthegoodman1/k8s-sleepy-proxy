@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package sleepypods.controlplane.v1;
+
+// OperatorControlPlane is the V1 operator-facing API surface. It is intentionally
+// unary-only so the same service can be exposed over native gRPC and gRPC-Web.
+// The proxy cache-miss Subscribe stream is a separate native-gRPC-only protocol
+// and is not part of this browser-facing service.
+service OperatorControlPlane {
+  rpc CreateWorkloadClassVersion(CreateWorkloadClassVersionRequest) returns (WorkloadClassVersion);
+  rpc GetWorkloadClassVersion(GetWorkloadClassVersionRequest) returns (WorkloadClassVersion);
+  rpc CreateInstance(CreateInstanceRequest) returns (Instance);
+  rpc GetInstance(GetInstanceRequest) returns (Instance);
+  rpc DeleteInstance(DeleteInstanceRequest) returns (DeleteInstanceResponse);
+  rpc CreateRouteBinding(CreateRouteBindingRequest) returns (RouteBinding);
+  rpc GetRouteBinding(GetRouteBindingRequest) returns (RouteBinding);
+  rpc DeleteRouteBinding(DeleteRouteBindingRequest) returns (DeleteRouteBindingResponse);
+  rpc PutHttp01Challenge(PutHttp01ChallengeRequest) returns (Http01Challenge);
+  rpc ResolveHttp01Challenge(ResolveHttp01ChallengeRequest) returns (ResolveHttp01ChallengeResponse);
+  rpc DeleteHttp01Challenge(DeleteHttp01ChallengeRequest) returns (DeleteHttp01ChallengeResponse);
+  rpc ExpireHttp01Challenges(ExpireHttp01ChallengesRequest) returns (ExpireHttp01ChallengesResponse);
+}
+
+message WorkloadClassVersionRef {
+  string class_id = 1;
+  uint64 version = 2;
+}
+
+message WorkloadClassVersion {
+  WorkloadClassVersionRef reference = 1;
+  uint64 template_generation = 2;
+  map<string, string> default_values = 3;
+}
+
+message CreateWorkloadClassVersionRequest {
+  string idempotency_key = 1;
+  string class_id = 2;
+  uint64 version = 3;
+  map<string, string> default_values = 4;
+}
+
+message GetWorkloadClassVersionRequest {
+  WorkloadClassVersionRef reference = 1;
+}
+
+message Instance {
+  string instance_id = 1;
+  WorkloadClassVersionRef workload_class = 2;
+  map<string, string> values = 3;
+  InstanceState state = 4;
+  uint64 generation = 5;
+}
+
+enum InstanceState {
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_COLD = 1;
+  INSTANCE_STATE_WAKING = 2;
+  INSTANCE_STATE_RUNNING = 3;
+  INSTANCE_STATE_DRAINING = 4;
+  INSTANCE_STATE_FAILED = 5;
+  INSTANCE_STATE_DELETING = 6;
+  INSTANCE_STATE_DELETED = 7;
+}
+
+message CreateInstanceRequest {
+  string idempotency_key = 1;
+  string instance_id = 2;
+  WorkloadClassVersionRef workload_class = 3;
+  map<string, string> values = 4;
+}
+
+message GetInstanceRequest {
+  string instance_id = 1;
+}
+
+message DeleteInstanceRequest {
+  string instance_id = 1;
+}
+
+message DeleteInstanceResponse {
+  bool deleted = 1;
+}
+
+message CreateRouteBindingRequest {
+  string idempotency_key = 1;
+  string route_binding_id = 2;
+  string instance_id = 3;
+  RouteIdentity identity = 4;
+  ProtocolRoute protocol = 5;
+}
+
+message GetRouteBindingRequest {
+  string route_binding_id = 1;
+}
+
+message DeleteRouteBindingRequest {
+  string route_binding_id = 1;
+}
+
+message DeleteRouteBindingResponse {
+  bool deleted = 1;
+}
+
+message RouteBinding {
+  string route_binding_id = 1;
+  string instance_id = 2;
+  RouteIdentity identity = 3;
+  ProtocolRoute protocol = 4;
+}
+
+message RouteIdentity {
+  oneof kind {
+    HttpRouteIdentity http = 1;
+    SniRouteIdentity sni = 2;
+  }
+}
+
+message HttpRouteIdentity {
+  RouteHost host = 1;
+  optional string path_prefix = 2;
+}
+
+message SniRouteIdentity {
+  RouteHost host = 1;
+}
+
+message RouteHost {
+  RouteHostKind kind = 1;
+  string host = 2;
+}
+
+enum RouteHostKind {
+  ROUTE_HOST_KIND_UNSPECIFIED = 0;
+  ROUTE_HOST_KIND_EXACT = 1;
+  ROUTE_HOST_KIND_WILDCARD_SUFFIX = 2;
+}
+
+enum ProtocolRoute {
+  PROTOCOL_ROUTE_UNSPECIFIED = 0;
+  PROTOCOL_ROUTE_HTTP = 1;
+  PROTOCOL_ROUTE_TLS_SNI = 2;
+}
+
+message Http01ChallengeKey {
+  string host = 1;
+  string token = 2;
+}
+
+message Http01Challenge {
+  Http01ChallengeKey key = 1;
+  string key_authorization = 2;
+  int64 expires_at_unix_millis = 3;
+}
+
+message PutHttp01ChallengeRequest {
+  Http01ChallengeKey key = 1;
+  string key_authorization = 2;
+  int64 expires_at_unix_millis = 3;
+}
+
+message ResolveHttp01ChallengeRequest {
+  Http01ChallengeKey key = 1;
+}
+
+message ResolveHttp01ChallengeResponse {
+  optional Http01Challenge challenge = 1;
+}
+
+message DeleteHttp01ChallengeRequest {
+  Http01ChallengeKey key = 1;
+}
+
+message DeleteHttp01ChallengeResponse {
+  bool deleted = 1;
+}
+
+message ExpireHttp01ChallengesRequest {
+  int64 now_unix_millis = 1;
+  optional uint64 limit = 2;
+}
+
+message ExpireHttp01ChallengesResponse {
+  uint64 expired = 1;
+}
