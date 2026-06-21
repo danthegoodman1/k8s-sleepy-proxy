@@ -22,6 +22,10 @@ considered done.
   maintainer could otherwise make a dangerous simplification.
 - Keep each sub-phase reviewable. A phase is not done until the narrowest useful
   integration test proves the behavior works.
+- Treat low-latency hot paths as an explicit design constraint. Proxy request
+  forwarding, stream forwarding, and local route-cache hits should avoid
+  control-plane calls, database access, global locks, unbounded allocation, and
+  per-request client construction.
 - Keep production containers small and explicit. The control plane, frontline
   proxy, and sidecar should use `scratch` final images when practical; if a
   component needs runtime files such as CA roots, timezone data, passwd/group
@@ -57,6 +61,9 @@ Use four test layers:
    - TLS termination
    - TLS/SNI passthrough
    - HTTP-01 challenge handling
+   - PostgreSQL/libpq 17+ SNI passthrough with `sslnegotiation=direct`, using
+     a real Postgres workload as proof that SNI routing works for application
+     code we did not write
 
 4. kind end-to-end tests:
    - build the final production-style images for the control plane, frontline
@@ -68,6 +75,9 @@ Use four test layers:
    - verify PV/PVC materialization before workload creation, intended binding,
      pod mount behavior, and data continuity across sleep/re-wake
    - verify custom host/SNI routing and HTTP-01 challenge lookup
+   - verify PostgreSQL/libpq 17+ connects through TLS/SNI passthrough using
+     `sslnegotiation=direct`; pin the image version in CI rather than relying
+     on a floating `latest` tag
 
 The kind suite is a release gate. Unit and component tests are not enough for
 this project because most failures will happen at Kubernetes object lifecycle,
@@ -99,6 +109,7 @@ Scope:
 - Timeout and backpressure primitives.
 - TLS ClientHello/SNI extraction helpers.
 - Shared metrics and tracing conventions.
+- Hot-path latency budgets and benchmark harnesses for proxy primitives.
 
 Sub-phases:
 
@@ -107,6 +118,7 @@ Sub-phases:
 - 1C: Timeout, backpressure, structured shutdown, and cancellation behavior.
 - 1D: TLS ClientHello/SNI extraction helpers.
 - 1E: Shared metrics and tracing conventions.
+- 1F: Proxy hot-path latency budgets, benchmark harnesses, and allocation checks.
 
 Done when:
 
@@ -120,6 +132,14 @@ Done when:
   peer disconnect, and backpressure.
 - Drain tests prove new work is rejected while existing streams get the grace
   period.
+- Hot-path benchmarks cover TCP forwarding, HTTP forwarding, WebSocket relay,
+  TLS ClientHello/SNI extraction, local route-key lookup primitives, and
+  admission/accounting overhead.
+- Benchmark notes separate hot routing latency from cold wake latency; cold wake
+  can be slower, but hot proxy paths must not depend on control-plane calls,
+  database access, per-request client construction, or unbounded allocation.
+- Allocation-sensitive tests or profiles exist for the hot path so regressions
+  are visible before the frontline proxy is built on top of these primitives.
 
 ## Milestone 2: Control Plane Resource Model
 
@@ -288,6 +308,9 @@ Done when:
   response bodies, HTTP/2 multiplexing, h2c gRPC trailers and status propagation,
   WebSocket close/backpressure, TLS passthrough byte preservation, and TCP
   half-close behavior.
+- PostgreSQL SNI passthrough tests use PostgreSQL/libpq 17+ with
+  `sslnegotiation=direct` so the frontline proxy can route on standard TLS SNI
+  without understanding the PostgreSQL startup protocol.
 - TLS tests cover SNI certificate selection, missing certificate behavior, cert
   rotation, and passthrough for unknown or non-HTTP TLS traffic.
 - HTTP-01 tests cover wrong host, wrong token, expired challenge, deleted
@@ -406,7 +429,8 @@ Sub-phases:
   write/read, idle drain, sleep, and re-wake with data continuity.
 - 6C: Custom host, wildcard host, SNI, and optional path-prefix routing.
 - 6D: Protocol matrix: HTTP/1.1, HTTP/2, h2c gRPC, gRPC-Web control-plane
-  access, WebSockets, TLS termination, and SNI passthrough.
+  access, WebSockets, TLS termination, SNI passthrough, and
+  PostgreSQL/libpq 17+ over SNI with `sslnegotiation=direct`.
 - 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior.
 - 6F: Failure-path matrix: wake timeout, bad route, missing PVC binding, bad
   volume template, stale proxy generation, and control-plane restart.
@@ -421,6 +445,9 @@ Done when:
   mounted write/read, sleep, re-wake, and data continuity.
 - kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, gRPC-Web control-plane access,
   WebSockets, TLS termination, and SNI passthrough.
+- kind E2E proves a real PostgreSQL/libpq 17+ deployment can connect through
+  TLS/SNI passthrough with `sslnegotiation=direct`, using a pinned Postgres
+  image in CI.
 - Failure-path E2E covers wake timeout, bad route, missing PVC binding, bad
   volume template, and stale proxy generation.
 - Lifecycle-race E2E proves generation checks prevent stale sidecar reports,
