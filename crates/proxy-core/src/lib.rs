@@ -7,6 +7,7 @@ pub mod http;
 pub mod shutdown;
 pub mod tcp;
 pub mod timeout;
+pub mod tls;
 pub mod websocket;
 
 pub use accounting::{ActiveConnection, ActiveConnectionCounter};
@@ -19,6 +20,11 @@ pub use http::{
 pub use shutdown::Shutdown;
 pub use tcp::{proxy_streams, TcpProxy, TcpProxyConfig, TcpProxyError, TcpProxyStats};
 pub use timeout::{with_timeout, TimeoutError};
+pub use tls::{
+    parse_tls_client_hello_sni, read_tls_client_hello_prefix,
+    read_tls_client_hello_prefix_with_limit, TlsClientHelloError, TlsClientHelloPrefix,
+    TlsClientHelloSni, MAX_TLS_CLIENT_HELLO_PREFIX_LEN,
+};
 pub use websocket::{
     proxy_websocket_streams, WebSocketProxy, WebSocketProxyError, WebSocketProxyStats,
 };
