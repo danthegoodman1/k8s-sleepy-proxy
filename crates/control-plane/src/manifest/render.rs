@@ -4,16 +4,23 @@ use crate::instance::InstanceRecord;
 
 use super::{
     ApplyOrder, Container, ContainerPort, ContainerTemplate, CsiPersistentVolumeSource, Deployment,
-    DeploymentSpec, EnvVar, KubernetesObject, LabelSelector, ManifestRenderError, ObjectMeta,
-    PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
-    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
-    PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderManifestRequest, RenderedManifest,
-    RenderedManifestObject, Service, ServicePort, ServiceSpec, ServiceTemplate, StatefulSet,
-    StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate,
-    WorkloadKind, ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    DeploymentSpec, EnvVar, KubernetesObject, LabelSelector, ManifestRenderError, ManifestTemplate,
+    ObjectMeta, PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeClaim,
+    PersistentVolumeClaimRef, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
+    PersistentVolumeSpec, PodSpec, PodTemplateMetadata, PodTemplateSpec, PodVolume,
+    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Service, ServicePort,
+    ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec, TemplateText,
+    VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
+    ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
     LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
+
+const SIDECAR_PORT_NAME: &str = "sleepypods";
+const ENV_LISTEN_PORT: &str = "SLEEPYPODS_LISTEN_PORT";
+const ENV_APP_PORT: &str = "SLEEPYPODS_APP_PORT";
+const ENV_INSTANCE_ID: &str = "SLEEPYPODS_INSTANCE_ID";
+const ENV_INSTANCE_GENERATION: &str = "SLEEPYPODS_INSTANCE_GENERATION";
 
 pub fn render_manifests(
     request: RenderManifestRequest<'_>,
@@ -34,6 +41,7 @@ pub fn render_manifests(
     let selector_labels = selector_labels(request.instance, &workload_name)?;
     let metadata_labels = metadata_labels(request.instance, &workload_name)?;
     let annotations = metadata_annotations(&request);
+    let sidecar = render_sidecar_config(request.template, request.instance)?;
 
     let rendered_volumes = request
         .template
@@ -101,7 +109,7 @@ pub fn render_manifests(
                 },
                 spec: ServiceSpec {
                     selector: selector_labels.clone(),
-                    ports: render_service_ports(service)?,
+                    ports: render_service_ports(service, sidecar.listen_port)?,
                 },
             }),
         });
@@ -113,11 +121,14 @@ pub fn render_manifests(
             annotations: annotations.clone(),
         },
         spec: PodSpec {
-            containers: vec![render_app_container(
-                &request.template.workload.app_container,
-                request.instance,
-                &rendered_volumes,
-            )?],
+            containers: vec![
+                render_app_container(
+                    &request.template.workload.app_container,
+                    request.instance,
+                    &rendered_volumes,
+                )?,
+                render_sidecar_container(&request.template.sidecar, request.instance, &sidecar)?,
+            ],
             volumes: rendered_volumes
                 .iter()
                 .map(|volume| PodVolume {
@@ -199,6 +210,59 @@ struct RenderedVolume {
     reclaim_policy: PersistentVolumeReclaimPolicy,
     storage_class_name: Option<String>,
     source: PersistentVolumeSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidecarRenderConfig {
+    listen_port: u16,
+    app_port: u16,
+}
+
+fn render_sidecar_config(
+    template: &ManifestTemplate,
+    instance: &InstanceRecord,
+) -> Result<SidecarRenderConfig, ManifestRenderError> {
+    validate_port("sidecar.listen_port", template.sidecar.listen_port)?;
+
+    let service = template
+        .service
+        .as_ref()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "service",
+            message: "sidecar-routed workloads require a service template".to_owned(),
+        })?;
+    if service.ports.len() != 1 {
+        return Err(ManifestRenderError::InvalidField {
+            field: "service.ports",
+            message: "exactly one service port is supported for sidecar-routed workloads"
+                .to_owned(),
+        });
+    }
+
+    let app_port = service.ports[0].target_port;
+    validate_port("service.ports.target_port", app_port)?;
+    if app_port == template.sidecar.listen_port {
+        return Err(ManifestRenderError::InvalidField {
+            field: "service.ports.target_port",
+            message: "original app target port must differ from the sidecar listen port".to_owned(),
+        });
+    }
+    let app_ports = &template.workload.app_container.ports;
+    if app_ports.iter().all(|port| port.container_port != 0)
+        && app_ports.iter().all(|port| port.container_port != app_port)
+    {
+        return Err(ManifestRenderError::InvalidField {
+            field: "service.ports.target_port",
+            message: format!("target port {app_port} must match an app container port"),
+        });
+    }
+    render_non_empty("sidecar.image", &template.sidecar.image, instance)?;
+    validate_dns_label("sidecar.name", &template.sidecar.name)?;
+
+    Ok(SidecarRenderConfig {
+        listen_port: template.sidecar.listen_port,
+        app_port,
+    })
 }
 
 fn render_volume(
@@ -320,8 +384,43 @@ fn render_app_container(
     })
 }
 
+fn render_sidecar_container(
+    template: &SidecarTemplate,
+    instance: &InstanceRecord,
+    config: &SidecarRenderConfig,
+) -> Result<Container, ManifestRenderError> {
+    Ok(Container {
+        name: template.name.clone(),
+        image: render_non_empty("sidecar.image", &template.image, instance)?,
+        ports: vec![ContainerPort {
+            name: Some(SIDECAR_PORT_NAME.to_owned()),
+            container_port: config.listen_port,
+        }],
+        env: vec![
+            EnvVar {
+                name: ENV_LISTEN_PORT.to_owned(),
+                value: config.listen_port.to_string(),
+            },
+            EnvVar {
+                name: ENV_APP_PORT.to_owned(),
+                value: config.app_port.to_string(),
+            },
+            EnvVar {
+                name: ENV_INSTANCE_ID.to_owned(),
+                value: instance.id.to_string(),
+            },
+            EnvVar {
+                name: ENV_INSTANCE_GENERATION.to_owned(),
+                value: instance.generation.to_string(),
+            },
+        ],
+        volume_mounts: Vec::new(),
+    })
+}
+
 fn render_service_ports(
     template: &ServiceTemplate,
+    sidecar_listen_port: u16,
 ) -> Result<Vec<ServicePort>, ManifestRenderError> {
     template
         .ports
@@ -332,7 +431,7 @@ fn render_service_ports(
             Ok(ServicePort {
                 name: port.name.clone(),
                 port: port.port,
-                target_port: port.target_port,
+                target_port: sidecar_listen_port,
             })
         })
         .collect()

@@ -18,6 +18,7 @@ pub enum TemplateTextPart {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestTemplate {
     pub workload: WorkloadTemplate,
+    pub sidecar: SidecarTemplate,
     pub service: Option<ServiceTemplate>,
     pub volumes: Vec<VolumeTemplate>,
 }
@@ -54,6 +55,13 @@ pub struct ContainerPortTemplate {
 pub struct EnvVarTemplate {
     pub name: String,
     pub value: TemplateText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidecarTemplate {
+    pub name: String,
+    pub image: TemplateText,
+    pub listen_port: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

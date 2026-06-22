@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use super::{
     render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate,
-    CsiPersistentVolumeSource, EnvVarTemplate, KubernetesObject, ManifestRenderError,
+    CsiPersistentVolumeSource, EnvVar, EnvVarTemplate, KubernetesObject, ManifestRenderError,
     ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
     PersistentVolumeSource, PersistentVolumeSourceTemplate, RenderManifestRequest,
-    ServicePortTemplate, ServiceTemplate, TemplateText, TemplateTextPart, VolumeTemplate,
-    WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
+    VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
     LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION,
 };
 use crate::{
@@ -76,7 +76,7 @@ fn renders_deployment_and_service_without_volumes() {
     assert_eq!(service.metadata.name, "svc-acme");
     assert_eq!(service.spec.selector[LABEL_INSTANCE_ID], "instance-a");
     assert_eq!(service.spec.ports[0].port, 80);
-    assert_eq!(service.spec.ports[0].target_port, 8080);
+    assert_eq!(service.spec.ports[0].target_port, 15000);
 
     let deployment = match &rendered.objects[1].object {
         KubernetesObject::Deployment(deployment) => deployment,
@@ -107,6 +107,7 @@ fn renders_deployment_and_service_without_volumes() {
         deployment.spec.template.metadata.annotations["sleepypods.io/template-generation"],
         "3"
     );
+    assert_eq!(deployment.spec.template.spec.containers.len(), 2);
     assert_eq!(
         deployment.spec.template.spec.containers[0].image,
         "example/app:1"
@@ -115,8 +116,43 @@ fn renders_deployment_and_service_without_volumes() {
         deployment.spec.template.spec.containers[0].ports[0].container_port,
         8080
     );
+    assert_eq!(
+        deployment.spec.template.spec.containers[1].name,
+        "sleepypods-sidecar"
+    );
+    assert_eq!(
+        deployment.spec.template.spec.containers[1].image,
+        "sleepypods/sidecar:test"
+    );
+    assert_eq!(
+        deployment.spec.template.spec.containers[1].ports[0].container_port,
+        15000
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_LISTEN_PORT",
+        "15000",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_APP_PORT",
+        "8080",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_INSTANCE_ID",
+        "instance-a",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_INSTANCE_GENERATION",
+        "7",
+    );
     assert!(deployment.spec.template.spec.volumes.is_empty());
     assert!(deployment.spec.template.spec.containers[0]
+        .volume_mounts
+        .is_empty());
+    assert!(deployment.spec.template.spec.containers[1]
         .volume_mounts
         .is_empty());
 }
@@ -194,6 +230,24 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     assert_eq!(stateful_set.metadata.name, "db-acme");
     assert_eq!(stateful_set.spec.service_name, "db-acme");
     assert_eq!(stateful_set.spec.replicas, 1);
+    assert_eq!(stateful_set.spec.template.spec.containers.len(), 2);
+    assert_eq!(
+        stateful_set.spec.template.spec.containers[0].ports[0].container_port,
+        5432
+    );
+    assert_eq!(
+        stateful_set.spec.template.spec.containers[1].name,
+        "sleepypods-sidecar"
+    );
+    assert_eq!(
+        stateful_set.spec.template.spec.containers[1].ports[0].container_port,
+        15000
+    );
+    assert_env(
+        &stateful_set.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_APP_PORT",
+        "5432",
+    );
     assert_eq!(
         stateful_set.spec.template.spec.volumes[0]
             .persistent_volume_claim
@@ -208,6 +262,9 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         stateful_set.spec.template.spec.containers[0].volume_mounts[0].mount_path,
         "/var/lib/postgresql/data"
     );
+    assert!(stateful_set.spec.template.spec.containers[1]
+        .volume_mounts
+        .is_empty());
 }
 
 #[test]
@@ -336,6 +393,149 @@ fn rejects_zero_service_target_port() {
 }
 
 #[test]
+fn rejects_zero_sidecar_listen_port() {
+    let mut template = deployment_template();
+    template.sidecar.listen_port = 0;
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("zero sidecar listen port is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "sidecar.listen_port",
+            message: "port must be between 1 and 65535".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_service_without_ports_for_sidecar_routing() {
+    let mut template = deployment_template();
+    template.service.as_mut().expect("service").ports = Vec::new();
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("service port is required");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "service.ports",
+            message: "exactly one service port is supported for sidecar-routed workloads"
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_missing_service_for_sidecar_routing() {
+    let mut template = deployment_template();
+    template.service = None;
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("service is required");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "service",
+            message: "sidecar-routed workloads require a service template".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_multiple_service_ports_for_sidecar_routing() {
+    let mut template = deployment_template();
+    template
+        .service
+        .as_mut()
+        .expect("service")
+        .ports
+        .push(ServicePortTemplate {
+            name: Some("admin".to_owned()),
+            port: 8081,
+            target_port: 8081,
+        });
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("ambiguous service ports are rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "service.ports",
+            message: "exactly one service port is supported for sidecar-routed workloads"
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_app_target_port_matching_sidecar_listen_port() {
+    let mut template = deployment_template();
+    template.service.as_mut().expect("service").ports[0].target_port = template.sidecar.listen_port;
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("loop-prone sidecar target is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "service.ports.target_port",
+            message: "original app target port must differ from the sidecar listen port".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_service_target_port_not_declared_on_app_container() {
+    let mut template = deployment_template();
+    template.service.as_mut().expect("service").ports[0].target_port = 9090;
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("service target port must be an app container port");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "service.ports.target_port",
+            message: "target port 9090 must match an app container port".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn rejects_volume_without_access_modes() {
     let mut template = stateful_template();
     template.volumes[0].access_modes = Vec::new();
@@ -388,6 +588,7 @@ fn deployment_template() -> ManifestTemplate {
                 target_port: 8080,
             }],
         }),
+        sidecar: sidecar_template(),
         volumes: Vec::new(),
     }
 }
@@ -416,6 +617,7 @@ fn stateful_template() -> ManifestTemplate {
                 target_port: 5432,
             }],
         }),
+        sidecar: sidecar_template(),
         volumes: vec![VolumeTemplate {
             name: "data".to_owned(),
             mount_path: TemplateText::literal("/var/lib/postgresql/data"),
@@ -437,6 +639,23 @@ fn stateful_template() -> ManifestTemplate {
             },
         }],
     }
+}
+
+fn sidecar_template() -> SidecarTemplate {
+    SidecarTemplate {
+        name: "sleepypods-sidecar".to_owned(),
+        image: TemplateText::literal("sleepypods/sidecar:test"),
+        listen_port: 15000,
+    }
+}
+
+fn assert_env(env: &[EnvVar], name: &str, expected: &str) {
+    let value = env
+        .iter()
+        .find(|var| var.name == name)
+        .unwrap_or_else(|| panic!("missing env var {name}"));
+
+    assert_eq!(value.value, expected);
 }
 
 fn composed(prefix: &str, field: &str) -> TemplateText {

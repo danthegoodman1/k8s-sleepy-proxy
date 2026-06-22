@@ -21,8 +21,8 @@ pub use render::render_manifests;
 pub use template::{
     ContainerPortTemplate, ContainerTemplate, EnvVarTemplate, ManifestTemplate,
     PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
-    ServicePortTemplate, ServiceTemplate, TemplateText, TemplateTextPart, VolumeTemplate,
-    WorkloadKind, WorkloadTemplate,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
+    VolumeTemplate, WorkloadKind, WorkloadTemplate,
 };
 
 const LABEL_INSTANCE_ID: &str = "sleepypods.io/instance-id";
