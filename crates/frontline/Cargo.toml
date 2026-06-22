@@ -11,12 +11,14 @@ http = { version = "1.4.2", default-features = false, features = ["std"] }
 http-body = { version = "1.0.1", default-features = false }
 hyper = { version = "1.10.1", default-features = false }
 proxy-core = { version = "0.1.0", path = "../proxy-core" }
-tokio = { version = "1.52.3", default-features = false, features = ["io-util"] }
+tokio = { version = "1.52.3", default-features = false, features = ["io-util", "net"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
 http-body-util = { version = "0.1.3", default-features = false, features = ["channel", "full"] }
 hyper = { version = "1.10.1", default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["ring"] }
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake"] }

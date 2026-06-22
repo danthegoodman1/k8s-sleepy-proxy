@@ -9,6 +9,7 @@ pub mod forward;
 pub mod identity;
 pub mod matcher;
 pub mod subscription;
+pub mod tls;
 pub mod wake;
 
 pub use cache::{
@@ -25,6 +26,11 @@ pub use subscription::{
     ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome, InvalidationReason, ProxySubscribeInput,
     RouteRequestId, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
     UnsubscribeOutcome,
+};
+pub use tls::{
+    passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateError,
+    TlsCertificateStore, TlsPassthrough, TlsPassthroughBackendError, TlsPassthroughError,
+    TlsTerminationError,
 };
 pub use wake::{
     route_wake_decision, validate_route_update, validate_wake_response, ReadyBackend,
