@@ -1,0 +1,768 @@
+use std::{error::Error, fmt, future::Future, pin::Pin};
+
+use crate::{
+    manifest::{ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject},
+    materialization::RenderedObjectRef,
+};
+
+pub type KubernetesClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type KubernetesClientResult<T> = Result<T, KubernetesClientError>;
+
+pub trait KubernetesMaterializerClient: Send + Sync {
+    fn apply_object<'a>(
+        &'a self,
+        object: &'a KubernetesObject,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>>;
+
+    fn delete_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>>;
+
+    fn wait_for_pvc_bound<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct KubernetesMaterializer<C> {
+    client: C,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubernetesClientError {
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaterializerError {
+    Apply {
+        object: RenderedObjectRef,
+        source: KubernetesClientError,
+    },
+    Delete {
+        object: RenderedObjectRef,
+        source: KubernetesClientError,
+    },
+    PvcBoundWait {
+        namespace: String,
+        name: String,
+        source: KubernetesClientError,
+    },
+}
+
+impl<C> KubernetesMaterializer<C>
+where
+    C: KubernetesMaterializerClient,
+{
+    pub fn new(client: C) -> Self {
+        Self { client }
+    }
+
+    pub fn client(&self) -> &C {
+        &self.client
+    }
+
+    pub async fn apply_manifest(
+        &self,
+        manifest: &RenderedManifest,
+    ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
+        let objects = ordered_objects(manifest);
+        let mut applied_refs = Vec::with_capacity(objects.len());
+
+        for object in objects
+            .iter()
+            .filter(|object| object.apply_order == ApplyOrder::PersistentVolume)
+        {
+            applied_refs.push(self.apply_object(&object.object).await?);
+        }
+
+        let mut pvc_refs = Vec::new();
+        for object in objects
+            .iter()
+            .filter(|object| object.apply_order == ApplyOrder::PersistentVolumeClaim)
+        {
+            let object_ref = self.apply_object(&object.object).await?;
+            pvc_refs.push(object_ref.clone());
+            applied_refs.push(object_ref);
+        }
+
+        for pvc in pvc_refs {
+            self.wait_for_pvc_bound(&pvc).await?;
+        }
+
+        for apply_order in [ApplyOrder::Service, ApplyOrder::Workload] {
+            for object in objects
+                .iter()
+                .filter(|object| object.apply_order == apply_order)
+            {
+                applied_refs.push(self.apply_object(&object.object).await?);
+            }
+        }
+
+        Ok(applied_refs)
+    }
+
+    pub async fn delete_rendered_objects(
+        &self,
+        objects: &[RenderedObjectRef],
+    ) -> Result<(), MaterializerError> {
+        for object in objects.iter().rev() {
+            self.client.delete_object(object).await.map_err(|source| {
+                MaterializerError::Delete {
+                    object: object.clone(),
+                    source,
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_object(
+        &self,
+        object: &KubernetesObject,
+    ) -> Result<RenderedObjectRef, MaterializerError> {
+        let object_ref = rendered_object_ref(object);
+        self.client
+            .apply_object(object)
+            .await
+            .map_err(|source| MaterializerError::Apply {
+                object: object_ref.clone(),
+                source,
+            })?;
+        Ok(object_ref)
+    }
+
+    async fn wait_for_pvc_bound(&self, pvc: &RenderedObjectRef) -> Result<(), MaterializerError> {
+        self.client
+            .wait_for_pvc_bound(&pvc.namespace, &pvc.name)
+            .await
+            .map_err(|source| MaterializerError::PvcBoundWait {
+                namespace: pvc.namespace.clone(),
+                name: pvc.name.clone(),
+                source,
+            })
+    }
+}
+
+pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
+    let (api_version, namespace) = match object {
+        KubernetesObject::Deployment(object) => ("apps/v1", object.metadata.namespace.clone()),
+        KubernetesObject::StatefulSet(object) => ("apps/v1", object.metadata.namespace.clone()),
+        KubernetesObject::Service(object) => ("v1", object.metadata.namespace.clone()),
+        KubernetesObject::PersistentVolume(object) => ("v1", object.metadata.namespace.clone()),
+        KubernetesObject::PersistentVolumeClaim(object) => {
+            ("v1", object.metadata.namespace.clone())
+        }
+    };
+
+    RenderedObjectRef {
+        api_version: api_version.to_owned(),
+        kind: object.kind().to_owned(),
+        namespace: namespace.unwrap_or_default(),
+        name: object.name().to_owned(),
+    }
+}
+
+fn ordered_objects(manifest: &RenderedManifest) -> Vec<&RenderedManifestObject> {
+    let mut objects = manifest.objects.iter().collect::<Vec<_>>();
+    objects.sort_by_key(|object| object.apply_order);
+    objects
+}
+
+impl KubernetesClientError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for KubernetesClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for KubernetesClientError {}
+
+impl fmt::Display for MaterializerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Apply { object, source } => {
+                write!(
+                    f,
+                    "failed to apply {} {}/{}: {}",
+                    object.kind, object.namespace, object.name, source
+                )
+            }
+            Self::Delete { object, source } => {
+                write!(
+                    f,
+                    "failed to delete {} {}/{}: {}",
+                    object.kind, object.namespace, object.name, source
+                )
+            }
+            Self::PvcBoundWait {
+                namespace,
+                name,
+                source,
+            } => write!(
+                f,
+                "failed waiting for PersistentVolumeClaim {namespace}/{name} to become Bound: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for MaterializerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Apply { source, .. }
+            | Self::Delete { source, .. }
+            | Self::PvcBoundWait { source, .. } => Some(source),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{
+        ids::{Generation, InstanceId, WorkloadClassId},
+        instance::{InstanceRecord, InstanceState, InstanceValues},
+        manifest::{
+            render_manifests, ContainerPortTemplate, ContainerTemplate, EnvVarTemplate,
+            KubernetesObject, ManifestTemplate, PersistentVolumeAccessMode,
+            PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, RenderManifestRequest,
+            ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
+            VolumeTemplate, WorkloadKind, WorkloadTemplate,
+        },
+        workload::WorkloadClassVersionRef,
+    };
+
+    use super::{
+        rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
+        KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError, RenderedObjectRef,
+    };
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeKubernetesClient {
+        inner: Arc<Mutex<FakeState>>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeState {
+        operations: Vec<FakeOperation>,
+        applied_objects: Vec<KubernetesObject>,
+        fail_pvc_wait: Option<(String, String)>,
+        fail_delete: Option<RenderedObjectRef>,
+        fail_apply: Option<RenderedObjectRef>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum FakeOperation {
+        Apply(RenderedObjectRef),
+        WaitPvcBound { namespace: String, name: String },
+        Delete(RenderedObjectRef),
+    }
+
+    #[test]
+    fn kubernetes_materializer_client_trait_is_dyn_safe() {
+        fn assert_dyn_safe<T: KubernetesMaterializerClient + ?Sized>() {}
+
+        assert_dyn_safe::<dyn KubernetesMaterializerClient>();
+    }
+
+    #[tokio::test]
+    async fn applies_stateful_manifest_with_pvc_bound_wait_before_service_and_workload() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let manifest = stateful_manifest();
+
+        let refs = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect("stateful manifest applies");
+
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Apply(object_ref(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    "data",
+                    "pvc-acme"
+                )),
+                FakeOperation::WaitPvcBound {
+                    namespace: "data".to_owned(),
+                    name: "pvc-acme".to_owned(),
+                },
+                FakeOperation::Apply(object_ref("v1", "Service", "data", "db-acme")),
+                FakeOperation::Apply(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
+            ]
+        );
+        assert_eq!(
+            refs,
+            vec![
+                object_ref("v1", "PersistentVolume", "", "pv-acme"),
+                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
+                object_ref("v1", "Service", "data", "db-acme"),
+                object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn applies_deployment_service_before_workload_and_returns_refs_in_apply_order() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let manifest = deployment_manifest();
+
+        let refs = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect("deployment manifest applies");
+
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(object_ref("v1", "Service", "apps", "svc-acme")),
+                FakeOperation::Apply(object_ref("apps/v1", "Deployment", "apps", "app-acme")),
+            ]
+        );
+        assert_eq!(
+            refs,
+            vec![
+                object_ref("v1", "Service", "apps", "svc-acme"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_failure_returns_typed_error_for_failed_object() {
+        let client = FakeKubernetesClient::default();
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        client.fail_apply(service_ref.clone());
+        let materializer = KubernetesMaterializer::new(client.clone());
+
+        let error = materializer
+            .apply_manifest(&deployment_manifest())
+            .await
+            .expect_err("service apply failure stops materialization");
+
+        assert_eq!(
+            error,
+            MaterializerError::Apply {
+                object: service_ref.clone(),
+                source: KubernetesClientError::new("apply failed"),
+            }
+        );
+        assert_eq!(client.operations(), vec![FakeOperation::Apply(service_ref)]);
+    }
+
+    #[tokio::test]
+    async fn pvc_bound_wait_failure_prevents_service_and_workload_apply() {
+        let client = FakeKubernetesClient::default();
+        client.fail_pvc_wait("data", "pvc-acme");
+        let materializer = KubernetesMaterializer::new(client.clone());
+
+        let error = materializer
+            .apply_manifest(&stateful_manifest())
+            .await
+            .expect_err("pvc wait failure stops materialization");
+
+        assert_eq!(
+            error,
+            MaterializerError::PvcBoundWait {
+                namespace: "data".to_owned(),
+                name: "pvc-acme".to_owned(),
+                source: KubernetesClientError::new("pvc did not bind"),
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Apply(object_ref(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    "data",
+                    "pvc-acme"
+                )),
+                FakeOperation::WaitPvcBound {
+                    namespace: "data".to_owned(),
+                    name: "pvc-acme".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_rendered_refs_in_reverse_order() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let refs = KubernetesMaterializer::new(FakeKubernetesClient::default())
+            .apply_manifest(&stateful_manifest())
+            .await
+            .expect("refs are derived");
+
+        materializer
+            .delete_rendered_objects(&refs)
+            .await
+            .expect("refs delete");
+
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Delete(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
+                FakeOperation::Delete(object_ref("v1", "Service", "data", "db-acme")),
+                FakeOperation::Delete(object_ref(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    "data",
+                    "pvc-acme"
+                )),
+                FakeOperation::Delete(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+            ]
+        );
+    }
+
+    #[test]
+    fn object_refs_use_expected_api_versions_kinds_names_and_namespaces() {
+        let manifest = stateful_manifest();
+        let refs = manifest
+            .objects
+            .iter()
+            .map(|object| rendered_object_ref(&object.object))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            refs,
+            vec![
+                object_ref("v1", "PersistentVolume", "", "pv-acme"),
+                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
+                object_ref("v1", "Service", "data", "db-acme"),
+                object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_failure_returns_typed_error_and_stops() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        let workload_ref = object_ref("apps/v1", "Deployment", "apps", "app-acme");
+        client.fail_delete(service_ref.clone());
+
+        let error = materializer
+            .delete_rendered_objects(&[service_ref.clone(), workload_ref.clone()])
+            .await
+            .expect_err("delete failure stops cleanup");
+
+        assert_eq!(
+            error,
+            MaterializerError::Delete {
+                object: service_ref.clone(),
+                source: KubernetesClientError::new("delete failed"),
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Delete(workload_ref),
+                FakeOperation::Delete(service_ref),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_objects_retain_ownership_and_generation_labels() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+
+        materializer
+            .apply_manifest(&deployment_manifest())
+            .await
+            .expect("deployment applies");
+
+        for object in client.applied_objects() {
+            let labels = object_labels(&object);
+            assert_eq!(labels["sleepypods.io/instance-id"], "instance-a");
+            assert_eq!(labels["sleepypods.io/instance-generation"], "7");
+        }
+    }
+
+    impl KubernetesMaterializerClient for FakeKubernetesClient {
+        fn apply_object<'a>(
+            &'a self,
+            object: &'a KubernetesObject,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            let object = object.clone();
+            let client = self.clone();
+            Box::pin(async move {
+                let object_ref = rendered_object_ref(&object);
+                let mut inner = client.inner.lock().expect("fake client lock not poisoned");
+                inner
+                    .operations
+                    .push(FakeOperation::Apply(object_ref.clone()));
+                inner.applied_objects.push(object);
+
+                if inner.fail_apply.as_ref() == Some(&object_ref) {
+                    Err(KubernetesClientError::new("apply failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn delete_object<'a>(
+            &'a self,
+            object: &'a RenderedObjectRef,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            let object = object.clone();
+            let client = self.clone();
+            Box::pin(async move {
+                let mut inner = client.inner.lock().expect("fake client lock not poisoned");
+                inner.operations.push(FakeOperation::Delete(object.clone()));
+
+                if inner.fail_delete.as_ref() == Some(&object) {
+                    Err(KubernetesClientError::new("delete failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn wait_for_pvc_bound<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            let namespace = namespace.to_owned();
+            let name = name.to_owned();
+            let client = self.clone();
+            Box::pin(async move {
+                let mut inner = client.inner.lock().expect("fake client lock not poisoned");
+                inner.operations.push(FakeOperation::WaitPvcBound {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                });
+
+                if inner.fail_pvc_wait.as_ref() == Some(&(namespace, name)) {
+                    Err(KubernetesClientError::new("pvc did not bind"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    impl FakeKubernetesClient {
+        fn operations(&self) -> Vec<FakeOperation> {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .operations
+                .clone()
+        }
+
+        fn applied_objects(&self) -> Vec<KubernetesObject> {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .applied_objects
+                .clone()
+        }
+
+        fn fail_pvc_wait(&self, namespace: &str, name: &str) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .fail_pvc_wait = Some((namespace.to_owned(), name.to_owned()));
+        }
+
+        fn fail_apply(&self, object: RenderedObjectRef) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .fail_apply = Some(object);
+        }
+
+        fn fail_delete(&self, object: RenderedObjectRef) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .fail_delete = Some(object);
+        }
+    }
+
+    fn deployment_manifest() -> crate::manifest::RenderedManifest {
+        render_manifests(RenderManifestRequest {
+            template: &deployment_template(),
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            namespace: "apps",
+            template_generation: Some(Generation::new(3)),
+        })
+        .expect("deployment renders")
+    }
+
+    fn stateful_manifest() -> crate::manifest::RenderedManifest {
+        render_manifests(RenderManifestRequest {
+            template: &stateful_template(),
+            instance: &instance(
+                "postgres-a",
+                2,
+                values([("tenant", "acme"), ("volume", "provider-vol-123")]),
+            ),
+            namespace: "data",
+            template_generation: None,
+        })
+        .expect("stateful workload renders")
+    }
+
+    fn deployment_template() -> ManifestTemplate {
+        ManifestTemplate {
+            workload: WorkloadTemplate {
+                kind: WorkloadKind::Deployment,
+                name: composed("app-", "tenant"),
+                replicas: None,
+                app_container: ContainerTemplate {
+                    name: "app".to_owned(),
+                    image: TemplateText::literal("example/app:1"),
+                    ports: vec![ContainerPortTemplate {
+                        name: Some("http".to_owned()),
+                        container_port: 8080,
+                    }],
+                    env: vec![EnvVarTemplate {
+                        name: "TENANT".to_owned(),
+                        value: TemplateText::instance_value("tenant"),
+                    }],
+                },
+            },
+            service: Some(ServiceTemplate {
+                name: composed("svc-", "tenant"),
+                ports: vec![ServicePortTemplate {
+                    name: Some("http".to_owned()),
+                    port: 80,
+                    target_port: 8080,
+                }],
+            }),
+            sidecar: sidecar_template(),
+            volumes: Vec::new(),
+        }
+    }
+
+    fn stateful_template() -> ManifestTemplate {
+        ManifestTemplate {
+            workload: WorkloadTemplate {
+                kind: WorkloadKind::StatefulSet,
+                name: composed("db-", "tenant"),
+                replicas: Some(1),
+                app_container: ContainerTemplate {
+                    name: "postgres".to_owned(),
+                    image: TemplateText::literal("postgres:17"),
+                    ports: vec![ContainerPortTemplate {
+                        name: Some("postgres".to_owned()),
+                        container_port: 5432,
+                    }],
+                    env: Vec::new(),
+                },
+            },
+            service: Some(ServiceTemplate {
+                name: composed("db-", "tenant"),
+                ports: vec![ServicePortTemplate {
+                    name: Some("postgres".to_owned()),
+                    port: 5432,
+                    target_port: 5432,
+                }],
+            }),
+            sidecar: sidecar_template(),
+            volumes: vec![VolumeTemplate {
+                name: "data".to_owned(),
+                mount_path: TemplateText::literal("/var/lib/postgresql/data"),
+                pv_name: composed("pv-", "tenant"),
+                pvc_name: composed("pvc-", "tenant"),
+                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                capacity: TemplateText::literal("10Gi"),
+                reclaim_policy: PersistentVolumeReclaimPolicy::Retain,
+                storage_class_name: Some(TemplateText::literal("manual")),
+                source: PersistentVolumeSourceTemplate::Csi {
+                    driver: TemplateText::literal("csi.example.com"),
+                    volume_handle: TemplateText::instance_value("volume"),
+                    fs_type: Some(TemplateText::literal("ext4")),
+                    read_only: false,
+                    volume_attributes: BTreeMap::new(),
+                },
+            }],
+        }
+    }
+
+    fn sidecar_template() -> SidecarTemplate {
+        SidecarTemplate {
+            name: "sleepypods-sidecar".to_owned(),
+            image: TemplateText::literal("sleepypods/sidecar:test"),
+            listen_port: 15000,
+        }
+    }
+
+    fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
+        RenderedObjectRef {
+            api_version: api_version.to_owned(),
+            kind: kind.to_owned(),
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    fn object_labels(object: &KubernetesObject) -> &BTreeMap<String, String> {
+        match object {
+            KubernetesObject::Deployment(object) => &object.metadata.labels,
+            KubernetesObject::StatefulSet(object) => &object.metadata.labels,
+            KubernetesObject::Service(object) => &object.metadata.labels,
+            KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
+            KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
+        }
+    }
+
+    fn composed(prefix: &str, field: &str) -> TemplateText {
+        TemplateText::from_parts([
+            TemplateTextPart::literal(prefix),
+            TemplateTextPart::instance_value(field),
+        ])
+    }
+
+    fn instance(id: &str, generation: u64, values: InstanceValues) -> InstanceRecord {
+        InstanceRecord {
+            id: InstanceId::new(id).expect("valid instance ID"),
+            workload_class: WorkloadClassVersionRef::new(
+                WorkloadClassId::new("web").expect("valid class ID"),
+                Generation::new(1),
+            ),
+            values,
+            state: InstanceState::Cold,
+            generation: Generation::new(generation),
+        }
+    }
+
+    fn values<const N: usize>(pairs: [(&str, &str); N]) -> InstanceValues {
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect()
+    }
+}

@@ -7,6 +7,7 @@ pub mod ids;
 pub mod instance;
 pub mod manifest;
 pub mod materialization;
+pub mod materializer;
 pub mod postgres;
 pub mod route;
 pub mod store;
@@ -42,6 +43,10 @@ pub use manifest::{
 pub use materialization::{
     BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
     RecordMaterializationRequest, RenderedObjectRef,
+};
+pub use materializer::{
+    rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
+    KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError,
 };
 pub use postgres::PostgresStore;
 pub use route::{
