@@ -11,8 +11,9 @@ http = { version = "1.4.2", default-features = false, features = ["std"] }
 http-body = { version = "1.0.1", default-features = false }
 hyper = { version = "1.10.1", default-features = false }
 proxy-core = { version = "0.1.0", path = "../proxy-core" }
-tokio = { version = "1.52.3", default-features = false, features = ["io-util", "net"] }
+tokio = { version = "1.52.3", default-features = false, features = ["io-util", "net", "sync"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tonic = { version = "0.14.6", default-features = false }
 
 [dev-dependencies]
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
