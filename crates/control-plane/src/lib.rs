@@ -12,6 +12,8 @@ pub mod materializer;
 pub mod postgres;
 pub mod route;
 pub mod store;
+#[allow(dead_code)]
+mod wake;
 pub mod workload;
 
 pub use config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
