@@ -98,6 +98,25 @@ where
     serve_http_listener_with_idle(listener, config, client, shutdown).await
 }
 
+pub async fn serve_tcp_with_idle<Client>(
+    config: SidecarRuntimeConfig,
+    client: Client,
+    shutdown: Shutdown,
+) -> Result<(), SidecarRuntimeError>
+where
+    Client: ReportIdleClient + Send + 'static,
+    Client::Error: Send + 'static,
+{
+    let listener = TcpListener::bind(config.listen_addr())
+        .await
+        .map_err(|source| SidecarRuntimeError::Bind {
+            addr: config.listen_addr(),
+            source,
+        })?;
+
+    serve_tcp_listener_with_idle(listener, config, client, shutdown).await
+}
+
 pub async fn serve_http_listener_with_idle<Client>(
     listener: TcpListener,
     config: SidecarRuntimeConfig,
@@ -171,6 +190,61 @@ where
     drain_result.map_err(SidecarRuntimeError::Drain)
 }
 
+pub async fn serve_tcp_listener_with_idle<Client>(
+    listener: TcpListener,
+    config: SidecarRuntimeConfig,
+    mut client: Client,
+    shutdown: Shutdown,
+) -> Result<(), SidecarRuntimeError>
+where
+    Client: ReportIdleClient + Send + 'static,
+    Client::Error: Send + 'static,
+{
+    let drain = DrainTracker::new(config.drain_grace_timeout());
+    let proxy = SidecarProxy::new(config.proxy().clone(), drain.clone());
+    let mut idle = IdleDetector::new(
+        config.instance_id().clone(),
+        config.generation(),
+        config.idle_report(),
+        drain,
+    );
+    let idle_task =
+        tokio::spawn(async move { idle.report_to_control_plane_when_idle(&mut client).await });
+    let mut connections = JoinSet::new();
+    let mut exit_error = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        exit_error = Some(SidecarRuntimeError::Accept(error));
+                        break;
+                    }
+                };
+                let proxy = proxy.clone();
+                connections.spawn(async move {
+                    let _ = proxy.forward_tcp(stream).await;
+                });
+            }
+        }
+    }
+
+    let drain_result = proxy.drain().await;
+    idle_task.abort();
+    let _ = idle_task.await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+
+    if let Some(error) = exit_error {
+        return Err(error);
+    }
+
+    drain_result.map_err(SidecarRuntimeError::Drain)
+}
+
 async fn forward_or_error(
     proxy: SidecarProxy,
     request: Request<Incoming>,
@@ -216,12 +290,9 @@ impl fmt::Display for SidecarRuntimeError {
         match self {
             Self::Config(error) => write!(f, "{error}"),
             Self::Bind { addr, source } => {
-                write!(
-                    f,
-                    "failed to bind sidecar HTTP listener on {addr}: {source}"
-                )
+                write!(f, "failed to bind sidecar listener on {addr}: {source}")
             }
-            Self::Accept(error) => write!(f, "failed to accept sidecar HTTP connection: {error}"),
+            Self::Accept(error) => write!(f, "failed to accept sidecar connection: {error}"),
             Self::Drain(error) => write!(f, "sidecar drain failed: {error}"),
         }
     }

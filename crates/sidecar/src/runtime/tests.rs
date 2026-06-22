@@ -23,13 +23,18 @@ use tokio::{
 };
 
 use crate::{
-    runtime::{serve_http_listener_with_idle, SidecarRuntimeConfig, SidecarRuntimeError},
+    runtime::{
+        serve_http_listener_with_idle, serve_tcp_listener_with_idle, SidecarRuntimeConfig,
+        SidecarRuntimeError,
+    },
     IdleReportConfig, ReportIdleClient, ReportIdleFuture, ReportIdleRequest, ReportIdleResponse,
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const DRAIN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_REQUEST: &[u8] = b"runtime tcp request bytes";
+const TCP_RESPONSE: &[u8] = b"runtime tcp response bytes";
 
 type RecordedRequests = Arc<Mutex<Vec<ReportIdleRequest>>>;
 
@@ -188,6 +193,121 @@ async fn shutdown_returns_after_drain_timeout_when_request_hangs() {
     let _ = upstream_task.await;
 }
 
+#[tokio::test]
+async fn tcp_bytes_are_forwarded_between_client_and_upstream() {
+    let (upstream_addr, upstream_task) = spawn_tcp_response_upstream().await;
+    let shutdown = Shutdown::new();
+    let client = FakeReportIdleClient::new();
+    let (runtime_addr, runtime_task) =
+        spawn_tcp_runtime(upstream_addr.port(), client, shutdown.clone()).await;
+
+    let mut stream = TcpStream::connect(runtime_addr)
+        .await
+        .expect("client connects to tcp runtime");
+    stream
+        .write_all(TCP_REQUEST)
+        .await
+        .expect("client writes tcp request bytes");
+
+    let mut response = vec![0; TCP_RESPONSE.len()];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("client reads tcp response bytes");
+    assert_eq!(response, TCP_RESPONSE);
+
+    stream.shutdown().await.expect("client half-closes");
+
+    shutdown.shutdown();
+    runtime_task
+        .await
+        .expect("runtime task joins")
+        .expect("runtime exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn open_tcp_stream_delays_idle_report_until_it_closes() {
+    let (upstream_received, upstream_received_rx) = oneshot::channel();
+    let (release_upstream, upstream_released) = oneshot::channel();
+    let (upstream_addr, upstream_task) =
+        spawn_blocked_tcp_upstream(upstream_received, upstream_released).await;
+    let shutdown = Shutdown::new();
+    let client = FakeReportIdleClient::new();
+    let requests = client.requests();
+    let (runtime_addr, runtime_task) =
+        spawn_tcp_runtime(upstream_addr.port(), client, shutdown.clone()).await;
+
+    let mut stream = TcpStream::connect(runtime_addr)
+        .await
+        .expect("client connects to tcp runtime");
+    stream
+        .write_all(b"x")
+        .await
+        .expect("client writes tcp byte");
+    upstream_received_rx
+        .await
+        .expect("upstream receives proxied byte");
+
+    tokio::time::sleep(IDLE_TIMEOUT + RETRY_BACKOFF).await;
+    assert_recorded_count(&requests, 0);
+
+    release_upstream.send(()).expect("upstream release sent");
+    stream.shutdown().await.expect("client half-closes");
+    wait_for_recorded_count(&requests, 1).await;
+
+    shutdown.shutdown();
+    runtime_task
+        .await
+        .expect("runtime task joins")
+        .expect("runtime exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn shutdown_returns_after_drain_timeout_when_tcp_stream_hangs() {
+    let (upstream_received, upstream_received_rx) = oneshot::channel();
+    let (upstream_addr, upstream_task) = spawn_hanging_tcp_upstream(upstream_received).await;
+    let shutdown = Shutdown::new();
+    let client = FakeReportIdleClient::new();
+    let (runtime_addr, runtime_task) = spawn_tcp_runtime_with_drain_timeout(
+        upstream_addr.port(),
+        client,
+        shutdown.clone(),
+        Duration::from_millis(50),
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(runtime_addr)
+        .await
+        .expect("client connects to tcp runtime");
+    stream
+        .write_all(b"x")
+        .await
+        .expect("client writes tcp byte");
+    upstream_received_rx
+        .await
+        .expect("upstream receives proxied byte");
+
+    shutdown.shutdown();
+
+    let runtime_result = tokio::time::timeout(Duration::from_secs(1), runtime_task)
+        .await
+        .expect("runtime returns after drain timeout")
+        .expect("runtime task joins");
+
+    assert!(matches!(
+        runtime_result,
+        Err(SidecarRuntimeError::Drain(DrainError::GraceTimeout {
+            active: 1,
+            ..
+        }))
+    ));
+
+    upstream_task.abort();
+    let _ = upstream_task.await;
+}
+
 impl FakeReportIdleClient {
     fn new() -> Self {
         Self {
@@ -265,6 +385,48 @@ async fn spawn_runtime_with_drain_timeout(
     .expect("runtime config is valid");
 
     let task = tokio::spawn(serve_http_listener_with_idle(
+        listener, config, client, shutdown,
+    ));
+    tokio::task::yield_now().await;
+
+    (runtime_addr, task)
+}
+
+async fn spawn_tcp_runtime(
+    app_port: u16,
+    client: FakeReportIdleClient,
+    shutdown: Shutdown,
+) -> (
+    SocketAddr,
+    JoinHandle<Result<(), crate::runtime::SidecarRuntimeError>>,
+) {
+    spawn_tcp_runtime_with_drain_timeout(app_port, client, shutdown, DRAIN_GRACE_TIMEOUT).await
+}
+
+async fn spawn_tcp_runtime_with_drain_timeout(
+    app_port: u16,
+    client: FakeReportIdleClient,
+    shutdown: Shutdown,
+    drain_grace_timeout: Duration,
+) -> (
+    SocketAddr,
+    JoinHandle<Result<(), crate::runtime::SidecarRuntimeError>>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("runtime listener binds");
+    let runtime_addr = listener.local_addr().expect("runtime listener has addr");
+    let config = SidecarRuntimeConfig::new(
+        runtime_addr,
+        app_port,
+        InstanceId::new("test-instance").expect("instance id is valid"),
+        Generation::new(7),
+        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF).expect("idle config is valid"),
+        drain_grace_timeout,
+    )
+    .expect("runtime config is valid");
+
+    let task = tokio::spawn(serve_tcp_listener_with_idle(
         listener, config, client, shutdown,
     ));
     tokio::task::yield_now().await;
@@ -375,6 +537,79 @@ async fn spawn_hanging_upstream(
             )
             .await
             .expect("upstream serves request");
+    });
+
+    (addr, task)
+}
+
+async fn spawn_tcp_response_upstream() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let addr = listener.local_addr().expect("upstream listener has addr");
+
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("upstream accepts runtime");
+        let mut received = vec![0; TCP_REQUEST.len()];
+        stream
+            .read_exact(&mut received)
+            .await
+            .expect("upstream reads tcp request bytes");
+        assert_eq!(received, TCP_REQUEST);
+
+        stream
+            .write_all(TCP_RESPONSE)
+            .await
+            .expect("upstream writes tcp response bytes");
+
+        let mut eof = [0; 1];
+        assert_eq!(stream.read(&mut eof).await.expect("upstream reads eof"), 0);
+    });
+
+    (addr, task)
+}
+
+async fn spawn_blocked_tcp_upstream(
+    received: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let addr = listener.local_addr().expect("upstream listener has addr");
+
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("upstream accepts runtime");
+        let mut byte = [0; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .expect("upstream reads proxied byte");
+        assert_eq!(byte, [b'x']);
+        received.send(()).expect("test waits for upstream byte");
+        release.await.expect("upstream release received");
+        stream.shutdown().await.expect("upstream half-closes");
+    });
+
+    (addr, task)
+}
+
+async fn spawn_hanging_tcp_upstream(received: oneshot::Sender<()>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let addr = listener.local_addr().expect("upstream listener has addr");
+
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("upstream accepts runtime");
+        let mut byte = [0; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .expect("upstream reads proxied byte");
+        assert_eq!(byte, [b'x']);
+        received.send(()).expect("test waits for upstream byte");
+        pending::<()>().await;
     });
 
     (addr, task)

@@ -3,7 +3,7 @@ use std::{env, error::Error, process, time::Duration};
 use control_plane::api::pb::sidecar_control_plane_client::SidecarControlPlaneClient;
 use proxy_core::Shutdown;
 use sidecar::{
-    runtime::{serve_http_with_idle, SidecarRuntimeConfig},
+    runtime::{serve_http_with_idle, serve_tcp_with_idle, SidecarRuntimeConfig},
     GrpcSidecarControlPlaneClient, IdleReportConfig,
 };
 use sleepypods_types::{Generation, InstanceId};
@@ -34,7 +34,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    serve_http_with_idle(env.runtime, client, shutdown).await?;
+    match env.runtime_mode {
+        SidecarRuntimeMode::Http => serve_http_with_idle(env.runtime, client, shutdown).await?,
+        SidecarRuntimeMode::Tcp => serve_tcp_with_idle(env.runtime, client, shutdown).await?,
+    }
 
     Ok(())
 }
@@ -42,6 +45,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 #[derive(Debug)]
 struct EnvConfig {
     runtime: SidecarRuntimeConfig,
+    runtime_mode: SidecarRuntimeMode,
     control_plane_endpoint: String,
 }
 
@@ -56,6 +60,7 @@ impl EnvConfig {
         let retry_backoff = duration_from_env_ms("SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", 5_000)?;
         let drain_grace_timeout =
             duration_from_env_ms("SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS", 30_000)?;
+        let runtime_mode = SidecarRuntimeMode::from_env()?;
         let idle_report = IdleReportConfig::new(idle_timeout, retry_backoff)?;
         let runtime = SidecarRuntimeConfig::new(
             listen_addr,
@@ -68,8 +73,32 @@ impl EnvConfig {
 
         Ok(Self {
             runtime,
+            runtime_mode,
             control_plane_endpoint,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarRuntimeMode {
+    Http,
+    Tcp,
+}
+
+impl SidecarRuntimeMode {
+    fn from_env() -> Result<Self, InvalidSidecarRuntimeMode> {
+        match env::var("SLEEPYPODS_SIDECAR_MODE") {
+            Ok(value) => Self::parse(value),
+            Err(_) => Ok(Self::Http),
+        }
+    }
+
+    fn parse(value: String) -> Result<Self, InvalidSidecarRuntimeMode> {
+        match value.as_str() {
+            "http" => Ok(Self::Http),
+            "tcp" => Ok(Self::Tcp),
+            _ => Err(InvalidSidecarRuntimeMode(value)),
+        }
     }
 }
 
@@ -99,3 +128,18 @@ impl std::fmt::Display for MissingEnvVar {
 }
 
 impl Error for MissingEnvVar {}
+
+#[derive(Debug)]
+struct InvalidSidecarRuntimeMode(String);
+
+impl std::fmt::Display for InvalidSidecarRuntimeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SLEEPYPODS_SIDECAR_MODE must be either http or tcp, got {:?}",
+            self.0
+        )
+    }
+}
+
+impl Error for InvalidSidecarRuntimeMode {}
