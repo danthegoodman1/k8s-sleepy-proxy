@@ -8,6 +8,7 @@ pub mod cache;
 pub mod identity;
 pub mod matcher;
 pub mod subscription;
+pub mod wake;
 
 pub use cache::{
     CacheInsertResult, CacheLookup, CacheLookupHit, CacheLookupStatus, NegativeCacheEntry,
@@ -19,4 +20,10 @@ pub use subscription::{
     ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome, InvalidationReason, ProxySubscribeInput,
     RouteRequestId, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
     UnsubscribeOutcome,
+};
+pub use wake::{
+    route_wake_decision, validate_route_update, validate_wake_response, ReadyBackend,
+    RouteUpdateDisposition, RouteWakeDecision, StaleWakeObservation, WakeAdmission,
+    WakeInstanceRequest, WakeInstanceResponse, WakeReason, WakeResponseDisposition, WakeTracker,
+    WakeUnavailable, WakeUnavailableReason, WakeWait, WakeWaitReason,
 };
