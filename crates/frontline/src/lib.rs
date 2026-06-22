@@ -14,6 +14,7 @@ pub mod identity;
 pub mod matcher;
 pub mod resolver;
 pub mod route;
+pub mod runtime;
 pub mod subscription;
 pub mod tls;
 pub mod wake;
@@ -47,6 +48,7 @@ pub use route::{
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome, WakeClient,
     WakeClientFuture,
 };
+pub use runtime::{FrontlineHttpRuntime, FrontlineRuntimeBody};
 pub use subscription::{
     ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome, InvalidationReason, ProxySubscribeInput,
     RouteRequestId, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
