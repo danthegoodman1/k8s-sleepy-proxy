@@ -4,6 +4,9 @@ use proxy_core::DrainTracker;
 use sleepypods_types::{Generation, InstanceId};
 use tokio::time::timeout;
 
+mod control_plane;
+pub use control_plane::ControlPlaneIdleReportOutcome;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdleReportConfig {
     idle_timeout: Duration,
@@ -152,14 +155,7 @@ impl IdleDetector {
         }
 
         loop {
-            self.wait_until_zero_active().await;
-
-            if self
-                .active_appeared_before(self.config.idle_timeout())
-                .await
-            {
-                continue;
-            }
+            self.wait_until_idle_timeout_elapsed().await;
 
             loop {
                 let request = self.report_request();
@@ -175,6 +171,19 @@ impl IdleDetector {
                 {
                     break;
                 }
+            }
+        }
+    }
+
+    async fn wait_until_idle_timeout_elapsed(&self) {
+        loop {
+            self.wait_until_zero_active().await;
+
+            if !self
+                .active_appeared_before(self.config.idle_timeout())
+                .await
+            {
+                return;
             }
         }
     }

@@ -20,8 +20,8 @@ use http::{Request, Response, Uri};
 use http_body::Body;
 use hyper::body::Incoming;
 pub use idle::{
-    IdleDetector, IdleObservation, IdleReportConfig, IdleReportConfigError, IdleReportOutcome,
-    ReportIdleRequest,
+    ControlPlaneIdleReportOutcome, IdleDetector, IdleObservation, IdleReportConfig,
+    IdleReportConfigError, IdleReportOutcome, ReportIdleRequest,
 };
 use proxy_core::{
     DrainError, DrainTracker, HttpProxy, HttpProxyError, Shutdown, TcpProxy, TcpProxyConfig,
