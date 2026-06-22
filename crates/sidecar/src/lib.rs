@@ -19,8 +19,8 @@ pub use idle::{
     ReportIdleRequest,
 };
 use proxy_core::{
-    DrainTracker, HttpProxy, HttpProxyError, TcpProxy, TcpProxyConfig, TcpProxyError,
-    TcpProxyStats, TrackedBody,
+    DrainError, DrainTracker, HttpProxy, HttpProxyError, Shutdown, TcpProxy, TcpProxyConfig,
+    TcpProxyError, TcpProxyStats, TrackedBody,
 };
 use tokio::net::TcpStream;
 
@@ -117,8 +117,29 @@ impl SidecarProxy {
         self.drain.active_count()
     }
 
+    pub fn is_draining(&self) -> bool {
+        self.drain.is_draining()
+    }
+
+    pub fn start_drain(&self) {
+        self.drain.start_drain();
+    }
+
     pub async fn wait_for_active_count(&self, expected: usize) {
         self.drain.wait_for_active_count(expected).await;
+    }
+
+    pub async fn wait_for_idle(&self) -> Result<(), DrainError> {
+        self.drain.wait_for_idle().await
+    }
+
+    pub async fn drain(&self) -> Result<(), DrainError> {
+        self.drain.drain().await
+    }
+
+    pub async fn drain_on_shutdown(&self, shutdown: Shutdown) -> Result<(), DrainError> {
+        shutdown.cancelled().await;
+        self.drain().await
     }
 
     pub async fn forward_http<B>(

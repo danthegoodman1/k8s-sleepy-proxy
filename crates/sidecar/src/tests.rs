@@ -9,7 +9,9 @@ use http::{Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use proxy_core::{DrainTracker, TcpProxyStats};
+use proxy_core::{
+    DrainError, DrainTracker, HttpProxyError, Shutdown, TcpProxyError, TcpProxyStats,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -41,6 +43,35 @@ fn config_rejects_zero_and_builds_loopback_targets() {
         config.tcp_upstream_addr(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
     );
+}
+
+#[tokio::test]
+async fn drain_rejects_new_http_forwarding_before_dialing_upstream() {
+    let sidecar = sidecar_for_app_port(9);
+    sidecar.start_drain();
+
+    let error = match sidecar.forward_http(empty_http_request()).await {
+        Ok(_) => panic!("draining sidecar should reject HTTP forwarding"),
+        Err(error) => error,
+    };
+
+    assert!(sidecar.is_draining());
+    assert_http_draining(error);
+}
+
+#[tokio::test]
+async fn drain_rejects_new_tcp_forwarding_before_dialing_upstream() {
+    let sidecar = sidecar_for_app_port(9);
+    let (_client, server_side) = connected_tcp_pair().await;
+
+    sidecar.start_drain();
+    let error = sidecar
+        .forward_tcp(server_side)
+        .await
+        .expect_err("draining sidecar should reject TCP forwarding");
+
+    assert!(sidecar.is_draining());
+    assert_tcp_draining(error);
 }
 
 #[tokio::test]
@@ -184,6 +215,57 @@ async fn http_active_count_remains_one_while_response_body_is_held() {
     drop(response);
     sidecar.wait_for_active_count(0).await;
     assert_eq!(sidecar.active_count(), 0);
+    upstream_task.await.expect("upstream task completed");
+}
+
+#[tokio::test]
+async fn drain_waits_for_active_http_response_body_then_completes() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts sidecar connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|_request: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                        HTTP_RESPONSE_BODY,
+                    ))))
+                }),
+            )
+            .await
+            .expect("upstream serves request");
+    });
+
+    let sidecar = sidecar_for_app_port(upstream_addr.port());
+    let response = sidecar
+        .forward_http(empty_http_request())
+        .await
+        .expect("sidecar forwards HTTP request");
+    assert_eq!(sidecar.active_count(), 1);
+
+    let drain_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        async move { sidecar.drain().await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(sidecar.is_draining());
+    assert!(!drain_task.is_finished());
+
+    drop(response);
+    sidecar.wait_for_active_count(0).await;
+
+    assert_eq!(drain_task.await.expect("drain task completed"), Ok(()));
     upstream_task.await.expect("upstream task completed");
 }
 
@@ -365,8 +447,216 @@ async fn tcp_active_count_remains_one_while_connection_is_open() {
     assert_eq!(sidecar.active_count(), 0);
 }
 
+#[tokio::test]
+async fn drain_waits_for_active_tcp_connection_then_completes() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+    let (upstream_read_tx, upstream_read_rx) = oneshot::channel();
+    let (release_upstream_tx, release_upstream_rx) = oneshot::channel();
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts sidecar connection");
+
+        let mut byte = [0; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .expect("upstream reads proxied byte");
+        assert_eq!(byte, [b'x']);
+        upstream_read_tx
+            .send(())
+            .expect("test waits for upstream read");
+        release_upstream_rx
+            .await
+            .expect("test releases upstream connection");
+        stream.shutdown().await.expect("upstream half-closes");
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener
+        .local_addr()
+        .expect("proxy listener has address");
+
+    let sidecar = sidecar_for_app_port(upstream_addr.port());
+    let proxy_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        async move {
+            let (client, _) = proxy_listener
+                .accept()
+                .await
+                .expect("proxy accepts client connection");
+
+            sidecar.forward_tcp(client).await
+        }
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+    client
+        .write_all(b"x")
+        .await
+        .expect("client writes one byte");
+
+    upstream_read_rx
+        .await
+        .expect("upstream received proxied byte");
+    sidecar.wait_for_active_count(1).await;
+    assert_eq!(sidecar.active_count(), 1);
+
+    let drain_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        async move { sidecar.drain().await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(sidecar.is_draining());
+    assert!(!drain_task.is_finished());
+
+    release_upstream_tx
+        .send(())
+        .expect("upstream release receiver is active");
+    client.shutdown().await.expect("client half-closes");
+
+    let stats = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect("tcp forwarding succeeds");
+    assert_eq!(
+        stats,
+        TcpProxyStats {
+            client_to_upstream: 1,
+            upstream_to_client: 0,
+        }
+    );
+
+    upstream_task.await.expect("upstream task completed");
+    assert_eq!(drain_task.await.expect("drain task completed"), Ok(()));
+    assert_eq!(sidecar.active_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_grace_timeout_surfaces_active_work() {
+    let grace_timeout = Duration::from_secs(5);
+    let sidecar = sidecar_for_app_port_with_grace(8080, grace_timeout);
+    let _permit = sidecar
+        .drain_tracker()
+        .try_acquire()
+        .expect("active work admitted");
+
+    let drain_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        async move { sidecar.drain().await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(sidecar.is_draining());
+
+    tokio::time::advance(grace_timeout).await;
+
+    assert_eq!(
+        drain_task
+            .await
+            .expect("drain task completed")
+            .expect_err("active work should exceed grace timeout"),
+        DrainError::GraceTimeout {
+            timeout: grace_timeout,
+            active: 1,
+        }
+    );
+}
+
+#[tokio::test]
+async fn shutdown_token_starts_drain_after_cancellation_and_completes_after_active_releases() {
+    let sidecar = sidecar_for_app_port(8080);
+    let permit = sidecar
+        .drain_tracker()
+        .try_acquire()
+        .expect("active work admitted");
+    let shutdown = Shutdown::new();
+
+    let drain_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        let shutdown = shutdown.clone();
+        async move { sidecar.drain_on_shutdown(shutdown).await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(!sidecar.is_draining());
+    assert!(!drain_task.is_finished());
+
+    shutdown.shutdown();
+    tokio::task::yield_now().await;
+    assert!(sidecar.is_draining());
+    assert!(!drain_task.is_finished());
+
+    drop(permit);
+    sidecar.wait_for_active_count(0).await;
+
+    assert_eq!(drain_task.await.expect("drain task completed"), Ok(()));
+}
+
+#[tokio::test]
+async fn already_triggered_shutdown_drains_immediately() {
+    let sidecar = sidecar_for_app_port(8080);
+    let shutdown = Shutdown::new();
+    shutdown.shutdown();
+
+    assert_eq!(sidecar.drain_on_shutdown(shutdown).await, Ok(()));
+    assert!(sidecar.is_draining());
+}
+
 fn sidecar_for_app_port(app_port: u16) -> SidecarProxy {
+    sidecar_for_app_port_with_grace(app_port, Duration::from_secs(5))
+}
+
+fn sidecar_for_app_port_with_grace(app_port: u16, grace_timeout: Duration) -> SidecarProxy {
     let config = SidecarProxyConfig::with_tcp_connect_timeout(app_port, Duration::from_secs(1))
         .expect("sidecar config builds");
-    SidecarProxy::new(config, DrainTracker::new(Duration::from_secs(5)))
+    SidecarProxy::new(config, DrainTracker::new(grace_timeout))
+}
+
+fn empty_http_request() -> Request<Full<Bytes>> {
+    Request::builder()
+        .uri("/")
+        .body(Full::new(Bytes::new()))
+        .expect("request builds")
+}
+
+async fn connected_tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("test listener binds");
+    let address = listener.local_addr().expect("listener has local addr");
+    let client = tokio::spawn(async move { TcpStream::connect(address).await });
+    let (server, _) = listener.accept().await.expect("listener accepts client");
+    let client = client
+        .await
+        .expect("client task completed")
+        .expect("client connects");
+
+    (client, server)
+}
+
+fn assert_http_draining(error: HttpProxyError) {
+    match error {
+        HttpProxyError::Drain(DrainError::Draining) => {}
+        other => panic!("expected HTTP drain rejection, got {other:?}"),
+    }
+}
+
+fn assert_tcp_draining(error: TcpProxyError) {
+    match error {
+        TcpProxyError::Drain(DrainError::Draining) => {}
+        other => panic!("expected TCP drain rejection, got {other:?}"),
+    }
 }
