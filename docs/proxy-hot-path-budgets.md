@@ -55,6 +55,51 @@ This initial smoke only covers the sidecar HTTP/1.1 hot path. It does not cover
 frontline routing, Kubernetes, the real control plane, HTTP/2, h2c, gRPC, TCP,
 WebSockets, streaming throughput, or tail latency.
 
+## Production Image Frontline HTTP Load Smoke
+
+Milestone 7E also has a narrow production-image smoke for the frontline
+HTTP/1.1 hot-cache path:
+
+```sh
+./scripts/smoke-frontline-load.sh
+```
+
+The script builds the final `frontline` image with the root `Dockerfile`
+(`BIN=frontline`), builds a small helper image, and starts that helper with a
+fixed HTTP backend plus a fake `ProxyControlPlane` gRPC service. The fake
+control plane returns a running route for `Host: app.example.test` and `/smoke`
+whose backend URI points at `http://127.0.0.1:<backend-port>` inside the helper
+network namespace. The production frontline container then joins that namespace,
+so both the control-plane endpoint and backend are reached through loopback
+while the load client connects to published `127.0.0.1:<port>` sockets and sends
+the known Host header.
+
+Before measuring the frontline path, the script waits for one successful
+frontline request. That request validates lazy route resolution through
+`SubscribeRoute` and warms the route cache; the measured frontline phase then
+uses the cached ready route. The client sends the same request count directly to
+the backend and through frontline, reporting request count, failures, elapsed
+milliseconds, and rough RPS for both paths. The smoke fails on correctness
+errors, startup or process failures, missing tools or images, and a conservative
+frontline/direct RPS ratio below `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO`
+(default `0.10`). As with the sidecar smoke, this ratio only catches extreme
+obvious regressions; local Docker RPS is not a stable latency budget.
+
+Useful knobs:
+
+```sh
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS=500 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY=16 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST=app.example.test \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH=/smoke \
+./scripts/smoke-frontline-load.sh
+```
+
+This smoke only covers the frontline HTTP/1.1 cached ready-route forwarding
+path. It does not cover Kubernetes, the real control plane, TLS/SNI, HTTP/2,
+h2c, gRPC, TCP, WebSockets, streaming throughput, cold wake latency, route-cache
+invalidation behavior, or tail latency.
+
 ## Budget Principles
 
 - Hot forwarding paths must not perform control-plane calls, database access,

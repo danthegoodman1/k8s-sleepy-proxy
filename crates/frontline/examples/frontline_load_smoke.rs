@@ -1,0 +1,758 @@
+use std::{
+    convert::Infallible,
+    env,
+    error::Error,
+    fmt, io,
+    net::SocketAddr,
+    process,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use bytes::Bytes;
+use control_plane::{
+    api::pb::{
+        self,
+        proxy_control_plane_server::{ProxyControlPlane, ProxyControlPlaneServer},
+    },
+    RouteHost,
+};
+use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
+use http_body_util::Full;
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+    time::timeout,
+};
+use tonic::{
+    codegen::tokio_stream::wrappers::ReceiverStream, transport::Server, Request, Response, Status,
+};
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+const BACKEND_BODY: &[u8] = b"frontline-load-smoke-ok\n";
+const DEFAULT_ROUTE_HOST: &str = "app.example.test";
+const DEFAULT_ROUTE_PATH: &str = "/smoke";
+const ROUTE_CACHE_TTL_MILLIS: u64 = 600_000;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBSCRIBE_RESPONSE_BUFFER: usize = 16;
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("{error}");
+        process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), BoxError> {
+    let mut args = env::args();
+    let _program = args.next();
+
+    match args.next().as_deref() {
+        None | Some("server") => run_server(ServerConfig::from_env()?).await,
+        Some("client") => run_client(ClientConfig::from_args(args)?).await,
+        Some(command) => Err(Box::new(InvalidArgs(format!(
+            "unknown command {command:?}; expected server or client"
+        )))),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerConfig {
+    backend_addr: SocketAddr,
+    control_plane_addr: SocketAddr,
+    backend_uri: String,
+    route_host: String,
+    route_path: String,
+}
+
+impl ServerConfig {
+    fn from_env() -> Result<Self, InvalidArgs> {
+        let backend_addr =
+            socket_addr_from_env("SLEEPYPODS_LOAD_SMOKE_BACKEND_ADDR", "0.0.0.0:18080")?;
+        let control_plane_addr =
+            socket_addr_from_env("SLEEPYPODS_LOAD_SMOKE_CONTROL_PLANE_ADDR", "0.0.0.0:19090")?;
+        let backend_uri = env::var("SLEEPYPODS_LOAD_SMOKE_BACKEND_URI")
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{}", backend_addr.port()));
+        let route_host = env::var("SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST")
+            .unwrap_or_else(|_| DEFAULT_ROUTE_HOST.to_owned());
+        let route_path = env::var("SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH")
+            .unwrap_or_else(|_| DEFAULT_ROUTE_PATH.to_owned());
+
+        let route_host = canonical_route_host("SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST", &route_host)?;
+        validate_route_path("SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH", &route_path)?;
+
+        Ok(Self {
+            backend_addr,
+            control_plane_addr,
+            backend_uri,
+            route_host,
+            route_path,
+        })
+    }
+}
+
+fn socket_addr_from_env(
+    name: &'static str,
+    default: &'static str,
+) -> Result<SocketAddr, InvalidArgs> {
+    env::var(name)
+        .unwrap_or_else(|_| default.to_owned())
+        .parse()
+        .map_err(|error| InvalidArgs(format!("{name} must be a socket address: {error}")))
+}
+
+async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
+    let backend_listener = TcpListener::bind(config.backend_addr).await?;
+    let backend_addr = backend_listener.local_addr()?;
+    eprintln!("load-smoke backend listening on {backend_addr}");
+    eprintln!(
+        "load-smoke frontline control plane listening on {}",
+        config.control_plane_addr
+    );
+    eprintln!(
+        "load-smoke route host={} path={} backend={}",
+        config.route_host, config.route_path, config.backend_uri
+    );
+
+    let backend = serve_backend(backend_listener);
+    let control_plane = Server::builder()
+        .add_service(ProxyControlPlaneServer::new(FakeProxyControlPlane::new(
+            config.route_host,
+            config.route_path,
+            config.backend_uri,
+        )))
+        .serve(config.control_plane_addr);
+
+    tokio::select! {
+        result = backend => result,
+        result = control_plane => result.map_err(|error| Box::new(error) as BoxError),
+    }
+}
+
+async fn serve_backend(listener: TcpListener) -> Result<(), BoxError> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+
+        tokio::spawn(async move {
+            let service =
+                service_fn(|request| async move { Ok::<_, Infallible>(backend_response(request)) });
+
+            if let Err(error) = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+            {
+                eprintln!("load-smoke backend connection failed: {error}");
+            }
+        });
+    }
+}
+
+fn backend_response(_request: HttpRequest<Incoming>) -> HttpResponse<Full<Bytes>> {
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain")
+        .header("content-length", BACKEND_BODY.len().to_string())
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from_static(BACKEND_BODY)))
+        .expect("fixed load-smoke response builds")
+}
+
+#[derive(Clone, Debug)]
+struct FakeProxyControlPlane {
+    route_host: Arc<str>,
+    route_path: Arc<str>,
+    backend_uri: Arc<str>,
+}
+
+impl FakeProxyControlPlane {
+    fn new(route_host: String, route_path: String, backend_uri: String) -> Self {
+        Self {
+            route_host: route_host.into(),
+            route_path: route_path.into(),
+            backend_uri: backend_uri.into(),
+        }
+    }
+
+    fn handle_subscribe_request(
+        &self,
+        request: pb::ProxySubscribeRequest,
+    ) -> Result<Option<pb::ProxySubscribeResponse>, Status> {
+        match request
+            .input
+            .ok_or_else(|| Status::invalid_argument("subscribe request input is required"))?
+        {
+            pb::proxy_subscribe_request::Input::SubscribeRoute(request) => {
+                Ok(Some(self.subscribe_route_response(request)?))
+            }
+            pb::proxy_subscribe_request::Input::Unsubscribe(_) => Ok(None),
+        }
+    }
+
+    fn subscribe_route_response(
+        &self,
+        request: pb::ProxySubscribeRouteRequest,
+    ) -> Result<pb::ProxySubscribeResponse, Status> {
+        let request_id = non_empty(request.request_id, "request_id")?;
+        let request_identity = request
+            .identity
+            .ok_or_else(|| Status::invalid_argument("identity is required"))?;
+
+        if self.route_matches(&request_identity) {
+            Ok(pb::ProxySubscribeResponse {
+                output: Some(pb::proxy_subscribe_response::Output::RouteResolved(
+                    pb::ProxyRouteResolvedResponse {
+                        subscription_id: format!("frontline-load-smoke:{request_id}"),
+                        request_id,
+                        matched_identity: Some(self.matched_identity()),
+                        route: Some(self.route_entry()),
+                        cache_policy: Some(pb::ProxyCachePolicy {
+                            ttl_millis: ROUTE_CACHE_TTL_MILLIS,
+                        }),
+                    },
+                )),
+            })
+        } else {
+            Ok(pb::ProxySubscribeResponse {
+                output: Some(pb::proxy_subscribe_response::Output::RouteMiss(
+                    pb::ProxyRouteMissResponse {
+                        request_id,
+                        request_identity: Some(request_identity),
+                        negative_cache_policy: Some(pb::ProxyCachePolicy { ttl_millis: 1_000 }),
+                    },
+                )),
+            })
+        }
+    }
+
+    fn route_matches(&self, identity: &pb::RouteIdentity) -> bool {
+        let Some(pb::route_identity::Kind::Http(identity)) = identity.kind.as_ref() else {
+            return false;
+        };
+        let Some(host) = identity.host.as_ref() else {
+            return false;
+        };
+
+        host.kind == pb::RouteHostKind::Exact as i32
+            && host.host == self.route_host.as_ref()
+            && path_prefix_matches(
+                identity.path_prefix.as_deref().unwrap_or("/"),
+                self.route_path.as_ref(),
+            )
+    }
+
+    fn matched_identity(&self) -> pb::RouteIdentity {
+        pb::RouteIdentity {
+            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                host: Some(pb::RouteHost {
+                    kind: pb::RouteHostKind::Exact as i32,
+                    host: self.route_host.to_string(),
+                }),
+                path_prefix: Some(self.route_path.to_string()),
+            })),
+        }
+    }
+
+    fn route_entry(&self) -> pb::ProxyRouteEntry {
+        pb::ProxyRouteEntry {
+            route_binding_id: "frontline-load-smoke-route".to_owned(),
+            instance_id: "frontline-load-smoke-instance".to_owned(),
+            instance_state: pb::InstanceState::Running as i32,
+            instance_generation: 1,
+            backend_uri: Some(self.backend_uri.to_string()),
+            backend_generation: Some(1),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl ProxyControlPlane for FakeProxyControlPlane {
+    type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
+
+    async fn wake_instance(
+        &self,
+        request: Request<pb::ProxyWakeInstanceRequest>,
+    ) -> Result<Response<pb::ProxyWakeInstanceResponse>, Status> {
+        let request = request.into_inner();
+
+        Ok(Response::new(pb::ProxyWakeInstanceResponse {
+            outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
+                pb::ProxyWakeReadyResult {
+                    instance_id: request.instance_id,
+                    instance_generation: request.expected_generation,
+                    backend_uri: self.backend_uri.to_string(),
+                    backend_generation: 1,
+                },
+            )),
+        }))
+    }
+
+    async fn subscribe(
+        &self,
+        request: Request<tonic::Streaming<pb::ProxySubscribeRequest>>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let mut requests = request.into_inner();
+        let service = self.clone();
+        let (responses, response_stream) = tokio::sync::mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
+
+        tokio::spawn(async move {
+            while let Some(request) = match requests.message().await {
+                Ok(request) => request,
+                Err(status) => {
+                    let _ = responses.send(Err(status)).await;
+                    return;
+                }
+            } {
+                match service.handle_subscribe_request(request) {
+                    Ok(Some(response)) => {
+                        if responses.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(status) => {
+                        let _ = responses.send(Err(status)).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(response_stream)))
+    }
+}
+
+fn non_empty(value: String, field: &'static str) -> Result<String, Status> {
+    if value.trim().is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field} must not be empty"
+        )));
+    }
+
+    Ok(value)
+}
+
+fn path_prefix_matches(request_path: &str, route_path: &str) -> bool {
+    if route_path == "/" || request_path == route_path {
+        return true;
+    }
+
+    if route_path.ends_with('/') {
+        return request_path.starts_with(route_path);
+    }
+
+    request_path
+        .strip_prefix(route_path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientConfig {
+    label: String,
+    target: HttpTarget,
+    host_header: String,
+    requests: u64,
+    concurrency: u64,
+}
+
+impl ClientConfig {
+    fn from_args(args: impl Iterator<Item = String>) -> Result<Self, InvalidArgs> {
+        let mut label = "smoke".to_owned();
+        let mut url = None;
+        let mut host_header = None;
+        let mut requests = 100;
+        let mut concurrency = 4;
+        let mut args = args.peekable();
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--label" => label = next_arg(&mut args, "--label")?,
+                "--url" => url = Some(next_arg(&mut args, "--url")?),
+                "--host" => host_header = Some(next_arg(&mut args, "--host")?),
+                "--requests" => {
+                    requests =
+                        parse_positive_u64("--requests", &next_arg(&mut args, "--requests")?)?
+                }
+                "--concurrency" => {
+                    concurrency =
+                        parse_positive_u64("--concurrency", &next_arg(&mut args, "--concurrency")?)?
+                }
+                _ => {
+                    return Err(InvalidArgs(format!(
+                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, or --concurrency"
+                    )));
+                }
+            }
+        }
+
+        let url = url.ok_or_else(|| InvalidArgs("--url is required".to_owned()))?;
+        let host_header =
+            host_header.ok_or_else(|| InvalidArgs("--host is required".to_owned()))?;
+        validate_header_value("--host", &host_header)?;
+
+        Ok(Self {
+            label,
+            target: HttpTarget::parse(&url)?,
+            host_header,
+            requests,
+            concurrency,
+        })
+    }
+}
+
+fn next_arg(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    name: &'static str,
+) -> Result<String, InvalidArgs> {
+    args.next()
+        .ok_or_else(|| InvalidArgs(format!("{name} requires a value")))
+}
+
+fn parse_positive_u64(name: &'static str, value: &str) -> Result<u64, InvalidArgs> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|error| InvalidArgs(format!("{name} must be a positive integer: {error}")))?;
+
+    if value == 0 {
+        return Err(InvalidArgs(format!("{name} must be greater than zero")));
+    }
+
+    Ok(value)
+}
+
+fn validate_header_value(name: &'static str, value: &str) -> Result<(), InvalidArgs> {
+    if value.trim().is_empty() {
+        return Err(InvalidArgs(format!("{name} must not be empty")));
+    }
+
+    if value.contains('\r') || value.contains('\n') {
+        return Err(InvalidArgs(format!("{name} must not contain CR or LF")));
+    }
+
+    Ok(())
+}
+
+fn canonical_route_host(name: &'static str, value: &str) -> Result<String, InvalidArgs> {
+    validate_header_value(name, value)?;
+
+    RouteHost::exact(value)
+        .map(|host| host.as_str().to_owned())
+        .map_err(|error| InvalidArgs(format!("{name} must be a valid exact route host: {error}")))
+}
+
+fn validate_route_path(name: &'static str, value: &str) -> Result<(), InvalidArgs> {
+    if !value.starts_with('/') {
+        return Err(InvalidArgs(format!("{name} must start with /")));
+    }
+
+    validate_header_value(name, value)
+}
+
+async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
+    let next_request = Arc::new(AtomicU64::new(0));
+    let failures = Arc::new(AtomicU64::new(0));
+    let mut tasks = JoinSet::new();
+    let start = Instant::now();
+
+    for _ in 0..config.concurrency {
+        let next_request = Arc::clone(&next_request);
+        let failures = Arc::clone(&failures);
+        let target = config.target.clone();
+        let host_header = config.host_header.clone();
+        let requests = config.requests;
+
+        tasks.spawn(async move {
+            loop {
+                let request_id = next_request.fetch_add(1, Ordering::Relaxed);
+
+                if request_id >= requests {
+                    break;
+                }
+
+                if let Err(error) = send_smoke_request(&target, &host_header, request_id).await {
+                    failures.fetch_add(1, Ordering::Relaxed);
+
+                    if request_id < 5 {
+                        eprintln!("request {request_id} failed: {error}");
+                    }
+                }
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result?;
+    }
+
+    let elapsed = start.elapsed();
+    let elapsed_ms = elapsed.as_millis().max(1);
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let failures = failures.load(Ordering::Relaxed);
+    let rps = config.requests as f64 / elapsed_secs;
+
+    println!(
+        "{} requests={} failures={} elapsed_ms={} rps={:.1}",
+        config.label, config.requests, failures, elapsed_ms, rps
+    );
+
+    if failures > 0 {
+        return Err(Box::new(ClientFailures { failures }));
+    }
+
+    Ok(())
+}
+
+async fn send_smoke_request(
+    target: &HttpTarget,
+    host_header: &str,
+    request_id: u64,
+) -> Result<(), BoxError> {
+    let mut stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
+        .await
+        .map_err(|_| timeout_error("connect"))??;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: frontline-load-smoke\r\n\r\n",
+        target.request_path(request_id),
+        host_header
+    );
+
+    timeout(REQUEST_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| timeout_error("write request"))??;
+
+    let mut response = Vec::with_capacity(256);
+    timeout(REQUEST_TIMEOUT, stream.read_to_end(&mut response))
+        .await
+        .map_err(|_| timeout_error("read response"))??;
+
+    validate_response(&response)?;
+    Ok(())
+}
+
+fn timeout_error(stage: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, format!("timed out during {stage}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HttpTarget {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl HttpTarget {
+    fn parse(url: &str) -> Result<Self, InvalidArgs> {
+        let rest = url
+            .strip_prefix("http://")
+            .ok_or_else(|| InvalidArgs("only http:// URLs are supported".to_owned()))?;
+        let (authority, path) = match rest.find('/') {
+            Some(index) => (&rest[..index], &rest[index..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| InvalidArgs("URL must include host and port".to_owned()))?;
+
+        if host.is_empty() {
+            return Err(InvalidArgs("URL host is required".to_owned()));
+        }
+
+        let port = port
+            .parse::<u16>()
+            .map_err(|error| InvalidArgs(format!("URL port must be a u16: {error}")))?;
+
+        if port == 0 {
+            return Err(InvalidArgs("URL port must be greater than zero".to_owned()));
+        }
+
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+            path: path.to_owned(),
+        })
+    }
+
+    fn authority(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    fn request_path(&self, request_id: u64) -> String {
+        let separator = if self.path.contains('?') { '&' } else { '?' };
+        format!("{}{}smoke_request={request_id}", self.path, separator)
+    }
+}
+
+fn validate_response(bytes: &[u8]) -> Result<(), ResponseValidationError> {
+    let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err(ResponseValidationError::MissingHeaders);
+    };
+    let headers = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|_| ResponseValidationError::NonUtf8Headers)?;
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or(ResponseValidationError::MissingStatus)?;
+
+    if !status_line.starts_with("HTTP/1.") || !status_line.contains(" 200 ") {
+        return Err(ResponseValidationError::UnexpectedStatus(
+            status_line.to_owned(),
+        ));
+    }
+
+    let body = &bytes[header_end + 4..];
+    if body != BACKEND_BODY {
+        return Err(ResponseValidationError::UnexpectedBody { len: body.len() });
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvalidArgs(String);
+
+impl fmt::Display for InvalidArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for InvalidArgs {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientFailures {
+    failures: u64,
+}
+
+impl fmt::Display for ClientFailures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} request(s) failed", self.failures)
+    }
+}
+
+impl Error for ClientFailures {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseValidationError {
+    MissingHeaders,
+    NonUtf8Headers,
+    MissingStatus,
+    UnexpectedStatus(String),
+    UnexpectedBody { len: usize },
+}
+
+impl fmt::Display for ResponseValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHeaders => write!(f, "HTTP response headers are missing"),
+            Self::NonUtf8Headers => write!(f, "HTTP response headers are not UTF-8"),
+            Self::MissingStatus => write!(f, "HTTP response status line is missing"),
+            Self::UnexpectedStatus(status) => write!(f, "unexpected HTTP status line {status:?}"),
+            Self::UnexpectedBody { len } => {
+                write!(f, "unexpected HTTP response body length {len}")
+            }
+        }
+    }
+}
+
+impl Error for ResponseValidationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        path_prefix_matches, validate_response, ClientConfig, FakeProxyControlPlane, HttpTarget,
+        BACKEND_BODY,
+    };
+    use control_plane::api::pb;
+
+    #[test]
+    fn parses_http_target_with_path_and_query() {
+        assert_eq!(
+            HttpTarget::parse("http://127.0.0.1:18080/smoke?ready=true").expect("target parses"),
+            HttpTarget {
+                host: "127.0.0.1".to_owned(),
+                port: 18080,
+                path: "/smoke?ready=true".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn request_path_appends_smoke_request_parameter() {
+        let target =
+            HttpTarget::parse("http://127.0.0.1:18080/smoke?ready=true").expect("target parses");
+
+        assert_eq!(target.request_path(7), "/smoke?ready=true&smoke_request=7");
+    }
+
+    #[test]
+    fn client_config_requires_explicit_host_header() {
+        let error = ClientConfig::from_args(
+            ["--url", "http://127.0.0.1:18080/"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("host is required");
+
+        assert_eq!(error.0, "--host is required");
+    }
+
+    #[test]
+    fn client_config_rejects_zero_request_count() {
+        let error = ClientConfig::from_args(
+            [
+                "--url",
+                "http://127.0.0.1:18080/",
+                "--host",
+                "app.example.test",
+                "--requests",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect_err("zero request count is rejected");
+
+        assert_eq!(error.0, "--requests must be greater than zero");
+    }
+
+    #[test]
+    fn path_prefix_matching_uses_route_boundaries() {
+        assert!(path_prefix_matches("/smoke", "/smoke"));
+        assert!(path_prefix_matches("/smoke/request", "/smoke"));
+        assert!(!path_prefix_matches("/smoke-test", "/smoke"));
+    }
+
+    #[test]
+    fn fake_control_plane_matches_known_http_route() {
+        let service = FakeProxyControlPlane::new(
+            "app.example.test".to_owned(),
+            "/smoke".to_owned(),
+            "http://127.0.0.1:18080".to_owned(),
+        );
+
+        assert!(service.route_matches(&pb::RouteIdentity {
+            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                host: Some(pb::RouteHost {
+                    kind: pb::RouteHostKind::Exact as i32,
+                    host: "app.example.test".to_owned(),
+                }),
+                path_prefix: Some("/smoke".to_owned()),
+            })),
+        }));
+    }
+
+    #[test]
+    fn response_validation_accepts_expected_http_response() {
+        let mut response = b"HTTP/1.1 200 OK\r\ncontent-length: 24\r\n\r\n".to_vec();
+        response.extend_from_slice(BACKEND_BODY);
+
+        validate_response(&response).expect("response validates");
+    }
+}
