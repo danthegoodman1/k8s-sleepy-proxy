@@ -12,7 +12,7 @@ prost = "0.14.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sleepypods-types = { version = "0.1.0", path = "../sleepypods-types" }
-tokio = { version = "1.52.3", features = ["time"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"

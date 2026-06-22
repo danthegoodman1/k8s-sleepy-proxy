@@ -12,6 +12,7 @@ pub mod materialization;
 pub mod materializer;
 pub mod postgres;
 pub mod route;
+pub mod runtime;
 pub mod store;
 mod wake;
 pub mod workload;
