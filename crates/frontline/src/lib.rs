@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod forward;
+pub mod http01;
 pub mod identity;
 pub mod matcher;
 pub mod subscription;
@@ -19,6 +20,11 @@ pub use cache::{
 pub use forward::{
     http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardError,
     FrontlineForwarder,
+};
+pub use http01::{
+    http01_challenge_key, http01_challenge_token, intercept_http01_challenge,
+    Http01ChallengeResponse, Http01InterceptDecision, Http01InterceptError,
+    HTTP01_CHALLENGE_PREFIX, HTTP01_CONTENT_TYPE,
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};
