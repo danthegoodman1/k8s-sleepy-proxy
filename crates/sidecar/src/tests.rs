@@ -1,0 +1,372 @@
+use std::{
+    convert::Infallible,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
+
+use bytes::Bytes;
+use http::{Request, Response, StatusCode, Uri};
+use http_body_util::{BodyExt, Full};
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
+use proxy_core::{DrainTracker, TcpProxyStats};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+};
+
+use super::{SidecarConfigError, SidecarProxy, SidecarProxyConfig};
+
+const HTTP_REQUEST_BODY: &[u8] = b"sidecar preserves this request body";
+const HTTP_RESPONSE_BODY: &[u8] = b"sidecar preserves this response body";
+const TCP_REQUEST: &[u8] = b"client bytes for the local workload";
+const TCP_RESPONSE: &[u8] = b"workload response bytes";
+
+#[test]
+fn config_rejects_zero_and_builds_loopback_targets() {
+    assert_eq!(
+        SidecarProxyConfig::new(0).expect_err("port 0 is rejected"),
+        SidecarConfigError::ZeroAppPort
+    );
+
+    let config = SidecarProxyConfig::new(8080).expect("non-zero port is valid");
+    let expected_origin: Uri = "http://127.0.0.1:8080"
+        .parse()
+        .expect("expected origin parses");
+
+    assert_eq!(config.app_port(), 8080);
+    assert_eq!(config.http_upstream_origin(), &expected_origin);
+    assert_eq!(
+        config.tcp_upstream_addr(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
+    );
+}
+
+#[tokio::test]
+async fn http_forwarding_preserves_request_response_and_releases_active_count() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts sidecar connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|mut request: Request<Incoming>| async move {
+                    assert_eq!(request.method(), "PATCH");
+                    assert_eq!(
+                        request
+                            .uri()
+                            .path_and_query()
+                            .expect("path and query present")
+                            .as_str(),
+                        "/v1/workload?preserve=true"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-preserve")
+                            .expect("normal header is preserved"),
+                        "yes"
+                    );
+                    assert!(request.headers().get("connection").is_none());
+                    assert!(request.headers().get("x-remove").is_none());
+
+                    let body = request
+                        .body_mut()
+                        .collect()
+                        .await
+                        .expect("upstream reads request body")
+                        .to_bytes();
+                    assert_eq!(body, Bytes::from_static(HTTP_REQUEST_BODY));
+
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::ACCEPTED)
+                            .header("x-upstream", "ok")
+                            .body(Full::new(Bytes::from_static(HTTP_RESPONSE_BODY)))
+                            .expect("response builds"),
+                    )
+                }),
+            )
+            .await
+            .expect("upstream serves request");
+    });
+
+    let sidecar = sidecar_for_app_port(upstream_addr.port());
+    let request = Request::builder()
+        .method("PATCH")
+        .uri("/v1/workload?preserve=true")
+        .header("x-preserve", "yes")
+        .header("connection", "x-remove")
+        .header("x-remove", "drop")
+        .body(Full::new(Bytes::from_static(HTTP_REQUEST_BODY)))
+        .expect("request builds");
+
+    let response = sidecar
+        .forward_http(request)
+        .await
+        .expect("sidecar forwards HTTP request");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream")
+            .expect("header present"),
+        "ok"
+    );
+    assert_eq!(sidecar.active_count(), 1);
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body is readable")
+        .to_bytes();
+    assert_eq!(body, Bytes::from_static(HTTP_RESPONSE_BODY));
+
+    sidecar.wait_for_active_count(0).await;
+    assert_eq!(sidecar.active_count(), 0);
+    upstream_task.await.expect("upstream task completed");
+}
+
+#[tokio::test]
+async fn http_active_count_remains_one_while_response_body_is_held() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts sidecar connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|_request: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                        HTTP_RESPONSE_BODY,
+                    ))))
+                }),
+            )
+            .await
+            .expect("upstream serves request");
+    });
+
+    let sidecar = sidecar_for_app_port(upstream_addr.port());
+    let request = Request::builder()
+        .uri("/")
+        .body(Full::new(Bytes::new()))
+        .expect("request builds");
+
+    let response = sidecar
+        .forward_http(request)
+        .await
+        .expect("sidecar forwards HTTP request");
+
+    assert_eq!(sidecar.active_count(), 1);
+
+    drop(response);
+    sidecar.wait_for_active_count(0).await;
+    assert_eq!(sidecar.active_count(), 0);
+    upstream_task.await.expect("upstream task completed");
+}
+
+#[tokio::test]
+async fn tcp_forwarding_preserves_bidirectional_bytes_and_releases_active_count() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts sidecar connection");
+
+        let mut received = vec![0; TCP_REQUEST.len()];
+        stream
+            .read_exact(&mut received)
+            .await
+            .expect("upstream reads proxied bytes");
+        assert_eq!(received, TCP_REQUEST);
+
+        stream
+            .write_all(TCP_RESPONSE)
+            .await
+            .expect("upstream writes response bytes");
+
+        let mut eof = [0; 1];
+        assert_eq!(stream.read(&mut eof).await.expect("upstream reads eof"), 0);
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener
+        .local_addr()
+        .expect("proxy listener has address");
+
+    let sidecar = sidecar_for_app_port(upstream_addr.port());
+    let proxy_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        async move {
+            let (client, _) = proxy_listener
+                .accept()
+                .await
+                .expect("proxy accepts client connection");
+
+            sidecar.forward_tcp(client).await
+        }
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+
+    client
+        .write_all(TCP_REQUEST)
+        .await
+        .expect("client writes request bytes");
+
+    sidecar.wait_for_active_count(1).await;
+    assert_eq!(sidecar.active_count(), 1);
+
+    let mut response = vec![0; TCP_RESPONSE.len()];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("client reads response bytes");
+    assert_eq!(response, TCP_RESPONSE);
+
+    client.shutdown().await.expect("client half-closes");
+
+    let stats = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect("tcp forwarding succeeds");
+
+    assert_eq!(
+        stats,
+        TcpProxyStats {
+            client_to_upstream: TCP_REQUEST.len() as u64,
+            upstream_to_client: TCP_RESPONSE.len() as u64,
+        }
+    );
+
+    upstream_task.await.expect("upstream task completed");
+    sidecar.wait_for_active_count(0).await;
+    assert_eq!(sidecar.active_count(), 0);
+}
+
+#[tokio::test]
+async fn tcp_active_count_remains_one_while_connection_is_open() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+    let (upstream_read_tx, upstream_read_rx) = oneshot::channel();
+    let (release_upstream_tx, release_upstream_rx) = oneshot::channel();
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts sidecar connection");
+
+        let mut byte = [0; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .expect("upstream reads proxied byte");
+        assert_eq!(byte, [b'x']);
+        upstream_read_tx
+            .send(())
+            .expect("test waits for upstream read");
+        release_upstream_rx
+            .await
+            .expect("test releases upstream connection");
+        stream.shutdown().await.expect("upstream half-closes");
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener
+        .local_addr()
+        .expect("proxy listener has address");
+
+    let sidecar = sidecar_for_app_port(upstream_addr.port());
+    let proxy_task = tokio::spawn({
+        let sidecar = sidecar.clone();
+        async move {
+            let (client, _) = proxy_listener
+                .accept()
+                .await
+                .expect("proxy accepts client connection");
+
+            sidecar.forward_tcp(client).await
+        }
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+    client
+        .write_all(b"x")
+        .await
+        .expect("client writes one byte");
+
+    upstream_read_rx
+        .await
+        .expect("upstream received proxied byte");
+    sidecar.wait_for_active_count(1).await;
+    assert_eq!(sidecar.active_count(), 1);
+
+    release_upstream_tx
+        .send(())
+        .expect("upstream release receiver is active");
+    client.shutdown().await.expect("client half-closes");
+
+    let stats = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect("tcp forwarding succeeds");
+    assert_eq!(
+        stats,
+        TcpProxyStats {
+            client_to_upstream: 1,
+            upstream_to_client: 0,
+        }
+    );
+
+    upstream_task.await.expect("upstream task completed");
+    sidecar.wait_for_active_count(0).await;
+    assert_eq!(sidecar.active_count(), 0);
+}
+
+fn sidecar_for_app_port(app_port: u16) -> SidecarProxy {
+    let config = SidecarProxyConfig::with_tcp_connect_timeout(app_port, Duration::from_secs(1))
+        .expect("sidecar config builds");
+    SidecarProxy::new(config, DrainTracker::new(Duration::from_secs(5)))
+}
