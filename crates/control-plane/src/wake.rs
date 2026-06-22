@@ -8,7 +8,8 @@ use crate::{
     },
     manifest::{render_manifests, ManifestRenderError, RenderManifestRequest},
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, MaterializationTarget, RenderedObjectRef,
+        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
+        MaterializationRecord, MaterializationTarget, RenderedObjectRef,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     store::{ControlPlaneStore, StoreError},
@@ -28,10 +29,9 @@ pub enum WakeInstanceResult {
     Completed {
         result: CompleteWakeResult,
     },
-    /// The store has no targeted materialization lookup in this phase, so this
-    /// result deliberately returns only the stable instance record.
     AlreadyRunning {
         instance: InstanceRecord,
+        materialization: MaterializationRecord,
     },
     AlreadyWaking {
         instance: InstanceRecord,
@@ -54,6 +54,10 @@ pub enum WakeInstanceError {
     Unavailable {
         instance: InstanceRecord,
         reason: WakeUnavailableReason,
+    },
+    ReadyMaterializationNotFound {
+        instance: InstanceRecord,
+        target: MaterializationTarget,
     },
     WorkloadClassNotFound,
     Store(StoreError),
@@ -85,7 +89,24 @@ where
 
     match instance.state {
         InstanceState::Running => {
-            return Ok(WakeInstanceResult::AlreadyRunning { instance });
+            let target = request.target.clone();
+            let materialization = store
+                .load_ready_materialization(LoadReadyMaterializationRequest::new(
+                    request.instance_id,
+                    instance.generation,
+                    request.target,
+                ))
+                .await
+                .map_err(map_store_error)?
+                .ok_or_else(|| WakeInstanceError::ReadyMaterializationNotFound {
+                    instance: instance.clone(),
+                    target,
+                })?;
+
+            return Ok(WakeInstanceResult::AlreadyRunning {
+                instance,
+                materialization,
+            });
         }
         InstanceState::Waking => {
             return Ok(WakeInstanceResult::AlreadyWaking { instance });
@@ -192,14 +213,17 @@ impl WakeInstanceResult {
     pub fn instance(&self) -> &InstanceRecord {
         match self {
             Self::Completed { result } => &result.instance,
-            Self::AlreadyRunning { instance } | Self::AlreadyWaking { instance } => instance,
+            Self::AlreadyRunning { instance, .. } | Self::AlreadyWaking { instance } => instance,
         }
     }
 
     pub fn rendered_objects(&self) -> &[RenderedObjectRef] {
         match self {
             Self::Completed { result } => &result.materialization.rendered_objects,
-            Self::AlreadyRunning { .. } | Self::AlreadyWaking { .. } => &[],
+            Self::AlreadyRunning {
+                materialization, ..
+            } => &materialization.rendered_objects,
+            Self::AlreadyWaking { .. } => &[],
         }
     }
 }
@@ -266,6 +290,11 @@ fn failure_message(error: &WakeInstanceError) -> String {
         WakeInstanceError::Unavailable { reason, .. } => {
             format!("instance is unavailable for wake: {reason:?}")
         }
+        WakeInstanceError::ReadyMaterializationNotFound { target, .. } => format!(
+            "ready materialization not found for target {}/{}",
+            target.cluster_id(),
+            target.namespace()
+        ),
     }
 }
 
@@ -282,6 +311,12 @@ impl fmt::Display for WakeInstanceError {
             Self::Unavailable { reason, .. } => {
                 write!(f, "instance is unavailable for wake: {reason:?}")
             }
+            Self::ReadyMaterializationNotFound { target, .. } => write!(
+                f,
+                "ready materialization not found for target {}/{}",
+                target.cluster_id(),
+                target.namespace()
+            ),
             Self::WorkloadClassNotFound => f.write_str("workload class version not found"),
             Self::Store(error) => write!(f, "wake store operation failed: {error}"),
             Self::Render(error) => write!(f, "wake manifest render failed: {error}"),
@@ -299,6 +334,7 @@ impl Error for WakeInstanceError {
             Self::NotFound
             | Self::GenerationConflict { .. }
             | Self::Unavailable { .. }
+            | Self::ReadyMaterializationNotFound { .. }
             | Self::WorkloadClassNotFound => None,
         }
     }

@@ -4,8 +4,8 @@ use crate::{
     ids::Generation,
     instance::{validate_instance_state_transition, InstanceState, StateTransitionReason},
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, MaterializationRecord, MaterializationState,
-        RecordMaterializationRequest,
+        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
+        MaterializationRecord, MaterializationState, RecordMaterializationRequest,
     },
     store::{StoreError, StoreResult},
 };
@@ -31,6 +31,35 @@ pub(crate) async fn record_materialization(
     transaction.commit().await.map_err(map_postgres_error)?;
 
     Ok(record)
+}
+
+pub(crate) async fn load_ready_materialization(
+    store: &PostgresStore,
+    request: LoadReadyMaterializationRequest,
+) -> StoreResult<Option<MaterializationRecord>> {
+    let client = store.client().await?;
+    let instance_id = request.instance_id.as_str();
+    let instance_generation = generation_to_i64(request.instance_generation)?;
+    let cluster_id = request.target.cluster_id();
+    let namespace = request.target.namespace();
+    let row = client
+        .query_opt(
+            "
+            SELECT materialization_id, instance_id, instance_generation, cluster_id,
+                namespace, state, backend_uri, backend_generation, rendered_objects
+            FROM materializations
+            WHERE instance_id = $1
+                AND instance_generation = $2
+                AND cluster_id = $3
+                AND namespace = $4
+                AND state = 'ready'
+            ",
+            &[&instance_id, &instance_generation, &cluster_id, &namespace],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.as_ref().map(materialization_from_row).transpose()
 }
 
 pub(crate) async fn complete_wake(

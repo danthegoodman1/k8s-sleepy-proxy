@@ -8,8 +8,8 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, MaterializationRecord,
-        RecordMaterializationRequest,
+        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
+        MaterializationRecord, RecordMaterializationRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
@@ -100,6 +100,15 @@ impl ControlPlaneStore for PostgresStore {
         request: RecordMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
         Box::pin(async move { materialization_ops::record_materialization(self, request).await })
+    }
+
+    fn load_ready_materialization<'a>(
+        &'a self,
+        request: LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(
+            async move { materialization_ops::load_ready_materialization(self, request).await },
+        )
     }
 
     fn complete_wake<'a>(

@@ -10,8 +10,8 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, MaterializationRecord,
-        RecordMaterializationRequest,
+        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
+        MaterializationRecord, RecordMaterializationRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
@@ -81,6 +81,11 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: RecordMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<MaterializationRecord>>;
+
+    fn load_ready_materialization<'a>(
+        &'a self,
+        request: LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>>;
 
     fn complete_wake<'a>(
         &'a self,

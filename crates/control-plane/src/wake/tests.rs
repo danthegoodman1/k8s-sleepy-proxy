@@ -16,7 +16,8 @@ use crate::{
         WorkloadKind, WorkloadTemplate,
     },
     materialization::{
-        BackendEndpoint, MaterializationRecord, MaterializationState, RecordMaterializationRequest,
+        BackendEndpoint, LoadReadyMaterializationRequest, MaterializationRecord,
+        MaterializationState, RecordMaterializationRequest,
     },
     materializer::{
         KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
@@ -46,6 +47,7 @@ struct FakeStore {
 struct FakeStoreState {
     instance: Option<InstanceRecord>,
     workload_class: Option<WorkloadClassVersion>,
+    materialization: Option<MaterializationRecord>,
     events: Vec<StoreEvent>,
     complete_conflict: bool,
 }
@@ -61,6 +63,11 @@ enum StoreEvent {
         expected_waking_generation: Generation,
         backend_generation: BackendGeneration,
         rendered_objects: Vec<RenderedObjectRef>,
+    },
+    LoadReadyMaterialization {
+        instance_id: InstanceId,
+        instance_generation: Generation,
+        target: MaterializationTarget,
     },
 }
 
@@ -191,9 +198,16 @@ async fn stale_expected_generation_writes_nothing_and_does_not_apply() {
 }
 
 #[tokio::test]
-async fn already_running_returns_instance_without_materialization_lookup_or_apply() {
+async fn already_running_returns_matching_ready_materialization_without_apply() {
     let running = instance("instance-a", InstanceState::Running, 5);
     let store = FakeStore::new(running.clone(), Some(workload_class()));
+    let materialization = ready_materialization(
+        "instance-a",
+        5,
+        target("cluster-a", "apps"),
+        "http://svc-acme.apps.svc.cluster.local:80",
+    );
+    store.set_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     let materializer = KubernetesMaterializer::new(client.clone());
 
@@ -211,8 +225,118 @@ async fn already_running_returns_instance_without_materialization_lookup_or_appl
 
     assert_eq!(
         result,
-        WakeInstanceResult::AlreadyRunning { instance: running }
+        WakeInstanceResult::AlreadyRunning {
+            instance: running.clone(),
+            materialization: materialization.clone()
+        }
     );
+    assert_eq!(result.rendered_objects(), materialization.rendered_objects);
+    assert_eq!(
+        store.events(),
+        vec![StoreEvent::LoadReadyMaterialization {
+            instance_id: instance_id("instance-a"),
+            instance_generation: Generation::new(5),
+            target: target("cluster-a", "apps"),
+        }]
+    );
+    assert!(client.applied_objects().is_empty());
+}
+
+#[tokio::test]
+async fn already_running_missing_or_filtered_materialization_errors_without_apply() {
+    let cases = [
+        ("missing ready materialization", None),
+        (
+            "wrong target",
+            Some(materialization(
+                "instance-a",
+                5,
+                target("cluster-a", "other"),
+                MaterializationState::Ready,
+                Some(backend("http://svc-acme.other.svc.cluster.local:80")),
+            )),
+        ),
+        (
+            "non-ready state",
+            Some(materialization(
+                "instance-a",
+                5,
+                target("cluster-a", "apps"),
+                MaterializationState::Pending,
+                Some(backend("http://svc-acme.apps.svc.cluster.local:80")),
+            )),
+        ),
+    ];
+
+    for (name, stored_materialization) in cases {
+        let running = instance("instance-a", InstanceState::Running, 5);
+        let store = FakeStore::new(running.clone(), Some(workload_class()));
+        if let Some(stored_materialization) = stored_materialization {
+            store.set_materialization(stored_materialization);
+        }
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let expected_target = target("cluster-a", "apps");
+
+        let error = wake_instance(
+            &store,
+            &materializer,
+            WakeInstanceRequest::new(
+                instance_id("instance-a"),
+                Generation::new(5),
+                expected_target.clone(),
+            ),
+        )
+        .await
+        .expect_err(name);
+
+        assert!(matches!(
+            error,
+            WakeInstanceError::ReadyMaterializationNotFound {
+                instance,
+                target
+            } if instance == running && target == expected_target
+        ));
+        assert_eq!(
+            store.events(),
+            vec![StoreEvent::LoadReadyMaterialization {
+                instance_id: instance_id("instance-a"),
+                instance_generation: Generation::new(5),
+                target: target("cluster-a", "apps"),
+            }]
+        );
+        assert!(client.applied_objects().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stale_running_expected_generation_does_not_load_materialization() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Running, 5),
+        Some(workload_class()),
+    );
+    store.set_materialization(ready_materialization(
+        "instance-a",
+        5,
+        target("cluster-a", "apps"),
+        "http://svc-acme.apps.svc.cluster.local:80",
+    ));
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(4),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("stale wake is rejected before materialization lookup");
+
+    assert_generation_conflict(error, Generation::new(4), Generation::new(5));
     assert!(store.events().is_empty());
     assert!(client.applied_objects().is_empty());
 }
@@ -359,6 +483,9 @@ async fn materializer_failure_marks_waking_generation_failed() {
                     ..
                 } => (expected, next_state),
                 StoreEvent::Complete { .. } => panic!("wake must not complete"),
+                StoreEvent::LoadReadyMaterialization { .. } => {
+                    panic!("cold wake failure must not load materialization")
+                }
             })
             .collect::<Vec<_>>(),
         vec![
@@ -455,6 +582,7 @@ impl FakeStore {
             inner: Arc::new(Mutex::new(FakeStoreState {
                 instance: Some(instance),
                 workload_class,
+                materialization: None,
                 events: Vec::new(),
                 complete_conflict: false,
             })),
@@ -483,6 +611,13 @@ impl FakeStore {
             .lock()
             .expect("fake store lock not poisoned")
             .complete_conflict = true;
+    }
+
+    fn set_materialization(&self, materialization: MaterializationRecord) {
+        self.inner
+            .lock()
+            .expect("fake store lock not poisoned")
+            .materialization = Some(materialization);
     }
 }
 
@@ -597,6 +732,30 @@ impl ControlPlaneStore for FakeStore {
         _request: RecordMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
         Box::pin(async { Err(StoreError::internal("not implemented")) })
+    }
+
+    fn load_ready_materialization<'a>(
+        &'a self,
+        request: LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().expect("fake store lock not poisoned");
+            inner.events.push(StoreEvent::LoadReadyMaterialization {
+                instance_id: request.instance_id.clone(),
+                instance_generation: request.instance_generation,
+                target: request.target.clone(),
+            });
+            Ok(inner
+                .materialization
+                .as_ref()
+                .filter(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.instance_generation == request.instance_generation
+                        && materialization.target == request.target
+                        && materialization.state == MaterializationState::Ready
+                })
+                .cloned())
+        })
     }
 
     fn complete_wake<'a>(
@@ -850,6 +1009,51 @@ fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> Ren
         kind: kind.to_owned(),
         namespace: namespace.to_owned(),
         name: name.to_owned(),
+    }
+}
+
+fn ready_materialization(
+    instance_id: &str,
+    instance_generation: u64,
+    target: MaterializationTarget,
+    backend_uri: &str,
+) -> MaterializationRecord {
+    materialization(
+        instance_id,
+        instance_generation,
+        target,
+        MaterializationState::Ready,
+        Some(backend(backend_uri)),
+    )
+}
+
+fn materialization(
+    instance_id: &str,
+    instance_generation: u64,
+    target: MaterializationTarget,
+    state: MaterializationState,
+    backend: Option<BackendEndpoint>,
+) -> MaterializationRecord {
+    MaterializationRecord {
+        id: MaterializationId::new(format!(
+            "{}:{}:{}",
+            instance_id,
+            target.cluster_id(),
+            target.namespace()
+        ))
+        .expect("materialization ID"),
+        instance_id: self::instance_id(instance_id),
+        instance_generation: Generation::new(instance_generation),
+        target: target.clone(),
+        state,
+        backend,
+        backend_generation: BackendGeneration::new(instance_generation),
+        rendered_objects: vec![object_ref(
+            "apps/v1",
+            "Deployment",
+            target.namespace(),
+            instance_id,
+        )],
     }
 }
 

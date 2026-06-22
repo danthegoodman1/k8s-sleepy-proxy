@@ -1001,6 +1001,13 @@ impl ControlPlaneStore for FakeInstanceStore {
         Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
     }
 
+    fn load_ready_materialization<'a>(
+        &'a self,
+        _request: control_plane::materialization::LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
     fn complete_wake<'a>(
         &'a self,
         _request: control_plane::CompleteWakeRequest,

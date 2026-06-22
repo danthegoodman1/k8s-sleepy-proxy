@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use control_plane::materialization::LoadReadyMaterializationRequest;
 use control_plane::{
     render_manifests, BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest,
     CompleteWakeRequest, ContainerPortTemplate, ContainerTemplate, ControlPlaneStore,
@@ -983,6 +984,59 @@ async fn exercise_complete_wake(
         Some("http://10.0.0.20:8080")
     );
     assert_eq!(completed.materialization.rendered_objects, rendered_objects);
+    let loaded_ready = store
+        .load_ready_materialization(LoadReadyMaterializationRequest::new(
+            completed.instance.id.clone(),
+            completed.instance.generation,
+            target.clone(),
+        ))
+        .await?
+        .expect("ready materialization loads by exact target and generation");
+    assert_eq!(loaded_ready, completed.materialization);
+    assert!(
+        store
+            .load_ready_materialization(LoadReadyMaterializationRequest::new(
+                completed.instance.id.clone(),
+                Generation::new(1),
+                target.clone(),
+            ))
+            .await?
+            .is_none(),
+        "wrong instance generation must not load ready materialization"
+    );
+    assert!(
+        store
+            .load_ready_materialization(LoadReadyMaterializationRequest::new(
+                completed.instance.id.clone(),
+                completed.instance.generation,
+                MaterializationTarget::new("cluster-complete", "other").expect("valid target"),
+            ))
+            .await?
+            .is_none(),
+        "wrong target must not load ready materialization"
+    );
+    let non_ready_target =
+        MaterializationTarget::new("cluster-complete", "pending").expect("valid target");
+    store
+        .record_materialization(RecordMaterializationRequest::new(
+            completed.instance.id.clone(),
+            completed.instance.generation,
+            non_ready_target.clone(),
+            MaterializationState::Pending,
+            BackendGeneration::new(1),
+        ))
+        .await?;
+    assert!(
+        store
+            .load_ready_materialization(LoadReadyMaterializationRequest::new(
+                completed.instance.id.clone(),
+                completed.instance.generation,
+                non_ready_target,
+            ))
+            .await?
+            .is_none(),
+        "non-ready materialization must not load"
+    );
 
     match store
         .resolve_route(http_identity("complete-wake.example.com", None))

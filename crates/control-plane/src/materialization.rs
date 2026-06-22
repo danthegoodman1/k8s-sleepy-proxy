@@ -39,6 +39,13 @@ pub struct CompleteWakeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadReadyMaterializationRequest {
+    pub instance_id: InstanceId,
+    pub instance_generation: Generation,
+    pub target: MaterializationTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompleteWakeResult {
     pub instance: InstanceRecord,
     pub materialization: MaterializationRecord,
@@ -112,6 +119,20 @@ impl CompleteWakeRequest {
             backend,
             backend_generation,
             rendered_objects: Vec::new(),
+        }
+    }
+}
+
+impl LoadReadyMaterializationRequest {
+    pub fn new(
+        instance_id: InstanceId,
+        instance_generation: Generation,
+        target: MaterializationTarget,
+    ) -> Self {
+        Self {
+            instance_id,
+            instance_generation,
+            target,
         }
     }
 }
