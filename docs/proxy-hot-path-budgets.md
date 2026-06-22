@@ -18,6 +18,43 @@ For a quick compile-and-smoke run:
 cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
+## Production Image Sidecar HTTP Load Smoke
+
+Milestone 7E starts with a small production-image smoke for the sidecar HTTP/1.1
+hot path:
+
+```sh
+./scripts/smoke-sidecar-load.sh
+```
+
+The script builds the final `sidecar` image with the root `Dockerfile`, starts a
+small helper container that serves both a fixed HTTP backend and a fake
+`SidecarControlPlane/ReportIdle` gRPC service, then runs the production sidecar
+image in the helper container's network namespace. This keeps the sidecar's
+`127.0.0.1:<app-port>` upstream target pointed at the same backend measured by
+the direct-backend baseline.
+
+The smoke client sends the same request count to the backend directly and
+through the sidecar. It reports request count, failures, elapsed milliseconds,
+and rough RPS for each path, then fails on request correctness errors, process
+startup failures, missing tools or images, and a very conservative
+sidecar/direct RPS ratio below `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO`
+(default `0.10`). The ratio guard is only intended to catch extreme obvious
+regressions; local Docker wall-clock numbers are not treated as stable latency
+budgets.
+
+Useful knobs:
+
+```sh
+SLEEPYPODS_SIDECAR_LOAD_SMOKE_REQUESTS=500 \
+SLEEPYPODS_SIDECAR_LOAD_SMOKE_CONCURRENCY=16 \
+./scripts/smoke-sidecar-load.sh
+```
+
+This initial smoke only covers the sidecar HTTP/1.1 hot path. It does not cover
+frontline routing, Kubernetes, the real control plane, HTTP/2, h2c, gRPC, TCP,
+WebSockets, streaming throughput, or tail latency.
+
 ## Budget Principles
 
 - Hot forwarding paths must not perform control-plane calls, database access,
