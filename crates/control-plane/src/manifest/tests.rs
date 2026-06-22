@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde_json::json;
+
 use super::{
     render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate,
     CsiPersistentVolumeSource, EnvVar, EnvVarTemplate, KubernetesObject, ManifestRenderError,
@@ -158,6 +160,83 @@ fn renders_deployment_and_service_without_volumes() {
 }
 
 #[test]
+fn serializes_deployment_and_service_as_kubernetes_json() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &deployment_template(),
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("deployment renders");
+
+    let objects = rendered.to_kubernetes_json_values();
+    let service = &objects[0];
+    assert_eq!(service["apiVersion"], json!("v1"));
+    assert_eq!(service["kind"], json!("Service"));
+    assert_eq!(service["metadata"]["name"], json!("svc-acme"));
+    assert_eq!(service["metadata"]["namespace"], json!("apps"));
+    assert_eq!(
+        service["metadata"]["labels"][LABEL_INSTANCE_ID],
+        json!("instance-a")
+    );
+    assert_eq!(
+        service["metadata"]["annotations"]["sleepypods.io/template-generation"],
+        json!("3")
+    );
+    assert_eq!(
+        service["spec"]["selector"][LABEL_INSTANCE_ID],
+        json!("instance-a")
+    );
+    assert_eq!(
+        service["spec"]["ports"][0],
+        json!({
+            "name": "http",
+            "port": 80,
+            "targetPort": 15000,
+        })
+    );
+
+    let deployment = &objects[1];
+    assert_eq!(deployment["apiVersion"], json!("apps/v1"));
+    assert_eq!(deployment["kind"], json!("Deployment"));
+    assert_eq!(deployment["metadata"]["name"], json!("app-acme"));
+    assert_eq!(deployment["metadata"]["namespace"], json!("apps"));
+    assert_eq!(deployment["spec"]["replicas"], json!(1));
+    assert_eq!(
+        deployment["spec"]["selector"]["matchLabels"],
+        service["spec"]["selector"]
+    );
+    assert_eq!(
+        deployment["spec"]["template"]["metadata"]["labels"][LABEL_INSTANCE_ID],
+        json!("instance-a")
+    );
+    assert_eq!(
+        deployment["spec"]["template"]["spec"]["containers"][0],
+        json!({
+            "name": "app",
+            "image": "example/app:1",
+            "ports": [{
+                "name": "http",
+                "containerPort": 8080,
+            }],
+            "env": [{
+                "name": "TENANT",
+                "value": "acme",
+            }],
+            "volumeMounts": [],
+        })
+    );
+    assert_eq!(
+        deployment["spec"]["template"]["spec"]["containers"][1]["ports"][0],
+        json!({
+            "name": "sleepypods",
+            "containerPort": 15000,
+        })
+    );
+    assert_eq!(deployment["spec"]["template"]["spec"]["volumes"], json!([]));
+}
+
+#[test]
 fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &stateful_template(),
@@ -265,6 +344,105 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     assert!(stateful_set.spec.template.spec.containers[1]
         .volume_mounts
         .is_empty());
+}
+
+#[test]
+fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &stateful_template(),
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([("tenant", "acme"), ("volume", "provider-vol-123")]),
+        ),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect("stateful workload renders");
+
+    let objects = rendered.to_kubernetes_json_values();
+    let pv = &objects[0];
+    assert_eq!(pv["apiVersion"], json!("v1"));
+    assert_eq!(pv["kind"], json!("PersistentVolume"));
+    assert_eq!(pv["metadata"]["name"], json!("pv-acme"));
+    assert!(
+        pv["metadata"].get("namespace").is_none(),
+        "PersistentVolumes are cluster-scoped"
+    );
+    assert_eq!(
+        pv["spec"],
+        json!({
+            "capacity": {
+                "storage": "10Gi",
+            },
+            "accessModes": ["ReadWriteOnce"],
+            "persistentVolumeReclaimPolicy": "Retain",
+            "storageClassName": "manual",
+            "claimRef": {
+                "namespace": "data",
+                "name": "pvc-acme",
+            },
+            "csi": {
+                "driver": "csi.example.com",
+                "volumeHandle": "provider-vol-123",
+                "fsType": "ext4",
+                "readOnly": false,
+                "volumeAttributes": {
+                    "tenant": "acme",
+                },
+            },
+        })
+    );
+
+    let pvc = &objects[1];
+    assert_eq!(pvc["apiVersion"], json!("v1"));
+    assert_eq!(pvc["kind"], json!("PersistentVolumeClaim"));
+    assert_eq!(pvc["metadata"]["name"], json!("pvc-acme"));
+    assert_eq!(pvc["metadata"]["namespace"], json!("data"));
+    assert_eq!(
+        pvc["spec"],
+        json!({
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {
+                "requests": {
+                    "storage": "10Gi",
+                },
+            },
+            "storageClassName": "manual",
+            "volumeName": "pv-acme",
+        })
+    );
+
+    let service = &objects[2];
+    assert_eq!(service["kind"], json!("Service"));
+    assert_eq!(service["spec"]["ports"][0]["targetPort"], json!(15000));
+
+    let stateful_set = &objects[3];
+    assert_eq!(stateful_set["apiVersion"], json!("apps/v1"));
+    assert_eq!(stateful_set["kind"], json!("StatefulSet"));
+    assert_eq!(stateful_set["metadata"]["name"], json!("db-acme"));
+    assert_eq!(stateful_set["spec"]["serviceName"], json!("db-acme"));
+    assert_eq!(stateful_set["spec"]["replicas"], json!(1));
+    assert_eq!(
+        stateful_set["spec"]["template"]["spec"]["volumes"][0],
+        json!({
+            "name": "data",
+            "persistentVolumeClaim": {
+                "claimName": "pvc-acme",
+            },
+        })
+    );
+    assert_eq!(
+        stateful_set["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0],
+        json!({
+            "name": "data",
+            "mountPath": "/var/lib/postgresql/data",
+        })
+    );
+    assert_eq!(
+        stateful_set["spec"]["template"]["spec"]["containers"][1]["volumeMounts"],
+        json!([])
+    );
 }
 
 #[test]

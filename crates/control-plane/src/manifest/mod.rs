@@ -4,6 +4,7 @@ use crate::instance::InstanceRecord;
 
 mod objects;
 mod render;
+mod serialize;
 mod template;
 
 #[cfg(test)]
