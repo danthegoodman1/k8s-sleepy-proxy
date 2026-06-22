@@ -6,7 +6,7 @@ use tonic::codegen::Body;
 
 use crate::ReportIdleRequest;
 
-pub type ReportIdleFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>;
+pub type ReportIdleFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 pub trait ReportIdleClient {
     type Error;
@@ -95,7 +95,8 @@ impl<T> GrpcSidecarControlPlaneClient<T> {
 
 impl<T> GrpcSidecarControlPlaneClient<T>
 where
-    T: tonic::client::GrpcService<tonic::body::Body>,
+    T: tonic::client::GrpcService<tonic::body::Body> + Send,
+    T::Future: Send,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
@@ -117,7 +118,8 @@ where
 
 impl<T> ReportIdleClient for GrpcSidecarControlPlaneClient<T>
 where
-    T: tonic::client::GrpcService<tonic::body::Body>,
+    T: tonic::client::GrpcService<tonic::body::Body> + Send,
+    T::Future: Send,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
