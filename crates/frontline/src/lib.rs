@@ -1,10 +1,11 @@
 //! Frontline route-resolution primitives.
 //!
-//! This crate intentionally contains no listeners, forwarding code, or real
-//! control-plane transport. It models the pure local state future frontline
-//! protocol handlers will use around lazy route subscription.
+//! This crate intentionally contains no listeners or real control-plane
+//! transport. It models the pure local state and forwarding adapters future
+//! frontline protocol handlers will use around lazy route subscription.
 
 pub mod cache;
+pub mod forward;
 pub mod identity;
 pub mod matcher;
 pub mod subscription;
@@ -13,6 +14,10 @@ pub mod wake;
 pub use cache::{
     CacheInsertResult, CacheLookup, CacheLookupHit, CacheLookupStatus, NegativeCacheEntry,
     PositiveCacheEntry, RouteCache,
+};
+pub use forward::{
+    http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardError,
+    FrontlineForwarder,
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};
