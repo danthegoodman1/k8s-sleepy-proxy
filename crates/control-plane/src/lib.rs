@@ -5,6 +5,7 @@ pub mod config;
 pub mod http01;
 pub mod ids;
 pub mod instance;
+mod kube_materializer;
 pub mod manifest;
 pub mod materialization;
 pub mod materializer;
@@ -26,6 +27,9 @@ pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
     DeleteInstanceRequest, GetInstanceRequest, InstanceRecord, InstanceState, InstanceValues,
     StateTransitionReason,
+};
+pub use kube_materializer::{
+    InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,
 };
 pub use manifest::{
     render_manifests, ApplyOrder, Container, ContainerPort, ContainerPortTemplate,

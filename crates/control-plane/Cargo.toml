@@ -6,9 +6,12 @@ license.workspace = true
 
 [dependencies]
 deadpool-postgres = "0.14.1"
+k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
+kube = { version = "4.0.0", default-features = false, features = ["client", "rustls-tls"] }
 prost = "0.14.4"
 serde_json = "1.0.150"
 sleepypods-types = { version = "0.1.0", path = "../sleepypods-types" }
+tokio = { version = "1.52.3", features = ["time"] }
 tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
