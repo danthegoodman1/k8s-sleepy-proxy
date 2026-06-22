@@ -29,6 +29,60 @@ service ProxyControlPlane {
   rpc Subscribe(stream ProxySubscribeRequest) returns (stream ProxySubscribeResponse);
 }
 
+// SidecarControlPlane is a native-gRPC-only sidecar control-plane surface. It
+// is intentionally separate from OperatorControlPlane so runtime lifecycle
+// traffic does not expand the operator/gRPC-Web API.
+service SidecarControlPlane {
+  rpc ReportIdle(SidecarReportIdleRequest) returns (SidecarReportIdleResponse);
+}
+
+message SidecarReportIdleRequest {
+  string instance_id = 1;
+  uint64 expected_generation = 2;
+  uint64 active_count = 3;
+}
+
+message SidecarReportIdleResponse {
+  oneof outcome {
+    SidecarReportIdleAccepted accepted = 1;
+    SidecarReportIdleAlreadyDraining already_draining = 2;
+    SidecarReportIdleGenerationConflict generation_conflict = 3;
+    SidecarReportIdleUnavailable unavailable = 4;
+  }
+}
+
+message SidecarReportIdleAccepted {
+  string instance_id = 1;
+  uint64 instance_generation = 2;
+}
+
+message SidecarReportIdleAlreadyDraining {
+  string instance_id = 1;
+  uint64 instance_generation = 2;
+}
+
+message SidecarReportIdleGenerationConflict {
+  string instance_id = 1;
+  uint64 expected_generation = 2;
+  uint64 actual_generation = 3;
+}
+
+message SidecarReportIdleUnavailable {
+  string instance_id = 1;
+  uint64 instance_generation = 2;
+  SidecarReportIdleUnavailableReason reason = 3;
+}
+
+enum SidecarReportIdleUnavailableReason {
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_COLD = 1;
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_WAKING = 2;
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_DRAINING = 3;
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_FAILED = 4;
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_DELETING = 5;
+  SIDECAR_REPORT_IDLE_UNAVAILABLE_REASON_DELETED = 6;
+}
+
 message ProxyWakeInstanceRequest {
   string instance_id = 1;
   uint64 expected_generation = 2;

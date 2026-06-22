@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod http01;
+mod idle;
 pub mod ids;
 pub mod instance;
 mod kube_materializer;
