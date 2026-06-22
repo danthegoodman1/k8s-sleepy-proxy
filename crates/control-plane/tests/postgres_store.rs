@@ -324,7 +324,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         })
         .await?;
     let route_entry = match initial_resolution {
-        RouteResolution::Resolved(entry) => entry,
+        RouteResolution::Resolved { entry, .. } => entry,
         RouteResolution::Miss { .. } => panic!("route should resolve"),
     };
     assert_eq!(route_entry.instance_id.as_str(), "instance-a");
@@ -429,7 +429,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         })
         .await?;
     match resolved_with_backend {
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             assert_eq!(
                 entry.backend.as_ref().map(BackendEndpoint::uri),
                 Some("http://10.0.0.10:8080")
@@ -465,7 +465,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         })
         .await?;
     match resolved_after_rewind_rejection {
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             assert_eq!(
                 entry.backend.as_ref().map(BackendEndpoint::uri),
                 Some("http://10.0.0.10:8080")
@@ -509,7 +509,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         })
         .await?;
     match resolved_after_generation_advance {
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             assert_eq!(entry.instance_generation, Generation::new(3));
             assert_eq!(entry.backend, None);
             assert_eq!(entry.backend_generation, None);
@@ -1042,7 +1042,7 @@ async fn exercise_complete_wake(
         .resolve_route(http_identity("complete-wake.example.com", None))
         .await?
     {
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             assert_eq!(entry.route_binding_id, route_binding_id);
             assert_eq!(entry.instance_id, completed.instance.id);
             assert_eq!(entry.instance_state, InstanceState::Running);
@@ -1218,7 +1218,7 @@ async fn exercise_complete_wake(
         .resolve_route(http_identity("complete-wake-rewind.example.com", None))
         .await?
     {
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             assert_eq!(entry.route_binding_id, rewind_route_binding_id);
             assert_eq!(entry.instance_state, InstanceState::Waking);
             assert_eq!(entry.instance_generation, Generation::new(1));
@@ -1508,7 +1508,7 @@ async fn exercise_route_bindings(
         RouteResolution::Miss { negative_cache } => {
             assert!(negative_cache.ttl() > Duration::from_secs(0));
         }
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             panic!("base wildcard suffix should not match itself: {entry:?}")
         }
     }
@@ -1543,7 +1543,7 @@ async fn assert_resolves_to(
     expected_route_binding_id: &RouteBindingId,
 ) -> Result<(), StoreError> {
     match store.resolve_route(identity).await? {
-        RouteResolution::Resolved(entry) => {
+        RouteResolution::Resolved { entry, .. } => {
             assert_eq!(&entry.route_binding_id, expected_route_binding_id);
             Ok(())
         }

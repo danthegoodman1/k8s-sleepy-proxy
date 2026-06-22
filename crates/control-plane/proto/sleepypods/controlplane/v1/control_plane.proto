@@ -22,11 +22,11 @@ service OperatorControlPlane {
 }
 
 // ProxyControlPlane is a native-gRPC-only proxy control-plane surface. It is
-// intentionally separate from OperatorControlPlane so proxy wake traffic does
-// not expand the operator/gRPC-Web API. Proxy Subscribe remains future
-// native-gRPC-only work and is not part of this phase.
+// intentionally separate from OperatorControlPlane so proxy wake and subscribe
+// traffic does not expand the operator/gRPC-Web API.
 service ProxyControlPlane {
   rpc WakeInstance(ProxyWakeInstanceRequest) returns (ProxyWakeInstanceResponse);
+  rpc Subscribe(stream ProxySubscribeRequest) returns (stream ProxySubscribeResponse);
 }
 
 message ProxyWakeInstanceRequest {
@@ -72,6 +72,79 @@ message ProxyWakeGenerationConflictResult {
   string instance_id = 1;
   uint64 expected_generation = 2;
   uint64 actual_generation = 3;
+}
+
+message ProxySubscribeRequest {
+  oneof input {
+    ProxySubscribeRouteRequest subscribe_route = 1;
+    ProxyUnsubscribeRequest unsubscribe = 2;
+  }
+}
+
+message ProxySubscribeRouteRequest {
+  string request_id = 1;
+  RouteIdentity identity = 2;
+}
+
+message ProxyUnsubscribeRequest {
+  string subscription_id = 1;
+}
+
+message ProxySubscribeResponse {
+  oneof output {
+    ProxyRouteResolvedResponse route_resolved = 1;
+    ProxyRouteMissResponse route_miss = 2;
+    ProxyRouteUpdatedResponse route_updated = 3;
+    ProxyRouteInvalidatedResponse route_invalidated = 4;
+  }
+}
+
+message ProxyRouteResolvedResponse {
+  string request_id = 1;
+  string subscription_id = 2;
+  RouteIdentity matched_identity = 3;
+  ProxyRouteEntry route = 4;
+  ProxyCachePolicy cache_policy = 5;
+}
+
+message ProxyRouteMissResponse {
+  string request_id = 1;
+  RouteIdentity request_identity = 2;
+  ProxyCachePolicy negative_cache_policy = 3;
+}
+
+message ProxyRouteUpdatedResponse {
+  string subscription_id = 1;
+  RouteIdentity matched_identity = 2;
+  ProxyRouteEntry route = 3;
+  ProxyCachePolicy cache_policy = 4;
+}
+
+message ProxyRouteInvalidatedResponse {
+  string subscription_id = 1;
+  ProxyRouteInvalidationReason reason = 2;
+}
+
+enum ProxyRouteInvalidationReason {
+  PROXY_ROUTE_INVALIDATION_REASON_UNSPECIFIED = 0;
+  PROXY_ROUTE_INVALIDATION_REASON_ROUTE_REMOVED = 1;
+  PROXY_ROUTE_INVALIDATION_REASON_ROUTE_CHANGED = 2;
+  PROXY_ROUTE_INVALIDATION_REASON_INSTANCE_CHANGED = 3;
+  PROXY_ROUTE_INVALIDATION_REASON_BACKEND_CHANGED = 4;
+  PROXY_ROUTE_INVALIDATION_REASON_STREAM_CLOSED = 5;
+}
+
+message ProxyRouteEntry {
+  string route_binding_id = 1;
+  string instance_id = 2;
+  InstanceState instance_state = 3;
+  uint64 instance_generation = 4;
+  optional string backend_uri = 5;
+  optional uint64 backend_generation = 6;
+}
+
+message ProxyCachePolicy {
+  uint64 ttl_millis = 1;
 }
 
 message WorkloadClassVersionRef {

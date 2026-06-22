@@ -52,8 +52,13 @@ pub struct DeleteRouteBindingRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteResolution {
-    Resolved(RouteEntry),
-    Miss { negative_cache: CachePolicy },
+    Resolved {
+        matched_identity: RouteIdentity,
+        entry: RouteEntry,
+    },
+    Miss {
+        negative_cache: CachePolicy,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

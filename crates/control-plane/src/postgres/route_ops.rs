@@ -137,8 +137,12 @@ pub(crate) async fn resolve_route(
         });
     };
 
+    let matched_identity = route.identity.clone();
     let entry = load_route_entry(&client, &route).await?;
-    Ok(RouteResolution::Resolved(entry))
+    Ok(RouteResolution::Resolved {
+        matched_identity,
+        entry,
+    })
 }
 
 pub(crate) async fn lookup_route_dependencies(

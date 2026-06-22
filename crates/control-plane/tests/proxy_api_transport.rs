@@ -1,27 +1,33 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use control_plane::api::{
     operator_grpc_server_builder,
     pb::{
-        proxy_control_plane_server::ProxyControlPlane, proxy_wake_instance_response,
+        proxy_control_plane_server::ProxyControlPlane, proxy_subscribe_request,
+        proxy_subscribe_response, proxy_wake_instance_response, HttpRouteIdentity, InstanceState,
+        ProxyCachePolicy, ProxyRouteEntry, ProxyRouteMissResponse, ProxyRouteResolvedResponse,
+        ProxySubscribeRequest, ProxySubscribeResponse, ProxySubscribeRouteRequest,
         ProxyWakeInstanceRequest, ProxyWakeInstanceResponse, ProxyWakeUnavailableReason,
+        RouteHost as ProtoRouteHost, RouteHostKind, RouteIdentity as ProtoRouteIdentity,
     },
     proxy_grpc_service_with_store, StoreBackedProxyApi, StoreBackedProxyGrpcService,
     OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
 };
 use control_plane::{
-    BackendEndpoint, BackendGeneration, CompleteWakeResult, ControlPlaneStore,
+    BackendEndpoint, BackendGeneration, CachePolicy, CompleteWakeResult, ControlPlaneStore,
     CreateInstanceResult, Generation, InstanceId, InstanceRecord,
     InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
-    RenderedObjectRef, StoreError, StoreFuture, StoreResult,
+    PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    RouteResolution, StoreError, StoreFuture, StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use tonic::body::Body;
-use tonic::codegen::http::{header, Request, Version};
+use tonic::codegen::http::{header, Request, Response as HttpResponse, Version};
 use tonic::server::NamedService;
 use tonic::Code;
 use tower::ServiceExt;
@@ -53,7 +59,26 @@ fn generated_api_contains_proxy_wake_shape_without_operator_surface_change() {
         PROXY_SERVICE_NAME
     );
     assert!(!OPERATOR_UNARY_METHODS.contains(&"WakeInstance"));
+    assert!(!OPERATOR_UNARY_METHODS.contains(&"Subscribe"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"ProxyControlPlane/WakeInstance"));
+    assert!(!OPERATOR_UNARY_METHODS.contains(&"ProxyControlPlane/Subscribe"));
+
+    let subscribe = ProxySubscribeRequest {
+        input: Some(proxy_subscribe_request::Input::SubscribeRoute(
+            ProxySubscribeRouteRequest {
+                request_id: "request-1".to_owned(),
+                identity: Some(proto_http_identity(
+                    RouteHostKind::Exact,
+                    "app.example.com",
+                    Some("/"),
+                )),
+            },
+        )),
+    };
+    assert!(matches!(
+        subscribe.input,
+        Some(proxy_subscribe_request::Input::SubscribeRoute(_))
+    ));
 }
 
 #[tokio::test]
@@ -138,6 +163,285 @@ async fn native_grpc_request_dispatches_to_store_backed_proxy_wake_instance() {
     assert_eq!(ready.instance_generation, 3);
     assert_eq!(ready.backend_generation, 55);
     assert_eq!(client.applied_objects_len(), 2);
+}
+
+#[tokio::test]
+async fn native_grpc_request_dispatches_to_store_backed_proxy_subscribe() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("example.com", Some("/")),
+        domain_route_entry(
+            "route-transport",
+            "instance-transport",
+            DomainInstanceState::Running,
+        ),
+    );
+
+    let response = proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "request-transport",
+            proto_http_identity(RouteHostKind::Exact, "app.example.com", Some("/v1")),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("native gRPC request should route through proxy subscribe service");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert_eq!(status, "0");
+    let resolved = expect_route_resolved(single_message(messages));
+    assert_eq!(resolved.request_id, "request-transport");
+    assert!(!resolved.subscription_id.is_empty());
+    assert!(!resolved.subscription_id.contains("route-transport"));
+    assert!(!resolved.subscription_id.contains("instance-transport"));
+    assert!(!resolved.subscription_id.contains("example.com"));
+    assert_eq!(
+        resolved
+            .matched_identity
+            .as_ref()
+            .and_then(|identity| identity.kind.as_ref())
+            .and_then(|kind| match kind {
+                control_plane::api::pb::route_identity::Kind::Http(http) => http.host.as_ref(),
+                _ => None,
+            })
+            .map(|host| (host.kind, host.host.as_str())),
+        Some((RouteHostKind::WildcardSuffix as i32, "example.com"))
+    );
+}
+
+#[tokio::test]
+async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("service.example.com", Some("/api")),
+        domain_route_entry(
+            "route-resolved",
+            "instance-resolved",
+            DomainInstanceState::Cold,
+        ),
+    );
+
+    let response = proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "request-resolved",
+            proto_http_identity(RouteHostKind::Exact, "service.example.com", Some("/api/v1")),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert_eq!(status, "0");
+    let resolved = expect_route_resolved(single_message(messages));
+    assert_eq!(resolved.request_id, "request-resolved");
+    assert!(!resolved.subscription_id.is_empty());
+    assert!(!resolved.subscription_id.contains("route-resolved"));
+    assert!(!resolved.subscription_id.contains("instance-resolved"));
+    assert!(!resolved.subscription_id.contains("service.example.com"));
+    assert_eq!(
+        resolved.matched_identity,
+        Some(proto_http_identity(
+            RouteHostKind::WildcardSuffix,
+            "service.example.com",
+            Some("/api")
+        ))
+    );
+    assert_eq!(
+        resolved.route,
+        Some(ProxyRouteEntry {
+            route_binding_id: "route-resolved".to_owned(),
+            instance_id: "instance-resolved".to_owned(),
+            instance_state: InstanceState::Cold as i32,
+            instance_generation: 7,
+            backend_uri: Some("http://backend.example.local:8080".to_owned()),
+            backend_generation: Some(9),
+        })
+    );
+    assert_eq!(
+        resolved.cache_policy,
+        Some(ProxyCachePolicy { ttl_millis: 10_000 })
+    );
+}
+
+#[tokio::test]
+async fn proxy_subscribe_route_miss_returns_negative_cache_policy() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_miss(Duration::from_secs(5));
+    let request_identity = proto_http_identity(RouteHostKind::Exact, "missing.example.com", None);
+
+    let response = proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "request-miss",
+            request_identity.clone(),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert_eq!(status, "0");
+    let miss = expect_route_miss(single_message(messages));
+    assert_eq!(miss.request_id, "request-miss");
+    assert_eq!(miss.request_identity, Some(request_identity));
+    assert_eq!(
+        miss.negative_cache_policy,
+        Some(ProxyCachePolicy { ttl_millis: 5_000 })
+    );
+}
+
+#[tokio::test]
+async fn proxy_subscribe_unsubscribe_is_idempotent_and_unacknowledged() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("unsubscribe.example.com", None),
+        domain_route_entry(
+            "route-unsubscribe",
+            "instance-unsubscribe",
+            DomainInstanceState::Running,
+        ),
+    );
+
+    let response = proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![
+            subscribe_route_request(
+                "request-unsubscribe",
+                proto_http_identity(RouteHostKind::Exact, "unsubscribe.example.com", None),
+            ),
+            unsubscribe_request("sub:1"),
+            unsubscribe_request("sub:1"),
+            unsubscribe_request("unknown-subscription"),
+        ],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert_eq!(status, "0");
+    assert_eq!(messages.len(), 1, "unsubscribe does not produce an ack");
+    let resolved = expect_route_resolved(single_message(messages));
+    assert_eq!(resolved.request_id, "request-unsubscribe");
+}
+
+#[tokio::test]
+async fn proxy_subscribe_invalid_request_returns_invalid_argument() {
+    let response = proxy_grpc_service_with_store(
+        Arc::new(FakeWakeStore::default()),
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "",
+            proto_http_identity(RouteHostKind::Exact, "invalid.example.com", None),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert!(messages.is_empty());
+    assert_eq!(status, "3");
+}
+
+#[tokio::test]
+async fn proxy_subscribe_invalid_route_identity_returns_invalid_argument() {
+    let response = proxy_grpc_service_with_store(
+        Arc::new(FakeWakeStore::default()),
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "request-invalid-identity",
+            proto_http_identity(RouteHostKind::Unspecified, "invalid.example.com", None),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert!(messages.is_empty());
+    assert_eq!(status, "3");
+}
+
+#[tokio::test]
+async fn proxy_subscribe_store_unavailable_terminates_stream() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_error_unavailable("store is offline");
+
+    let response = proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "request-store-error",
+            proto_http_identity(RouteHostKind::Exact, "offline.example.com", None),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert!(messages.is_empty());
+    assert_eq!(status, "14");
+}
+
+#[tokio::test]
+async fn proxy_subscribe_store_internal_error_terminates_stream() {
+    let response = proxy_grpc_service_with_store(
+        Arc::new(FakeWakeStore::default()),
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(
+            "request-store-internal-error",
+            proto_http_identity(RouteHostKind::Exact, "internal.example.com", None),
+        )],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert!(messages.is_empty());
+    assert_eq!(status, "13");
 }
 
 #[tokio::test]
@@ -361,31 +665,81 @@ fn grpc_proxy_wake_request(
     )
 }
 
+fn grpc_proxy_subscribe_request(
+    requests: Vec<ProxySubscribeRequest>,
+    content_type: &'static str,
+    version: Version,
+) -> Request<Body> {
+    grpc_stream_request(
+        requests,
+        "/sleepypods.controlplane.v1.ProxyControlPlane/Subscribe",
+        content_type,
+        version,
+    )
+}
+
 fn grpc_unary_request<M: Message>(
     request: M,
     uri: &'static str,
     content_type: &'static str,
     version: Version,
 ) -> Request<Body> {
-    let mut message = BytesMut::new();
-    request.encode(&mut message).expect("request encodes");
+    grpc_stream_request(vec![request], uri, content_type, version)
+}
 
-    let mut frame = BytesMut::with_capacity(5 + message.len());
-    frame.put_u8(0);
-    frame.put_u32(message.len() as u32);
-    frame.extend_from_slice(&message);
+fn grpc_stream_request<M: Message>(
+    requests: Vec<M>,
+    uri: &'static str,
+    content_type: &'static str,
+    version: Version,
+) -> Request<Body> {
+    let mut body = BytesMut::new();
+    for request in requests {
+        encode_grpc_message(request, &mut body);
+    }
 
     Request::builder()
         .version(version)
         .method("POST")
         .uri(uri)
         .header(header::CONTENT_TYPE, content_type)
-        .body(Body::new(Full::new(frame.freeze())))
+        .body(Body::new(Full::new(body.freeze())))
         .expect("request builds")
+}
+
+fn encode_grpc_message<M: Message>(request: M, body: &mut BytesMut) {
+    let mut message = BytesMut::new();
+    request.encode(&mut message).expect("request encodes");
+
+    body.put_u8(0);
+    body.put_u32(message.len() as u32);
+    body.extend_from_slice(&message);
 }
 
 fn decode_grpc_proxy_wake_response(bytes: &[u8]) -> ProxyWakeInstanceResponse {
     decode_grpc_message(bytes)
+}
+
+async fn collect_grpc_proxy_subscribe_response(
+    response: HttpResponse<Body>,
+) -> (Vec<ProxySubscribeResponse>, String) {
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| headers.get("grpc-status"))
+        .expect("gRPC status is returned")
+        .to_str()
+        .expect("gRPC status is valid")
+        .to_owned();
+
+    (decode_grpc_messages(collected.to_bytes().as_ref()), status)
 }
 
 fn decode_grpc_message<M: Message + Default>(bytes: &[u8]) -> M {
@@ -398,11 +752,94 @@ fn decode_grpc_message<M: Message + Default>(bytes: &[u8]) -> M {
     M::decode(&bytes[5..5 + length]).expect("gRPC response decodes")
 }
 
+fn decode_grpc_messages<M: Message + Default>(bytes: &[u8]) -> Vec<M> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        assert_eq!(bytes.get(offset), Some(&0), "gRPC message is uncompressed");
+        let length = u32::from_be_bytes(
+            bytes[offset + 1..offset + 5]
+                .try_into()
+                .expect("gRPC response frame has a length prefix"),
+        ) as usize;
+        offset += 5;
+        messages.push(M::decode(&bytes[offset..offset + length]).expect("gRPC response decodes"));
+        offset += length;
+    }
+
+    messages
+}
+
+fn single_message(messages: Vec<ProxySubscribeResponse>) -> ProxySubscribeResponse {
+    assert_eq!(messages.len(), 1, "expected exactly one subscribe response");
+    messages
+        .into_iter()
+        .next()
+        .expect("one response is present")
+}
+
+fn subscribe_route_request(
+    request_id: &str,
+    identity: ProtoRouteIdentity,
+) -> ProxySubscribeRequest {
+    ProxySubscribeRequest {
+        input: Some(proxy_subscribe_request::Input::SubscribeRoute(
+            ProxySubscribeRouteRequest {
+                request_id: request_id.to_owned(),
+                identity: Some(identity),
+            },
+        )),
+    }
+}
+
+fn unsubscribe_request(subscription_id: &str) -> ProxySubscribeRequest {
+    ProxySubscribeRequest {
+        input: Some(proxy_subscribe_request::Input::Unsubscribe(
+            control_plane::api::pb::ProxyUnsubscribeRequest {
+                subscription_id: subscription_id.to_owned(),
+            },
+        )),
+    }
+}
+
+fn expect_route_resolved(response: ProxySubscribeResponse) -> ProxyRouteResolvedResponse {
+    let Some(proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output else {
+        panic!("expected route resolved response");
+    };
+    resolved
+}
+
+fn expect_route_miss(response: ProxySubscribeResponse) -> ProxyRouteMissResponse {
+    let Some(proxy_subscribe_response::Output::RouteMiss(miss)) = response.output else {
+        panic!("expected route miss response");
+    };
+    miss
+}
+
+fn proto_http_identity(
+    kind: RouteHostKind,
+    host: &str,
+    path_prefix: Option<&str>,
+) -> ProtoRouteIdentity {
+    ProtoRouteIdentity {
+        kind: Some(control_plane::api::pb::route_identity::Kind::Http(
+            HttpRouteIdentity {
+                host: Some(ProtoRouteHost {
+                    kind: kind as i32,
+                    host: host.to_owned(),
+                }),
+                path_prefix: path_prefix.map(str::to_owned),
+            },
+        )),
+    }
+}
+
 #[derive(Default)]
 struct FakeWakeStore {
     instance: Mutex<Option<InstanceRecord>>,
     workload_class: Mutex<Option<control_plane::WorkloadClassVersion>>,
     materializations: Mutex<Vec<MaterializationRecord>>,
+    route_resolution: Mutex<Option<FakeRouteResolution>>,
 }
 
 impl FakeWakeStore {
@@ -423,6 +860,45 @@ impl FakeWakeStore {
             .expect("fake store lock is available")
             .push(materialization);
     }
+
+    fn seed_route_resolved(&self, matched_identity: RouteIdentity, entry: RouteEntry) {
+        *self
+            .route_resolution
+            .lock()
+            .expect("fake store lock is available") = Some(FakeRouteResolution::Resolved {
+            matched_identity,
+            entry,
+        });
+    }
+
+    fn seed_route_miss(&self, ttl: Duration) {
+        *self
+            .route_resolution
+            .lock()
+            .expect("fake store lock is available") = Some(FakeRouteResolution::Miss {
+            negative_cache: CachePolicy::new(ttl),
+        });
+    }
+
+    fn seed_route_error_unavailable(&self, message: &str) {
+        *self
+            .route_resolution
+            .lock()
+            .expect("fake store lock is available") =
+            Some(FakeRouteResolution::Unavailable(message.to_owned()));
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FakeRouteResolution {
+    Resolved {
+        matched_identity: RouteIdentity,
+        entry: RouteEntry,
+    },
+    Miss {
+        negative_cache: CachePolicy,
+    },
+    Unavailable(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -524,7 +1000,29 @@ impl ControlPlaneStore for FakeWakeStore {
         &'a self,
         _identity: control_plane::RouteIdentity,
     ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            match self
+                .route_resolution
+                .lock()
+                .expect("fake store lock is available")
+                .clone()
+            {
+                Some(FakeRouteResolution::Resolved {
+                    matched_identity,
+                    entry,
+                }) => Ok(RouteResolution::Resolved {
+                    matched_identity,
+                    entry,
+                }),
+                Some(FakeRouteResolution::Miss { negative_cache }) => {
+                    Ok(RouteResolution::Miss { negative_cache })
+                }
+                Some(FakeRouteResolution::Unavailable(message)) => {
+                    Err(StoreError::unavailable(message))
+                }
+                None => Err(StoreError::internal("fake store method is not implemented")),
+            }
+        })
     }
 
     fn compare_and_swap_instance_state<'a>(
@@ -803,5 +1301,29 @@ fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationR
         ),
         backend_generation: BackendGeneration::new(generation),
         rendered_objects: Vec::new(),
+    }
+}
+
+fn domain_http_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
+    RouteIdentity::Http {
+        host: RouteHost::wildcard_suffix(host).expect("route host is valid"),
+        path: path_prefix.map(|path| PathPrefix::new(path).expect("path prefix is valid")),
+    }
+}
+
+fn domain_route_entry(
+    route_binding_id: &str,
+    instance_id: &str,
+    state: DomainInstanceState,
+) -> RouteEntry {
+    RouteEntry {
+        route_binding_id: RouteBindingId::new(route_binding_id).expect("route binding ID is valid"),
+        instance_id: InstanceId::new(instance_id).expect("instance ID is valid"),
+        instance_state: state,
+        instance_generation: Generation::new(7),
+        backend: Some(
+            BackendEndpoint::new("http://backend.example.local:8080").expect("backend is valid"),
+        ),
+        backend_generation: Some(BackendGeneration::new(9)),
     }
 }
