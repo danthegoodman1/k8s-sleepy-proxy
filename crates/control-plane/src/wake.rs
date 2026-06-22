@@ -9,12 +9,15 @@ use crate::{
     manifest::{render_manifests, ManifestRenderError, RenderManifestRequest},
     materialization::{
         CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
-        MaterializationRecord, MaterializationTarget, RenderedObjectRef,
+        MaterializationRecord, MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
+
+#[cfg(test)]
+use crate::materialization::RenderedObjectRef;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WakeInstanceRequest {
@@ -59,10 +62,18 @@ pub enum WakeInstanceError {
         instance: InstanceRecord,
         target: MaterializationTarget,
     },
-    WorkloadClassNotFound,
+    WorkloadClassNotFound {
+        instance: InstanceRecord,
+    },
     Store(StoreError),
-    Render(ManifestRenderError),
-    Materializer(MaterializerError),
+    Render {
+        instance: InstanceRecord,
+        source: ManifestRenderError,
+    },
+    Materializer {
+        instance: InstanceRecord,
+        source: MaterializerError,
+    },
 }
 
 pub async fn wake_instance<S, C>(
@@ -71,7 +82,7 @@ pub async fn wake_instance<S, C>(
     request: WakeInstanceRequest,
 ) -> Result<WakeInstanceResult, WakeInstanceError>
 where
-    S: ControlPlaneStore,
+    S: ControlPlaneStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     let instance = store
@@ -144,9 +155,14 @@ where
     {
         Ok(Some(workload_class)) => workload_class,
         Ok(None) => {
-            return Err(
-                fail_waking(store, &waking, WakeInstanceError::WorkloadClassNotFound).await,
-            );
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::WorkloadClassNotFound {
+                    instance: waking.clone(),
+                },
+            )
+            .await);
         }
         Err(error) => return Err(fail_waking_with_store_error(store, &waking, error).await),
     };
@@ -159,14 +175,30 @@ where
     }) {
         Ok(manifest) => manifest,
         Err(error) => {
-            return Err(fail_waking(store, &waking, WakeInstanceError::Render(error)).await);
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Render {
+                    instance: waking.clone(),
+                    source: error,
+                },
+            )
+            .await);
         }
     };
 
     let applied = match materializer.apply_manifest_until_ready(&manifest).await {
         Ok(applied) => applied,
         Err(error) => {
-            return Err(fail_waking(store, &waking, WakeInstanceError::Materializer(error)).await);
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Materializer {
+                    instance: waking.clone(),
+                    source: error,
+                },
+            )
+            .await);
         }
     };
 
@@ -210,6 +242,7 @@ impl WakeInstanceRequest {
 }
 
 impl WakeInstanceResult {
+    #[cfg(test)]
     pub fn instance(&self) -> &InstanceRecord {
         match self {
             Self::Completed { result } => &result.instance,
@@ -217,6 +250,7 @@ impl WakeInstanceResult {
         }
     }
 
+    #[cfg(test)]
     pub fn rendered_objects(&self) -> &[RenderedObjectRef] {
         match self {
             Self::Completed { result } => &result.materialization.rendered_objects,
@@ -246,7 +280,7 @@ async fn fail_waking<S>(
     original: WakeInstanceError,
 ) -> WakeInstanceError
 where
-    S: ControlPlaneStore,
+    S: ControlPlaneStore + ?Sized,
 {
     best_effort_mark_failed(store, waking, failure_message(&original)).await;
     original
@@ -258,7 +292,7 @@ async fn fail_waking_with_store_error<S>(
     error: StoreError,
 ) -> WakeInstanceError
 where
-    S: ControlPlaneStore,
+    S: ControlPlaneStore + ?Sized,
 {
     let mapped = map_store_error(error);
     fail_waking(store, waking, mapped).await
@@ -266,7 +300,7 @@ where
 
 async fn best_effort_mark_failed<S>(store: &S, waking: &InstanceRecord, message: String)
 where
-    S: ControlPlaneStore,
+    S: ControlPlaneStore + ?Sized,
 {
     let request = CompareAndSwapInstanceStateRequest::new(
         waking.id.clone(),
@@ -279,9 +313,13 @@ where
 
 fn failure_message(error: &WakeInstanceError) -> String {
     match error {
-        WakeInstanceError::WorkloadClassNotFound => "workload class version not found".to_owned(),
-        WakeInstanceError::Render(error) => format!("manifest render failed: {error}"),
-        WakeInstanceError::Materializer(error) => format!("materialization failed: {error}"),
+        WakeInstanceError::WorkloadClassNotFound { .. } => {
+            "workload class version not found".to_owned()
+        }
+        WakeInstanceError::Render { source, .. } => format!("manifest render failed: {source}"),
+        WakeInstanceError::Materializer { source, .. } => {
+            format!("materialization failed: {source}")
+        }
         WakeInstanceError::Store(error) => format!("store operation failed: {error}"),
         WakeInstanceError::NotFound => "instance not found".to_owned(),
         WakeInstanceError::GenerationConflict { expected, actual } => {
@@ -317,10 +355,12 @@ impl fmt::Display for WakeInstanceError {
                 target.cluster_id(),
                 target.namespace()
             ),
-            Self::WorkloadClassNotFound => f.write_str("workload class version not found"),
+            Self::WorkloadClassNotFound { .. } => f.write_str("workload class version not found"),
             Self::Store(error) => write!(f, "wake store operation failed: {error}"),
-            Self::Render(error) => write!(f, "wake manifest render failed: {error}"),
-            Self::Materializer(error) => write!(f, "wake materializer failed: {error}"),
+            Self::Render { source, .. } => write!(f, "wake manifest render failed: {source}"),
+            Self::Materializer { source, .. } => {
+                write!(f, "wake materializer failed: {source}")
+            }
         }
     }
 }
@@ -329,13 +369,13 @@ impl Error for WakeInstanceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(error) => Some(error),
-            Self::Render(error) => Some(error),
-            Self::Materializer(error) => Some(error),
+            Self::Render { source, .. } => Some(source),
+            Self::Materializer { source, .. } => Some(source),
             Self::NotFound
             | Self::GenerationConflict { .. }
             | Self::Unavailable { .. }
             | Self::ReadyMaterializationNotFound { .. }
-            | Self::WorkloadClassNotFound => None,
+            | Self::WorkloadClassNotFound { .. } => None,
         }
     }
 }

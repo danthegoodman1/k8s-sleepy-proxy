@@ -21,6 +21,59 @@ service OperatorControlPlane {
   rpc ExpireHttp01Challenges(ExpireHttp01ChallengesRequest) returns (ExpireHttp01ChallengesResponse);
 }
 
+// ProxyControlPlane is a native-gRPC-only proxy control-plane surface. It is
+// intentionally separate from OperatorControlPlane so proxy wake traffic does
+// not expand the operator/gRPC-Web API. Proxy Subscribe remains future
+// native-gRPC-only work and is not part of this phase.
+service ProxyControlPlane {
+  rpc WakeInstance(ProxyWakeInstanceRequest) returns (ProxyWakeInstanceResponse);
+}
+
+message ProxyWakeInstanceRequest {
+  string instance_id = 1;
+  uint64 expected_generation = 2;
+  optional uint64 backend_generation = 3;
+}
+
+message ProxyWakeInstanceResponse {
+  oneof outcome {
+    ProxyWakeReadyResult ready = 1;
+    ProxyWakeStillWakingResult still_waking = 2;
+    ProxyWakeUnavailableResult unavailable = 3;
+    ProxyWakeGenerationConflictResult generation_conflict = 4;
+  }
+}
+
+message ProxyWakeReadyResult {
+  string instance_id = 1;
+  uint64 instance_generation = 2;
+  string backend_uri = 3;
+  uint64 backend_generation = 4;
+}
+
+message ProxyWakeStillWakingResult {
+  string instance_id = 1;
+  uint64 instance_generation = 2;
+}
+
+message ProxyWakeUnavailableResult {
+  string instance_id = 1;
+  uint64 instance_generation = 2;
+  ProxyWakeUnavailableReason reason = 3;
+}
+
+enum ProxyWakeUnavailableReason {
+  PROXY_WAKE_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  PROXY_WAKE_UNAVAILABLE_REASON_DELETING = 1;
+  PROXY_WAKE_UNAVAILABLE_REASON_DELETED = 2;
+}
+
+message ProxyWakeGenerationConflictResult {
+  string instance_id = 1;
+  uint64 expected_generation = 2;
+  uint64 actual_generation = 3;
+}
+
 message WorkloadClassVersionRef {
   string class_id = 1;
   uint64 version = 2;

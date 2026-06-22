@@ -633,6 +633,7 @@ fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
     assert!(OPERATOR_UNARY_METHODS.contains(&"GetRouteBinding"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteRouteBinding"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
+    assert!(!OPERATOR_UNARY_METHODS.contains(&"WakeInstance"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"Subscribe"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveRoute"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"LookupRouteDependencies"));

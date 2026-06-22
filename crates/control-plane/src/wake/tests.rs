@@ -422,7 +422,7 @@ async fn render_failure_marks_waking_generation_failed_without_apply() {
     .await
     .expect_err("invalid namespace fails render");
 
-    assert!(matches!(error, WakeInstanceError::Render(_)));
+    assert!(matches!(error, WakeInstanceError::Render { .. }));
     assert_eq!(store.instance().state, InstanceState::Failed);
     assert_eq!(store.instance().generation, Generation::new(6));
     assert_eq!(
@@ -468,7 +468,7 @@ async fn materializer_failure_marks_waking_generation_failed() {
     .await
     .expect_err("readiness failure fails wake");
 
-    assert!(matches!(error, WakeInstanceError::Materializer(_)));
+    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
     assert_eq!(store.instance().state, InstanceState::Failed);
     assert_eq!(store.instance().generation, Generation::new(8));
     assert_eq!(client.applied_objects().len(), 2);
