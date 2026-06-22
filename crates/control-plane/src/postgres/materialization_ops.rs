@@ -2,7 +2,11 @@ use deadpool_postgres::GenericClient;
 
 use crate::{
     ids::Generation,
-    materialization::{MaterializationRecord, RecordMaterializationRequest},
+    instance::{validate_instance_state_transition, InstanceState, StateTransitionReason},
+    materialization::{
+        CompleteWakeRequest, CompleteWakeResult, MaterializationRecord, MaterializationState,
+        RecordMaterializationRequest,
+    },
     store::{StoreError, StoreResult},
 };
 
@@ -10,8 +14,9 @@ use super::{
     connection::PostgresStore,
     error::map_postgres_error,
     mapping::{
-        backend_generation_to_i64, generation_to_i64, materialization_from_row, materialization_id,
-        materialization_state_to_db, rendered_objects_to_json,
+        backend_generation_to_i64, generation_to_i64, instance_from_row, instance_state_to_db,
+        materialization_from_row, materialization_id, materialization_state_to_db,
+        rendered_objects_to_json,
     },
 };
 
@@ -22,7 +27,95 @@ pub(crate) async fn record_materialization(
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     ensure_instance_generation(&transaction, &request).await?;
+    let record = upsert_materialization(&transaction, &request).await?;
+    transaction.commit().await.map_err(map_postgres_error)?;
 
+    Ok(record)
+}
+
+pub(crate) async fn complete_wake(
+    store: &PostgresStore,
+    request: CompleteWakeRequest,
+) -> StoreResult<CompleteWakeResult> {
+    let mut client = store.client().await?;
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    let instance_id = request.instance_id.as_str();
+    let current = transaction
+        .query_opt(
+            "
+            SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
+            FROM instances
+            WHERE instance_id = $1
+            FOR UPDATE
+            ",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(row) = current else {
+        return Err(StoreError::NotFound {
+            resource: "instance",
+        });
+    };
+    let current = instance_from_row(&row)?;
+
+    if current.generation != request.expected_waking_generation {
+        return Err(StoreError::GenerationConflict {
+            expected: request.expected_waking_generation,
+            actual: current.generation,
+        });
+    }
+
+    validate_instance_state_transition(
+        current.state,
+        InstanceState::Running,
+        &StateTransitionReason::MaterializationReady,
+    )
+    .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+
+    let running_generation = request.expected_waking_generation.next();
+    let running_generation_db = generation_to_i64(running_generation)?;
+    let running_state = instance_state_to_db(InstanceState::Running);
+    let row = transaction
+        .query_one(
+            "
+            UPDATE instances
+            SET state = $2,
+                generation = $3,
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1
+            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
+            ",
+            &[&instance_id, &running_state, &running_generation_db],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let instance = instance_from_row(&row)?;
+
+    let mut materialization_request = RecordMaterializationRequest::new(
+        request.instance_id,
+        running_generation,
+        request.target,
+        MaterializationState::Ready,
+        request.backend_generation,
+    );
+    materialization_request.backend = Some(request.backend);
+    materialization_request.rendered_objects = request.rendered_objects;
+    let materialization = upsert_materialization(&transaction, &materialization_request).await?;
+
+    transaction.commit().await.map_err(map_postgres_error)?;
+
+    Ok(CompleteWakeResult {
+        instance,
+        materialization,
+    })
+}
+
+async fn upsert_materialization(
+    client: &impl GenericClient,
+    request: &RecordMaterializationRequest,
+) -> StoreResult<MaterializationRecord> {
     let id = materialization_id(&request.instance_id, &request.target)?;
     let instance_id = request.instance_id.as_str();
     let instance_generation = generation_to_i64(request.instance_generation)?;
@@ -34,7 +127,7 @@ pub(crate) async fn record_materialization(
     let rendered_objects = rendered_objects_to_json(&request.rendered_objects);
     let materialization_id = id.as_str();
 
-    let row = transaction
+    let row = client
         .query_opt(
             "
             INSERT INTO materializations (
@@ -79,7 +172,7 @@ pub(crate) async fn record_materialization(
 
     let Some(row) = row else {
         return Err(backend_generation_rewind_error(
-            &transaction,
+            client,
             instance_id,
             cluster_id,
             namespace,
@@ -88,10 +181,7 @@ pub(crate) async fn record_materialization(
         .await);
     };
 
-    let record = materialization_from_row(&row)?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-
-    Ok(record)
+    materialization_from_row(&row)
 }
 
 async fn ensure_instance_generation(

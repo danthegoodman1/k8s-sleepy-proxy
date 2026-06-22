@@ -45,8 +45,8 @@ pub use manifest::{
     VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind, WorkloadTemplate,
 };
 pub use materialization::{
-    BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
-    RecordMaterializationRequest, RenderedObjectRef,
+    BackendEndpoint, CompleteWakeRequest, CompleteWakeResult, MaterializationRecord,
+    MaterializationState, MaterializationTarget, RecordMaterializationRequest, RenderedObjectRef,
 };
 pub use materializer::{
     rendered_object_ref, AppliedMaterialization, KubernetesClientError, KubernetesClientFuture,

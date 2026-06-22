@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 use crate::ids::{
     BackendGeneration, EmptyStringError, Generation, InstanceId, MaterializationId, NonEmptyString,
 };
+use crate::instance::InstanceRecord;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationRecord {
@@ -25,6 +26,22 @@ pub struct RecordMaterializationRequest {
     pub backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteWakeRequest {
+    pub instance_id: InstanceId,
+    pub expected_waking_generation: Generation,
+    pub target: MaterializationTarget,
+    pub backend: BackendEndpoint,
+    pub backend_generation: BackendGeneration,
+    pub rendered_objects: Vec<RenderedObjectRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteWakeResult {
+    pub instance: InstanceRecord,
+    pub materialization: MaterializationRecord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +91,25 @@ impl RecordMaterializationRequest {
             target,
             state,
             backend: None,
+            backend_generation,
+            rendered_objects: Vec::new(),
+        }
+    }
+}
+
+impl CompleteWakeRequest {
+    pub fn new(
+        instance_id: InstanceId,
+        expected_waking_generation: Generation,
+        target: MaterializationTarget,
+        backend: BackendEndpoint,
+        backend_generation: BackendGeneration,
+    ) -> Self {
+        Self {
+            instance_id,
+            expected_waking_generation,
+            target,
+            backend,
             backend_generation,
             rendered_objects: Vec::new(),
         }

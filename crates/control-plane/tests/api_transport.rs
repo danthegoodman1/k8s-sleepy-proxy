@@ -1001,6 +1001,13 @@ impl ControlPlaneStore for FakeInstanceStore {
         Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
     }
 
+    fn complete_wake<'a>(
+        &'a self,
+        _request: control_plane::CompleteWakeRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::CompleteWakeResult>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
     fn lookup_route_dependencies<'a>(
         &'a self,
         _request: control_plane::RouteDependencyLookup,

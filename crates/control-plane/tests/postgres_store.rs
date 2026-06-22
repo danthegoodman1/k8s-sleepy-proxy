@@ -6,17 +6,18 @@ use std::{
 
 use control_plane::{
     render_manifests, BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest,
-    ContainerPortTemplate, ContainerTemplate, ControlPlaneStore, CreateInstanceRequest,
-    CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
-    DeleteRouteBindingRequest, EnvVarTemplate, ExpireHttp01ChallengesRequest, Generation,
-    GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey, InstanceId,
-    InstanceState, ManifestTemplate, MaterializationState, MaterializationTarget, PathPrefix,
-    PostgresStore, PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest,
-    RecordMaterializationRequest, RenderManifestRequest, RenderedObjectRef, RouteBindingId,
-    RouteBindingSpec, RouteDependencyLookup, RouteHost, RouteIdentity, RouteResolution,
-    ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason, StoreError,
-    TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion, WorkloadClassVersionRef,
-    WorkloadKind, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    CompleteWakeRequest, ContainerPortTemplate, ContainerTemplate, ControlPlaneStore,
+    CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
+    DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
+    ExpireHttp01ChallengesRequest, Generation, GetInstanceRequest, GetRouteBindingRequest,
+    Http01ChallengeKey, IdempotencyKey, InstanceId, InstanceState, ManifestTemplate,
+    MaterializationState, MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig,
+    ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest, RenderManifestRequest,
+    RenderedObjectRef, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
+    RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+    StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
+    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -287,6 +288,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
 
     exercise_route_bindings(store, class.reference.clone()).await?;
     exercise_instance_lifecycle(store, class.reference.clone()).await?;
+    exercise_complete_wake(store, class.reference.clone()).await?;
 
     let delete_target = store
         .create_instance(create_instance_request(
@@ -896,6 +898,300 @@ async fn wake_to_running(
             StateTransitionReason::MaterializationReady,
         ))
         .await
+}
+
+async fn exercise_complete_wake(
+    store: &PostgresStore,
+    workload_class: WorkloadClassVersionRef,
+) -> Result<(), StoreError> {
+    let success = store
+        .create_instance(create_instance_request(
+            "idem-complete-wake-success",
+            "instance-complete-wake-success",
+            workload_class.clone(),
+            vec![http_route("complete-wake.example.com", None)],
+        ))
+        .await?;
+    let instance_id = success.instance.id.clone();
+    let route_binding_id = success.route_bindings[0].id.clone();
+    let waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            instance_id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    assert_eq!(waking.state, InstanceState::Waking);
+    assert_eq!(waking.generation, Generation::new(1));
+
+    let target = MaterializationTarget::new("cluster-complete", "apps").expect("valid target");
+    let pending = RecordMaterializationRequest::new(
+        instance_id.clone(),
+        waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(6),
+    );
+    let pending_record = store.record_materialization(pending).await?;
+    assert_eq!(pending_record.instance_generation, Generation::new(1));
+    assert_eq!(pending_record.backend_generation, BackendGeneration::new(6));
+
+    let rendered_objects = vec![
+        RenderedObjectRef {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: "apps".to_owned(),
+            name: "instance-complete-wake-success".to_owned(),
+        },
+        RenderedObjectRef {
+            api_version: "v1".to_owned(),
+            kind: "Service".to_owned(),
+            namespace: "apps".to_owned(),
+            name: "instance-complete-wake-success".to_owned(),
+        },
+    ];
+    let mut complete = CompleteWakeRequest::new(
+        instance_id.clone(),
+        waking.generation,
+        target.clone(),
+        BackendEndpoint::new("http://10.0.0.20:8080").expect("valid backend"),
+        BackendGeneration::new(7),
+    );
+    complete.rendered_objects = rendered_objects.clone();
+    let completed = store.complete_wake(complete).await?;
+    assert_eq!(completed.instance.id, instance_id);
+    assert_eq!(completed.instance.state, InstanceState::Running);
+    assert_eq!(completed.instance.generation, Generation::new(2));
+    assert_eq!(completed.materialization.instance_id, completed.instance.id);
+    assert_eq!(
+        completed.materialization.instance_generation,
+        completed.instance.generation
+    );
+    assert_eq!(completed.materialization.target, target);
+    assert_eq!(completed.materialization.state, MaterializationState::Ready);
+    assert_eq!(
+        completed.materialization.backend_generation,
+        BackendGeneration::new(7)
+    );
+    assert_eq!(
+        completed
+            .materialization
+            .backend
+            .as_ref()
+            .map(BackendEndpoint::uri),
+        Some("http://10.0.0.20:8080")
+    );
+    assert_eq!(completed.materialization.rendered_objects, rendered_objects);
+
+    match store
+        .resolve_route(http_identity("complete-wake.example.com", None))
+        .await?
+    {
+        RouteResolution::Resolved(entry) => {
+            assert_eq!(entry.route_binding_id, route_binding_id);
+            assert_eq!(entry.instance_id, completed.instance.id);
+            assert_eq!(entry.instance_state, InstanceState::Running);
+            assert_eq!(entry.instance_generation, Generation::new(2));
+            assert_eq!(
+                entry.backend.as_ref().map(BackendEndpoint::uri),
+                Some("http://10.0.0.20:8080")
+            );
+            assert_eq!(entry.backend_generation, Some(BackendGeneration::new(7)));
+        }
+        RouteResolution::Miss { .. } => panic!("route should resolve after complete_wake"),
+    }
+    let dependencies = store
+        .lookup_route_dependencies(RouteDependencyLookup::new(route_binding_id))
+        .await?
+        .expect("route dependencies load after complete_wake");
+    assert_eq!(
+        dependencies.materialization_generation,
+        Some(BackendGeneration::new(7))
+    );
+
+    let stale = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-complete-wake-stale",
+        "instance-complete-wake-stale",
+    )
+    .await?;
+    let stale_id = stale.instance.id.clone();
+    store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            stale_id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let stale_target =
+        MaterializationTarget::new("cluster-complete", "stale").expect("valid target");
+    let stale_error = store
+        .complete_wake(CompleteWakeRequest::new(
+            stale_id.clone(),
+            Generation::new(0),
+            stale_target.clone(),
+            BackendEndpoint::new("http://10.0.0.30:8080").expect("valid backend"),
+            BackendGeneration::new(5),
+        ))
+        .await
+        .expect_err("stale complete_wake generation is rejected");
+    match stale_error {
+        StoreError::GenerationConflict { expected, actual } => {
+            assert_eq!(expected, Generation::new(0));
+            assert_eq!(actual, Generation::new(1));
+        }
+        other => panic!("expected stale complete_wake generation conflict, got {other}"),
+    }
+    let stale_after = store
+        .get_instance(GetInstanceRequest::new(stale_id.clone()))
+        .await?
+        .expect("stale complete_wake target still exists");
+    assert_eq!(stale_after.state, InstanceState::Waking);
+    assert_eq!(stale_after.generation, Generation::new(1));
+    let stale_probe = RecordMaterializationRequest::new(
+        stale_id,
+        Generation::new(1),
+        stale_target,
+        MaterializationState::Pending,
+        BackendGeneration::new(4),
+    );
+    let stale_probe_record = store.record_materialization(stale_probe).await?;
+    assert_eq!(
+        stale_probe_record.backend_generation,
+        BackendGeneration::new(4)
+    );
+
+    let cold = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-complete-wake-cold",
+        "instance-complete-wake-cold",
+    )
+    .await?;
+    let cold_id = cold.instance.id.clone();
+    let cold_target = MaterializationTarget::new("cluster-complete", "cold").expect("valid target");
+    let cold_error = store
+        .complete_wake(CompleteWakeRequest::new(
+            cold_id.clone(),
+            Generation::new(0),
+            cold_target.clone(),
+            BackendEndpoint::new("http://10.0.0.31:8080").expect("valid backend"),
+            BackendGeneration::new(3),
+        ))
+        .await
+        .expect_err("cold instances cannot complete wake");
+    assert!(matches!(cold_error, StoreError::InvalidArgument { .. }));
+    let cold_after = store
+        .get_instance(GetInstanceRequest::new(cold_id.clone()))
+        .await?
+        .expect("cold complete_wake target still exists");
+    assert_eq!(cold_after.state, InstanceState::Cold);
+    assert_eq!(cold_after.generation, Generation::new(0));
+    let cold_probe = RecordMaterializationRequest::new(
+        cold_id,
+        Generation::new(0),
+        cold_target,
+        MaterializationState::Pending,
+        BackendGeneration::new(2),
+    );
+    let cold_probe_record = store.record_materialization(cold_probe).await?;
+    assert_eq!(
+        cold_probe_record.backend_generation,
+        BackendGeneration::new(2)
+    );
+
+    let rewind = store
+        .create_instance(create_instance_request(
+            "idem-complete-wake-rewind",
+            "instance-complete-wake-rewind",
+            workload_class,
+            vec![http_route("complete-wake-rewind.example.com", None)],
+        ))
+        .await?;
+    let rewind_id = rewind.instance.id.clone();
+    let rewind_route_binding_id = rewind.route_bindings[0].id.clone();
+    store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            rewind_id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let rewind_target =
+        MaterializationTarget::new("cluster-complete", "rewind").expect("valid target");
+    let mut old_ready = RecordMaterializationRequest::new(
+        rewind_id.clone(),
+        Generation::new(1),
+        rewind_target.clone(),
+        MaterializationState::Ready,
+        BackendGeneration::new(9),
+    );
+    old_ready.backend = Some(BackendEndpoint::new("http://10.0.0.40:8080").expect("valid backend"));
+    old_ready.rendered_objects = vec![RenderedObjectRef {
+        api_version: "apps/v1".to_owned(),
+        kind: "Deployment".to_owned(),
+        namespace: "rewind".to_owned(),
+        name: "old-ready".to_owned(),
+    }];
+    store.record_materialization(old_ready).await?;
+    let rewind_error = store
+        .complete_wake(CompleteWakeRequest::new(
+            rewind_id.clone(),
+            Generation::new(1),
+            rewind_target.clone(),
+            BackendEndpoint::new("http://10.0.0.41:8080").expect("valid backend"),
+            BackendGeneration::new(8),
+        ))
+        .await
+        .expect_err("complete_wake rejects backend generation rewinds");
+    match rewind_error {
+        StoreError::InvalidArgument { message } => {
+            assert!(message.contains("backend generation rewind"));
+        }
+        other => panic!("expected backend rewind invalid argument, got {other}"),
+    }
+    let rewind_after = store
+        .get_instance(GetInstanceRequest::new(rewind_id.clone()))
+        .await?
+        .expect("rewind complete_wake target still exists");
+    assert_eq!(rewind_after.state, InstanceState::Waking);
+    assert_eq!(rewind_after.generation, Generation::new(1));
+    match store
+        .resolve_route(http_identity("complete-wake-rewind.example.com", None))
+        .await?
+    {
+        RouteResolution::Resolved(entry) => {
+            assert_eq!(entry.route_binding_id, rewind_route_binding_id);
+            assert_eq!(entry.instance_state, InstanceState::Waking);
+            assert_eq!(entry.instance_generation, Generation::new(1));
+            assert_eq!(
+                entry.backend.as_ref().map(BackendEndpoint::uri),
+                Some("http://10.0.0.40:8080")
+            );
+            assert_eq!(entry.backend_generation, Some(BackendGeneration::new(9)));
+        }
+        RouteResolution::Miss { .. } => {
+            panic!("route should still resolve to the unchanged old materialization")
+        }
+    }
+    let lower_backend_generation = RecordMaterializationRequest::new(
+        rewind_id,
+        Generation::new(1),
+        rewind_target,
+        MaterializationState::Ready,
+        BackendGeneration::new(8),
+    );
+    let lower_error = store
+        .record_materialization(lower_backend_generation)
+        .await
+        .expect_err("old materialization backend generation remains newer");
+    assert!(matches!(lower_error, StoreError::InvalidArgument { .. }));
+
+    Ok(())
 }
 
 async fn exercise_route_bindings(
