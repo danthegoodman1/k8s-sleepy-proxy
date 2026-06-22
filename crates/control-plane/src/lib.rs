@@ -45,8 +45,9 @@ pub use materialization::{
     RecordMaterializationRequest, RenderedObjectRef,
 };
 pub use materializer::{
-    rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
-    KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError,
+    rendered_object_ref, AppliedMaterialization, KubernetesClientError, KubernetesClientFuture,
+    KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
+    MaterializerError,
 };
 pub use postgres::PostgresStore;
 pub use route::{

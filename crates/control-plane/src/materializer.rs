@@ -2,7 +2,7 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use crate::{
     manifest::{ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject},
-    materialization::RenderedObjectRef,
+    materialization::{BackendEndpoint, RenderedObjectRef},
 };
 
 pub type KubernetesClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -24,6 +24,11 @@ pub trait KubernetesMaterializerClient: Send + Sync {
         namespace: &'a str,
         name: &'a str,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>>;
+
+    fn wait_for_readiness<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>>;
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +39,12 @@ pub struct KubernetesMaterializer<C> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KubernetesClientError {
     message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedMaterialization {
+    pub rendered_objects: Vec<RenderedObjectRef>,
+    pub backend: BackendEndpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +62,10 @@ pub enum MaterializerError {
         name: String,
         source: KubernetesClientError,
     },
+    ReadinessWait {
+        rendered_objects: Vec<RenderedObjectRef>,
+        source: KubernetesClientError,
+    },
 }
 
 impl<C> KubernetesMaterializer<C>
@@ -63,6 +78,26 @@ where
 
     pub fn client(&self) -> &C {
         &self.client
+    }
+
+    pub async fn apply_manifest_until_ready(
+        &self,
+        manifest: &RenderedManifest,
+    ) -> Result<AppliedMaterialization, MaterializerError> {
+        let rendered_objects = self.apply_manifest(manifest).await?;
+        let backend = self
+            .client
+            .wait_for_readiness(&rendered_objects)
+            .await
+            .map_err(|source| MaterializerError::ReadinessWait {
+                rendered_objects: rendered_objects.clone(),
+                source,
+            })?;
+
+        Ok(AppliedMaterialization {
+            rendered_objects,
+            backend,
+        })
     }
 
     pub async fn apply_manifest(
@@ -218,6 +253,14 @@ impl fmt::Display for MaterializerError {
                 f,
                 "failed waiting for PersistentVolumeClaim {namespace}/{name} to become Bound: {source}"
             ),
+            Self::ReadinessWait {
+                rendered_objects,
+                source,
+            } => write!(
+                f,
+                "failed waiting for readiness across {} rendered Kubernetes objects: {source}",
+                rendered_objects.len()
+            ),
         }
     }
 }
@@ -227,7 +270,8 @@ impl Error for MaterializerError {
         match self {
             Self::Apply { source, .. }
             | Self::Delete { source, .. }
-            | Self::PvcBoundWait { source, .. } => Some(source),
+            | Self::PvcBoundWait { source, .. }
+            | Self::ReadinessWait { source, .. } => Some(source),
         }
     }
 }
@@ -253,8 +297,9 @@ mod tests {
     };
 
     use super::{
-        rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
-        KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError, RenderedObjectRef,
+        rendered_object_ref, AppliedMaterialization, BackendEndpoint, KubernetesClientError,
+        KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
+        KubernetesMaterializerClient, MaterializerError, RenderedObjectRef,
     };
 
     #[derive(Clone, Debug, Default)]
@@ -266,15 +311,18 @@ mod tests {
     struct FakeState {
         operations: Vec<FakeOperation>,
         applied_objects: Vec<KubernetesObject>,
+        readiness_backend: Option<BackendEndpoint>,
         fail_pvc_wait: Option<(String, String)>,
         fail_delete: Option<RenderedObjectRef>,
         fail_apply: Option<RenderedObjectRef>,
+        fail_readiness: bool,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum FakeOperation {
         Apply(RenderedObjectRef),
         WaitPvcBound { namespace: String, name: String },
+        WaitReadiness(Vec<RenderedObjectRef>),
         Delete(RenderedObjectRef),
     }
 
@@ -353,6 +401,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applies_deployment_manifest_until_ready_after_all_objects_and_returns_backend() {
+        let client = FakeKubernetesClient::default();
+        let backend = backend_endpoint("http://svc-acme.apps.svc.cluster.local:80");
+        client.set_readiness_backend(backend.clone());
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let manifest = deployment_manifest();
+        let refs = vec![
+            object_ref("v1", "Service", "apps", "svc-acme"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+        ];
+
+        let applied = materializer
+            .apply_manifest_until_ready(&manifest)
+            .await
+            .expect("deployment manifest applies and becomes ready");
+
+        assert_eq!(
+            applied,
+            AppliedMaterialization {
+                rendered_objects: refs.clone(),
+                backend
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(refs[0].clone()),
+                FakeOperation::Apply(refs[1].clone()),
+                FakeOperation::WaitReadiness(refs),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn applies_stateful_manifest_until_ready_after_pvc_bound_service_and_workload() {
+        let client = FakeKubernetesClient::default();
+        let backend = backend_endpoint("tcp://db-acme.data.svc.cluster.local:5432");
+        client.set_readiness_backend(backend.clone());
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let manifest = stateful_manifest();
+        let refs = vec![
+            object_ref("v1", "PersistentVolume", "", "pv-acme"),
+            object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
+            object_ref("v1", "Service", "data", "db-acme"),
+            object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+        ];
+
+        let applied = materializer
+            .apply_manifest_until_ready(&manifest)
+            .await
+            .expect("stateful manifest applies and becomes ready");
+
+        assert_eq!(
+            applied,
+            AppliedMaterialization {
+                rendered_objects: refs.clone(),
+                backend
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(refs[0].clone()),
+                FakeOperation::Apply(refs[1].clone()),
+                FakeOperation::WaitPvcBound {
+                    namespace: "data".to_owned(),
+                    name: "pvc-acme".to_owned(),
+                },
+                FakeOperation::Apply(refs[2].clone()),
+                FakeOperation::Apply(refs[3].clone()),
+                FakeOperation::WaitReadiness(refs),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn apply_failure_returns_typed_error_for_failed_object() {
         let client = FakeKubernetesClient::default();
         let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
@@ -407,6 +531,75 @@ mod tests {
                     namespace: "data".to_owned(),
                     name: "pvc-acme".to_owned(),
                 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pvc_bound_wait_failure_prevents_readiness_wait() {
+        let client = FakeKubernetesClient::default();
+        client.fail_pvc_wait("data", "pvc-acme");
+        let materializer = KubernetesMaterializer::new(client.clone());
+
+        let error = materializer
+            .apply_manifest_until_ready(&stateful_manifest())
+            .await
+            .expect_err("pvc wait failure stops ready materialization");
+
+        assert_eq!(
+            error,
+            MaterializerError::PvcBoundWait {
+                namespace: "data".to_owned(),
+                name: "pvc-acme".to_owned(),
+                source: KubernetesClientError::new("pvc did not bind"),
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Apply(object_ref(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    "data",
+                    "pvc-acme"
+                )),
+                FakeOperation::WaitPvcBound {
+                    namespace: "data".to_owned(),
+                    name: "pvc-acme".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_failure_returns_typed_error_with_rendered_refs() {
+        let client = FakeKubernetesClient::default();
+        client.fail_readiness();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let refs = vec![
+            object_ref("v1", "Service", "apps", "svc-acme"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+        ];
+
+        let error = materializer
+            .apply_manifest_until_ready(&deployment_manifest())
+            .await
+            .expect_err("readiness wait failure stops ready materialization");
+
+        assert_eq!(
+            error,
+            MaterializerError::ReadinessWait {
+                rendered_objects: refs.clone(),
+                source: KubernetesClientError::new("readiness wait failed"),
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(refs[0].clone()),
+                FakeOperation::Apply(refs[1].clone()),
+                FakeOperation::WaitReadiness(refs),
             ]
         );
     }
@@ -570,6 +763,27 @@ mod tests {
                 }
             })
         }
+
+        fn wait_for_readiness<'a>(
+            &'a self,
+            objects: &'a [RenderedObjectRef],
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
+            let objects = objects.to_vec();
+            let client = self.clone();
+            Box::pin(async move {
+                let mut inner = client.inner.lock().expect("fake client lock not poisoned");
+                inner.operations.push(FakeOperation::WaitReadiness(objects));
+
+                if inner.fail_readiness {
+                    Err(KubernetesClientError::new("readiness wait failed"))
+                } else {
+                    Ok(inner
+                        .readiness_backend
+                        .clone()
+                        .unwrap_or_else(default_backend_endpoint))
+                }
+            })
+        }
     }
 
     impl FakeKubernetesClient {
@@ -608,6 +822,20 @@ mod tests {
                 .lock()
                 .expect("fake client lock not poisoned")
                 .fail_delete = Some(object);
+        }
+
+        fn set_readiness_backend(&self, backend: BackendEndpoint) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .readiness_backend = Some(backend);
+        }
+
+        fn fail_readiness(&self) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .fail_readiness = true;
         }
     }
 
@@ -727,6 +955,14 @@ mod tests {
             namespace: namespace.to_owned(),
             name: name.to_owned(),
         }
+    }
+
+    fn backend_endpoint(uri: &str) -> BackendEndpoint {
+        BackendEndpoint::new(uri).expect("valid backend endpoint")
+    }
+
+    fn default_backend_endpoint() -> BackendEndpoint {
+        backend_endpoint("http://ready.backend")
     }
 
     fn object_labels(object: &KubernetesObject) -> &BTreeMap<String, String> {
