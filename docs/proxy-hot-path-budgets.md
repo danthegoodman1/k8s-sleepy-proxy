@@ -51,9 +51,51 @@ SLEEPYPODS_SIDECAR_LOAD_SMOKE_CONCURRENCY=16 \
 ./scripts/smoke-sidecar-load.sh
 ```
 
-This initial smoke only covers the sidecar HTTP/1.1 hot path. It does not cover
+This HTTP smoke only covers the sidecar HTTP/1.1 hot path. It does not cover
 frontline routing, Kubernetes, the real control plane, HTTP/2, h2c, gRPC, TCP,
 WebSockets, streaming throughput, or tail latency.
+
+## Production Image Sidecar TCP Load Smoke
+
+Milestone 7E also includes a small production-image smoke for the sidecar TCP
+hot path:
+
+```sh
+./scripts/smoke-sidecar-tcp-load.sh
+```
+
+The script builds the final `sidecar` image with the root `Dockerfile`
+(`BIN=sidecar`), builds the sidecar load-smoke helper image, and starts the
+helper with a deterministic TCP echo backend plus a fake
+`SidecarControlPlane/ReportIdle` gRPC service. The production sidecar container
+joins the helper container's network namespace with
+`SLEEPYPODS_SIDECAR_MODE=tcp`, so the sidecar's `127.0.0.1:<app-port>` upstream
+target points at the same TCP echo backend used by the direct-backend baseline.
+
+The TCP smoke client opens a fixed number of streams, writes a known byte count
+per stream, and validates the exact echoed bytes while reads and writes run
+concurrently. It fails on byte mismatches, early close, timeouts, startup or
+process failures, and missing tools or images. It reports stream count, echoed
+bytes, expected bytes, failures, elapsed milliseconds, and rough MiB/s for the
+direct and sidecar paths. A conservative
+`SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO` guard defaults to `0.05` and is
+only meant to catch extreme obvious regressions; local Docker throughput is not
+a stable latency or throughput budget.
+
+Useful knobs:
+
+```sh
+SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_STREAMS=8 \
+SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CONCURRENCY=4 \
+SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_BYTES_PER_STREAM=8388608 \
+SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CHUNK_SIZE=32768 \
+./scripts/smoke-sidecar-tcp-load.sh
+```
+
+This smoke only covers plain TCP byte forwarding through the sidecar production
+image. It does not cover Kubernetes, the real control plane, frontline routing,
+TLS/SNI, HTTP/2, h2c, gRPC, WebSockets, protocol-specific streaming behavior,
+tail latency, or stable large-stream throughput budgets.
 
 ## Production Image Frontline HTTP Load Smoke
 
