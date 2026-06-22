@@ -5,6 +5,7 @@
 //! frontline protocol handlers will use around lazy route subscription.
 
 pub mod cache;
+pub mod control_plane;
 pub mod forward;
 pub mod http01;
 pub mod identity;
@@ -16,6 +17,10 @@ pub mod wake;
 pub use cache::{
     CacheInsertResult, CacheLookup, CacheLookupHit, CacheLookupStatus, NegativeCacheEntry,
     PositiveCacheEntry, RouteCache,
+};
+pub use control_plane::{
+    proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
+    proxy_wake_response_from_proto, wake_instance_request_to_proto, ProxyProtocolAdapterError,
 };
 pub use forward::{
     http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardError,
