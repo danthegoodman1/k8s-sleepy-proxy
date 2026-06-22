@@ -112,6 +112,10 @@ pub enum PersistentVolumeSourceTemplate {
         read_only: bool,
         volume_attributes: BTreeMap<String, TemplateText>,
     },
+    HostPath {
+        path: TemplateText,
+        type_: Option<TemplateText>,
+    },
 }
 
 impl TemplateText {

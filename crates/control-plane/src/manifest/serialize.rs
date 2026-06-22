@@ -1,11 +1,11 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    Container, ContainerPort, CsiPersistentVolumeSource, Deployment, EnvVar, KubernetesObject,
-    ObjectMeta, PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeClaim,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PodTemplateMetadata, PodTemplateSpec,
-    PodVolume, RenderedManifest, RenderedManifestObject, Service, ServicePort, StatefulSet,
-    VolumeMount,
+    Container, ContainerPort, CsiPersistentVolumeSource, Deployment, EnvVar,
+    HostPathPersistentVolumeSource, KubernetesObject, ObjectMeta, PersistentVolume,
+    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSource, PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderedManifest,
+    RenderedManifestObject, Service, ServicePort, StatefulSet, VolumeMount,
 };
 
 impl RenderedManifest {
@@ -114,6 +114,9 @@ fn persistent_volume_to_value(object: &PersistentVolume) -> Value {
     match &object.spec.source {
         PersistentVolumeSource::Csi(source) => {
             spec.insert("csi".to_owned(), csi_source_to_value(source));
+        }
+        PersistentVolumeSource::HostPath(source) => {
+            spec.insert("hostPath".to_owned(), host_path_source_to_value(source));
         }
     }
 
@@ -247,6 +250,13 @@ fn csi_source_to_value(source: &CsiPersistentVolumeSource) -> Value {
         "volumeAttributes".to_owned(),
         json!(source.volume_attributes),
     );
+    Value::Object(value)
+}
+
+fn host_path_source_to_value(source: &HostPathPersistentVolumeSource) -> Value {
+    let mut value = Map::new();
+    value.insert("path".to_owned(), json!(source.path));
+    insert_optional_string(&mut value, "type", source.type_.as_deref());
     Value::Object(value)
 }
 

@@ -4,16 +4,16 @@ use crate::instance::InstanceRecord;
 
 use super::{
     ApplyOrder, Container, ContainerPort, ContainerTemplate, CsiPersistentVolumeSource, Deployment,
-    DeploymentSpec, EnvVar, KubernetesObject, LabelSelector, ManifestRenderError, ManifestTemplate,
-    ObjectMeta, PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeClaim,
-    PersistentVolumeClaimRef, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
-    PersistentVolumeSpec, PodSpec, PodTemplateMetadata, PodTemplateSpec, PodVolume,
-    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Service, ServicePort,
-    ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec, TemplateText,
-    VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
-    ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
-    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector,
+    ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
+    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
+    PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderManifestRequest, RenderedManifest,
+    RenderedManifestObject, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate,
+    StatefulSet, StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements,
+    VolumeTemplate, WorkloadKind, ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
+    LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
 const SIDECAR_PORT_NAME: &str = "sleepypods";
@@ -325,6 +325,22 @@ fn render_volume(
                     .transpose()?,
                 read_only: *read_only,
                 volume_attributes: rendered_attributes,
+            })
+        }
+        PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
+            let path = render_non_empty("volume.source.host_path.path", path, instance)?;
+            if !path.starts_with('/') {
+                return Err(ManifestRenderError::InvalidField {
+                    field: "volume.source.host_path.path",
+                    message: format!("hostPath path {path:?} must be absolute"),
+                });
+            }
+            PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
+                path,
+                type_: type_
+                    .as_ref()
+                    .map(|value| render_non_empty("volume.source.host_path.type", value, instance))
+                    .transpose()?,
             })
         }
     };

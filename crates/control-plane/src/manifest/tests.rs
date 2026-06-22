@@ -4,12 +4,12 @@ use serde_json::json;
 
 use super::{
     render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate,
-    CsiPersistentVolumeSource, EnvVar, EnvVarTemplate, KubernetesObject, ManifestRenderError,
-    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PersistentVolumeSourceTemplate, RenderManifestRequest,
-    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
-    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION,
+    CsiPersistentVolumeSource, EnvVar, EnvVarTemplate, HostPathPersistentVolumeSource,
+    KubernetesObject, ManifestRenderError, ManifestTemplate, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
+    RenderManifestRequest, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION,
+    LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION,
 };
 use crate::{
     ids::{Generation, InstanceId, WorkloadClassId},
@@ -446,6 +446,55 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
 }
 
 #[test]
+fn renders_host_path_persistent_volume_source() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &host_path_stateful_template(),
+        instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect("hostPath stateful workload renders");
+
+    let pv = match &rendered.objects[0].object {
+        KubernetesObject::PersistentVolume(pv) => pv,
+        other => panic!("expected PersistentVolume, got {}", other.kind()),
+    };
+
+    assert_eq!(
+        pv.spec.source,
+        PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
+            path: "/var/local/sleepypods/acme".to_owned(),
+            type_: Some("DirectoryOrCreate".to_owned()),
+        })
+    );
+}
+
+#[test]
+fn serializes_host_path_persistent_volume_source_as_kubernetes_json() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &host_path_stateful_template(),
+        instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect("hostPath stateful workload renders");
+
+    let pv = &rendered.to_kubernetes_json_values()[0];
+
+    assert_eq!(
+        pv["spec"]["hostPath"],
+        json!({
+            "path": "/var/local/sleepypods/acme",
+            "type": "DirectoryOrCreate",
+        })
+    );
+    assert!(
+        pv["spec"].get("csi").is_none(),
+        "hostPath PVs should not serialize a CSI source"
+    );
+}
+
+#[test]
 fn rejects_stateful_set_scale_above_one() {
     let mut template = stateful_template();
     template.workload.replicas = Some(2);
@@ -739,6 +788,31 @@ fn rejects_volume_without_access_modes() {
     );
 }
 
+#[test]
+fn rejects_relative_host_path_persistent_volume_source() {
+    let mut template = host_path_stateful_template();
+    template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {
+        path: TemplateText::literal("var/local/sleepypods/acme"),
+        type_: None,
+    };
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect_err("relative hostPath source is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volume.source.host_path.path",
+            message: "hostPath path \"var/local/sleepypods/acme\" must be absolute".to_owned(),
+        }
+    );
+}
+
 fn deployment_template() -> ManifestTemplate {
     ManifestTemplate {
         workload: WorkloadTemplate {
@@ -817,6 +891,19 @@ fn stateful_template() -> ManifestTemplate {
             },
         }],
     }
+}
+
+fn host_path_stateful_template() -> ManifestTemplate {
+    let mut template = stateful_template();
+    template.volumes[0].storage_class_name = Some(TemplateText::literal("manual-host-path"));
+    template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {
+        path: TemplateText::from_parts([
+            TemplateTextPart::literal("/var/local/sleepypods/"),
+            TemplateTextPart::instance_value("tenant"),
+        ]),
+        type_: Some(TemplateText::literal("DirectoryOrCreate")),
+    };
+    template
 }
 
 fn sidecar_template() -> SidecarTemplate {

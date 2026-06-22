@@ -170,6 +170,7 @@ pub struct PersistentVolumeClaimRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersistentVolumeSource {
     Csi(CsiPersistentVolumeSource),
+    HostPath(HostPathPersistentVolumeSource),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +180,12 @@ pub struct CsiPersistentVolumeSource {
     pub fs_type: Option<String>,
     pub read_only: bool,
     pub volume_attributes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPathPersistentVolumeSource {
+    pub path: String,
+    pub type_: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

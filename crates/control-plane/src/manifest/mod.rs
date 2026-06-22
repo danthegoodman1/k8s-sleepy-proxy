@@ -12,11 +12,12 @@ mod tests;
 
 pub use objects::{
     ApplyOrder, Container, ContainerPort, CsiPersistentVolumeSource, Deployment, DeploymentSpec,
-    EnvVar, KubernetesObject, LabelSelector, ObjectMeta, PersistentVolume, PersistentVolumeClaim,
-    PersistentVolumeClaimRef, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
-    PersistentVolumeSource, PersistentVolumeSpec, PodSpec, PodTemplateMetadata, PodTemplateSpec,
-    PodVolume, RenderedManifest, RenderedManifestObject, Service, ServicePort, ServiceSpec,
-    StatefulSet, StatefulSetSpec, VolumeMount, VolumeResourceRequirements,
+    EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector, ObjectMeta,
+    PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimRef, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, PersistentVolumeSource, PersistentVolumeSpec, PodSpec,
+    PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderedManifest, RenderedManifestObject,
+    Service, ServicePort, ServiceSpec, StatefulSet, StatefulSetSpec, VolumeMount,
+    VolumeResourceRequirements,
 };
 pub use render::render_manifests;
 pub use template::{
