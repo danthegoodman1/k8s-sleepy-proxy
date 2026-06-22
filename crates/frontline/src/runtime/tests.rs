@@ -20,10 +20,9 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 use super::FrontlineHttpRuntime;
 use crate::{
-    FrontlineForwarder, FrontlineRouteCoordinator, FrontlineRouteResolver, RouteRequestId,
-    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
-    SubscriptionState, WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
-    WakeTracker,
+    FrontlineRouteCoordinator, FrontlineRouteResolver, RouteRequestId, RouteSubscriptionClient,
+    RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
+    WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse, WakeTracker,
 };
 
 const READY_RESPONSE: &[u8] = b"ready-from-upstream";
@@ -451,7 +450,7 @@ fn runtime_with_state(
             WakeTracker::new(),
             wake_client,
         ),
-        FrontlineForwarder::new(DrainTracker::new(Duration::from_secs(5))),
+        DrainTracker::new(Duration::from_secs(5)),
     )
 }
 

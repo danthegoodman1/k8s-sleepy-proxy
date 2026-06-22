@@ -186,8 +186,9 @@ where
 
 impl<T> RouteSubscriptionClient for GrpcProxyControlPlaneClient<T>
 where
-    T: tonic::client::GrpcService<tonic::body::Body>,
+    T: tonic::client::GrpcService<tonic::body::Body> + Send,
     T::Error: Into<tonic::codegen::StdError>,
+    T::Future: Send,
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
@@ -214,8 +215,9 @@ where
 
 impl<T> WakeClient for GrpcProxyControlPlaneClient<T>
 where
-    T: tonic::client::GrpcService<tonic::body::Body>,
+    T: tonic::client::GrpcService<tonic::body::Body> + Send,
     T::Error: Into<tonic::codegen::StdError>,
+    T::Future: Send,
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
 {

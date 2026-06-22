@@ -10,10 +10,10 @@ use crate::{
     WakeUnavailable, WakeWait,
 };
 
-pub type WakeClientFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>;
+pub type WakeClientFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 pub trait WakeClient {
-    type Error;
+    type Error: Send;
 
     fn wake_instance(
         &mut self,
