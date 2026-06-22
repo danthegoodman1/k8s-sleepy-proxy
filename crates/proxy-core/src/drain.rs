@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::accounting::{ActiveConnection, ActiveConnectionCounter};
+use crate::accounting::{ActiveConnection, ActiveConnectionCounter, IdleActivityWatch};
 use crate::timeout::with_timeout;
 
 /// Tracks active sessions and rejects new work once drain starts.
@@ -113,6 +113,10 @@ impl DrainTracker {
 
     pub async fn wait_for_active_count(&self, expected: usize) {
         self.inner.active.wait_for_count(expected).await;
+    }
+
+    pub fn watch_for_activity_after_idle(&self) -> Option<IdleActivityWatch> {
+        self.inner.active.watch_for_activity_after_idle()
     }
 }
 

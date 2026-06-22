@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -11,10 +11,19 @@ pub struct ActiveConnectionCounter {
     inner: Arc<Inner>,
 }
 
+/// Watches for any active-count update after an idle baseline is observed.
+#[derive(Debug)]
+pub struct IdleActivityWatch {
+    counter: ActiveConnectionCounter,
+    updates: watch::Receiver<()>,
+    baseline_revision: u64,
+}
+
 #[derive(Debug)]
 struct Inner {
     active: AtomicUsize,
-    updates: watch::Sender<usize>,
+    revision: AtomicU64,
+    updates: watch::Sender<()>,
 }
 
 /// A counted active connection.
@@ -28,11 +37,12 @@ pub struct ActiveConnection {
 
 impl ActiveConnectionCounter {
     pub fn new() -> Self {
-        let (updates, _) = watch::channel(0);
+        let (updates, _) = watch::channel(());
 
         Self {
             inner: Arc::new(Inner {
                 active: AtomicUsize::new(0),
+                revision: AtomicU64::new(0),
                 updates,
             }),
         }
@@ -43,8 +53,8 @@ impl ActiveConnectionCounter {
     }
 
     pub fn track(&self) -> ActiveConnection {
-        let next = self.inner.active.fetch_add(1, Ordering::AcqRel) + 1;
-        self.inner.updates.send_replace(next);
+        self.inner.active.fetch_add(1, Ordering::AcqRel);
+        self.publish();
 
         ActiveConnection {
             inner: Some(Arc::clone(&self.inner)),
@@ -68,6 +78,44 @@ impl ActiveConnectionCounter {
             }
         }
     }
+
+    pub fn watch_for_activity_after_idle(&self) -> Option<IdleActivityWatch> {
+        let updates = self.inner.updates.subscribe();
+        let baseline_revision = self.revision();
+
+        if self.active() != 0 {
+            return None;
+        }
+
+        Some(IdleActivityWatch {
+            counter: self.clone(),
+            updates,
+            baseline_revision,
+        })
+    }
+
+    fn revision(&self) -> u64 {
+        self.inner.revision.load(Ordering::Acquire)
+    }
+
+    fn publish(&self) {
+        self.inner.revision.fetch_add(1, Ordering::AcqRel);
+        self.inner.updates.send_replace(());
+    }
+}
+
+impl IdleActivityWatch {
+    pub async fn wait_for_update(mut self) {
+        loop {
+            if self.counter.revision() > self.baseline_revision {
+                return;
+            }
+
+            if self.updates.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 impl Default for ActiveConnectionCounter {
@@ -87,7 +135,8 @@ impl ActiveConnection {
             previous > 0,
             "active connection count underflowed while releasing guard"
         );
-        inner.updates.send_replace(previous.saturating_sub(1));
+        inner.revision.fetch_add(1, Ordering::AcqRel);
+        inner.updates.send_replace(());
     }
 }
 
@@ -123,6 +172,28 @@ mod tests {
         drop(guard);
 
         counter.wait_for_zero().await;
+        assert_eq!(counter.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_activity_watch_is_absent_when_work_is_already_active() {
+        let counter = ActiveConnectionCounter::new();
+        let _guard = counter.track();
+
+        assert!(counter.watch_for_activity_after_idle().is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_activity_watch_resolves_for_brief_active_burst() {
+        let counter = ActiveConnectionCounter::new();
+        let watch = counter
+            .watch_for_activity_after_idle()
+            .expect("counter is idle");
+
+        let guard = counter.track();
+        drop(guard);
+
+        watch.wait_for_update().await;
         assert_eq!(counter.active(), 0);
     }
 }

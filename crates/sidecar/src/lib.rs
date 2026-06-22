@@ -1,5 +1,7 @@
 //! Sidecar-local proxy wiring.
 
+pub mod idle;
+
 use std::{
     error::Error,
     fmt,
@@ -12,6 +14,10 @@ use bytes::Bytes;
 use http::{Request, Response, Uri};
 use http_body::Body;
 use hyper::body::Incoming;
+pub use idle::{
+    IdleDetector, IdleObservation, IdleReportConfig, IdleReportConfigError, IdleReportOutcome,
+    ReportIdleRequest,
+};
 use proxy_core::{
     DrainTracker, HttpProxy, HttpProxyError, TcpProxy, TcpProxyConfig, TcpProxyError,
     TcpProxyStats, TrackedBody,

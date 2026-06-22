@@ -8,6 +8,7 @@ license.workspace = true
 deadpool-postgres = "0.14.1"
 prost = "0.14.4"
 serde_json = "1.0.150"
+sleepypods-types = { version = "0.1.0", path = "../sleepypods-types" }
 tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
