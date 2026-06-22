@@ -19,6 +19,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "workload_class_value_schema",
         sql: include_str!("../../migrations/0002_workload_class_value_schema.sql"),
     },
+    Migration {
+        version: 3,
+        name: "workload_class_manifest_template",
+        sql: include_str!("../../migrations/0003_workload_class_manifest_template.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &impl GenericClient) -> StoreResult<()> {

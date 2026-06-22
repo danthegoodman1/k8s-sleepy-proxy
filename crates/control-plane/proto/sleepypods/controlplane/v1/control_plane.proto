@@ -36,11 +36,122 @@ message WorkloadValueFieldRule {
   optional string default_value = 2;
 }
 
+message TemplateText {
+  repeated TemplateTextPart parts = 1;
+}
+
+message TemplateTextPart {
+  oneof kind {
+    string literal = 1;
+    string instance_value = 2;
+  }
+}
+
+message ManifestTemplate {
+  WorkloadTemplate workload = 1;
+  SidecarTemplate sidecar = 2;
+  ServiceTemplate service = 3;
+  repeated VolumeTemplate volumes = 4;
+}
+
+message WorkloadTemplate {
+  WorkloadKind kind = 1;
+  TemplateText name = 2;
+  optional uint32 replicas = 3;
+  ContainerTemplate app_container = 4;
+}
+
+enum WorkloadKind {
+  WORKLOAD_KIND_UNSPECIFIED = 0;
+  WORKLOAD_KIND_DEPLOYMENT = 1;
+  WORKLOAD_KIND_STATEFUL_SET = 2;
+}
+
+message ContainerTemplate {
+  string name = 1;
+  TemplateText image = 2;
+  repeated ContainerPortTemplate ports = 3;
+  repeated EnvVarTemplate env = 4;
+}
+
+message ContainerPortTemplate {
+  optional string name = 1;
+  uint32 container_port = 2;
+}
+
+message EnvVarTemplate {
+  string name = 1;
+  TemplateText value = 2;
+}
+
+message SidecarTemplate {
+  string name = 1;
+  TemplateText image = 2;
+  uint32 listen_port = 3;
+}
+
+message ServiceTemplate {
+  TemplateText name = 1;
+  repeated ServicePortTemplate ports = 2;
+}
+
+message ServicePortTemplate {
+  optional string name = 1;
+  uint32 port = 2;
+  uint32 target_port = 3;
+}
+
+message VolumeTemplate {
+  string name = 1;
+  TemplateText mount_path = 2;
+  TemplateText pv_name = 3;
+  TemplateText pvc_name = 4;
+  repeated PersistentVolumeAccessMode access_modes = 5;
+  TemplateText capacity = 6;
+  PersistentVolumeReclaimPolicy reclaim_policy = 7;
+  TemplateText storage_class_name = 8;
+  PersistentVolumeSourceTemplate source = 9;
+}
+
+enum PersistentVolumeAccessMode {
+  PERSISTENT_VOLUME_ACCESS_MODE_UNSPECIFIED = 0;
+  PERSISTENT_VOLUME_ACCESS_MODE_READ_WRITE_ONCE = 1;
+  PERSISTENT_VOLUME_ACCESS_MODE_READ_ONLY_MANY = 2;
+  PERSISTENT_VOLUME_ACCESS_MODE_READ_WRITE_MANY = 3;
+}
+
+enum PersistentVolumeReclaimPolicy {
+  PERSISTENT_VOLUME_RECLAIM_POLICY_UNSPECIFIED = 0;
+  PERSISTENT_VOLUME_RECLAIM_POLICY_RETAIN = 1;
+  PERSISTENT_VOLUME_RECLAIM_POLICY_DELETE = 2;
+}
+
+message PersistentVolumeSourceTemplate {
+  oneof kind {
+    CsiVolumeSourceTemplate csi = 1;
+    HostPathVolumeSourceTemplate host_path = 2;
+  }
+}
+
+message CsiVolumeSourceTemplate {
+  TemplateText driver = 1;
+  TemplateText volume_handle = 2;
+  TemplateText fs_type = 3;
+  bool read_only = 4;
+  map<string, TemplateText> volume_attributes = 5;
+}
+
+message HostPathVolumeSourceTemplate {
+  TemplateText path = 1;
+  TemplateText type = 2;
+}
+
 message WorkloadClassVersion {
   WorkloadClassVersionRef reference = 1;
   uint64 template_generation = 2;
   map<string, string> default_values = 3;
   WorkloadValueSchema value_schema = 4;
+  ManifestTemplate template = 5;
 }
 
 message CreateWorkloadClassVersionRequest {
@@ -50,6 +161,7 @@ message CreateWorkloadClassVersionRequest {
   map<string, string> default_values = 4;
   WorkloadValueSchema value_schema = 5;
   uint64 template_generation = 6;
+  ManifestTemplate template = 7;
 }
 
 message GetWorkloadClassVersionRequest {

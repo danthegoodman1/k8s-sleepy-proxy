@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use crate::{
     ids::{Generation, WorkloadClassId},
     instance::InstanceValues,
+    manifest::ManifestTemplate,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub struct CreateWorkloadClassVersionRequest {
 pub struct WorkloadClassVersion {
     pub reference: WorkloadClassVersionRef,
     pub template_generation: Generation,
+    pub template: ManifestTemplate,
     pub default_values: InstanceValues,
     pub value_schema: WorkloadValueSchema,
 }

@@ -345,6 +345,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rustls",
+ "serde",
  "serde_json",
  "sleepypods-types",
  "tokio",

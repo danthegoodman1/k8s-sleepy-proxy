@@ -13,6 +13,7 @@ use crate::{
         WorkloadClassId,
     },
     instance::{InstanceRecord, InstanceState, InstanceValues},
+    manifest::ManifestTemplate,
     materialization::{
         BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
         RenderedObjectRef,
@@ -48,6 +49,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
     let class_id: String = row.get("class_id");
     let version: i64 = row.get("version");
     let template_generation: i64 = row.get("template_generation");
+    let template: Value = row.get("manifest_template");
     let default_values: Value = row.get("default_values");
     let value_schema: Value = row.get("value_schema");
 
@@ -57,6 +59,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
             version: generation_from_i64(version)?,
         },
         template_generation: generation_from_i64(template_generation)?,
+        template: manifest_template_from_json(template)?,
         default_values: values_from_json(default_values)?,
         value_schema: value_schema_from_json(value_schema)?,
     })
@@ -174,6 +177,20 @@ pub(crate) fn values_from_json(value: Value) -> StoreResult<InstanceValues> {
     serde_json::from_value::<BTreeMap<String, String>>(value).map_err(|error| {
         StoreError::internal(format!(
             "stored instance values were not a string map: {error}"
+        ))
+    })
+}
+
+pub(crate) fn manifest_template_to_json(template: &ManifestTemplate) -> StoreResult<Value> {
+    serde_json::to_value(template).map_err(|error| {
+        StoreError::internal(format!("failed to encode manifest template: {error}"))
+    })
+}
+
+pub(crate) fn manifest_template_from_json(value: Value) -> StoreResult<ManifestTemplate> {
+    serde_json::from_value(value).map_err(|error| {
+        StoreError::internal(format!(
+            "stored manifest template was not a supported template shape: {error}"
         ))
     })
 }

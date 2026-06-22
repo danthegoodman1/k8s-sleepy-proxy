@@ -58,6 +58,21 @@ fn template_text_reports_missing_instance_value() {
 }
 
 #[test]
+fn manifest_templates_survive_json_round_trips() {
+    for template in [
+        deployment_template(),
+        stateful_template(),
+        host_path_stateful_template(),
+    ] {
+        let encoded = serde_json::to_value(&template).expect("manifest template encodes");
+        let decoded: ManifestTemplate =
+            serde_json::from_value(encoded).expect("manifest template decodes");
+
+        assert_eq!(decoded, template);
+    }
+}
+
+#[test]
 fn renders_deployment_and_service_without_volumes() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &deployment_template(),

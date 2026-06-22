@@ -1,6 +1,7 @@
 //! Protobuf-defined control-plane API and transport scaffolding.
 
 pub mod server;
+mod template;
 
 pub mod pb {
     tonic::include_proto!("sleepypods.controlplane.v1");

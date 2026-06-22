@@ -235,6 +235,10 @@ mod tests {
 
     use crate::{
         ids::{Generation, IdempotencyKey, InstanceId, WorkloadClassId},
+        manifest::{
+            ContainerPortTemplate, ContainerTemplate, ManifestTemplate, ServicePortTemplate,
+            ServiceTemplate, SidecarTemplate, TemplateText, WorkloadKind, WorkloadTemplate,
+        },
         workload::{
             WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule,
             WorkloadValueSchema,
@@ -453,8 +457,42 @@ mod tests {
                 Generation::new(1),
             ),
             template_generation: Generation::new(1),
+            template: test_manifest_template(),
             default_values: BTreeMap::new(),
             value_schema,
+        }
+    }
+
+    fn test_manifest_template() -> ManifestTemplate {
+        ManifestTemplate {
+            workload: WorkloadTemplate {
+                kind: WorkloadKind::Deployment,
+                name: TemplateText::literal("app"),
+                replicas: None,
+                app_container: ContainerTemplate {
+                    name: "app".to_owned(),
+                    image: TemplateText::literal("example/app:1"),
+                    ports: vec![ContainerPortTemplate {
+                        name: Some("http".to_owned()),
+                        container_port: 8080,
+                    }],
+                    env: Vec::new(),
+                },
+            },
+            sidecar: SidecarTemplate {
+                name: "sleepypods-sidecar".to_owned(),
+                image: TemplateText::literal("sleepypods/sidecar:test"),
+                listen_port: 15000,
+            },
+            service: Some(ServiceTemplate {
+                name: TemplateText::literal("app"),
+                ports: vec![ServicePortTemplate {
+                    name: Some("http".to_owned()),
+                    port: 80,
+                    target_port: 8080,
+                }],
+            }),
+            volumes: Vec::new(),
         }
     }
 

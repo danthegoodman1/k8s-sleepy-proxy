@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::instance::InstanceValues;
 
 use super::ManifestRenderError;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateText {
     parts: Vec<TemplateTextPart>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TemplateTextPart {
     Literal(String),
     InstanceValue(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestTemplate {
     pub workload: WorkloadTemplate,
     pub sidecar: SidecarTemplate,
@@ -23,7 +25,7 @@ pub struct ManifestTemplate {
     pub volumes: Vec<VolumeTemplate>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadTemplate {
     pub kind: WorkloadKind,
     pub name: TemplateText,
@@ -31,13 +33,13 @@ pub struct WorkloadTemplate {
     pub app_container: ContainerTemplate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkloadKind {
     Deployment,
     StatefulSet,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerTemplate {
     pub name: String,
     pub image: TemplateText,
@@ -45,39 +47,39 @@ pub struct ContainerTemplate {
     pub env: Vec<EnvVarTemplate>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerPortTemplate {
     pub name: Option<String>,
     pub container_port: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvVarTemplate {
     pub name: String,
     pub value: TemplateText,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarTemplate {
     pub name: String,
     pub image: TemplateText,
     pub listen_port: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceTemplate {
     pub name: TemplateText,
     pub ports: Vec<ServicePortTemplate>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServicePortTemplate {
     pub name: Option<String>,
     pub port: u16,
     pub target_port: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeTemplate {
     pub name: String,
     pub mount_path: TemplateText,
@@ -90,20 +92,20 @@ pub struct VolumeTemplate {
     pub source: PersistentVolumeSourceTemplate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentVolumeAccessMode {
     ReadWriteOnce,
     ReadOnlyMany,
     ReadWriteMany,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentVolumeReclaimPolicy {
     Retain,
     Delete,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentVolumeSourceTemplate {
     Csi {
         driver: TemplateText,
@@ -135,6 +137,10 @@ impl TemplateText {
         Self {
             parts: parts.into(),
         }
+    }
+
+    pub fn parts(&self) -> &[TemplateTextPart] {
+        &self.parts
     }
 
     pub fn render(&self, values: &InstanceValues) -> Result<String, ManifestRenderError> {

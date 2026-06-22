@@ -19,6 +19,8 @@ use crate::{
     workload::{self as domain_workload, WorkloadClassVersion, WorkloadClassVersionRef},
 };
 
+use super::template::{manifest_template_from_proto, manifest_template_to_proto};
+
 pub const OPERATOR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.OperatorControlPlane";
 
 pub const OPERATOR_UNARY_METHODS: &[&str] = &[
@@ -401,6 +403,10 @@ fn create_workload_class_request_from_proto(
             crate::ids::Generation::new(request.version),
         ),
         template_generation: crate::ids::Generation::new(request.template_generation),
+        template: request
+            .template
+            .ok_or_else(|| Status::invalid_argument("template is required"))
+            .and_then(manifest_template_from_proto)?,
         default_values: request.default_values.into_iter().collect(),
         value_schema: request
             .value_schema
@@ -570,6 +576,7 @@ fn workload_class_to_proto(workload_class: WorkloadClassVersion) -> pb::Workload
         template_generation: workload_class.template_generation.get(),
         default_values: workload_class.default_values.into_iter().collect(),
         value_schema: Some(workload_value_schema_to_proto(workload_class.value_schema)),
+        template: Some(manifest_template_to_proto(workload_class.template)),
     }
 }
 

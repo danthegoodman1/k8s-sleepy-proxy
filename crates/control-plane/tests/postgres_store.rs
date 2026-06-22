@@ -5,15 +5,18 @@ use std::{
 };
 
 use control_plane::{
-    BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest, ControlPlaneStore,
-    CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
-    DeleteInstanceRequest, DeleteRouteBindingRequest, ExpireHttp01ChallengesRequest, Generation,
+    render_manifests, BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest,
+    ContainerPortTemplate, ContainerTemplate, ControlPlaneStore, CreateInstanceRequest,
+    CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
+    DeleteRouteBindingRequest, EnvVarTemplate, ExpireHttp01ChallengesRequest, Generation,
     GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey, InstanceId,
-    InstanceState, MaterializationState, MaterializationTarget, PathPrefix, PostgresStore,
-    PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest,
-    RenderedObjectRef, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
-    RouteIdentity, RouteResolution, StateTransitionReason, StoreError, WorkloadClassId,
-    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+    InstanceState, ManifestTemplate, MaterializationState, MaterializationTarget, PathPrefix,
+    PostgresStore, PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest,
+    RecordMaterializationRequest, RenderManifestRequest, RenderedObjectRef, RouteBindingId,
+    RouteBindingSpec, RouteDependencyLookup, RouteHost, RouteIdentity, RouteResolution,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason, StoreError,
+    TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion, WorkloadClassVersionRef,
+    WorkloadKind, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -110,6 +113,22 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .expect("v1 still loads after conflicting create");
     assert_eq!(loaded_v1_after_conflict, class);
 
+    let mut changed_template_class = class.clone();
+    changed_template_class.template.workload.app_container.image =
+        TemplateText::literal("example/app:changed");
+    let template_conflict = store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(
+            changed_template_class,
+        ))
+        .await
+        .expect_err("same class/version with a different template is immutable");
+    assert!(matches!(
+        template_conflict,
+        StoreError::AlreadyExists {
+            resource: "workload class version"
+        }
+    ));
+
     let class_v2 = workload_class("class-a", 2);
     let created_v2 = store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class_v2.clone()))
@@ -182,6 +201,20 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .await?
         .expect("created instance loads through public store API");
     assert_eq!(loaded_created, created.instance);
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &loaded.template,
+        instance: &created.instance,
+        namespace: "apps",
+        template_generation: Some(loaded.template_generation),
+    })
+    .map_err(|error| StoreError::internal(error.to_string()))?;
+    assert!(
+        rendered
+            .objects
+            .iter()
+            .any(|object| object.object.name() == "app-instance-a"),
+        "loaded workload class template should render durable instance manifests"
+    );
 
     let replayed = store.create_instance(create.clone()).await?;
     assert!(replayed.idempotency_replayed);
@@ -1177,6 +1210,7 @@ fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
             Generation::new(version),
         ),
         template_generation: Generation::new(1),
+        template: workload_manifest_template(),
         default_values: BTreeMap::from([("image".to_owned(), image.clone())]),
         value_schema: WorkloadValueSchema::new(false)
             .with_field("tenant", WorkloadValueFieldRule::required())
@@ -1185,6 +1219,49 @@ fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
                 WorkloadValueFieldRule::optional_with_default(image),
             ),
     }
+}
+
+fn workload_manifest_template() -> ManifestTemplate {
+    ManifestTemplate {
+        workload: WorkloadTemplate {
+            kind: WorkloadKind::Deployment,
+            name: composed_text("app-", "tenant"),
+            replicas: None,
+            app_container: ContainerTemplate {
+                name: "app".to_owned(),
+                image: TemplateText::instance_value("image"),
+                ports: vec![ContainerPortTemplate {
+                    name: Some("http".to_owned()),
+                    container_port: 8080,
+                }],
+                env: vec![EnvVarTemplate {
+                    name: "TENANT".to_owned(),
+                    value: TemplateText::instance_value("tenant"),
+                }],
+            },
+        },
+        sidecar: SidecarTemplate {
+            name: "sleepypods-sidecar".to_owned(),
+            image: TemplateText::literal("sleepypods/sidecar:test"),
+            listen_port: 15000,
+        },
+        service: Some(ServiceTemplate {
+            name: composed_text("svc-", "tenant"),
+            ports: vec![ServicePortTemplate {
+                name: Some("http".to_owned()),
+                port: 80,
+                target_port: 8080,
+            }],
+        }),
+        volumes: Vec::new(),
+    }
+}
+
+fn composed_text(prefix: &str, field: &str) -> TemplateText {
+    TemplateText::from_parts([
+        TemplateTextPart::literal(prefix),
+        TemplateTextPart::instance_value(field),
+    ])
 }
 
 fn create_instance_request(

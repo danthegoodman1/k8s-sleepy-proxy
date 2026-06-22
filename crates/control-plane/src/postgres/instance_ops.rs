@@ -21,9 +21,9 @@ use super::{
     error::map_postgres_error,
     idempotency::{self, CREATE_INSTANCE_OPERATION},
     mapping::{
-        self, generation_to_i64, instance_from_row, instance_state_to_db, protocol_to_db,
-        route_binding_from_row, route_identity_parts, value_schema_to_json, values_to_json,
-        workload_class_version_from_row,
+        self, generation_to_i64, instance_from_row, instance_state_to_db,
+        manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
+        value_schema_to_json, values_to_json, workload_class_version_from_row,
     },
 };
 
@@ -94,6 +94,7 @@ pub(crate) async fn create_workload_class_version(
     let class_id = desired.reference.class_id.as_str();
     let version = generation_to_i64(desired.reference.version)?;
     let template_generation = generation_to_i64(desired.template_generation)?;
+    let manifest_template = manifest_template_to_json(&desired.template)?;
     let default_values = values_to_json(&desired.default_values)?;
     let value_schema = value_schema_to_json(&desired.value_schema);
     let inserted = client
@@ -103,16 +104,18 @@ pub(crate) async fn create_workload_class_version(
                 class_id,
                 version,
                 template_generation,
+                manifest_template,
                 default_values,
                 value_schema
             )
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
             &[
                 &class_id,
                 &version,
                 &template_generation,
+                &manifest_template,
                 &default_values,
                 &value_schema,
             ],
@@ -287,7 +290,7 @@ async fn load_workload_class_version_from_client(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, default_values, value_schema
+            SELECT class_id, version, template_generation, manifest_template, default_values, value_schema
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",

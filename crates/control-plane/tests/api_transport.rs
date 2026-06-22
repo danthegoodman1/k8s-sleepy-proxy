@@ -9,13 +9,18 @@ use control_plane::api::{
     operator_grpc_server_builder, operator_grpc_service, operator_grpc_service_with_store,
     operator_grpc_web_server_builder,
     pb::{
-        operator_control_plane_server::OperatorControlPlane, route_identity, CreateInstanceRequest,
-        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteHttp01ChallengeRequest,
-        DeleteInstanceRequest, DeleteRouteBindingRequest, ExpireHttp01ChallengesRequest,
+        operator_control_plane_server::OperatorControlPlane, persistent_volume_source_template,
+        route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
+        CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
+        CsiVolumeSourceTemplate, DeleteHttp01ChallengeRequest, DeleteInstanceRequest,
+        DeleteRouteBindingRequest, EnvVarTemplate, ExpireHttp01ChallengesRequest,
         GetInstanceRequest, GetRouteBindingRequest, GetWorkloadClassVersionRequest,
-        Http01ChallengeKey, HttpRouteIdentity, Instance, InstanceState, ProtocolRoute,
-        PutHttp01ChallengeRequest, ResolveHttp01ChallengeRequest, RouteBinding, RouteHost,
-        RouteHostKind, RouteIdentity, SniRouteIdentity, WorkloadClassVersionRef,
+        HostPathVolumeSourceTemplate, Http01ChallengeKey, HttpRouteIdentity, Instance,
+        InstanceState, ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+        PersistentVolumeSourceTemplate, ProtocolRoute, PutHttp01ChallengeRequest,
+        ResolveHttp01ChallengeRequest, RouteBinding, RouteHost, RouteHostKind, RouteIdentity,
+        ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText,
+        TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
         WorkloadValueFieldRule, WorkloadValueSchema,
     },
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
@@ -64,6 +69,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
             allow_extra: false,
         }),
         template_generation: 1,
+        template: Some(stateful_manifest_template_proto()),
     };
 
     assert_eq!(request.values["tenant"], "acme");
@@ -75,6 +81,26 @@ fn generated_api_contains_expected_v1_resource_shape() {
             .expect("value schema is present")
             .fields["tenant"]
             .required
+    );
+    let template = workload_class
+        .template
+        .as_ref()
+        .expect("template is present");
+    assert_eq!(
+        template
+            .workload
+            .as_ref()
+            .expect("workload template is present")
+            .kind,
+        WorkloadKind::StatefulSet as i32
+    );
+    assert_eq!(
+        template.volumes[0]
+            .access_modes
+            .first()
+            .copied()
+            .expect("access mode is generated"),
+        PersistentVolumeAccessMode::ReadWriteOnce as i32
     );
     assert_eq!(InstanceState::Cold as i32, 1);
     assert_eq!(ProtocolRoute::Http as i32, 1);
@@ -155,6 +181,7 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 #[tokio::test]
 async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let template = stateful_manifest_template_proto();
 
     let created_class = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
@@ -174,11 +201,13 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
                 allow_extra: false,
             }),
             template_generation: 9,
+            template: Some(template.clone()),
         }))
         .await
         .expect("create workload class succeeds")
         .into_inner();
     assert_eq!(created_class.template_generation, 9);
+    assert_eq!(created_class.template, Some(template));
 
     let loaded_class = service
         .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
@@ -191,6 +220,21 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .expect("get workload class succeeds")
         .into_inner();
     assert_eq!(loaded_class, created_class);
+
+    let missing_template = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-class-missing-template".to_owned(),
+            class_id: "class-missing-template".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: None,
+        }))
+        .await
+        .expect_err("template is required");
+    assert_eq!(missing_template.code(), Code::InvalidArgument);
+    assert!(missing_template.message().contains("template is required"));
 
     let created_route = service
         .create_route_binding(tonic::Request::new(CreateRouteBindingRequest {
@@ -287,6 +331,108 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .into_inner();
     assert!(deleted.deleted);
     assert!(expires_at > SystemTime::now());
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_round_trips_host_path_template() {
+    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let template = host_path_manifest_template_proto();
+
+    let created = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-host-path-class".to_owned(),
+            class_id: "host-path-class".to_owned(),
+            version: 1,
+            default_values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template.clone()),
+        }))
+        .await
+        .expect("create workload class with hostPath template succeeds")
+        .into_inner();
+
+    assert_eq!(created.template, Some(template.clone()));
+
+    let loaded = service
+        .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "host-path-class".to_owned(),
+                version: 1,
+            }),
+        }))
+        .await
+        .expect("get workload class with hostPath template succeeds")
+        .into_inner();
+
+    assert_eq!(loaded, created);
+    let source = loaded.template.as_ref().expect("template returned").volumes[0]
+        .source
+        .as_ref()
+        .and_then(|source| source.kind.as_ref())
+        .expect("volume source returned");
+    assert!(matches!(
+        source,
+        persistent_volume_source_template::Kind::HostPath(_)
+    ));
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_rejects_empty_template_static_strings() {
+    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let mut template = stateful_manifest_template_proto();
+    template
+        .workload
+        .as_mut()
+        .expect("workload template exists")
+        .app_container
+        .as_mut()
+        .expect("app container exists")
+        .name
+        .clear();
+
+    let error = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-empty-container-name-class".to_owned(),
+            class_id: "empty-container-name-class".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template),
+        }))
+        .await
+        .expect_err("empty static template names are rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("template.container.name"));
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
+    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let mut template = stateful_manifest_template_proto();
+    template
+        .workload
+        .as_mut()
+        .expect("workload template exists")
+        .name = Some(TemplateText { parts: Vec::new() });
+
+    let error = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-empty-template-text-class".to_owned(),
+            class_id: "empty-template-text-class".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template),
+        }))
+        .await
+        .expect_err("empty template text parts are rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("template text parts"));
 }
 
 #[tokio::test]
@@ -585,6 +731,105 @@ fn sni_identity(host: &str) -> RouteIdentity {
                 host: host.to_owned(),
             }),
         })),
+    }
+}
+
+fn stateful_manifest_template_proto() -> ManifestTemplate {
+    ManifestTemplate {
+        workload: Some(WorkloadTemplate {
+            kind: WorkloadKind::StatefulSet as i32,
+            name: Some(composed_text("db-", "tenant")),
+            replicas: Some(1),
+            app_container: Some(ContainerTemplate {
+                name: "postgres".to_owned(),
+                image: Some(literal_text("postgres:17")),
+                ports: vec![ContainerPortTemplate {
+                    name: Some("postgres".to_owned()),
+                    container_port: 5432,
+                }],
+                env: vec![EnvVarTemplate {
+                    name: "TENANT".to_owned(),
+                    value: Some(instance_value_text("tenant")),
+                }],
+            }),
+        }),
+        sidecar: Some(SidecarTemplate {
+            name: "sleepypods-sidecar".to_owned(),
+            image: Some(literal_text("sleepypods/sidecar:test")),
+            listen_port: 15000,
+        }),
+        service: Some(ServiceTemplate {
+            name: Some(composed_text("db-", "tenant")),
+            ports: vec![ServicePortTemplate {
+                name: Some("postgres".to_owned()),
+                port: 5432,
+                target_port: 5432,
+            }],
+        }),
+        volumes: vec![VolumeTemplate {
+            name: "data".to_owned(),
+            mount_path: Some(literal_text("/var/lib/postgresql/data")),
+            pv_name: Some(composed_text("pv-", "tenant")),
+            pvc_name: Some(composed_text("pvc-", "tenant")),
+            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce as i32],
+            capacity: Some(literal_text("10Gi")),
+            reclaim_policy: PersistentVolumeReclaimPolicy::Retain as i32,
+            storage_class_name: Some(literal_text("manual")),
+            source: Some(PersistentVolumeSourceTemplate {
+                kind: Some(persistent_volume_source_template::Kind::Csi(
+                    CsiVolumeSourceTemplate {
+                        driver: Some(literal_text("csi.example.com")),
+                        volume_handle: Some(instance_value_text("volume")),
+                        fs_type: Some(literal_text("ext4")),
+                        read_only: false,
+                        volume_attributes: [("tenant".to_owned(), instance_value_text("tenant"))]
+                            .into(),
+                    },
+                )),
+            }),
+        }],
+    }
+}
+
+fn host_path_manifest_template_proto() -> ManifestTemplate {
+    let mut template = stateful_manifest_template_proto();
+    template.volumes[0].source = Some(PersistentVolumeSourceTemplate {
+        kind: Some(persistent_volume_source_template::Kind::HostPath(
+            HostPathVolumeSourceTemplate {
+                path: Some(composed_text("/var/local/sleepypods/", "tenant")),
+                r#type: Some(literal_text("DirectoryOrCreate")),
+            },
+        )),
+    });
+    template
+}
+
+fn literal_text(value: &str) -> TemplateText {
+    TemplateText {
+        parts: vec![TemplateTextPart {
+            kind: Some(template_text_part::Kind::Literal(value.to_owned())),
+        }],
+    }
+}
+
+fn instance_value_text(field: &str) -> TemplateText {
+    TemplateText {
+        parts: vec![TemplateTextPart {
+            kind: Some(template_text_part::Kind::InstanceValue(field.to_owned())),
+        }],
+    }
+}
+
+fn composed_text(prefix: &str, field: &str) -> TemplateText {
+    TemplateText {
+        parts: vec![
+            TemplateTextPart {
+                kind: Some(template_text_part::Kind::Literal(prefix.to_owned())),
+            },
+            TemplateTextPart {
+                kind: Some(template_text_part::Kind::InstanceValue(field.to_owned())),
+            },
+        ],
     }
 }
 
