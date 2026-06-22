@@ -1,5 +1,6 @@
 //! Sidecar-local proxy wiring.
 
+pub mod control_plane_transport;
 pub mod idle;
 
 use std::{
@@ -11,6 +12,10 @@ use std::{
 };
 
 use bytes::Bytes;
+pub use control_plane_transport::{
+    GrpcSidecarControlPlaneClient, GrpcSidecarControlPlaneError, ReportIdleClient,
+    ReportIdleFuture, ReportIdleResponse, ReportIdleUnavailableReason, SidecarProtocolAdapterError,
+};
 use http::{Request, Response, Uri};
 use http_body::Body;
 use hyper::body::Incoming;
