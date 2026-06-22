@@ -10,6 +10,7 @@ pub mod forward;
 pub mod http01;
 pub mod identity;
 pub mod matcher;
+pub mod resolver;
 pub mod subscription;
 pub mod tls;
 pub mod wake;
@@ -33,6 +34,11 @@ pub use http01::{
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};
+pub use resolver::{
+    FrontlineRouteResolution, FrontlineRouteResolver, FrontlineRouteResolverError,
+    RouteResolverProtocolError, RouteSubscriptionClient, RouteSubscriptionFuture,
+    UnexpectedSubscribeResponseKind,
+};
 pub use subscription::{
     ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome, InvalidationReason, ProxySubscribeInput,
     RouteRequestId, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,

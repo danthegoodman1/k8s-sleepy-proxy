@@ -25,7 +25,7 @@ pub(crate) fn route_entry(
     )
 }
 
-fn route_entry_for_instance(
+pub(crate) fn route_entry_for_instance(
     route_binding_id: &str,
     instance_id: &str,
     instance_generation: u64,
@@ -291,7 +291,9 @@ fn update_replaces_targeted_entry() {
 
     assert_eq!(
         outcome,
-        ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced)
+        ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced(
+            crate::CacheInsertResult::default()
+        ))
     );
     let entry = state
         .cache()
@@ -424,7 +426,9 @@ fn update_accepts_reassignment_to_different_instance_with_lower_generation() {
 
     assert_eq!(
         outcome,
-        ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced)
+        ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced(
+            crate::CacheInsertResult::default()
+        ))
     );
     let entry = state
         .cache()

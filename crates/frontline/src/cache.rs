@@ -272,7 +272,25 @@ impl RouteCache {
         entry: RouteEntry,
         cache_policy: CachePolicy,
         now: Instant,
-    ) -> bool {
+    ) -> CacheInsertResult {
+        let mut result = CacheInsertResult::default();
+        if self.positive_by_subscription(subscription_id).is_none() {
+            return result;
+        }
+
+        if let Some(conflicting) = self
+            .positive_by_matched_identity(&matched_identity)
+            .cloned()
+        {
+            if &conflicting.subscription_id != subscription_id {
+                if let Some(removed) = self.remove_positive(&conflicting.subscription_id) {
+                    result
+                        .subscriptions_to_unsubscribe
+                        .push(removed.subscription_id);
+                }
+            }
+        }
+
         if let Some(existing) = self
             .positives
             .iter_mut()
@@ -281,10 +299,9 @@ impl RouteCache {
             existing.matched_identity = matched_identity;
             existing.entry = entry;
             existing.expires_at = now + cache_policy.ttl();
-            true
-        } else {
-            false
         }
+
+        result
     }
 
     pub fn positive_by_subscription(

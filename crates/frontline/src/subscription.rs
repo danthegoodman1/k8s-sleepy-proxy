@@ -67,9 +67,9 @@ pub enum ApplyControlPlaneMessageOutcome {
     Invalidated { removed: bool },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyUpdateOutcome {
-    Replaced,
+    Replaced(CacheInsertResult),
     MissingSubscription,
     StaleInstanceGeneration {
         current: Generation,
@@ -237,24 +237,36 @@ impl SubscriptionState {
         };
 
         if let Some(stale) = stale_route_entry(&current.entry, &entry) {
-            return match stale {
-                StaleRouteEntry::InstanceGeneration { current, incoming } => {
-                    ApplyUpdateOutcome::StaleInstanceGeneration { current, incoming }
-                }
-                StaleRouteEntry::BackendGeneration { current, incoming } => {
-                    ApplyUpdateOutcome::StaleBackendGeneration { current, incoming }
-                }
-            };
+            return stale_update_outcome(stale);
         }
 
-        self.cache.replace_subscription(
+        if let Some(conflicting) = self.cache.positive_by_matched_identity(&matched_identity) {
+            if &conflicting.subscription_id != subscription_id {
+                if let Some(stale) = stale_route_entry(&conflicting.entry, &entry) {
+                    return stale_update_outcome(stale);
+                }
+            }
+        }
+
+        let result = self.cache.replace_subscription(
             subscription_id,
             matched_identity,
             entry,
             cache_policy,
             now,
         );
-        ApplyUpdateOutcome::Replaced
+        ApplyUpdateOutcome::Replaced(result)
+    }
+}
+
+fn stale_update_outcome(stale: StaleRouteEntry) -> ApplyUpdateOutcome {
+    match stale {
+        StaleRouteEntry::InstanceGeneration { current, incoming } => {
+            ApplyUpdateOutcome::StaleInstanceGeneration { current, incoming }
+        }
+        StaleRouteEntry::BackendGeneration { current, incoming } => {
+            ApplyUpdateOutcome::StaleBackendGeneration { current, incoming }
+        }
     }
 }
 
