@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     error::Error,
+    future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,17 +17,28 @@ use control_plane::{
 };
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
-    core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim, Service},
+    core::v1::{
+        Container, EnvVar, Namespace, Node, PersistentVolume, PersistentVolumeClaim,
+        PersistentVolumeClaimVolumeSource, Pod, PodSpec, Service, Volume, VolumeMount,
+    },
 };
 use kube::{
-    api::{DeleteParams, ObjectMeta, PostParams},
+    api::{DeleteParams, ListParams, LogParams, ObjectMeta, PostParams},
     Api, Client, Error as KubeError,
 };
+use tokio::time::{sleep, Instant};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+const PVC_NAME: &str = "sleepypods-kind-pvc";
+const WORKLOAD_NAME: &str = "sleepypods-kind-app";
+const HELPER_IMAGE: &str = "busybox:1.36";
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const OBJECT_DELETION_TIMEOUT: Duration = Duration::from_secs(90);
+const HELPER_POD_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[tokio::test]
-#[ignore = "requires SLEEPYPODS_KIND_TEST=1 and a disposable kind/current kube context"]
+#[ignore = "requires SLEEPYPODS_KIND_TEST=1 and a disposable single-node kind/current kube context"]
 async fn materializes_stateful_set_with_static_host_path_volume() -> TestResult<()> {
     if env::var("SLEEPYPODS_KIND_TEST").as_deref() != Ok("1") {
         eprintln!("skipping kind materializer test because SLEEPYPODS_KIND_TEST=1 is not set");
@@ -36,7 +48,9 @@ async fn materializes_stateful_set_with_static_host_path_volume() -> TestResult<
     install_rustls_crypto_provider();
 
     let client = Client::try_default().await?;
-    let namespace = unique_namespace();
+    verify_single_node_cluster(client.clone()).await?;
+
+    let namespace = unique_namespace()?;
     create_namespace(client.clone(), &namespace).await?;
 
     let result = run_materializer_lifecycle(client.clone(), &namespace).await;
@@ -53,10 +67,11 @@ fn install_rustls_crypto_provider() {
 
 async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResult<()> {
     let pv_name = pv_name(namespace);
+    let marker = marker_value(namespace);
     let config = KubeMaterializerClientConfig {
         pvc_bound_timeout: Duration::from_secs(60),
         readiness_timeout: Duration::from_secs(90),
-        poll_interval: Duration::from_secs(1),
+        poll_interval: POLL_INTERVAL,
         ..KubeMaterializerClientConfig::default()
     };
     let kube_client = KubeMaterializerClient::with_config(client.clone(), config)?;
@@ -64,26 +79,64 @@ async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResu
     let manifest = kind_manifest(namespace, &pv_name)?;
     let refs = rendered_refs(&manifest);
 
-    let lifecycle_result: TestResult<String> = async {
+    let lifecycle_result: TestResult<()> = async {
         let applied_refs = materializer.apply_manifest(&manifest).await?;
-        assert_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name).await?;
+        verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name).await?;
         let backend = materializer
             .client()
             .wait_for_readiness(&applied_refs)
             .await?;
-        Ok(backend.uri().to_owned())
+        verify_backend_uri(backend.uri(), namespace)?;
+
+        write_marker(client.clone(), namespace, &marker).await?;
+
+        materializer.delete_rendered_objects(&refs).await?;
+        wait_for_rendered_objects_deleted(client.clone(), namespace, &pv_name).await?;
+
+        let rematerialized_manifest = kind_manifest(namespace, &pv_name)?;
+        let applied_refs = materializer
+            .apply_manifest(&rematerialized_manifest)
+            .await?;
+        verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name).await?;
+        let backend = materializer
+            .client()
+            .wait_for_readiness(&applied_refs)
+            .await?;
+        verify_backend_uri(backend.uri(), namespace)?;
+
+        verify_marker_present(client.clone(), namespace, &marker).await?;
+        Ok(())
     }
     .await;
+
     let delete_result = materializer.delete_rendered_objects(&refs).await;
+    let deletion_wait_result = wait_for_rendered_objects_deleted(client, namespace, &pv_name).await;
 
-    let backend_uri = lifecycle_result?;
-    assert_eq!(
-        backend_uri,
-        format!("http://sleepypods-kind-app.{namespace}.svc.cluster.local:8080")
-    );
-
+    lifecycle_result?;
     delete_result?;
-    assert_deleted_or_deleting(client, namespace, &pv_name).await?;
+    deletion_wait_result?;
+    Ok(())
+}
+
+async fn verify_single_node_cluster(client: Client) -> TestResult<()> {
+    let nodes: Api<Node> = Api::all(client);
+    let node_count = nodes.list(&ListParams::default()).await?.items.len();
+    if node_count != 1 {
+        return Err(format!(
+            "kind materializer hostPath continuity test requires exactly one Kubernetes node; found {node_count}"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn verify_backend_uri(uri: &str, namespace: &str) -> TestResult<()> {
+    let expected = format!("http://{WORKLOAD_NAME}.{namespace}.svc.cluster.local:8080");
+    if uri != expected {
+        return Err(format!("expected backend URI {expected}, got {uri}").into());
+    }
+
     Ok(())
 }
 
@@ -91,7 +144,7 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
     let template = ManifestTemplate {
         workload: WorkloadTemplate {
             kind: WorkloadKind::StatefulSet,
-            name: TemplateText::literal("sleepypods-kind-app"),
+            name: TemplateText::literal(WORKLOAD_NAME),
             replicas: Some(1),
             app_container: ContainerTemplate {
                 name: "app".to_owned(),
@@ -109,7 +162,7 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
             listen_port: 80,
         },
         service: Some(ServiceTemplate {
-            name: TemplateText::literal("sleepypods-kind-app"),
+            name: TemplateText::literal(WORKLOAD_NAME),
             ports: vec![ServicePortTemplate {
                 name: Some("http".to_owned()),
                 port: 8080,
@@ -120,7 +173,7 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
             name: "data".to_owned(),
             mount_path: TemplateText::literal("/data"),
             pv_name: TemplateText::literal(pv_name),
-            pvc_name: TemplateText::literal("sleepypods-kind-pvc"),
+            pvc_name: TemplateText::literal(PVC_NAME),
             access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
             capacity: TemplateText::literal("1Mi"),
             reclaim_policy: PersistentVolumeReclaimPolicy::Retain,
@@ -135,9 +188,9 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
         }],
     };
     let instance = InstanceRecord {
-        id: InstanceId::new("kind-materializer").expect("valid instance ID"),
+        id: InstanceId::new("kind-materializer")?,
         workload_class: WorkloadClassVersionRef::new(
-            WorkloadClassId::new("kind").expect("valid workload class ID"),
+            WorkloadClassId::new("kind")?,
             Generation::new(1),
         ),
         values: InstanceValues::new(),
@@ -153,7 +206,7 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
     })?)
 }
 
-async fn assert_pv_and_bound_pvc_exist(
+async fn verify_pv_and_bound_pvc_exist(
     client: Client,
     namespace: &str,
     pv_name: &str,
@@ -161,69 +214,257 @@ async fn assert_pv_and_bound_pvc_exist(
     let pvs: Api<PersistentVolume> = Api::all(client.clone());
     let pv = pvs.get(pv_name).await?;
     let expected_path = format!("/tmp/sleepypods-kind/{namespace}");
-    assert_eq!(
-        pv.spec
-            .as_ref()
-            .and_then(|spec| spec.host_path.as_ref())
-            .map(|source| source.path.as_str()),
-        Some(expected_path.as_str())
-    );
+    let actual_path = pv
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.host_path.as_ref())
+        .map(|source| source.path.as_str());
+    if actual_path != Some(expected_path.as_str()) {
+        return Err(format!(
+            "expected PersistentVolume {pv_name} hostPath {expected_path}, got {actual_path:?}"
+        )
+        .into());
+    }
 
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
-    let pvc = pvcs.get("sleepypods-kind-pvc").await?;
-    assert_eq!(
-        pvc.status
-            .as_ref()
-            .and_then(|status| status.phase.as_deref()),
-        Some("Bound")
-    );
+    let pvc = pvcs.get(PVC_NAME).await?;
+    let phase = pvc
+        .status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref());
+    if phase != Some("Bound") {
+        return Err(format!(
+            "expected PersistentVolumeClaim {namespace}/{PVC_NAME} to be Bound, got {phase:?}"
+        )
+        .into());
+    }
+
     Ok(())
 }
 
-async fn assert_deleted_or_deleting(
+async fn write_marker(client: Client, namespace: &str, marker: &str) -> TestResult<()> {
+    run_pvc_helper_pod(
+        client,
+        namespace,
+        "sleepypods-marker-write",
+        marker,
+        &[
+            "sh",
+            "-c",
+            "printf '%s' \"$MARKER_VALUE\" > /data/sleepypods-marker",
+        ],
+    )
+    .await
+}
+
+async fn verify_marker_present(client: Client, namespace: &str, marker: &str) -> TestResult<()> {
+    run_pvc_helper_pod(
+        client,
+        namespace,
+        "sleepypods-marker-read",
+        marker,
+        &[
+            "sh",
+            "-c",
+            "test \"$(cat /data/sleepypods-marker)\" = \"$MARKER_VALUE\"",
+        ],
+    )
+    .await
+}
+
+async fn run_pvc_helper_pod(
+    client: Client,
+    namespace: &str,
+    name: &str,
+    marker: &str,
+    command: &[&str],
+) -> TestResult<()> {
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
+    let pod = pvc_helper_pod(namespace, name, marker, command);
+
+    pods.create(&PostParams::default(), &pod).await?;
+    let result = wait_for_helper_pod_success(pods.clone(), name).await;
+    let delete_result = delete_pod_if_present(pods.clone(), name).await;
+    let deletion_wait_result = wait_for_absence(
+        || {
+            let pods = pods.clone();
+            async move { pods.get(name).await }
+        },
+        format!("Pod {namespace}/{name}"),
+        OBJECT_DELETION_TIMEOUT,
+    )
+    .await;
+
+    result?;
+    delete_result?;
+    deletion_wait_result?;
+    Ok(())
+}
+
+fn pvc_helper_pod(namespace: &str, name: &str, marker: &str, command: &[&str]) -> Pod {
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            namespace: Some(namespace.to_owned()),
+            labels: Some(BTreeMap::from([(
+                "sleepypods.io/kind-test-helper".to_owned(),
+                "true".to_owned(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".to_owned()),
+            containers: vec![Container {
+                name: "marker".to_owned(),
+                image: Some(HELPER_IMAGE.to_owned()),
+                command: Some(command.iter().map(|part| (*part).to_owned()).collect()),
+                env: Some(vec![EnvVar {
+                    name: "MARKER_VALUE".to_owned(),
+                    value: Some(marker.to_owned()),
+                    ..EnvVar::default()
+                }]),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "data".to_owned(),
+                    mount_path: "/data".to_owned(),
+                    ..VolumeMount::default()
+                }]),
+                ..Container::default()
+            }],
+            volumes: Some(vec![Volume {
+                name: "data".to_owned(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: PVC_NAME.to_owned(),
+                    read_only: Some(false),
+                }),
+                ..Volume::default()
+            }]),
+            ..PodSpec::default()
+        }),
+        ..Pod::default()
+    }
+}
+
+async fn wait_for_helper_pod_success(pods: Api<Pod>, name: &str) -> TestResult<()> {
+    let deadline = Instant::now() + HELPER_POD_TIMEOUT;
+
+    loop {
+        let pod = pods.get(name).await?;
+        let phase = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref());
+        match phase {
+            Some("Succeeded") => return Ok(()),
+            Some("Failed") => {
+                let logs = pods
+                    .logs(name, &LogParams::default())
+                    .await
+                    .unwrap_or_default();
+                return Err(format!("helper Pod {name} failed; logs: {logs}").into());
+            }
+            _ => {}
+        }
+
+        sleep_until_next_poll(
+            deadline,
+            format!("timed out waiting for helper Pod {name} to succeed"),
+        )
+        .await?;
+    }
+}
+
+async fn delete_pod_if_present(pods: Api<Pod>, name: &str) -> TestResult<()> {
+    match pods.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+async fn wait_for_rendered_objects_deleted(
     client: Client,
     namespace: &str,
     pv_name: &str,
 ) -> TestResult<()> {
     let stateful_sets: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
-    assert_deleted_or_deleting_object(stateful_sets.get("sleepypods-kind-app").await, |object| {
-        object.metadata.deletion_timestamp.is_some()
-    })?;
+    wait_for_absence(
+        || {
+            let stateful_sets = stateful_sets.clone();
+            async move { stateful_sets.get(WORKLOAD_NAME).await }
+        },
+        format!("StatefulSet {namespace}/{WORKLOAD_NAME}"),
+        OBJECT_DELETION_TIMEOUT,
+    )
+    .await?;
 
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
-    assert_deleted_or_deleting_object(services.get("sleepypods-kind-app").await, |object| {
-        object.metadata.deletion_timestamp.is_some()
-    })?;
+    wait_for_absence(
+        || {
+            let services = services.clone();
+            async move { services.get(WORKLOAD_NAME).await }
+        },
+        format!("Service {namespace}/{WORKLOAD_NAME}"),
+        OBJECT_DELETION_TIMEOUT,
+    )
+    .await?;
 
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
-    assert_deleted_or_deleting_object(pvcs.get("sleepypods-kind-pvc").await, |object| {
-        object.metadata.deletion_timestamp.is_some()
-    })?;
+    wait_for_absence(
+        || {
+            let pvcs = pvcs.clone();
+            async move { pvcs.get(PVC_NAME).await }
+        },
+        format!("PersistentVolumeClaim {namespace}/{PVC_NAME}"),
+        OBJECT_DELETION_TIMEOUT,
+    )
+    .await?;
 
     let pvs: Api<PersistentVolume> = Api::all(client);
-    assert_deleted_or_deleting_object(pvs.get(pv_name).await, |object| {
-        object.metadata.deletion_timestamp.is_some()
-    })?;
+    wait_for_absence(
+        || {
+            let pvs = pvs.clone();
+            async move { pvs.get(pv_name).await }
+        },
+        format!("PersistentVolume {pv_name}"),
+        OBJECT_DELETION_TIMEOUT,
+    )
+    .await?;
     Ok(())
 }
 
-fn assert_deleted_or_deleting_object<K>(
-    result: Result<K, KubeError>,
-    is_deleting: impl FnOnce(&K) -> bool,
+async fn wait_for_absence<K, Fut>(
+    mut get: impl FnMut() -> Fut,
+    description: String,
+    timeout: Duration,
 ) -> TestResult<()>
 where
+    Fut: Future<Output = Result<K, KubeError>>,
 {
-    match result {
-        Ok(object) => {
-            assert!(
-                is_deleting(&object),
-                "object still exists and Kubernetes has not accepted deletion"
-            );
-            Ok(())
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match get().await {
+            Ok(_) => {}
+            Err(error) if is_not_found(&error) => return Ok(()),
+            Err(error) => return Err(Box::new(error)),
         }
-        Err(error) if is_not_found(&error) => Ok(()),
-        Err(error) => Err(Box::new(error)),
+
+        sleep_until_next_poll(
+            deadline,
+            format!("timed out waiting for {description} to be deleted"),
+        )
+        .await?;
     }
+}
+
+async fn sleep_until_next_poll(deadline: Instant, timeout_message: String) -> TestResult<()> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(timeout_message.into());
+    }
+
+    sleep(POLL_INTERVAL.min(deadline - now)).await;
+    Ok(())
 }
 
 async fn create_namespace(client: Client, namespace: &str) -> TestResult<()> {
@@ -260,16 +501,17 @@ fn rendered_refs(manifest: &RenderedManifest) -> Vec<RenderedObjectRef> {
         .collect()
 }
 
-fn unique_namespace() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after Unix epoch")
-        .as_millis();
-    format!("sleepypods-kind-{millis}-{}", std::process::id())
+fn unique_namespace() -> TestResult<String> {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    Ok(format!("sleepypods-kind-{millis}-{}", std::process::id()))
 }
 
 fn pv_name(namespace: &str) -> String {
     format!("{namespace}-pv")
+}
+
+fn marker_value(namespace: &str) -> String {
+    format!("{namespace}-marker")
 }
 
 fn is_not_found(error: &KubeError) -> bool {
