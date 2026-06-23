@@ -413,6 +413,254 @@ async fn http_proxy_preserves_chunked_request_body() {
 }
 
 #[tokio::test]
+async fn http_proxy_preserves_large_request_and_response_bodies() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener.local_addr().expect("upstream address");
+    let upstream_origin: Uri = format!("http://{upstream_addr}")
+        .parse()
+        .expect("upstream URI parses");
+    let large_body = Bytes::from(
+        (0..512 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let expected_body = large_body.clone();
+
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts proxy connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |mut request: Request<Incoming>| {
+                    let expected_body = expected_body.clone();
+
+                    async move {
+                        assert_eq!(request.uri().path(), "/large");
+                        let body = request
+                            .body_mut()
+                            .collect()
+                            .await
+                            .expect("upstream reads large request")
+                            .to_bytes();
+                        assert_eq!(body, expected_body);
+
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("content-length", body.len().to_string())
+                                .body(Full::new(body))
+                                .expect("large response builds"),
+                        )
+                    }
+                }),
+            )
+            .await
+            .expect("upstream serves large request");
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
+    let drain = DrainTracker::new(Duration::from_secs(5));
+    let proxy = HttpProxy::new(drain.clone());
+
+    let proxy_task = tokio::spawn(async move {
+        let (stream, _) = proxy_listener
+            .accept()
+            .await
+            .expect("proxy accepts client connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |request| {
+                    let proxy = proxy.clone();
+                    let upstream_origin = upstream_origin.clone();
+
+                    async move { proxy.proxy(request, &upstream_origin).await }
+                }),
+            )
+            .await
+            .expect("proxy serves large request");
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+    client
+        .write_all(
+            format!(
+                "POST /large HTTP/1.1\r\n\
+                 Host: public.example.test\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                large_body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("client writes large request headers");
+    client
+        .write_all(&large_body)
+        .await
+        .expect("client writes large request body");
+
+    let mut response = Vec::new();
+    expect_within(
+        client.read_to_end(&mut response),
+        "client reads large response",
+    )
+    .await
+    .expect("client reads large response");
+    let (headers, body) = split_http_response(&response);
+    assert!(headers.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(body, large_body.as_ref());
+
+    proxy_task.await.expect("proxy task completed");
+    upstream_task.await.expect("upstream task completed");
+    drain.wait_for_active_count(0).await;
+    assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test]
+async fn http_proxy_streams_request_body_before_client_finishes_sending() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener.local_addr().expect("upstream address");
+    let upstream_origin: Uri = format!("http://{upstream_addr}")
+        .parse()
+        .expect("upstream URI parses");
+    let (first_chunk_tx, first_chunk_rx) = oneshot::channel();
+    let first_chunk_tx = Arc::new(Mutex::new(Some(first_chunk_tx)));
+
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts proxy connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |mut request: Request<Incoming>| {
+                    let first_chunk_tx = Arc::clone(&first_chunk_tx);
+
+                    async move {
+                        assert_eq!(request.uri().path(), "/stream-request");
+                        let first = request
+                            .body_mut()
+                            .frame()
+                            .await
+                            .expect("upstream receives first request frame")
+                            .expect("first request frame is valid")
+                            .into_data()
+                            .expect("first request frame is data");
+                        assert_eq!(first, Bytes::from_static(b"first chunk"));
+
+                        if let Some(tx) = first_chunk_tx
+                            .lock()
+                            .expect("first chunk channel lock is not poisoned")
+                            .take()
+                        {
+                            tx.send(()).expect("test waits for streamed first chunk");
+                        }
+
+                        let tail = request
+                            .body_mut()
+                            .collect()
+                            .await
+                            .expect("upstream reads request tail")
+                            .to_bytes();
+                        assert_eq!(tail, Bytes::from_static(b"second chunk"));
+
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                            b"streamed",
+                        ))))
+                    }
+                }),
+            )
+            .await
+            .expect("upstream serves streaming request");
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
+    let drain = DrainTracker::new(Duration::from_secs(5));
+    let proxy = HttpProxy::new(drain.clone());
+
+    let proxy_task = tokio::spawn(async move {
+        let (stream, _) = proxy_listener
+            .accept()
+            .await
+            .expect("proxy accepts client connection");
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |request| {
+                    let proxy = proxy.clone();
+                    let upstream_origin = upstream_origin.clone();
+
+                    async move { proxy.proxy(request, &upstream_origin).await }
+                }),
+            )
+            .await
+            .expect("proxy serves streaming request");
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+    client
+        .write_all(
+            b"POST /stream-request HTTP/1.1\r\n\
+              Host: public.example.test\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Connection: close\r\n\
+              \r\n\
+              b\r\nfirst chunk\r\n",
+        )
+        .await
+        .expect("client writes first request chunk");
+
+    first_chunk_rx
+        .await
+        .expect("upstream received first chunk before request completed");
+    assert_eq!(drain.active_count(), 1);
+
+    client
+        .write_all(b"c\r\nsecond chunk\r\n0\r\n\r\n")
+        .await
+        .expect("client writes final request chunk");
+
+    let mut response = Vec::new();
+    expect_within(
+        client.read_to_end(&mut response),
+        "client reads streaming request response",
+    )
+    .await
+    .expect("client reads streaming request response");
+    let (headers, body) = split_http_response(&response);
+    assert!(headers.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(body, b"streamed");
+
+    proxy_task.await.expect("proxy task completed");
+    upstream_task.await.expect("upstream task completed");
+    drain.wait_for_active_count(0).await;
+    assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test]
 async fn http_proxy_streaming_response_holds_lifecycle_until_body_finishes() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await

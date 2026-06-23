@@ -1,11 +1,22 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use proxy_core::{DrainError, DrainTracker, WebSocketProxy, WebSocketProxyError};
-use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+use proxy_core::{
+    proxy_websocket_streams, DrainError, DrainTracker, WebSocketProxy, WebSocketProxyError,
+};
+use tokio::{
+    io::{duplex, AsyncWriteExt},
+    net::TcpListener,
+    sync::oneshot,
+    time::timeout,
+};
 use tokio_tungstenite::{
     accept_async, connect_async,
-    tungstenite::{protocol::CloseFrame, Bytes as WsBytes, Message},
+    tungstenite::{
+        protocol::{CloseFrame, Role},
+        Bytes as WsBytes, Error as TungsteniteError, Message,
+    },
+    WebSocketStream,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -437,6 +448,65 @@ async fn websocket_proxy_releases_lifecycle_after_upstream_peer_disconnect() {
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
     assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test]
+async fn websocket_proxy_backpressure_blocks_until_slow_downstream_peer_reads() {
+    const MESSAGE_COUNT: usize = 32;
+
+    let (downstream_peer, proxy_downstream) = duplex(1024);
+    let (proxy_upstream, upstream_peer) = duplex(1024);
+    let proxy_downstream =
+        WebSocketStream::from_raw_socket(proxy_downstream, Role::Server, None).await;
+    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
+    let mut downstream =
+        WebSocketStream::from_raw_socket(downstream_peer, Role::Client, None).await;
+    let mut upstream = WebSocketStream::from_raw_socket(upstream_peer, Role::Server, None).await;
+    let payload = WsBytes::from(vec![b's'; 16 * 1024]);
+
+    let mut proxy_task = tokio::spawn(proxy_websocket_streams(proxy_downstream, proxy_upstream));
+    let upstream_payload = payload.clone();
+    let mut upstream_task = tokio::spawn(async move {
+        for _ in 0..MESSAGE_COUNT {
+            upstream
+                .send(Message::Binary(upstream_payload.clone()))
+                .await
+                .expect("upstream eventually sends backpressured message");
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        timeout(Duration::from_millis(25), &mut proxy_task)
+            .await
+            .is_err(),
+        "proxy should remain blocked while the downstream peer is not reading"
+    );
+    assert!(
+        timeout(Duration::from_millis(25), &mut upstream_task)
+            .await
+            .is_err(),
+        "bounded websocket path should apply backpressure to the upstream sender"
+    );
+
+    for _ in 0..MESSAGE_COUNT {
+        let message = timeout(TEST_TIMEOUT, downstream.next())
+            .await
+            .expect("downstream receives message after resuming reads")
+            .expect("downstream receives websocket message")
+            .expect("websocket message is valid");
+        assert_eq!(message, Message::Binary(payload.clone()));
+    }
+
+    upstream_task.await.expect("upstream task completed");
+    let _ = timeout(TEST_TIMEOUT, downstream.next())
+        .await
+        .expect("downstream observes upstream completion after draining messages");
+    let error = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect_err("raw upstream disconnect is reported after slow downstream resumes");
+    assert!(matches!(error, TungsteniteError::Protocol(_)));
 }
 
 #[tokio::test]

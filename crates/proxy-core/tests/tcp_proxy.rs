@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{io::ErrorKind, net::SocketAddr, time::Duration};
 
 use proxy_core::{
     proxy_streams, DrainError, DrainTracker, TcpProxy, TcpProxyConfig, TcpProxyError, TcpProxyStats,
 };
+use socket2::SockRef;
 use tokio::{
     io::{duplex, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -10,6 +11,7 @@ use tokio::{
 };
 
 const REQUEST: &[u8] = b"preserve these bytes across the proxy";
+const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test]
 async fn tcp_proxy_preserves_bytes_and_tracks_connection_lifecycle() {
@@ -152,6 +154,57 @@ async fn tcp_proxy_surfaces_upstream_connect_errors_and_releases_lifecycle() {
 }
 
 #[tokio::test]
+async fn tcp_proxy_surfaces_deterministic_connect_timeout_and_releases_lifecycle() {
+    let upstream_addr = SocketAddr::from(([192, 0, 2, 1], 80));
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
+    let drain = DrainTracker::new(Duration::from_secs(5));
+    let proxy = TcpProxy::new(
+        drain.clone(),
+        TcpProxyConfig {
+            connect_timeout: Duration::ZERO,
+        },
+    );
+
+    let proxy_task = tokio::spawn(async move {
+        let (client, _) = proxy_listener
+            .accept()
+            .await
+            .expect("proxy accepts client connection");
+
+        proxy.proxy(client, upstream_addr).await
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+    let mut eof = [0; 1];
+    assert_eq!(
+        timeout(TEST_TIMEOUT, client.read(&mut eof))
+            .await
+            .expect("client observes timeout close before deadline")
+            .expect("client reads eof after connect timeout"),
+        0
+    );
+
+    let error = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect_err("proxy reports deterministic upstream connect timeout");
+    assert!(matches!(
+        error,
+        TcpProxyError::ConnectTimeout {
+            timeout: Duration::ZERO
+        }
+    ));
+    drain.wait_for_active_count(0).await;
+    assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test]
 async fn tcp_proxy_releases_lifecycle_after_client_disconnect() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -288,6 +341,86 @@ async fn tcp_proxy_releases_lifecycle_after_upstream_disconnect() {
             upstream_to_client: 0,
         }
     );
+    upstream_task.await.expect("upstream task completed");
+    drain.wait_for_active_count(0).await;
+    assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test]
+async fn tcp_proxy_reports_os_level_upstream_reset_and_releases_lifecycle() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+    let (upstream_reset_tx, upstream_reset_rx) = tokio::sync::oneshot::channel();
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts proxy connection");
+
+        let mut received = vec![0; REQUEST.len()];
+        stream
+            .read_exact(&mut received)
+            .await
+            .expect("upstream reads proxied bytes before reset");
+        assert_eq!(received, REQUEST);
+
+        SockRef::from(&stream)
+            .set_linger(Some(Duration::ZERO))
+            .expect("upstream enables reset-on-close linger");
+        upstream_reset_tx
+            .send(())
+            .expect("test waits for upstream reset");
+        drop(stream);
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
+    let drain = DrainTracker::new(Duration::from_secs(5));
+    let proxy = TcpProxy::new(
+        drain.clone(),
+        TcpProxyConfig {
+            connect_timeout: Duration::from_secs(1),
+        },
+    );
+
+    let proxy_task = tokio::spawn(async move {
+        let (client, _) = proxy_listener
+            .accept()
+            .await
+            .expect("proxy accepts client connection");
+
+        proxy.proxy(client, upstream_addr).await
+    });
+
+    let mut client = TcpStream::connect(proxy_addr)
+        .await
+        .expect("client connects to proxy");
+    client
+        .write_all(REQUEST)
+        .await
+        .expect("client writes request bytes");
+    drain.wait_for_active_count(1).await;
+    upstream_reset_rx
+        .await
+        .expect("upstream performed reset close");
+
+    let error = timeout(TEST_TIMEOUT, proxy_task)
+        .await
+        .expect("proxy reports upstream reset before timeout")
+        .expect("proxy task completed")
+        .expect_err("proxy reports OS-level upstream reset");
+    match error {
+        TcpProxyError::Proxy(error) => assert_eq!(error.kind(), ErrorKind::ConnectionReset),
+        other => panic!("expected proxy reset error, got {other:?}"),
+    }
+
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
     assert_eq!(drain.active_count(), 0);
