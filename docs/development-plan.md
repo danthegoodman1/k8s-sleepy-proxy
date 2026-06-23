@@ -623,7 +623,7 @@ Done criteria:
 | Incomplete | kind tests prove sleep deletes workload, Service, PVC, and PV. | Sleep-driven cleanup is covered by component transport tests, but no kind/full-platform `ReportIdle` cleanup gate proves deletion of real workload, Service, PVC, and PV objects. |
 | Complete | kind tests prove re-wake recreates manifests from same values and preserves static-volume data. | `scripts/test-kind-materializer.sh` rematerializes the manifest and verifies the previous marker remains. |
 | Complete | Failure tests cover missing/bad volume handles, PVCs never bind, wrong access modes, and stale manifest generation. | Manifest tests reject missing/empty CSI volume handles plus unsupported/duplicate access modes; materializer tests cover PVC bind failures and stale generation labels/annotations being rejected before apply. |
-| Incomplete | Readiness tests prove routes are not published until ready and withdrawn when unready. | Materializer readiness returns a backend only after ready, but route publication/withdrawal is not wired to readiness changes; follow-up: M9. |
+| Complete | Readiness tests prove routes are not published until ready and withdrawn when unready. | `proxy_api_transport.rs` proves `SubscribeRoute` resolves the route while publishing a backend only from a ready materialization for the configured target/current instance generation, and withholds/withdraws backend publication for no materialization, pending, failed, deleting, deleted, stale generation, and wrong target. This is component/API evidence only; subscribed push update/invalidation delivery and full-platform kind proof remain tracked in M9. |
 
 ## Milestone 6: End-to-End V1
 

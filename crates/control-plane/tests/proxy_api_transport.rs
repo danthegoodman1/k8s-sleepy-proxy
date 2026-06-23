@@ -226,6 +226,7 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
             DomainInstanceState::Cold,
         ),
     );
+    store.seed_ready_materialization(ready_materialization("instance-resolved", 7));
 
     let response = proxy_grpc_service_with_store(
         store,
@@ -266,14 +267,138 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
             instance_id: "instance-resolved".to_owned(),
             instance_state: InstanceState::Cold as i32,
             instance_generation: 7,
-            backend_uri: Some("http://backend.example.local:8080".to_owned()),
-            backend_generation: Some(9),
+            backend_uri: Some("http://svc-acme.apps.svc.cluster.local:80".to_owned()),
+            backend_generation: Some(7),
         })
     );
     assert_eq!(
         resolved.cache_policy,
         Some(ProxyCachePolicy { ttl_millis: 10_000 })
     );
+}
+
+#[tokio::test]
+async fn proxy_subscribe_publishes_backend_only_from_ready_materialization_for_target() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("ready.example.com", None),
+        domain_route_entry(
+            "route-ready",
+            "instance-ready",
+            DomainInstanceState::Running,
+        ),
+    );
+    store.seed_ready_materialization(ready_materialization("instance-ready", 7));
+
+    let resolved = subscribe_resolved_route(
+        store,
+        "request-ready",
+        proto_http_identity(RouteHostKind::Exact, "ready.example.com", None),
+        proxy_target(),
+    )
+    .await;
+
+    let route = resolved.route.expect("route entry is returned");
+    assert_eq!(
+        route.backend_uri,
+        Some("http://svc-acme.apps.svc.cluster.local:80".to_owned())
+    );
+    assert_eq!(route.backend_generation, Some(7));
+}
+
+#[tokio::test]
+async fn proxy_subscribe_withholds_backend_without_ready_materialization() {
+    let cases = [
+        ("absent", None),
+        ("pending", Some(MaterializationState::Pending)),
+        ("failed", Some(MaterializationState::Failed)),
+        ("deleting", Some(MaterializationState::Deleting)),
+        ("deleted", Some(MaterializationState::Deleted)),
+    ];
+
+    for (suffix, materialization_state) in cases {
+        let instance_id = format!("instance-{suffix}");
+        let store = Arc::new(FakeWakeStore::default());
+        store.seed_route_resolved(
+            domain_http_identity(&format!("{suffix}.example.com"), None),
+            domain_route_entry(
+                &format!("route-{suffix}"),
+                &instance_id,
+                DomainInstanceState::Running,
+            ),
+        );
+        if let Some(state) = materialization_state {
+            store.seed_materialization(materialization_with_state(&instance_id, 7, state));
+        }
+
+        let resolved = subscribe_resolved_route(
+            store,
+            &format!("request-{suffix}"),
+            proto_http_identity(RouteHostKind::Exact, &format!("{suffix}.example.com"), None),
+            proxy_target(),
+        )
+        .await;
+
+        let route = resolved.route.expect("route entry is returned");
+        assert_eq!(route.backend_uri, None, "{suffix} must not publish backend");
+        assert_eq!(
+            route.backend_generation, None,
+            "{suffix} must not publish backend generation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proxy_subscribe_withholds_backend_for_stale_generation_or_wrong_target() {
+    let stale_store = Arc::new(FakeWakeStore::default());
+    stale_store.seed_route_resolved(
+        domain_http_identity("stale.example.com", None),
+        domain_route_entry(
+            "route-stale",
+            "instance-stale",
+            DomainInstanceState::Running,
+        ),
+    );
+    stale_store.seed_ready_materialization(ready_materialization("instance-stale", 6));
+
+    let stale = subscribe_resolved_route(
+        stale_store,
+        "request-stale",
+        proto_http_identity(RouteHostKind::Exact, "stale.example.com", None),
+        proxy_target(),
+    )
+    .await;
+    let stale_route = stale.route.expect("route entry is returned");
+    assert_eq!(stale_route.instance_generation, 7);
+    assert_eq!(stale_route.backend_uri, None);
+    assert_eq!(stale_route.backend_generation, None);
+
+    let wrong_target_store = Arc::new(FakeWakeStore::default());
+    wrong_target_store.seed_route_resolved(
+        domain_http_identity("wrong-target.example.com", None),
+        domain_route_entry(
+            "route-wrong-target",
+            "instance-wrong-target",
+            DomainInstanceState::Running,
+        ),
+    );
+    wrong_target_store.seed_materialization(materialization_with_state_and_target(
+        "instance-wrong-target",
+        7,
+        MaterializationState::Ready,
+        MaterializationTarget::new("cluster-other", "apps").expect("target is valid"),
+    ));
+
+    let wrong_target = subscribe_resolved_route(
+        wrong_target_store,
+        "request-wrong-target",
+        proto_http_identity(RouteHostKind::Exact, "wrong-target.example.com", None),
+        proxy_target(),
+    )
+    .await;
+    let wrong_target_route = wrong_target.route.expect("route entry is returned");
+    assert_eq!(wrong_target_route.backend_uri, None);
+    assert_eq!(wrong_target_route.backend_generation, None);
 }
 
 #[tokio::test]
@@ -855,6 +980,10 @@ impl FakeWakeStore {
     }
 
     fn seed_ready_materialization(&self, materialization: MaterializationRecord) {
+        self.seed_materialization(materialization);
+    }
+
+    fn seed_materialization(&self, materialization: MaterializationRecord) {
         self.materializations
             .lock()
             .expect("fake store lock is available")
@@ -1255,6 +1384,30 @@ fn proxy_target() -> MaterializationTarget {
     MaterializationTarget::new("cluster-a", "apps").expect("proxy target is valid")
 }
 
+async fn subscribe_resolved_route(
+    store: Arc<FakeWakeStore>,
+    request_id: &str,
+    identity: ProtoRouteIdentity,
+    target: MaterializationTarget,
+) -> ProxyRouteResolvedResponse {
+    let response = proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        target,
+    )
+    .oneshot(grpc_proxy_subscribe_request(
+        vec![subscribe_route_request(request_id, identity)],
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("subscribe request should dispatch");
+
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert_eq!(status, "0");
+    expect_route_resolved(single_message(messages))
+}
+
 fn expect_ready(
     response: control_plane::api::pb::ProxyWakeInstanceResponse,
 ) -> control_plane::api::pb::ProxyWakeReadyResult {
@@ -1323,13 +1476,35 @@ fn domain_workload_ref() -> control_plane::WorkloadClassVersionRef {
 }
 
 fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationRecord {
+    materialization_with_state(instance_id, generation, MaterializationState::Ready)
+}
+
+fn materialization_with_state(
+    instance_id: &str,
+    generation: u64,
+    state: MaterializationState,
+) -> MaterializationRecord {
+    materialization_with_state_and_target(instance_id, generation, state, proxy_target())
+}
+
+fn materialization_with_state_and_target(
+    instance_id: &str,
+    generation: u64,
+    state: MaterializationState,
+    target: MaterializationTarget,
+) -> MaterializationRecord {
     MaterializationRecord {
-        id: MaterializationId::new(format!("{instance_id}:cluster-a:apps"))
-            .expect("materialization ID is valid"),
+        id: MaterializationId::new(format!(
+            "{}:{}:{}",
+            instance_id,
+            target.cluster_id(),
+            target.namespace()
+        ))
+        .expect("materialization ID is valid"),
         instance_id: InstanceId::new(instance_id).expect("instance ID is valid"),
         instance_generation: Generation::new(generation),
-        target: proxy_target(),
-        state: MaterializationState::Ready,
+        target,
+        state,
         backend: Some(
             BackendEndpoint::new("http://svc-acme.apps.svc.cluster.local:80")
                 .expect("backend URI is valid"),

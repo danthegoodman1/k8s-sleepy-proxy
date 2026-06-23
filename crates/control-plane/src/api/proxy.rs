@@ -9,7 +9,9 @@ use crate::{
     api::pb::{self, proxy_control_plane_server::ProxyControlPlaneServer},
     ids::{BackendGeneration, Generation, InstanceId},
     instance::{self as domain_instance, InstanceState},
-    materialization::{MaterializationRecord, MaterializationTarget},
+    materialization::{
+        LoadReadyMaterializationRequest, MaterializationRecord, MaterializationTarget,
+    },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     route as domain_route,
     store::{ControlPlaneStore, StoreError},
@@ -105,6 +107,7 @@ where
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let mut requests = request.into_inner();
         let store = Arc::clone(&self.store);
+        let target = self.target.clone();
         let (responses, response_stream) = tokio::sync::mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
 
         tokio::spawn(async move {
@@ -120,6 +123,7 @@ where
             } {
                 let response = handle_subscribe_request(
                     store.as_ref(),
+                    target.clone(),
                     request,
                     &mut subscriptions,
                     &mut next_subscription_number,
@@ -149,6 +153,7 @@ where
 
 async fn handle_subscribe_request(
     store: &dyn ControlPlaneStore,
+    target: MaterializationTarget,
     request: pb::ProxySubscribeRequest,
     subscriptions: &mut HashMap<String, domain_route::RouteDependencyLookup>,
     next_subscription_number: &mut u64,
@@ -157,11 +162,15 @@ async fn handle_subscribe_request(
         .input
         .ok_or_else(|| Status::invalid_argument("subscribe request input is required"))?
     {
-        pb::proxy_subscribe_request::Input::SubscribeRoute(request) => {
-            subscribe_route(store, request, subscriptions, next_subscription_number)
-                .await
-                .map(Some)
-        }
+        pb::proxy_subscribe_request::Input::SubscribeRoute(request) => subscribe_route(
+            store,
+            target,
+            request,
+            subscriptions,
+            next_subscription_number,
+        )
+        .await
+        .map(Some),
         pb::proxy_subscribe_request::Input::Unsubscribe(request) => {
             let subscription_id = non_empty_field(request.subscription_id, "subscription_id")?;
             subscriptions.remove(&subscription_id);
@@ -174,6 +183,7 @@ async fn handle_subscribe_request(
 
 async fn subscribe_route(
     store: &dyn ControlPlaneStore,
+    target: MaterializationTarget,
     request: pb::ProxySubscribeRouteRequest,
     subscriptions: &mut HashMap<String, domain_route::RouteDependencyLookup>,
     next_subscription_number: &mut u64,
@@ -191,8 +201,9 @@ async fn subscribe_route(
     {
         domain_route::RouteResolution::Resolved {
             matched_identity,
-            entry,
+            mut entry,
         } => {
+            publish_ready_backend(store, &mut entry, target).await?;
             let subscription_id = next_subscription_id(next_subscription_number);
             subscriptions.insert(
                 subscription_id.clone(),
@@ -223,6 +234,33 @@ async fn subscribe_route(
             )),
         }),
     }
+}
+
+async fn publish_ready_backend(
+    store: &dyn ControlPlaneStore,
+    entry: &mut domain_route::RouteEntry,
+    target: MaterializationTarget,
+) -> Result<(), Status> {
+    entry.backend = None;
+    entry.backend_generation = None;
+
+    let materialization = store
+        .load_ready_materialization(LoadReadyMaterializationRequest::new(
+            entry.instance_id.clone(),
+            entry.instance_generation,
+            target,
+        ))
+        .await
+        .map_err(store_error_to_status)?;
+
+    if let Some(materialization) = materialization {
+        if let Some(backend) = materialization.backend {
+            entry.backend = Some(backend);
+            entry.backend_generation = Some(materialization.backend_generation);
+        }
+    }
+
+    Ok(())
 }
 
 fn next_subscription_id(next_subscription_number: &mut u64) -> String {
