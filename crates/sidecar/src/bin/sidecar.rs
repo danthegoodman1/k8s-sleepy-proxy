@@ -28,7 +28,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
+            if shutdown_signal().await.is_ok() {
                 shutdown.shutdown();
             }
         }
@@ -39,6 +39,24 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         SidecarRuntimeMode::Tcp => serve_tcp_with_idle(env.runtime, client, shutdown).await?,
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
