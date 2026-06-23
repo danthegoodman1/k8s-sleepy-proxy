@@ -283,7 +283,7 @@ Done criteria:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Database migrations and store tests pass against a real test database. | `postgres_store_conformance_against_real_database` exists and runs when `SLEEPYPODS_POSTGRES_URL` is configured, but this audit has no current real database run evidence; follow-up: M9 live database gate. |
+| Complete | Database migrations and store tests pass against a real test database. | `scripts/test-postgres-store.sh` sets `SLEEPYPODS_POSTGRES_URL` from either the caller environment or a disposable `postgres:17-alpine` container and runs `cargo test -p control-plane --test postgres_store -- --nocapture`; verified passing against a disposable real database. |
 | Complete | Store conformance covers idempotency, rollback, duplicate routes, conflicts, CAS, materialization generations, and provider config errors. | `postgres_store.rs` conformance covers these cases, including invalid connection URL and transactional rollback after duplicate route identity. |
 | Complete | Control plane can construct the configured store provider. | `runtime.rs` tests cover env parsing and provider construction paths. |
 | Complete | Native gRPC and gRPC-Web integration tests exercise the same operator APIs. | `api_transport.rs` covers native store-backed dispatch and gRPC-Web store-backed unary calls for representative workload class, instance create/get/delete, route binding create/get/delete, and HTTP-01 put/resolve/delete flows. |
@@ -944,9 +944,10 @@ Done when:
   leaves no workload, Service, PVC, or PV objects owned by that instance.
 - full-platform kind E2E uses the real control-plane, frontline, and sidecar
   images against a real database and Kubernetes API, not fake clients.
-- Live database gates run the Postgres store conformance suite with
-  `SLEEPYPODS_POSTGRES_URL` set and prove migrations plus store behavior against
-  a real database.
+- Live database gate `scripts/test-postgres-store.sh` runs the Postgres store
+  conformance suite with `SLEEPYPODS_POSTGRES_URL` set, using either a caller
+  URL or disposable `postgres:17-alpine`, and proves migrations plus store
+  behavior against a real database.
 - Runtime tests prove the frontline binary wires HTTP, TLS termination, and
   TLS/SNI passthrough listeners rather than leaving TLS/SNI as library-only
   primitives.
