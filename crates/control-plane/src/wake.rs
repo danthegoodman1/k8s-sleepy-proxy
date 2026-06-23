@@ -12,6 +12,7 @@ use crate::{
         MaterializationRecord, MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
+    sleep_policy::SleepPolicyError,
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
@@ -69,6 +70,10 @@ pub enum WakeInstanceError {
     Render {
         instance: InstanceRecord,
         source: ManifestRenderError,
+    },
+    SleepPolicy {
+        instance: InstanceRecord,
+        source: SleepPolicyError,
     },
     Materializer {
         instance: InstanceRecord,
@@ -167,9 +172,25 @@ where
         Err(error) => return Err(fail_waking_with_store_error(store, &waking, error).await),
     };
 
+    let sleep_policy = match workload_class.sleep_policy.resolve(&waking.values) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::SleepPolicy {
+                    instance: waking.clone(),
+                    source: error,
+                },
+            )
+            .await);
+        }
+    };
+
     let manifest = match render_manifests(RenderManifestRequest {
         template: &workload_class.template,
         instance: &waking,
+        sleep_policy,
         namespace: request.target.namespace(),
         template_generation: Some(workload_class.template_generation),
     }) {
@@ -317,6 +338,9 @@ fn failure_message(error: &WakeInstanceError) -> String {
             "workload class version not found".to_owned()
         }
         WakeInstanceError::Render { source, .. } => format!("manifest render failed: {source}"),
+        WakeInstanceError::SleepPolicy { source, .. } => {
+            format!("sleep policy resolution failed: {source}")
+        }
         WakeInstanceError::Materializer { source, .. } => {
             format!("materialization failed: {source}")
         }
@@ -358,6 +382,9 @@ impl fmt::Display for WakeInstanceError {
             Self::WorkloadClassNotFound { .. } => f.write_str("workload class version not found"),
             Self::Store(error) => write!(f, "wake store operation failed: {error}"),
             Self::Render { source, .. } => write!(f, "wake manifest render failed: {source}"),
+            Self::SleepPolicy { source, .. } => {
+                write!(f, "wake sleep policy resolution failed: {source}")
+            }
             Self::Materializer { source, .. } => {
                 write!(f, "wake materializer failed: {source}")
             }
@@ -370,6 +397,7 @@ impl Error for WakeInstanceError {
         match self {
             Self::Store(error) => Some(error),
             Self::Render { source, .. } => Some(source),
+            Self::SleepPolicy { source, .. } => Some(source),
             Self::Materializer { source, .. } => Some(source),
             Self::NotFound
             | Self::GenerationConflict { .. }

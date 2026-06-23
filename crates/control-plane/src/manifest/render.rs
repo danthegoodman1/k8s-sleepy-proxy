@@ -21,6 +21,9 @@ const ENV_LISTEN_PORT: &str = "SLEEPYPODS_LISTEN_PORT";
 const ENV_APP_PORT: &str = "SLEEPYPODS_APP_PORT";
 const ENV_INSTANCE_ID: &str = "SLEEPYPODS_INSTANCE_ID";
 const ENV_INSTANCE_GENERATION: &str = "SLEEPYPODS_INSTANCE_GENERATION";
+const ENV_IDLE_TIMEOUT_MS: &str = "SLEEPYPODS_IDLE_TIMEOUT_MS";
+const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
+const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 
 pub fn render_manifests(
     request: RenderManifestRequest<'_>,
@@ -127,7 +130,12 @@ pub fn render_manifests(
                     request.instance,
                     &rendered_volumes,
                 )?,
-                render_sidecar_container(&request.template.sidecar, request.instance, &sidecar)?,
+                render_sidecar_container(
+                    &request.template.sidecar,
+                    request.instance,
+                    &sidecar,
+                    request.sleep_policy,
+                )?,
             ],
             volumes: rendered_volumes
                 .iter()
@@ -404,6 +412,7 @@ fn render_sidecar_container(
     template: &SidecarTemplate,
     instance: &InstanceRecord,
     config: &SidecarRenderConfig,
+    sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
 ) -> Result<Container, ManifestRenderError> {
     Ok(Container {
         name: template.name.clone(),
@@ -428,6 +437,18 @@ fn render_sidecar_container(
             EnvVar {
                 name: ENV_INSTANCE_GENERATION.to_owned(),
                 value: instance.generation.to_string(),
+            },
+            EnvVar {
+                name: ENV_IDLE_TIMEOUT_MS.to_owned(),
+                value: sleep_policy.idle_timeout_ms.to_string(),
+            },
+            EnvVar {
+                name: ENV_IDLE_RETRY_BACKOFF_MS.to_owned(),
+                value: sleep_policy.idle_retry_backoff_ms.to_string(),
+            },
+            EnvVar {
+                name: ENV_DRAIN_GRACE_TIMEOUT_MS.to_owned(),
+                value: sleep_policy.drain_grace_timeout_ms.to_string(),
             },
         ],
         volume_mounts: Vec::new(),

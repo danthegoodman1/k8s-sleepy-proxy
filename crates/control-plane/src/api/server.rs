@@ -15,6 +15,7 @@ use crate::{
     ids::{IdempotencyKey, InstanceId, WorkloadClassId},
     instance::{self as domain_instance, InstanceState},
     route as domain_route,
+    sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{ControlPlaneStore, StoreError},
     workload::{self as domain_workload, WorkloadClassVersion, WorkloadClassVersionRef},
 };
@@ -413,6 +414,10 @@ fn create_workload_class_request_from_proto(
             .map(workload_value_schema_from_proto)
             .transpose()?
             .unwrap_or_default(),
+        sleep_policy: request
+            .sleep_policy
+            .ok_or_else(|| Status::invalid_argument("sleep_policy is required"))
+            .and_then(workload_sleep_policy_from_proto)?,
     };
 
     Ok(domain_workload::CreateWorkloadClassVersionRequest::new(
@@ -466,6 +471,26 @@ fn workload_value_schema_from_proto(
             .collect(),
         allow_extra: schema.allow_extra,
     })
+}
+
+fn workload_sleep_policy_from_proto(
+    policy: pb::WorkloadSleepPolicy,
+) -> Result<WorkloadSleepPolicy, Status> {
+    let policy = WorkloadSleepPolicy {
+        idle_timeout_ms: policy.idle_timeout_ms,
+        idle_retry_backoff_ms: policy.idle_retry_backoff_ms,
+        drain_grace_timeout_ms: policy.drain_grace_timeout_ms,
+        idle_timeout_override: policy.idle_timeout_override.map(|override_policy| {
+            IdleTimeoutOverridePolicy {
+                value_field: override_policy.value_field,
+                min_idle_timeout_ms: override_policy.min_idle_timeout_ms,
+                max_idle_timeout_ms: override_policy.max_idle_timeout_ms,
+            }
+        }),
+    };
+    policy.validate().map_err(invalid_argument_status)?;
+
+    Ok(policy)
 }
 
 fn route_identity_from_proto(
@@ -577,6 +602,7 @@ fn workload_class_to_proto(workload_class: WorkloadClassVersion) -> pb::Workload
         default_values: workload_class.default_values.into_iter().collect(),
         value_schema: Some(workload_value_schema_to_proto(workload_class.value_schema)),
         template: Some(manifest_template_to_proto(workload_class.template)),
+        sleep_policy: Some(workload_sleep_policy_to_proto(workload_class.sleep_policy)),
     }
 }
 
@@ -598,6 +624,21 @@ fn workload_value_schema_to_proto(
             })
             .collect(),
         allow_extra: schema.allow_extra,
+    }
+}
+
+fn workload_sleep_policy_to_proto(policy: WorkloadSleepPolicy) -> pb::WorkloadSleepPolicy {
+    pb::WorkloadSleepPolicy {
+        idle_timeout_ms: policy.idle_timeout_ms,
+        idle_retry_backoff_ms: policy.idle_retry_backoff_ms,
+        drain_grace_timeout_ms: policy.drain_grace_timeout_ms,
+        idle_timeout_override: policy.idle_timeout_override.map(|override_policy| {
+            pb::IdleTimeoutOverridePolicy {
+                value_field: override_policy.value_field,
+                min_idle_timeout_ms: override_policy.min_idle_timeout_ms,
+                max_idle_timeout_ms: override_policy.max_idle_timeout_ms,
+            }
+        }),
     }
 }
 

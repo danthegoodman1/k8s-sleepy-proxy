@@ -28,6 +28,7 @@ use crate::{
         RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteIdentity,
         RouteResolution,
     },
+    sleep_policy::WorkloadSleepPolicy,
     store::{StoreFuture, StoreResult},
     workload::{
         CreateWorkloadClassVersionRequest, WorkloadClassVersion, WorkloadClassVersionRef,
@@ -169,6 +170,17 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
             .get("sleepypods.io/instance-generation"),
         Some(&"2".to_owned())
     );
+    let sidecar = deployment
+        .spec
+        .template
+        .spec
+        .containers
+        .iter()
+        .find(|container| container.name == "sleepypods-sidecar")
+        .expect("sidecar container was rendered");
+    assert_env(&sidecar.env, "SLEEPYPODS_IDLE_TIMEOUT_MS", "120000");
+    assert_env(&sidecar.env, "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", "5000");
+    assert_env(&sidecar.env, "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS", "30000");
 }
 
 #[tokio::test]
@@ -932,6 +944,15 @@ fn assert_generation_conflict(error: WakeInstanceError, expected: Generation, ac
     ));
 }
 
+fn assert_env(env: &[crate::manifest::EnvVar], name: &str, expected: &str) {
+    let value = env
+        .iter()
+        .find(|var| var.name == name)
+        .unwrap_or_else(|| panic!("missing env var {name}"));
+
+    assert_eq!(value.value, expected);
+}
+
 fn workload_class() -> WorkloadClassVersion {
     WorkloadClassVersion {
         reference: workload_ref(),
@@ -939,6 +960,7 @@ fn workload_class() -> WorkloadClassVersion {
         template: deployment_template(),
         default_values: InstanceValues::new(),
         value_schema: WorkloadValueSchema::new(true),
+        sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy"),
     }
 }
 

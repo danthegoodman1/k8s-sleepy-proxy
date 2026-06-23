@@ -11,14 +11,14 @@ use control_plane::{
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
     ExpireHttp01ChallengesRequest, Generation, GetInstanceRequest, GetRouteBindingRequest,
-    Http01ChallengeKey, IdempotencyKey, InstanceId, InstanceState, ManifestTemplate,
-    MaterializationState, MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig,
-    ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest, RenderManifestRequest,
-    RenderedObjectRef, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
-    RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
-    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
-    WorkloadValueFieldRule, WorkloadValueSchema,
+    Http01ChallengeKey, IdempotencyKey, IdleTimeoutOverridePolicy, InstanceId, InstanceState,
+    ManifestTemplate, MaterializationState, MaterializationTarget, PathPrefix, PostgresStore,
+    PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest,
+    RenderManifestRequest, RenderedObjectRef, RouteBindingId, RouteBindingSpec,
+    RouteDependencyLookup, RouteHost, RouteIdentity, RouteResolution, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, StateTransitionReason, StoreError, TemplateText,
+    TemplateTextPart, WorkloadClassId, WorkloadClassVersion, WorkloadClassVersionRef, WorkloadKind,
+    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -131,6 +131,20 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         }
     ));
 
+    let mut changed_policy_class = class.clone();
+    changed_policy_class.sleep_policy =
+        WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy");
+    let policy_conflict = store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(changed_policy_class))
+        .await
+        .expect_err("same class/version with a different sleep policy is immutable");
+    assert!(matches!(
+        policy_conflict,
+        StoreError::AlreadyExists {
+            resource: "workload class version"
+        }
+    ));
+
     let class_v2 = workload_class("class-a", 2);
     let created_v2 = store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class_v2.clone()))
@@ -174,6 +188,55 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         .expect_err("unknown instance values are rejected when schema disallows them");
     assert!(matches!(unknown_value, StoreError::InvalidArgument { .. }));
 
+    let override_class = workload_class_with_idle_override("class-override", 1);
+    store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(
+            override_class.clone(),
+        ))
+        .await?;
+    let out_of_bounds_override = store
+        .create_instance(
+            create_instance_request(
+                "idem-override-out-of-bounds",
+                "instance-override-out-of-bounds",
+                override_class.reference.clone(),
+                vec![],
+            )
+            .with_values(BTreeMap::from([
+                (
+                    "tenant".to_owned(),
+                    "instance-override-out-of-bounds".to_owned(),
+                ),
+                ("idle_ms".to_owned(), "50000".to_owned()),
+            ])),
+        )
+        .await
+        .expect_err("out-of-bounds idle override is rejected before persistence");
+    assert!(matches!(
+        out_of_bounds_override,
+        StoreError::InvalidArgument { .. }
+    ));
+
+    let valid_override = store
+        .create_instance(
+            create_instance_request(
+                "idem-override-valid",
+                "instance-override-valid",
+                override_class.reference.clone(),
+                vec![],
+            )
+            .with_values(BTreeMap::from([
+                ("tenant".to_owned(), "instance-override-valid".to_owned()),
+                ("idle_ms".to_owned(), "120000".to_owned()),
+            ])),
+        )
+        .await?;
+    let resolved_override = override_class
+        .sleep_policy
+        .resolve(&valid_override.instance.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    assert_eq!(resolved_override.idle_timeout_ms, 120_000);
+
     let create = create_instance_request(
         "idem-create-a",
         "instance-a",
@@ -206,6 +269,10 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     let rendered = render_manifests(RenderManifestRequest {
         template: &loaded.template,
         instance: &created.instance,
+        sleep_policy: loaded
+            .sleep_policy
+            .resolve(&created.instance.values)
+            .map_err(|error| StoreError::internal(error.to_string()))?,
         namespace: "apps",
         template_generation: Some(loaded.template_generation),
     })
@@ -1568,7 +1635,26 @@ fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
                 "image",
                 WorkloadValueFieldRule::optional_with_default(image),
             ),
+        sleep_policy: default_sleep_policy(),
     }
+}
+
+fn workload_class_with_idle_override(class_id: &str, version: u64) -> WorkloadClassVersion {
+    let mut workload_class = workload_class(class_id, version);
+    workload_class.value_schema = workload_class
+        .value_schema
+        .with_field("idle_ms", WorkloadValueFieldRule::optional());
+    workload_class.sleep_policy = default_sleep_policy()
+        .with_idle_timeout_override(
+            IdleTimeoutOverridePolicy::new("idle_ms", 60_000, 600_000)
+                .expect("valid override policy"),
+        )
+        .expect("override policy attaches");
+    workload_class
+}
+
+fn default_sleep_policy() -> WorkloadSleepPolicy {
+    WorkloadSleepPolicy::new(300_000, 5_000, 30_000).expect("valid sleep policy")
 }
 
 fn workload_manifest_template() -> ManifestTemplate {

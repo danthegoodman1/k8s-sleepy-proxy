@@ -22,6 +22,7 @@ use crate::{
         CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteEntry,
         RouteHost, RouteHostKind, RouteIdentity,
     },
+    sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{StoreError, StoreResult},
     workload::{
         WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
@@ -52,6 +53,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
     let template: Value = row.get("manifest_template");
     let default_values: Value = row.get("default_values");
     let value_schema: Value = row.get("value_schema");
+    let sleep_policy: Value = row.get("sleep_policy");
 
     Ok(WorkloadClassVersion {
         reference: WorkloadClassVersionRef {
@@ -62,6 +64,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
         template: manifest_template_from_json(template)?,
         default_values: values_from_json(default_values)?,
         value_schema: value_schema_from_json(value_schema)?,
+        sleep_policy: sleep_policy_from_json(sleep_policy)?,
     })
 }
 
@@ -250,6 +253,63 @@ pub(crate) fn value_schema_from_json(value: Value) -> StoreResult<WorkloadValueS
     }
 
     Ok(schema)
+}
+
+pub(crate) fn sleep_policy_to_json(policy: &WorkloadSleepPolicy) -> StoreResult<Value> {
+    policy
+        .validate()
+        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+    let idle_timeout_override = policy
+        .idle_timeout_override
+        .as_ref()
+        .map(|override_policy| {
+            json!({
+                "value_field": override_policy.value_field.clone(),
+                "min_idle_timeout_ms": override_policy.min_idle_timeout_ms,
+                "max_idle_timeout_ms": override_policy.max_idle_timeout_ms,
+            })
+        });
+
+    Ok(json!({
+        "idle_timeout_ms": policy.idle_timeout_ms,
+        "idle_retry_backoff_ms": policy.idle_retry_backoff_ms,
+        "drain_grace_timeout_ms": policy.drain_grace_timeout_ms,
+        "idle_timeout_override": idle_timeout_override,
+    }))
+}
+
+pub(crate) fn sleep_policy_from_json(value: Value) -> StoreResult<WorkloadSleepPolicy> {
+    let Value::Object(mut object) = value else {
+        return Err(StoreError::internal(
+            "stored workload sleep policy was not an object",
+        ));
+    };
+
+    let idle_timeout_ms = take_json_u64(&mut object, "idle_timeout_ms")?;
+    let idle_retry_backoff_ms = take_json_u64(&mut object, "idle_retry_backoff_ms")?;
+    let drain_grace_timeout_ms = take_json_u64(&mut object, "drain_grace_timeout_ms")?;
+    let idle_timeout_override = match object.remove("idle_timeout_override") {
+        Some(Value::Object(mut object)) => Some(IdleTimeoutOverridePolicy {
+            value_field: take_json_string(&mut object, "value_field")?,
+            min_idle_timeout_ms: take_json_u64(&mut object, "min_idle_timeout_ms")?,
+            max_idle_timeout_ms: take_json_u64(&mut object, "max_idle_timeout_ms")?,
+        }),
+        Some(Value::Null) | None => None,
+        _ => {
+            return Err(StoreError::internal(
+                "stored workload sleep policy override was not an object",
+            ))
+        }
+    };
+    let policy = WorkloadSleepPolicy {
+        idle_timeout_ms,
+        idle_retry_backoff_ms,
+        drain_grace_timeout_ms,
+        idle_timeout_override,
+    };
+    policy.validate().map_err(invalid_stored_data)?;
+
+    Ok(policy)
 }
 
 pub(crate) fn rendered_objects_to_json(objects: &[RenderedObjectRef]) -> Value {
@@ -601,6 +661,18 @@ fn take_json_bool(
         Some(Value::Bool(value)) => Ok(value),
         _ => Err(StoreError::internal(format!(
             "stored field {field:?} was not a boolean"
+        ))),
+    }
+}
+
+fn take_json_u64(
+    object: &mut serde_json::Map<String, Value>,
+    field: &'static str,
+) -> StoreResult<u64> {
+    match object.remove(field).and_then(|value| value.as_u64()) {
+        Some(value) => Ok(value),
+        None => Err(StoreError::internal(format!(
+            "stored field {field:?} was not an unsigned integer"
         ))),
     }
 }

@@ -293,6 +293,7 @@ mod tests {
             ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
             VolumeTemplate, WorkloadKind, WorkloadTemplate,
         },
+        sleep_policy::ResolvedSleepPolicy,
         workload::WorkloadClassVersionRef,
     };
 
@@ -843,6 +844,7 @@ mod tests {
         render_manifests(RenderManifestRequest {
             template: &deployment_template(),
             instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: resolved_sleep_policy(),
             namespace: "apps",
             template_generation: Some(Generation::new(3)),
         })
@@ -857,10 +859,19 @@ mod tests {
                 2,
                 values([("tenant", "acme"), ("volume", "provider-vol-123")]),
             ),
+            sleep_policy: resolved_sleep_policy(),
             namespace: "data",
             template_generation: None,
         })
         .expect("stateful workload renders")
+    }
+
+    fn resolved_sleep_policy() -> ResolvedSleepPolicy {
+        ResolvedSleepPolicy {
+            idle_timeout_ms: 300_000,
+            idle_retry_backoff_ms: 5_000,
+            drain_grace_timeout_ms: 30_000,
+        }
     }
 
     fn deployment_template() -> ManifestTemplate {

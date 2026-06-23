@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use crate::instance::InstanceRecord;
+use crate::{instance::InstanceRecord, sleep_policy::ResolvedSleepPolicy};
 
 mod objects;
 mod render;
@@ -38,6 +38,7 @@ const ANNOTATION_TEMPLATE_GENERATION: &str = "sleepypods.io/template-generation"
 pub struct RenderManifestRequest<'a> {
     pub template: &'a ManifestTemplate,
     pub instance: &'a InstanceRecord,
+    pub sleep_policy: ResolvedSleepPolicy,
     pub namespace: &'a str,
     pub template_generation: Option<crate::ids::Generation>,
 }

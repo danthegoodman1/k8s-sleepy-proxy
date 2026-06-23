@@ -13,6 +13,7 @@ pub mod materializer;
 pub mod postgres;
 pub mod route;
 pub mod runtime;
+pub mod sleep_policy;
 pub mod store;
 mod wake;
 pub mod workload;
@@ -28,8 +29,8 @@ pub use ids::{
 };
 pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-    DeleteInstanceRequest, GetInstanceRequest, InstanceRecord, InstanceState, InstanceValues,
-    StateTransitionReason,
+    CreateInstanceValidationError, DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
+    InstanceState, InstanceValues, StateTransitionReason,
 };
 pub use kube_materializer::{
     InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,
@@ -61,6 +62,9 @@ pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
     PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteDependencyLookup,
     RouteDependencySet, RouteEntry, RouteHost, RouteHostKind, RouteIdentity, RouteResolution,
+};
+pub use sleep_policy::{
+    IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,
 };
 pub use store::{ControlPlaneStore, StoreError, StoreFuture, StoreResult};
 pub use workload::{

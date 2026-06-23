@@ -23,7 +23,8 @@ use super::{
     mapping::{
         self, generation_to_i64, instance_from_row, instance_state_to_db,
         manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
-        value_schema_to_json, values_to_json, workload_class_version_from_row,
+        sleep_policy_to_json, value_schema_to_json, values_to_json,
+        workload_class_version_from_row,
     },
 };
 
@@ -90,6 +91,9 @@ pub(crate) async fn create_workload_class_version(
     request: CreateWorkloadClassVersionRequest,
 ) -> StoreResult<WorkloadClassVersion> {
     let desired = request.workload_class_version;
+    desired
+        .validate()
+        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
     let client = store.client().await?;
     let class_id = desired.reference.class_id.as_str();
     let version = generation_to_i64(desired.reference.version)?;
@@ -97,6 +101,7 @@ pub(crate) async fn create_workload_class_version(
     let manifest_template = manifest_template_to_json(&desired.template)?;
     let default_values = values_to_json(&desired.default_values)?;
     let value_schema = value_schema_to_json(&desired.value_schema);
+    let sleep_policy = sleep_policy_to_json(&desired.sleep_policy)?;
     let inserted = client
         .execute(
             "
@@ -106,9 +111,10 @@ pub(crate) async fn create_workload_class_version(
                 template_generation,
                 manifest_template,
                 default_values,
-                value_schema
+                value_schema,
+                sleep_policy
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
             &[
@@ -118,6 +124,7 @@ pub(crate) async fn create_workload_class_version(
                 &manifest_template,
                 &default_values,
                 &value_schema,
+                &sleep_policy,
             ],
         )
         .await
@@ -290,7 +297,7 @@ async fn load_workload_class_version_from_client(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, manifest_template, default_values, value_schema
+            SELECT class_id, version, template_generation, manifest_template, default_values, value_schema, sleep_policy
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",

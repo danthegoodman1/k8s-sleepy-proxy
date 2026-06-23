@@ -14,6 +14,7 @@ use super::{
 use crate::{
     ids::{Generation, InstanceId, WorkloadClassId},
     instance::{InstanceRecord, InstanceState, InstanceValues},
+    sleep_policy::ResolvedSleepPolicy,
     workload::WorkloadClassVersionRef,
 };
 
@@ -77,6 +78,7 @@ fn renders_deployment_and_service_without_volumes() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &deployment_template(),
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: Some(Generation::new(3)),
     })
@@ -165,6 +167,21 @@ fn renders_deployment_and_service_without_volumes() {
         "SLEEPYPODS_INSTANCE_GENERATION",
         "7",
     );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_IDLE_TIMEOUT_MS",
+        "120000",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS",
+        "5000",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS",
+        "30000",
+    );
     assert!(deployment.spec.template.spec.volumes.is_empty());
     assert!(deployment.spec.template.spec.containers[0]
         .volume_mounts
@@ -179,6 +196,7 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &deployment_template(),
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: Some(Generation::new(3)),
     })
@@ -260,6 +278,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
             2,
             values([("tenant", "acme"), ("volume", "provider-vol-123")]),
         ),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -370,6 +389,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
             2,
             values([("tenant", "acme"), ("volume", "provider-vol-123")]),
         ),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -465,6 +485,7 @@ fn renders_host_path_persistent_volume_source() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &host_path_stateful_template(),
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -489,6 +510,7 @@ fn serializes_host_path_persistent_volume_source_as_kubernetes_json() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &host_path_stateful_template(),
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -521,6 +543,7 @@ fn rejects_stateful_set_scale_above_one() {
             2,
             values([("tenant", "acme"), ("volume", "provider-vol-123")]),
         ),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -541,6 +564,7 @@ fn rejects_instance_id_that_is_not_label_value_safe() {
     let error = render_manifests(RenderManifestRequest {
         template: &deployment_template(),
         instance: &instance("tenant/foo", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -560,6 +584,7 @@ fn rejects_workload_class_id_that_is_not_label_value_safe() {
             7,
             values([("tenant", "acme")]),
         ),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -576,6 +601,7 @@ fn rejects_zero_container_port() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -598,6 +624,7 @@ fn rejects_zero_service_port() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -620,6 +647,7 @@ fn rejects_zero_service_target_port() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -642,6 +670,7 @@ fn rejects_zero_sidecar_listen_port() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -664,6 +693,7 @@ fn rejects_service_without_ports_for_sidecar_routing() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -687,6 +717,7 @@ fn rejects_missing_service_for_sidecar_routing() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -718,6 +749,7 @@ fn rejects_multiple_service_ports_for_sidecar_routing() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -741,6 +773,7 @@ fn rejects_app_target_port_matching_sidecar_listen_port() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -763,6 +796,7 @@ fn rejects_service_target_port_not_declared_on_app_container() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "apps",
         template_generation: None,
     })
@@ -789,6 +823,7 @@ fn rejects_volume_without_access_modes() {
             2,
             values([("tenant", "acme"), ("volume", "provider-vol-123")]),
         ),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -814,6 +849,7 @@ fn rejects_relative_host_path_persistent_volume_source() {
     let error = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
         namespace: "data",
         template_generation: None,
     })
@@ -926,6 +962,14 @@ fn sidecar_template() -> SidecarTemplate {
         name: "sleepypods-sidecar".to_owned(),
         image: TemplateText::literal("sleepypods/sidecar:test"),
         listen_port: 15000,
+    }
+}
+
+fn sleep_policy() -> ResolvedSleepPolicy {
+    ResolvedSleepPolicy {
+        idle_timeout_ms: 120_000,
+        idle_retry_backoff_ms: 5_000,
+        drain_grace_timeout_ms: 30_000,
     }
 }
 

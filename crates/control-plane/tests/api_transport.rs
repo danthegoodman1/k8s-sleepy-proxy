@@ -15,12 +15,13 @@ use control_plane::api::{
         CsiVolumeSourceTemplate, DeleteHttp01ChallengeRequest, DeleteInstanceRequest,
         DeleteRouteBindingRequest, EnvVarTemplate, ExpireHttp01ChallengesRequest,
         GetInstanceRequest, GetRouteBindingRequest, GetWorkloadClassVersionRequest,
-        HostPathVolumeSourceTemplate, Http01ChallengeKey, HttpRouteIdentity, Instance,
-        InstanceState, ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-        PersistentVolumeSourceTemplate, ProtocolRoute, PutHttp01ChallengeRequest,
-        ResolveHttp01ChallengeRequest, RouteBinding, RouteHost, RouteHostKind, RouteIdentity,
-        ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText,
-        TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
+        HostPathVolumeSourceTemplate, Http01ChallengeKey, HttpRouteIdentity,
+        IdleTimeoutOverridePolicy, Instance, InstanceState, ManifestTemplate,
+        PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
+        ProtocolRoute, PutHttp01ChallengeRequest, ResolveHttp01ChallengeRequest, RouteBinding,
+        RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate,
+        SidecarTemplate, SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate,
+        WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
         WorkloadValueFieldRule, WorkloadValueSchema,
     },
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
@@ -70,6 +71,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
         }),
         template_generation: 1,
         template: Some(stateful_manifest_template_proto()),
+        sleep_policy: Some(sleep_policy_proto()),
     };
 
     assert_eq!(request.values["tenant"], "acme");
@@ -105,6 +107,14 @@ fn generated_api_contains_expected_v1_resource_shape() {
     assert_eq!(InstanceState::Cold as i32, 1);
     assert_eq!(ProtocolRoute::Http as i32, 1);
     assert_eq!(RouteHostKind::WildcardSuffix as i32, 2);
+    assert_eq!(
+        workload_class
+            .sleep_policy
+            .as_ref()
+            .expect("sleep policy is present")
+            .idle_timeout_ms,
+        300_000
+    );
 }
 
 #[tokio::test]
@@ -202,12 +212,14 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
             }),
             template_generation: 9,
             template: Some(template.clone()),
+            sleep_policy: Some(sleep_policy_proto()),
         }))
         .await
         .expect("create workload class succeeds")
         .into_inner();
     assert_eq!(created_class.template_generation, 9);
-    assert_eq!(created_class.template, Some(template));
+    assert_eq!(created_class.template, Some(template.clone()));
+    assert_eq!(created_class.sleep_policy, Some(sleep_policy_proto()));
 
     let loaded_class = service
         .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
@@ -230,11 +242,53 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
             value_schema: None,
             template_generation: 1,
             template: None,
+            sleep_policy: Some(sleep_policy_proto()),
         }))
         .await
         .expect_err("template is required");
     assert_eq!(missing_template.code(), Code::InvalidArgument);
     assert!(missing_template.message().contains("template is required"));
+
+    let missing_policy = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-class-missing-policy".to_owned(),
+            class_id: "class-missing-policy".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template.clone()),
+            sleep_policy: None,
+        }))
+        .await
+        .expect_err("sleep policy is required");
+    assert_eq!(missing_policy.code(), Code::InvalidArgument);
+    assert!(missing_policy
+        .message()
+        .contains("sleep_policy is required"));
+
+    let invalid_policy = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-class-invalid-policy".to_owned(),
+            class_id: "class-invalid-policy".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template.clone()),
+            sleep_policy: Some(WorkloadSleepPolicy {
+                idle_timeout_ms: 0,
+                idle_retry_backoff_ms: 5_000,
+                drain_grace_timeout_ms: 30_000,
+                idle_timeout_override: None,
+            }),
+        }))
+        .await
+        .expect_err("invalid sleep policy is rejected");
+    assert_eq!(invalid_policy.code(), Code::InvalidArgument);
+    assert!(invalid_policy
+        .message()
+        .contains("sleep_policy.idle_timeout_ms"));
 
     let created_route = service
         .create_route_binding(tonic::Request::new(CreateRouteBindingRequest {
@@ -347,6 +401,7 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
             value_schema: None,
             template_generation: 1,
             template: Some(template.clone()),
+            sleep_policy: Some(sleep_policy_proto()),
         }))
         .await
         .expect("create workload class with hostPath template succeeds")
@@ -400,6 +455,7 @@ async fn store_backed_workload_class_api_rejects_empty_template_static_strings()
             value_schema: None,
             template_generation: 1,
             template: Some(template),
+            sleep_policy: Some(sleep_policy_proto()),
         }))
         .await
         .expect_err("empty static template names are rejected");
@@ -427,6 +483,7 @@ async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
             value_schema: None,
             template_generation: 1,
             template: Some(template),
+            sleep_policy: Some(sleep_policy_proto()),
         }))
         .await
         .expect_err("empty template text parts are rejected");
@@ -803,6 +860,19 @@ fn host_path_manifest_template_proto() -> ManifestTemplate {
         )),
     });
     template
+}
+
+fn sleep_policy_proto() -> WorkloadSleepPolicy {
+    WorkloadSleepPolicy {
+        idle_timeout_ms: 300_000,
+        idle_retry_backoff_ms: 5_000,
+        drain_grace_timeout_ms: 30_000,
+        idle_timeout_override: Some(IdleTimeoutOverridePolicy {
+            value_field: "idle_ms".to_owned(),
+            min_idle_timeout_ms: 60_000,
+            max_idle_timeout_ms: 600_000,
+        }),
+    }
 }
 
 fn literal_text(value: &str) -> TemplateText {

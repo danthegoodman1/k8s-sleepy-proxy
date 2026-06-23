@@ -24,6 +24,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "workload_class_manifest_template",
         sql: include_str!("../../migrations/0003_workload_class_manifest_template.sql"),
     },
+    Migration {
+        version: 4,
+        name: "workload_class_sleep_policy",
+        sql: include_str!("../../migrations/0004_workload_class_sleep_policy.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &impl GenericClient) -> StoreResult<()> {

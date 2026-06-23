@@ -4,6 +4,7 @@ use crate::{
     ids::{Generation, WorkloadClassId},
     instance::InstanceValues,
     manifest::ManifestTemplate,
+    sleep_policy::{SleepPolicyError, WorkloadSleepPolicy},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub struct WorkloadClassVersion {
     pub template: ManifestTemplate,
     pub default_values: InstanceValues,
     pub value_schema: WorkloadValueSchema,
+    pub sleep_policy: WorkloadSleepPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +68,12 @@ impl CreateWorkloadClassVersionRequest {
 impl LoadWorkloadClassVersionRequest {
     pub fn new(reference: WorkloadClassVersionRef) -> Self {
         Self { reference }
+    }
+}
+
+impl WorkloadClassVersion {
+    pub fn validate(&self) -> Result<(), SleepPolicyError> {
+        self.sleep_policy.validate()
     }
 }
 

@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use crate::{
     ids::{Generation, IdempotencyKey, InstanceId},
     route::{RouteBindingRecord, RouteBindingSpec},
+    sleep_policy::SleepPolicyError,
     workload::{ValueSchemaError, WorkloadClassVersion, WorkloadClassVersionRef},
 };
 
@@ -195,9 +196,39 @@ impl CreateInstanceRequest {
     pub fn validate_values_against(
         mut self,
         workload_class: &WorkloadClassVersion,
-    ) -> Result<Self, ValueSchemaError> {
+    ) -> Result<Self, CreateInstanceValidationError> {
         self.values = workload_class.value_schema.validate_values(&self.values)?;
+        workload_class.sleep_policy.resolve(&self.values)?;
         Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateInstanceValidationError {
+    ValueSchema(ValueSchemaError),
+    SleepPolicy(SleepPolicyError),
+}
+
+impl fmt::Display for CreateInstanceValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ValueSchema(error) => error.fmt(f),
+            Self::SleepPolicy(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for CreateInstanceValidationError {}
+
+impl From<ValueSchemaError> for CreateInstanceValidationError {
+    fn from(error: ValueSchemaError) -> Self {
+        Self::ValueSchema(error)
+    }
+}
+
+impl From<SleepPolicyError> for CreateInstanceValidationError {
+    fn from(error: SleepPolicyError) -> Self {
+        Self::SleepPolicy(error)
     }
 }
 
@@ -239,6 +270,7 @@ mod tests {
             ContainerPortTemplate, ContainerTemplate, ManifestTemplate, ServicePortTemplate,
             ServiceTemplate, SidecarTemplate, TemplateText, WorkloadKind, WorkloadTemplate,
         },
+        sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
         workload::{
             WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule,
             WorkloadValueSchema,
@@ -308,6 +340,55 @@ mod tests {
         assert_eq!(
             validated.values,
             values([("image", "example/app:1"), ("tenant", "acme")])
+        );
+    }
+
+    #[test]
+    fn create_instance_validation_resolves_defaulted_sleep_policy_override() {
+        let validated = create_request()
+            .validate_values_against(&workload_class_with_sleep_policy(
+                WorkloadValueSchema::new(false).with_field(
+                    "idle_ms",
+                    WorkloadValueFieldRule::optional_with_default("120000"),
+                ),
+                override_sleep_policy(),
+            ))
+            .expect("defaulted override is valid");
+
+        assert_eq!(validated.values, values([("idle_ms", "120000")]));
+    }
+
+    #[test]
+    fn create_instance_validation_rejects_malformed_sleep_policy_override() {
+        let error = create_request()
+            .with_values(values([("idle_ms", "two-minutes")]))
+            .validate_values_against(&workload_class_with_sleep_policy(
+                WorkloadValueSchema::new(false)
+                    .with_field("idle_ms", WorkloadValueFieldRule::optional()),
+                override_sleep_policy(),
+            ))
+            .expect_err("malformed override is rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "idle timeout override value \"idle_ms\"=\"two-minutes\" is not a decimal millisecond value"
+        );
+    }
+
+    #[test]
+    fn create_instance_validation_rejects_out_of_bounds_sleep_policy_override() {
+        let error = create_request()
+            .with_values(values([("idle_ms", "50000")]))
+            .validate_values_against(&workload_class_with_sleep_policy(
+                WorkloadValueSchema::new(false)
+                    .with_field("idle_ms", WorkloadValueFieldRule::optional()),
+                override_sleep_policy(),
+            ))
+            .expect_err("out-of-bounds override is rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "idle timeout override value \"idle_ms\"=50000 is outside allowed range 60000..=600000"
         );
     }
 
@@ -451,6 +532,13 @@ mod tests {
     }
 
     fn workload_class(value_schema: WorkloadValueSchema) -> WorkloadClassVersion {
+        workload_class_with_sleep_policy(value_schema, default_sleep_policy())
+    }
+
+    fn workload_class_with_sleep_policy(
+        value_schema: WorkloadValueSchema,
+        sleep_policy: WorkloadSleepPolicy,
+    ) -> WorkloadClassVersion {
         WorkloadClassVersion {
             reference: WorkloadClassVersionRef::new(
                 WorkloadClassId::new("class-1").expect("valid class ID"),
@@ -460,7 +548,21 @@ mod tests {
             template: test_manifest_template(),
             default_values: BTreeMap::new(),
             value_schema,
+            sleep_policy,
         }
+    }
+
+    fn default_sleep_policy() -> WorkloadSleepPolicy {
+        WorkloadSleepPolicy::new(300_000, 5_000, 30_000).expect("valid sleep policy")
+    }
+
+    fn override_sleep_policy() -> WorkloadSleepPolicy {
+        default_sleep_policy()
+            .with_idle_timeout_override(
+                IdleTimeoutOverridePolicy::new("idle_ms", 60_000, 600_000)
+                    .expect("valid override policy"),
+            )
+            .expect("override attaches")
     }
 
     fn test_manifest_template() -> ManifestTemplate {

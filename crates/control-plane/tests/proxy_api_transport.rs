@@ -1277,6 +1277,8 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
         },
         default_values: control_plane::InstanceValues::new(),
         value_schema: control_plane::WorkloadValueSchema::new(true),
+        sleep_policy: control_plane::WorkloadSleepPolicy::new(300_000, 5_000, 30_000)
+            .expect("valid sleep policy"),
     }
 }
 

@@ -12,8 +12,9 @@ use control_plane::{
     KubeMaterializerClientConfig, KubernetesMaterializer, KubernetesMaterializerClient,
     ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
     PersistentVolumeSourceTemplate, RenderManifestRequest, RenderedManifest, RenderedObjectRef,
-    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadClassId, WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
+    ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadClassId, WorkloadClassVersionRef, WorkloadKind,
+    WorkloadTemplate,
 };
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
@@ -201,9 +202,18 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
     Ok(render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance,
+        sleep_policy: resolved_sleep_policy(),
         namespace,
         template_generation: Some(Generation::new(1)),
     })?)
+}
+
+fn resolved_sleep_policy() -> ResolvedSleepPolicy {
+    ResolvedSleepPolicy {
+        idle_timeout_ms: 300_000,
+        idle_retry_backoff_ms: 5_000,
+        drain_grace_timeout_ms: 30_000,
+    }
 }
 
 async fn verify_pv_and_bound_pvc_exist(

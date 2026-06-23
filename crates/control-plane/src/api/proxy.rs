@@ -323,6 +323,10 @@ fn proxy_wake_error_response(
             "manifest render failed for instance {}: {source}",
             instance.id.as_str()
         ))),
+        WakeInstanceError::SleepPolicy { instance, source } => Err(Status::internal(format!(
+            "sleep policy resolution failed for instance {}: {source}",
+            instance.id.as_str()
+        ))),
         WakeInstanceError::Materializer { instance, source } => Err(Status::unavailable(format!(
             "materialization failed for instance {}: {source}",
             instance.id.as_str()
