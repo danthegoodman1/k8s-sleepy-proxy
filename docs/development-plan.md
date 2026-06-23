@@ -156,7 +156,7 @@ Scope:
 | Complete | Timeout and backpressure primitives. | `src/timeout.rs` covers typed timeout results; TCP/WebSocket proxy tests exercise async copy paths. |
 | Complete | TLS ClientHello/SNI extraction helpers. | `src/tls.rs` covers valid SNI, malformed input, missing SNI, invalid hostnames, and fragmented prefix reads. |
 | Complete | Shared metrics and tracing conventions. | `crates/proxy-core/src/observability` descriptor tests assert metric names, labels, and trace fields. |
-| Incomplete | Hot-path latency budgets and benchmark harnesses for proxy primitives. | `crates/proxy-core/benches/proxy_primitives.rs` exists, but the route-key lookup benchmark required by `docs/proxy-hot-path-budgets.md` is absent; follow-up: M9 protocol and hot-path gates. |
+| Complete | Hot-path latency budgets and benchmark harnesses for proxy primitives. | `crates/proxy-core/benches/proxy_primitives.rs`, `crates/frontline/benches/route_lookup.rs`, and `docs/proxy-hot-path-budgets.md` cover proxy primitives plus local route-key lookup budgets. |
 
 Sub-phases:
 
@@ -167,7 +167,7 @@ Sub-phases:
 | Complete | 1C: Timeout, backpressure, structured shutdown, and cancellation behavior. | `src/timeout.rs`, `src/shutdown.rs`, and lifecycle tests cover typed timeout and cancellation; deeper reset/backpressure protocol cases remain done-criteria gaps below. |
 | Complete | 1D: TLS ClientHello/SNI extraction helpers. | `src/tls.rs` tests cover fragmented and malformed ClientHello handling. |
 | Complete | 1E: Shared metrics and tracing conventions. | Observability descriptor tests cover stable metric and trace field definitions. |
-| Incomplete | 1F: Proxy hot-path latency budgets, benchmark harnesses, and allocation checks. | Primitive benches and allocation tests exist, but route-key lookup coverage is missing; follow-up: M9. |
+| Complete | 1F: Proxy hot-path latency budgets, benchmark harnesses, and allocation checks. | Primitive benches, allocation tests, hot-path budget docs, and the frontline route-key lookup benchmark are present. |
 
 Done criteria:
 
@@ -179,7 +179,7 @@ Done criteria:
 | Incomplete | HTTP tests cover keep-alive, chunked/large/streaming bodies, HTTP/2 multiplexing, and cancellation. | `tests/http_proxy.rs` now covers HTTP/1.1 keep-alive, chunked request bodies, streaming response lifecycle, cancellation while upstream is pending, and concurrent HTTP/2 streams; large HTTP bodies and streaming request bodies remain follow-up M9 protocol gaps. |
 | Incomplete | WebSocket tests cover upgrade failure, bidirectional traffic, close frames, peer disconnect, and backpressure. | `tests/websocket_proxy.rs` now covers upgrade failure, client and upstream peer disconnect, and a large-frame backpressure smoke; a true slow-peer backpressure test remains a follow-up M9 protocol gap. |
 | Complete | Drain tests prove new work is rejected while existing streams get the grace period. | `src/drain.rs`, `tests/http_proxy.rs`, and `tests/websocket_proxy.rs` cover drain rejection and grace-timeout behavior. |
-| Incomplete | Hot-path benchmarks cover TCP, HTTP, WebSocket, TLS SNI, local route-key lookup, and admission/accounting. | Existing benches cover primitives except local route-key lookup; follow-up: M9. |
+| Complete | Hot-path benchmarks cover TCP, HTTP, WebSocket, TLS SNI, local route-key lookup, and admission/accounting. | `proxy_primitives` covers TCP, HTTP, WebSocket, TLS SNI, admission, and accounting; `route_lookup` covers local frontline route-key lookup. |
 | Complete | Benchmark notes separate hot routing latency from cold wake latency and forbid control-plane calls on hot paths. | `docs/proxy-hot-path-budgets.md` documents hot-path budgets, smoke commands, and current limitations. |
 | Complete | Allocation-sensitive tests or profiles exist for the hot path. | `crates/proxy-core/tests/allocation_hot_paths.rs` covers observability, accounting/admission, HTTP helpers, and TLS SNI parsing. |
 
@@ -805,8 +805,8 @@ Scope:
 | Incomplete | Proxy `Subscribe` reconnect and lazy cache rebuild. | Resolver can lazy-subscribe, but reconnect behavior is not proven; follow-up: M9. |
 | Incomplete | Control-plane restart recovery from database state. | No restart reconciliation tests or runtime recovery loop found; follow-up: M9. |
 | Incomplete | Minimal production images for control plane, frontline, and sidecar. | Distroless non-root Dockerfiles and `scripts/smoke-images.sh` exist, but images are not used by full kind E2E/soak and full startup/connectivity gates are missing; follow-up: M9. |
-| Incomplete | Load tests for route lookup and hot proxy path. | `scripts/smoke-frontline-load.sh`, sidecar load smokes, and `docs/proxy-hot-path-budgets.md` exist, but route-lookup benchmark, protocol throughput matrix, and stable tail-latency gates are missing; follow-up: M9. |
-| Incomplete | Indexed frontline route matcher for hot-path lookup. | Positive route-cache lookup currently scans cached route entries and ranks matches; follow-up: M9 indexed matcher and route-key benchmark gates. |
+| Incomplete | Load tests for route lookup and hot proxy path. | `scripts/smoke-frontline-load.sh`, sidecar load smokes, `crates/frontline/benches/route_lookup.rs`, and `docs/proxy-hot-path-budgets.md` exist; protocol throughput matrix, cold-wake load coverage, and stable tail-latency gates are still missing; follow-up: M9. |
+| Complete | Indexed frontline route matcher for hot-path lookup. | `RouteCache` uses `PositiveRouteIndex` for exact hosts, wildcard suffixes, HTTP path candidates, and SNI candidates; cache tests cover precedence/lifecycle behavior and `route_lookup` benchmarks hot positive lookups with 4096 unrelated routes. |
 | Incomplete | Soak tests for repeated wake/sleep cycles. | `scripts/soak-kind-materializer.sh` is materializer-only, not full wake/sleep; follow-up: M9. |
 
 Sub-phases:
@@ -817,7 +817,7 @@ Sub-phases:
 | Incomplete | 7B: Control-plane restart recovery during wake, sleep, and delete. | No restart recovery gate found; follow-up: M9. |
 | Incomplete | 7C: Proxy Subscribe reconnect, lazy cache rebuild, and stale backend recovery. | Stale backend recovery has component coverage, but reconnect/lazy rebuild is not tested; follow-up: M9. |
 | Incomplete | 7D: Minimal final images and container runtime smoke tests. | Distroless images and smoke script exist, but full startup/connectivity/kind-use and image-size budgets are missing; follow-up: M9. |
-| Incomplete | 7E: Load tests for route lookup and proxy protocols. | Conservative load smokes exist, but route lookup, h2/h2c/gRPC, WebSocket, tail-latency, and regression budgets are incomplete; follow-up: M9. |
+| Incomplete | 7E: Load tests for route lookup and proxy protocols. | Conservative load smokes and the route lookup benchmark exist, but h2/h2c/gRPC, WebSocket, cold-wake, tail-latency, and enforced regression budgets are incomplete; follow-up: M9. |
 | Incomplete | 7F: kind wake/sleep soak and leaked-object detection. | Existing soak is materializer-only; full wake/sleep soak is missing; follow-up: M9. |
 | Incomplete | 7G: Operator runbook and metric name documentation. | Operator-facing metric/runbook docs are not present; follow-up: M10. |
 
@@ -829,7 +829,7 @@ Done criteria:
 | Incomplete | Metrics tests assert counters/histograms and labels for lifecycle paths. | Proxy-core descriptor tests exist, but requested lifecycle metrics are not instrumented/tested; follow-up: M9. |
 | Incomplete | Structured log tests/goldens cover lifecycle fields and errors. | No structured log assertions found; follow-up: M9. |
 | Incomplete | Repeated kind wake/sleep soak passes without leaked Kubernetes objects. | Materializer-only soak checks leaked namespaces/PVs; full wake/sleep soak is missing; follow-up: M9. |
-| Incomplete | Load-test targets for route lookup, hot proxy path, and cold wake latency are defined before 7D. | `docs/proxy-hot-path-budgets.md` documents current load smokes and limitations, but route lookup/cold wake/tail targets are incomplete; follow-up: M9. |
+| Incomplete | Load-test targets for route lookup, hot proxy path, and cold wake latency are defined before 7D. | `docs/proxy-hot-path-budgets.md` documents route lookup and current load-smoke limitations, but cold wake and stable tail-latency targets are incomplete; follow-up: M9. |
 | Incomplete | Proxy load tests use production images and direct-backend baselines. | Production-image load smokes exist with fake control plane/direct comparisons, but full protocol and kind production-image gates are missing; follow-up: M9. |
 | Incomplete | Hot-cache HTTP/1.1 request rate stays within 20% of direct backend. | `scripts/smoke-frontline-load.sh` has a conservative HTTP/1.1 cached-route smoke, but not a stable release-gate budget; follow-up: M9. |
 | Incomplete | Hot-cache h2, h2c, and gRPC request rate stays within 25%. | No h2/h2c/gRPC load gate found; follow-up: M9. |
@@ -838,8 +838,8 @@ Done criteria:
 | Incomplete | Hot-cache p99 added latency stays below documented budget or within 25% baseline. | No stable p99/tail-latency gate found; follow-up: M9. |
 | Incomplete | Benchmark regressions warn above 10-15% and fail above 20-25%. | No regression budget enforcement found; follow-up: M9. |
 | Incomplete | Hot-cache route handling makes zero control-plane calls under load. | Component tests avoid calls on cache hits; no load gate asserts zero calls; follow-up: M9. |
-| Incomplete | Route lookup and hot proxy path meet target latency under load. | Route lookup benchmark is absent; follow-up: M9. |
-| Incomplete | Hot-cache route lookup avoids scanning every positive cached route. | Current positive route-cache lookup is a linear scan; follow-up: M9 indexed matcher and route-key benchmark gates. |
+| Incomplete | Route lookup and hot proxy path meet target latency under load. | Route lookup has a Criterion benchmark and provisional budget, and hot proxy paths have conservative smokes; stable under-load release gates for hot proxy path, cold wake, and tail latency are still missing; follow-up: M9. |
+| Complete | Hot-cache route lookup avoids scanning every positive cached route. | `RouteCache::lookup` narrows positive candidates through `PositiveRouteIndex` by host/suffix/path/SNI before ranking, with cache tests preserving match semantics and route lookup benchmarks covering many unrelated cached routes. |
 | Incomplete | Retry/backoff tests cover transient database errors, Kubernetes conflicts, proxy disconnects, and materializer retries. | Sidecar retry is covered; database/Kubernetes/proxy/materializer retry gates are missing; follow-up: M9. |
 | Incomplete | Container tests prove images start, run non-root, include required files, access CA certs, and are used by kind E2E/soak. | `scripts/smoke-images.sh` checks non-root/no shell/files and expected startup failure without config; full startup/connectivity/kind-use is missing; follow-up: M9. |
 | Incomplete | Image-size budgets are defined and enforced. | No image-size budget gate found; follow-up: M9. |

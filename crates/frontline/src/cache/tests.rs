@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 use control_plane::{CachePolicy, PathPrefix, RouteHost, RouteIdentity};
 
 use super::{CacheLookup, CacheLookupHit, CacheLookupStatus, RouteCache};
-use crate::{subscription::tests::route_entry, SubscriptionId};
+use crate::{
+    subscription::tests::{route_entry, route_entry_for_instance},
+    SubscriptionId,
+};
 
 fn now() -> Instant {
     Instant::now()
@@ -447,6 +450,68 @@ fn replace_subscription_reindexes_new_matched_identity() {
     assert_positive_route(
         cache.lookup(&http_request("new.example.com", "/api/users"), now),
         "route-new",
+    );
+}
+
+#[test]
+fn duplicate_matched_identity_rejects_lower_instance_generation() {
+    let now = now();
+    let mut cache = RouteCache::new(4);
+    let matched_identity = http_exact_rule("app.example.com", Some("/api"));
+    cache.insert_positive(
+        subscription_id("sub-current"),
+        matched_identity.clone(),
+        route_entry_for_instance("route-current", "instance-a", 7, Some(4)),
+        ttl(10),
+        now,
+    );
+
+    let result = cache.insert_positive(
+        subscription_id("sub-stale"),
+        matched_identity,
+        route_entry_for_instance("route-stale", "instance-a", 6, Some(5)),
+        ttl(10),
+        now,
+    );
+
+    assert_eq!(
+        result.subscriptions_to_unsubscribe,
+        vec![subscription_id("sub-stale")]
+    );
+    assert_positive_route(
+        cache.lookup(&http_request("app.example.com", "/api/users"), now),
+        "route-current",
+    );
+}
+
+#[test]
+fn duplicate_matched_identity_rejects_lower_backend_generation() {
+    let now = now();
+    let mut cache = RouteCache::new(4);
+    let matched_identity = http_exact_rule("app.example.com", Some("/api"));
+    cache.insert_positive(
+        subscription_id("sub-current"),
+        matched_identity.clone(),
+        route_entry_for_instance("route-current", "instance-a", 7, Some(4)),
+        ttl(10),
+        now,
+    );
+
+    let result = cache.insert_positive(
+        subscription_id("sub-stale"),
+        matched_identity,
+        route_entry_for_instance("route-stale", "instance-a", 7, Some(3)),
+        ttl(10),
+        now,
+    );
+
+    assert_eq!(
+        result.subscriptions_to_unsubscribe,
+        vec![subscription_id("sub-stale")]
+    );
+    assert_positive_route(
+        cache.lookup(&http_request("app.example.com", "/api/users"), now),
+        "route-current",
     );
 }
 
