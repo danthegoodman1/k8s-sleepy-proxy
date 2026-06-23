@@ -563,11 +563,25 @@ fn path_score(binding: Option<&PathPrefix>, lookup: Option<&PathPrefix>) -> Opti
     match (binding, lookup) {
         (None, _) => Some(0),
         (Some(_), None) => None,
-        (Some(binding), Some(lookup)) if lookup.as_str().starts_with(binding.as_str()) => {
+        (Some(binding), Some(lookup)) if path_prefix_matches(lookup.as_str(), binding.as_str()) => {
             Some(binding.as_str().len())
         }
         (Some(_), Some(_)) => None,
     }
+}
+
+fn path_prefix_matches(lookup_path: &str, binding_path: &str) -> bool {
+    if binding_path == "/" || lookup_path == binding_path {
+        return true;
+    }
+
+    if binding_path.ends_with('/') {
+        return lookup_path.starts_with(binding_path);
+    }
+
+    lookup_path
+        .strip_prefix(binding_path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn instance_state_from_db(value: &str) -> StoreResult<InstanceState> {
@@ -769,6 +783,30 @@ mod tests {
         };
 
         assert!(route_matches(&long, &lookup) > route_matches(&short, &lookup));
+    }
+
+    #[test]
+    fn path_prefix_matching_respects_segment_boundaries() {
+        let api = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api").expect("valid prefix")),
+        };
+        let exact = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api").expect("valid prefix")),
+        };
+        let child = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/child").expect("valid prefix")),
+        };
+        let near_miss = RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/apix").expect("valid prefix")),
+        };
+
+        assert!(route_matches(&api, &exact).is_some());
+        assert!(route_matches(&api, &child).is_some());
+        assert!(route_matches(&api, &near_miss).is_none());
     }
 
     #[test]
