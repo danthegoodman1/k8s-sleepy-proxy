@@ -1,4 +1,4 @@
-use std::{error::Error, process};
+use std::{error::Error, process, time::Duration};
 
 use control_plane::api::pb::{
     operator_control_plane_client::OperatorControlPlaneClient,
@@ -10,7 +10,11 @@ use frontline::{
     GrpcProxyControlPlaneClient, TlsCertificateStore, WakeTracker,
 };
 use proxy_core::{observability::recorder::ObservabilityRecorder, DrainTracker, Shutdown};
+use tokio::time::{sleep, Instant};
 use tonic::transport::Endpoint;
+
+const CONTROL_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_PLANE_CONNECT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() {
@@ -28,9 +32,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let tls_certificates = env
         .load_tls_certificate_store()?
         .unwrap_or_else(TlsCertificateStore::new);
-    let channel = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?
-        .connect()
-        .await?;
+    let endpoint = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?;
+    let channel = connect_control_plane(endpoint, env.control_plane_endpoint()).await?;
     let route_client =
         GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel.clone()));
     let wake_client =
@@ -74,4 +77,21 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     .await?;
 
     Ok(())
+}
+
+async fn connect_control_plane(
+    endpoint: Endpoint,
+    endpoint_label: &str,
+) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    let deadline = Instant::now() + CONTROL_PLANE_CONNECT_TIMEOUT;
+    loop {
+        match endpoint.clone().connect().await {
+            Ok(channel) => return Ok(channel),
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("frontline waiting for control-plane endpoint {endpoint_label}: {error}");
+                sleep(CONTROL_PLANE_CONNECT_RETRY_BACKOFF).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }

@@ -17,9 +17,9 @@ use crate::{
     },
     manifest::{render_manifests, ManifestRenderError, RenderManifestRequest},
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, LoadActiveMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationRecord, MaterializationState,
-        MaterializationTarget,
+        CompleteWakeRequest, CompleteWakeResult, FinalizeSleepRequest,
+        LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
+        MaterializationState, MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     sleep_policy::SleepPolicyError,
@@ -47,6 +47,7 @@ pub enum WakeInstanceResult {
         instance: InstanceRecord,
         materialization: MaterializationRecord,
     },
+    #[allow(dead_code)]
     AlreadyWaking {
         instance: InstanceRecord,
     },
@@ -122,7 +123,7 @@ where
     S: ControlPlaneStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
-    let instance = store
+    let mut instance = store
         .get_instance(GetInstanceRequest::new(request.instance_id.clone()))
         .await
         .map_err(map_store_error)?
@@ -156,7 +157,7 @@ where
                 materialization,
             });
         }
-        InstanceState::Waking => Some(instance),
+        InstanceState::Waking => Some(instance.clone()),
         InstanceState::Deleting => {
             return Err(WakeInstanceError::Unavailable {
                 instance,
@@ -179,7 +180,14 @@ where
                 .map_err(map_store_error)?
             {
                 if materialization.state == MaterializationState::Deleting {
-                    return Ok(WakeInstanceResult::AlreadyWaking { instance });
+                    instance = resume_deleting_sleep(
+                        store,
+                        materializer,
+                        request.target.clone(),
+                        instance,
+                        materialization,
+                    )
+                    .await?;
                 }
             }
 
@@ -194,7 +202,7 @@ where
         store
             .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
                 request.instance_id.clone(),
-                request.expected_generation,
+                instance.generation,
                 InstanceState::Waking,
                 StateTransitionReason::WakeRequested,
             ))
@@ -289,6 +297,36 @@ where
         .complete_wake(complete)
         .await
         .map(|result| WakeInstanceResult::Completed { result })
+        .map_err(map_store_error)
+}
+
+async fn resume_deleting_sleep<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    instance: InstanceRecord,
+    materialization: MaterializationRecord,
+) -> Result<InstanceRecord, WakeInstanceError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    materializer
+        .delete_rendered_objects(&materialization.rendered_objects)
+        .await
+        .map_err(|source| WakeInstanceError::Materializer {
+            instance: instance.clone(),
+            source,
+        })?;
+
+    store
+        .finalize_sleep(FinalizeSleepRequest::new(
+            instance.id,
+            instance.generation,
+            target,
+        ))
+        .await
+        .map(|result| result.instance)
         .map_err(map_store_error)
 }
 

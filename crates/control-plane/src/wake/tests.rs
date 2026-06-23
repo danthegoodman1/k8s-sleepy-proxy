@@ -74,6 +74,10 @@ enum StoreEvent {
         backend_generation: BackendGeneration,
         rendered_objects: Vec<RenderedObjectRef>,
     },
+    FinalizeSleep {
+        expected_draining_generation: Generation,
+        target: MaterializationTarget,
+    },
     LoadActiveMaterialization {
         instance_id: InstanceId,
         target: MaterializationTarget,
@@ -93,6 +97,7 @@ struct FakeKubernetesClient {
 #[derive(Clone, Debug)]
 struct FakeKubernetesState {
     applied_objects: Vec<KubernetesObject>,
+    deleted_objects: Vec<RenderedObjectRef>,
     readiness_calls: Vec<Vec<RenderedObjectRef>>,
     backend: BackendEndpoint,
     fail_readiness: bool,
@@ -102,6 +107,7 @@ impl Default for FakeKubernetesState {
     fn default() -> Self {
         Self {
             applied_objects: Vec::new(),
+            deleted_objects: Vec::new(),
             readiness_calls: Vec::new(),
             backend: backend("http://svc-acme.apps.svc.cluster.local:80"),
             fail_readiness: false,
@@ -542,6 +548,9 @@ async fn materializer_failure_marks_waking_generation_failed() {
                 StoreEvent::LoadActiveMaterialization { .. } => {
                     panic!("cold wake failure must not load active materialization")
                 }
+                StoreEvent::FinalizeSleep { .. } => {
+                    panic!("cold wake failure must not finalize sleep")
+                }
             })
             .collect::<Vec<_>>(),
         vec![
@@ -691,8 +700,11 @@ async fn deleting_and_deleted_are_unavailable_and_do_not_apply() {
 
 #[tokio::test]
 async fn draining_with_deleting_materialization_waits_for_sleep_cleanup() {
-    let draining = instance("instance-a", InstanceState::Draining, 13);
-    let store = FakeStore::new(draining.clone(), Some(workload_class()));
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Draining, 13),
+        Some(workload_class()),
+    );
+    let rendered_objects = vec![object_ref("apps/v1", "Deployment", "apps", "instance-a")];
     store.set_materialization(materialization(
         "instance-a",
         12,
@@ -713,20 +725,38 @@ async fn draining_with_deleting_materialization_waits_for_sleep_cleanup() {
         ),
     )
     .await
-    .expect("deleting materialization is treated as in-progress wake/sleep work");
+    .expect("deleting materialization sleep cleanup resumes before wake");
 
-    assert_eq!(
-        result,
-        WakeInstanceResult::AlreadyWaking { instance: draining }
-    );
+    assert_eq!(result.instance().state, InstanceState::Running);
+    assert_eq!(result.instance().generation, Generation::new(16));
     assert_eq!(
         store.events(),
-        vec![StoreEvent::LoadActiveMaterialization {
-            instance_id: instance_id("instance-a"),
-            target: target("cluster-a", "apps"),
-        }]
+        vec![
+            StoreEvent::LoadActiveMaterialization {
+                instance_id: instance_id("instance-a"),
+                target: target("cluster-a", "apps"),
+            },
+            StoreEvent::FinalizeSleep {
+                expected_draining_generation: Generation::new(13),
+                target: target("cluster-a", "apps"),
+            },
+            StoreEvent::Cas {
+                expected: Generation::new(14),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::Complete {
+                expected_waking_generation: Generation::new(15),
+                backend_generation: BackendGeneration::new(15),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+        ]
     );
-    assert!(client.applied_objects().is_empty());
+    assert_eq!(client.deleted_objects(), rendered_objects);
+    assert_eq!(client.applied_objects().len(), 2);
 }
 
 impl FakeStore {
@@ -997,9 +1027,39 @@ impl ControlPlaneStore for FakeStore {
 
     fn finalize_sleep<'a>(
         &'a self,
-        _request: FinalizeSleepRequest,
+        request: FinalizeSleepRequest,
     ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        Box::pin(async { Err(StoreError::internal("not implemented")) })
+        Box::pin(async move {
+            let mut inner = self.inner.lock().expect("fake store lock not poisoned");
+            inner.events.push(StoreEvent::FinalizeSleep {
+                expected_draining_generation: request.expected_draining_generation,
+                target: request.target.clone(),
+            });
+            let instance = inner.instance.as_mut().ok_or(StoreError::NotFound {
+                resource: "instance",
+            })?;
+            if instance.generation != request.expected_draining_generation {
+                return Err(StoreError::GenerationConflict {
+                    expected: request.expected_draining_generation,
+                    actual: instance.generation,
+                });
+            }
+
+            instance.state = InstanceState::Cold;
+            instance.generation = request.expected_draining_generation.next();
+            let instance = instance.clone();
+            let materialization = inner.materialization.as_mut().map(|materialization| {
+                materialization.state = MaterializationState::Deleted;
+                materialization.instance_generation = instance.generation;
+                materialization.rendered_objects.clear();
+                materialization.clone()
+            });
+
+            Ok(FinalizeSleepResult {
+                instance,
+                materialization,
+            })
+        })
     }
 
     fn lookup_route_dependencies<'a>(
@@ -1047,6 +1107,14 @@ impl FakeKubernetesClient {
             .clone()
     }
 
+    fn deleted_objects(&self) -> Vec<RenderedObjectRef> {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .deleted_objects
+            .clone()
+    }
+
     fn readiness_calls(&self) -> Vec<Vec<RenderedObjectRef>> {
         self.inner
             .lock()
@@ -1080,9 +1148,16 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
 
     fn delete_object<'a>(
         &'a self,
-        _object: &'a RenderedObjectRef,
+        object: &'a RenderedObjectRef,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.inner
+                .lock()
+                .expect("fake kubernetes lock not poisoned")
+                .deleted_objects
+                .push(object.clone());
+            Ok(())
+        })
     }
 
     fn wait_for_pvc_bound<'a>(
