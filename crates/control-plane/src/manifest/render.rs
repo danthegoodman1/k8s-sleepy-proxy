@@ -205,7 +205,11 @@ pub fn render_manifests(
         }
     }
 
-    Ok(RenderedManifest { objects })
+    Ok(RenderedManifest {
+        instance_generation: request.instance.generation,
+        template_generation: request.template_generation,
+        objects,
+    })
 }
 
 struct RenderedVolume {
@@ -283,6 +287,17 @@ fn render_volume(
         return Err(ManifestRenderError::InvalidField {
             field: "volume.access_modes",
             message: "at least one access mode is required".to_owned(),
+        });
+    }
+    if template
+        .access_modes
+        .iter()
+        .enumerate()
+        .any(|(index, mode)| template.access_modes[..index].contains(mode))
+    {
+        return Err(ManifestRenderError::InvalidField {
+            field: "volume.access_modes",
+            message: "access modes must not contain duplicates".to_owned(),
         });
     }
 

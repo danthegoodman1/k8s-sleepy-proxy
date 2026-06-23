@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 
+use crate::ids::Generation;
+
 use super::{PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedManifest {
+    pub instance_generation: Generation,
+    pub template_generation: Option<Generation>,
     pub objects: Vec<RenderedManifestObject>,
 }
 

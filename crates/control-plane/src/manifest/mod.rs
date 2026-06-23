@@ -27,12 +27,12 @@ pub use template::{
     VolumeTemplate, WorkloadKind, WorkloadTemplate,
 };
 
-const LABEL_INSTANCE_ID: &str = "sleepypods.io/instance-id";
-const LABEL_INSTANCE_GENERATION: &str = "sleepypods.io/instance-generation";
-const LABEL_WORKLOAD_CLASS_ID: &str = "sleepypods.io/workload-class-id";
-const LABEL_WORKLOAD_CLASS_VERSION: &str = "sleepypods.io/workload-class-version";
-const LABEL_WORKLOAD_NAME: &str = "sleepypods.io/workload-name";
-const ANNOTATION_TEMPLATE_GENERATION: &str = "sleepypods.io/template-generation";
+pub(crate) const LABEL_INSTANCE_ID: &str = "sleepypods.io/instance-id";
+pub(crate) const LABEL_INSTANCE_GENERATION: &str = "sleepypods.io/instance-generation";
+pub(crate) const LABEL_WORKLOAD_CLASS_ID: &str = "sleepypods.io/workload-class-id";
+pub(crate) const LABEL_WORKLOAD_CLASS_VERSION: &str = "sleepypods.io/workload-class-version";
+pub(crate) const LABEL_WORKLOAD_NAME: &str = "sleepypods.io/workload-name";
+pub(crate) const ANNOTATION_TEMPLATE_GENERATION: &str = "sleepypods.io/template-generation";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderManifestRequest<'a> {

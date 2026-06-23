@@ -1,7 +1,10 @@
-use std::{error::Error, fmt, future::Future, pin::Pin};
+use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
 
 use crate::{
-    manifest::{ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject},
+    manifest::{
+        ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject,
+        ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
+    },
     materialization::{BackendEndpoint, RenderedObjectRef},
 };
 
@@ -49,6 +52,9 @@ pub struct AppliedMaterialization {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MaterializerError {
+    InvalidManifest {
+        message: String,
+    },
     Apply {
         object: RenderedObjectRef,
         source: KubernetesClientError,
@@ -104,6 +110,8 @@ where
         &self,
         manifest: &RenderedManifest,
     ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
+        validate_manifest_generations(manifest)?;
+
         let objects = ordered_objects(manifest);
         let mut applied_refs = Vec::with_capacity(objects.len());
 
@@ -231,6 +239,7 @@ impl Error for KubernetesClientError {}
 impl fmt::Display for MaterializerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidManifest { message } => write!(f, "invalid rendered manifest: {message}"),
             Self::Apply { object, source } => {
                 write!(
                     f,
@@ -268,11 +277,133 @@ impl fmt::Display for MaterializerError {
 impl Error for MaterializerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidManifest { .. } => None,
             Self::Apply { source, .. }
             | Self::Delete { source, .. }
             | Self::PvcBoundWait { source, .. }
             | Self::ReadinessWait { source, .. } => Some(source),
         }
+    }
+}
+
+fn validate_manifest_generations(manifest: &RenderedManifest) -> Result<(), MaterializerError> {
+    let expected_instance_generation = manifest.instance_generation.to_string();
+    let expected_template_generation = manifest
+        .template_generation
+        .map(|generation| generation.to_string());
+
+    for rendered in &manifest.objects {
+        let (labels, annotations) = object_metadata(&rendered.object);
+        validate_metadata_generation(
+            &rendered.object,
+            labels,
+            annotations,
+            &expected_instance_generation,
+            expected_template_generation.as_deref(),
+            "metadata",
+        )?;
+
+        if let Some((labels, annotations)) = pod_template_metadata(&rendered.object) {
+            validate_metadata_generation(
+                &rendered.object,
+                labels,
+                annotations,
+                &expected_instance_generation,
+                expected_template_generation.as_deref(),
+                "pod template metadata",
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_metadata_generation(
+    object: &KubernetesObject,
+    labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+    expected_instance_generation: &str,
+    expected_template_generation: Option<&str>,
+    context: &'static str,
+) -> Result<(), MaterializerError> {
+    validate_generation_value(
+        object,
+        context,
+        LABEL_INSTANCE_GENERATION,
+        labels.get(LABEL_INSTANCE_GENERATION),
+        expected_instance_generation,
+    )?;
+
+    if let Some(expected) = expected_template_generation {
+        validate_generation_value(
+            object,
+            context,
+            ANNOTATION_TEMPLATE_GENERATION,
+            annotations.get(ANNOTATION_TEMPLATE_GENERATION),
+            expected,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_generation_value(
+    object: &KubernetesObject,
+    context: &'static str,
+    key: &'static str,
+    actual: Option<&String>,
+    expected: &str,
+) -> Result<(), MaterializerError> {
+    if actual.is_some_and(|actual| actual == expected) {
+        return Ok(());
+    }
+
+    let object_ref = rendered_object_ref(object);
+    Err(MaterializerError::InvalidManifest {
+        message: format!(
+            "{} {}/{} {context} {key} must be {expected:?}, got {:?}",
+            object_ref.kind, object_ref.namespace, object_ref.name, actual
+        ),
+    })
+}
+
+fn object_metadata(
+    object: &KubernetesObject,
+) -> (&BTreeMap<String, String>, &BTreeMap<String, String>) {
+    match object {
+        KubernetesObject::Deployment(object) => {
+            (&object.metadata.labels, &object.metadata.annotations)
+        }
+        KubernetesObject::StatefulSet(object) => {
+            (&object.metadata.labels, &object.metadata.annotations)
+        }
+        KubernetesObject::Service(object) => {
+            (&object.metadata.labels, &object.metadata.annotations)
+        }
+        KubernetesObject::PersistentVolume(object) => {
+            (&object.metadata.labels, &object.metadata.annotations)
+        }
+        KubernetesObject::PersistentVolumeClaim(object) => {
+            (&object.metadata.labels, &object.metadata.annotations)
+        }
+    }
+}
+
+fn pod_template_metadata(
+    object: &KubernetesObject,
+) -> Option<(&BTreeMap<String, String>, &BTreeMap<String, String>)> {
+    match object {
+        KubernetesObject::Deployment(object) => Some((
+            &object.spec.template.metadata.labels,
+            &object.spec.template.metadata.annotations,
+        )),
+        KubernetesObject::StatefulSet(object) => Some((
+            &object.spec.template.metadata.labels,
+            &object.spec.template.metadata.annotations,
+        )),
+        KubernetesObject::Service(_)
+        | KubernetesObject::PersistentVolume(_)
+        | KubernetesObject::PersistentVolumeClaim(_) => None,
     }
 }
 
@@ -701,6 +832,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stale_object_generation_manifest_is_rejected_before_apply() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let mut manifest = deployment_manifest();
+        let deployment = manifest
+            .objects
+            .iter_mut()
+            .find_map(|object| match &mut object.object {
+                KubernetesObject::Deployment(deployment) => Some(deployment),
+                _ => None,
+            })
+            .expect("deployment object");
+        deployment.metadata.labels.insert(
+            "sleepypods.io/instance-generation".to_owned(),
+            "6".to_owned(),
+        );
+
+        let error = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect_err("stale generation label is rejected");
+
+        assert_invalid_manifest(
+            error,
+            "Deployment apps/app-acme metadata sleepypods.io/instance-generation must be \"7\"",
+        );
+        assert!(
+            client.operations().is_empty(),
+            "stale manifest must not be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_template_generation_manifest_is_rejected_before_apply() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let mut manifest = deployment_manifest();
+        let deployment = manifest
+            .objects
+            .iter_mut()
+            .find_map(|object| match &mut object.object {
+                KubernetesObject::Deployment(deployment) => Some(deployment),
+                _ => None,
+            })
+            .expect("deployment object");
+        deployment.spec.template.metadata.annotations.insert(
+            "sleepypods.io/template-generation".to_owned(),
+            "2".to_owned(),
+        );
+
+        let error = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect_err("stale template generation annotation is rejected");
+
+        assert_invalid_manifest(
+            error,
+            "Deployment apps/app-acme pod template metadata sleepypods.io/template-generation must be \"3\"",
+        );
+        assert!(
+            client.operations().is_empty(),
+            "stale manifest must not be applied"
+        );
+    }
+
     impl KubernetesMaterializerClient for FakeKubernetesClient {
         fn apply_object<'a>(
             &'a self,
@@ -983,6 +1180,18 @@ mod tests {
             KubernetesObject::Service(object) => &object.metadata.labels,
             KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
             KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
+        }
+    }
+
+    fn assert_invalid_manifest(error: MaterializerError, expected_message: &str) {
+        match error {
+            MaterializerError::InvalidManifest { message } => {
+                assert!(
+                    message.contains(expected_message),
+                    "message {message:?} should contain {expected_message:?}"
+                );
+            }
+            other => panic!("expected invalid manifest error, got {other:?}"),
         }
     }
 

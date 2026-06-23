@@ -839,6 +839,97 @@ fn rejects_volume_without_access_modes() {
 }
 
 #[test]
+fn rejects_duplicate_volume_access_modes() {
+    let mut template = stateful_template();
+    template.volumes[0].access_modes = vec![
+        PersistentVolumeAccessMode::ReadWriteOnce,
+        PersistentVolumeAccessMode::ReadWriteOnce,
+    ];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([("tenant", "acme"), ("volume", "provider-vol-123")]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect_err("duplicate access modes are rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volume.access_modes",
+            message: "access modes must not contain duplicates".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_unsupported_volume_access_mode_at_decode_boundary() {
+    let mut encoded = serde_json::to_value(stateful_template()).expect("template encodes");
+    encoded["volumes"][0]["access_modes"][0] = json!("ReadWriteOncePod");
+
+    let error = serde_json::from_value::<ManifestTemplate>(encoded)
+        .expect_err("unsupported access mode is rejected while decoding");
+
+    assert!(
+        error.to_string().contains("ReadWriteOncePod"),
+        "decode error {error} should identify the unsupported access mode"
+    );
+}
+
+#[test]
+fn rejects_missing_csi_volume_handle_value() {
+    let template = stateful_template();
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect_err("missing CSI volume handle is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::MissingInstanceValue {
+            field: "volume".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_empty_csi_volume_handle() {
+    let template = stateful_template();
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([("tenant", "acme"), ("volume", "   ")]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect_err("empty CSI volume handle is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volume.source.csi.volume_handle",
+            message: "rendered value must not be empty".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn rejects_relative_host_path_persistent_volume_source() {
     let mut template = host_path_stateful_template();
     template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {

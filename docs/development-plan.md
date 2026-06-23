@@ -622,7 +622,7 @@ Done criteria:
 | Complete | kind tests prove workload can read/write expected mount path. | `scripts/test-kind-materializer.sh` writes and verifies a marker through the mounted hostPath volume. |
 | Incomplete | kind tests prove sleep deletes workload, Service, PVC, and PV. | Materializer-only delete is tested, but sleep-driven cleanup is not wired; follow-up: M9. |
 | Complete | kind tests prove re-wake recreates manifests from same values and preserves static-volume data. | `scripts/test-kind-materializer.sh` rematerializes the manifest and verifies the previous marker remains. |
-| Incomplete | Failure tests cover missing/bad volume handles, PVCs never bind, wrong access modes, and stale manifest generation. | PVC wait/readiness/apply failures and several render validation failures are covered; wrong access mode and stale manifest generation failure gates are incomplete; follow-up: M9. |
+| Complete | Failure tests cover missing/bad volume handles, PVCs never bind, wrong access modes, and stale manifest generation. | Manifest tests reject missing/empty CSI volume handles plus unsupported/duplicate access modes; materializer tests cover PVC bind failures and stale generation labels/annotations being rejected before apply. |
 | Incomplete | Readiness tests prove routes are not published until ready and withdrawn when unready. | Materializer readiness returns a backend only after ready, but route publication/withdrawal is not wired to readiness changes; follow-up: M9. |
 
 ## Milestone 6: End-to-End V1
