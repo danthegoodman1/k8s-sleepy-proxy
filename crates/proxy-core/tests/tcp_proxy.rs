@@ -467,6 +467,56 @@ async fn tcp_proxy_stream_backpressure_stalls_until_upstream_reads() {
 }
 
 #[tokio::test]
+async fn tcp_proxy_stream_allows_reverse_bytes_after_client_half_close() {
+    let (mut client, proxy_client) = duplex(64);
+    let (proxy_upstream, mut upstream) = duplex(64);
+    let request = b"request before half-close";
+    let response = b"response after client half-close";
+
+    let proxy_task = tokio::spawn(proxy_streams(proxy_client, proxy_upstream));
+    client
+        .write_all(request)
+        .await
+        .expect("client writes request bytes");
+    client.shutdown().await.expect("client half-closes");
+
+    let mut received = vec![0; request.len()];
+    upstream
+        .read_exact(&mut received)
+        .await
+        .expect("upstream reads request bytes");
+    assert_eq!(received, request);
+    let mut eof = [0; 1];
+    assert_eq!(
+        timeout(TEST_TIMEOUT, upstream.read(&mut eof))
+            .await
+            .expect("upstream observes propagated client half-close before timeout")
+            .expect("upstream reads client half-close"),
+        0
+    );
+
+    upstream
+        .write_all(response)
+        .await
+        .expect("upstream writes response after client half-close");
+    upstream.shutdown().await.expect("upstream half-closes");
+
+    let mut echoed = vec![0; response.len()];
+    client
+        .read_exact(&mut echoed)
+        .await
+        .expect("client reads response after half-close");
+    assert_eq!(echoed, response);
+
+    let stats = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect("proxy completes after both halves close");
+    assert_eq!(stats.client_to_upstream, request.len() as u64);
+    assert_eq!(stats.upstream_to_client, response.len() as u64);
+}
+
+#[tokio::test]
 async fn tcp_proxy_drain_times_out_while_connection_is_stalled_then_releases() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
