@@ -18,7 +18,9 @@ use crate::{
     },
     config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
     materialization::{InvalidMaterializationTarget, MaterializationTarget},
-    materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
+    materializer::{
+        KubernetesMaterializer, KubernetesMaterializerClient, RetryingKubernetesMaterializerClient,
+    },
     postgres::PostgresStore,
     store::ControlPlaneStore,
     KubeMaterializerClient,
@@ -149,7 +151,9 @@ pub async fn run_from_env() -> RuntimeResult<()> {
     let config = RuntimeConfig::from_env()?;
     let store = connect_store(&config.control_plane.store).await?;
     let kube_client = KubeMaterializerClient::try_default().await?;
-    let materializer = KubernetesMaterializer::new(kube_client);
+    let materializer = KubernetesMaterializer::new(
+        RetryingKubernetesMaterializerClient::with_default_policy(kube_client),
+    );
 
     serve(config, store, materializer).await?;
 

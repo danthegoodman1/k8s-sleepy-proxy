@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
+use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin, time::Duration};
 
 use crate::{
     manifest::{
@@ -39,9 +39,23 @@ pub struct KubernetesMaterializer<C> {
     client: C,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryPolicy {
+    max_attempts: usize,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct RetryingKubernetesMaterializerClient<C> {
+    inner: C,
+    policy: RetryPolicy,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KubernetesClientError {
     message: String,
+    retryable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +205,126 @@ where
     }
 }
 
+impl RetryPolicy {
+    pub fn new(max_attempts: usize, initial_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+
+    pub fn max_attempts(&self) -> usize {
+        self.max_attempts
+    }
+
+    pub fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    async fn retry<T, O, Fut>(&self, mut operation: O) -> KubernetesClientResult<T>
+    where
+        O: FnMut() -> Fut,
+        Fut: Future<Output = KubernetesClientResult<T>>,
+    {
+        let max_attempts = self.max_attempts.max(1);
+        let mut attempts = 0;
+        let mut backoff = self.initial_backoff;
+
+        loop {
+            attempts += 1;
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempts < max_attempts && error.is_retryable() => {
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    backoff = next_backoff(backoff, self.max_backoff);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(2),
+        }
+    }
+}
+
+impl<C> RetryingKubernetesMaterializerClient<C> {
+    pub fn new(inner: C, policy: RetryPolicy) -> Self {
+        Self { inner, policy }
+    }
+
+    pub fn with_default_policy(inner: C) -> Self {
+        Self::new(inner, RetryPolicy::default())
+    }
+
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
+
+    pub fn policy(&self) -> RetryPolicy {
+        self.policy
+    }
+}
+
+impl<C> KubernetesMaterializerClient for RetryingKubernetesMaterializerClient<C>
+where
+    C: KubernetesMaterializerClient,
+{
+    fn apply_object<'a>(
+        &'a self,
+        object: &'a KubernetesObject,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        let inner = &self.inner;
+        let policy = self.policy;
+        Box::pin(async move { policy.retry(|| inner.apply_object(object)).await })
+    }
+
+    fn delete_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        let inner = &self.inner;
+        let policy = self.policy;
+        Box::pin(async move { policy.retry(|| inner.delete_object(object)).await })
+    }
+
+    fn wait_for_pvc_bound<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        let inner = &self.inner;
+        let policy = self.policy;
+        Box::pin(async move {
+            policy
+                .retry(|| inner.wait_for_pvc_bound(namespace, name))
+                .await
+        })
+    }
+
+    fn wait_for_readiness<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
+        let inner = &self.inner;
+        let policy = self.policy;
+        Box::pin(async move { policy.retry(|| inner.wait_for_readiness(objects)).await })
+    }
+}
+
 pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
     let (api_version, namespace) = match object {
         KubernetesObject::Deployment(object) => ("apps/v1", object.metadata.namespace.clone()),
@@ -220,11 +354,23 @@ impl KubernetesClientError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
     }
 }
 
@@ -235,6 +381,14 @@ impl fmt::Display for KubernetesClientError {
 }
 
 impl Error for KubernetesClientError {}
+
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    if current.is_zero() || max.is_zero() {
+        return Duration::ZERO;
+    }
+
+    current.checked_mul(2).unwrap_or(max).min(max)
+}
 
 impl fmt::Display for MaterializerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -410,8 +564,9 @@ fn pod_template_metadata(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use crate::{
@@ -431,7 +586,8 @@ mod tests {
     use super::{
         rendered_object_ref, AppliedMaterialization, BackendEndpoint, KubernetesClientError,
         KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
-        KubernetesMaterializerClient, MaterializerError, RenderedObjectRef,
+        KubernetesMaterializerClient, MaterializerError, RenderedObjectRef, RetryPolicy,
+        RetryingKubernetesMaterializerClient,
     };
 
     #[derive(Clone, Debug, Default)]
@@ -443,6 +599,7 @@ mod tests {
     struct FakeState {
         operations: Vec<FakeOperation>,
         applied_objects: Vec<KubernetesObject>,
+        queued_failures: VecDeque<(FakeOperation, KubernetesClientError)>,
         readiness_backend: Option<BackendEndpoint>,
         fail_pvc_wait: Option<(String, String)>,
         fail_delete: Option<RenderedObjectRef>,
@@ -463,6 +620,170 @@ mod tests {
         fn assert_dyn_safe<T: KubernetesMaterializerClient + ?Sized>() {}
 
         assert_dyn_safe::<dyn KubernetesMaterializerClient>();
+    }
+
+    #[test]
+    fn new_client_errors_are_permanent_by_default() {
+        let error = KubernetesClientError::new("permanent");
+
+        assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn retrying_materializer_client_retries_transient_apply_failure_until_success() {
+        let client = FakeKubernetesClient::default();
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        client.fail_next(
+            FakeOperation::Apply(service_ref.clone()),
+            KubernetesClientError::transient("apply conflict"),
+        );
+        let materializer = KubernetesMaterializer::new(retrying_client(client.clone()));
+
+        let refs = materializer
+            .apply_manifest(&deployment_manifest())
+            .await
+            .expect("transient apply failure is retried");
+
+        assert_eq!(
+            refs,
+            vec![
+                service_ref.clone(),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            ]
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(service_ref.clone()),
+                FakeOperation::Apply(service_ref),
+                FakeOperation::Apply(object_ref("apps/v1", "Deployment", "apps", "app-acme")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_materializer_client_retries_transient_delete_failure_until_success() {
+        let client = FakeKubernetesClient::default();
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        let workload_ref = object_ref("apps/v1", "Deployment", "apps", "app-acme");
+        client.fail_next(
+            FakeOperation::Delete(workload_ref.clone()),
+            KubernetesClientError::transient("delete timeout"),
+        );
+        let materializer = KubernetesMaterializer::new(retrying_client(client.clone()));
+
+        materializer
+            .delete_rendered_objects(&[service_ref.clone(), workload_ref.clone()])
+            .await
+            .expect("transient delete failure is retried");
+
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Delete(workload_ref.clone()),
+                FakeOperation::Delete(workload_ref),
+                FakeOperation::Delete(service_ref),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_materializer_client_retries_transient_pvc_wait_failure_until_success() {
+        let client = FakeKubernetesClient::default();
+        let pvc_wait = FakeOperation::WaitPvcBound {
+            namespace: "data".to_owned(),
+            name: "pvc-acme".to_owned(),
+        };
+        client.fail_next(
+            pvc_wait.clone(),
+            KubernetesClientError::transient("pvc get failed"),
+        );
+        let materializer = KubernetesMaterializer::new(retrying_client(client.clone()));
+
+        materializer
+            .apply_manifest(&stateful_manifest())
+            .await
+            .expect("transient pvc wait failure is retried");
+
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Apply(object_ref(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    "data",
+                    "pvc-acme"
+                )),
+                pvc_wait.clone(),
+                pvc_wait,
+                FakeOperation::Apply(object_ref("v1", "Service", "data", "db-acme")),
+                FakeOperation::Apply(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_materializer_client_retries_transient_readiness_failure_until_success() {
+        let client = FakeKubernetesClient::default();
+        let backend = backend_endpoint("http://svc-acme.apps.svc.cluster.local:80");
+        client.set_readiness_backend(backend.clone());
+        let refs = vec![
+            object_ref("v1", "Service", "apps", "svc-acme"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+        ];
+        client.fail_next(
+            FakeOperation::WaitReadiness(refs.clone()),
+            KubernetesClientError::transient("endpoint slice list failed"),
+        );
+        let materializer = KubernetesMaterializer::new(retrying_client(client.clone()));
+
+        let applied = materializer
+            .apply_manifest_until_ready(&deployment_manifest())
+            .await
+            .expect("transient readiness failure is retried");
+
+        assert_eq!(
+            applied,
+            AppliedMaterialization {
+                rendered_objects: refs.clone(),
+                backend
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(refs[0].clone()),
+                FakeOperation::Apply(refs[1].clone()),
+                FakeOperation::WaitReadiness(refs.clone()),
+                FakeOperation::WaitReadiness(refs),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_materializer_client_does_not_retry_permanent_apply_failure() {
+        let client = FakeKubernetesClient::default();
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        client.fail_next(
+            FakeOperation::Apply(service_ref.clone()),
+            KubernetesClientError::new("invalid object"),
+        );
+        let materializer = KubernetesMaterializer::new(retrying_client(client.clone()));
+
+        let error = materializer
+            .apply_manifest(&deployment_manifest())
+            .await
+            .expect_err("permanent apply failure is not retried");
+
+        assert_eq!(
+            error,
+            MaterializerError::Apply {
+                object: service_ref.clone(),
+                source: KubernetesClientError::new("invalid object"),
+            }
+        );
+        assert_eq!(client.operations(), vec![FakeOperation::Apply(service_ref)]);
     }
 
     #[tokio::test]
@@ -912,6 +1233,11 @@ mod tests {
                     .operations
                     .push(FakeOperation::Apply(object_ref.clone()));
                 inner.applied_objects.push(object);
+                if let Some(error) =
+                    take_queued_failure(&mut inner, &FakeOperation::Apply(object_ref.clone()))
+                {
+                    return Err(error);
+                }
 
                 if inner.fail_apply.as_ref() == Some(&object_ref) {
                     Err(KubernetesClientError::new("apply failed"))
@@ -929,7 +1255,11 @@ mod tests {
             let client = self.clone();
             Box::pin(async move {
                 let mut inner = client.inner.lock().expect("fake client lock not poisoned");
-                inner.operations.push(FakeOperation::Delete(object.clone()));
+                let operation = FakeOperation::Delete(object.clone());
+                inner.operations.push(operation.clone());
+                if let Some(error) = take_queued_failure(&mut inner, &operation) {
+                    return Err(error);
+                }
 
                 if inner.fail_delete.as_ref() == Some(&object) {
                     Err(KubernetesClientError::new("delete failed"))
@@ -949,10 +1279,14 @@ mod tests {
             let client = self.clone();
             Box::pin(async move {
                 let mut inner = client.inner.lock().expect("fake client lock not poisoned");
-                inner.operations.push(FakeOperation::WaitPvcBound {
+                let operation = FakeOperation::WaitPvcBound {
                     namespace: namespace.clone(),
                     name: name.clone(),
-                });
+                };
+                inner.operations.push(operation.clone());
+                if let Some(error) = take_queued_failure(&mut inner, &operation) {
+                    return Err(error);
+                }
 
                 if inner.fail_pvc_wait.as_ref() == Some(&(namespace, name)) {
                     Err(KubernetesClientError::new("pvc did not bind"))
@@ -970,7 +1304,11 @@ mod tests {
             let client = self.clone();
             Box::pin(async move {
                 let mut inner = client.inner.lock().expect("fake client lock not poisoned");
-                inner.operations.push(FakeOperation::WaitReadiness(objects));
+                let operation = FakeOperation::WaitReadiness(objects);
+                inner.operations.push(operation.clone());
+                if let Some(error) = take_queued_failure(&mut inner, &operation) {
+                    return Err(error);
+                }
 
                 if inner.fail_readiness {
                     Err(KubernetesClientError::new("readiness wait failed"))
@@ -1035,6 +1373,35 @@ mod tests {
                 .expect("fake client lock not poisoned")
                 .fail_readiness = true;
         }
+
+        fn fail_next(&self, operation: FakeOperation, error: KubernetesClientError) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .queued_failures
+                .push_back((operation, error));
+        }
+    }
+
+    fn take_queued_failure(
+        inner: &mut FakeState,
+        operation: &FakeOperation,
+    ) -> Option<KubernetesClientError> {
+        let (next_operation, _) = inner.queued_failures.front()?;
+        if next_operation == operation {
+            inner.queued_failures.pop_front().map(|(_, error)| error)
+        } else {
+            None
+        }
+    }
+
+    fn retrying_client(
+        client: FakeKubernetesClient,
+    ) -> RetryingKubernetesMaterializerClient<FakeKubernetesClient> {
+        RetryingKubernetesMaterializerClient::new(
+            client,
+            RetryPolicy::new(3, Duration::ZERO, Duration::ZERO),
+        )
     }
 
     fn deployment_manifest() -> crate::manifest::RenderedManifest {

@@ -57,7 +57,7 @@ pub use materialization::{
 pub use materializer::{
     rendered_object_ref, AppliedMaterialization, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
-    MaterializerError,
+    MaterializerError, RetryPolicy, RetryingKubernetesMaterializerClient,
 };
 pub use postgres::PostgresStore;
 pub use route::{

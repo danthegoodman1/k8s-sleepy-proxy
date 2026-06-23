@@ -372,7 +372,22 @@ fn is_not_found(error: &KubeError) -> bool {
 }
 
 fn kube_error(error: KubeError) -> KubernetesClientError {
-    KubernetesClientError::new(error.to_string())
+    let message = error.to_string();
+    if is_transient_kube_error(&error) {
+        KubernetesClientError::transient(message)
+    } else {
+        KubernetesClientError::new(message)
+    }
+}
+
+fn is_transient_kube_error(error: &KubeError) -> bool {
+    match error {
+        KubeError::Api(status) => {
+            status.is_conflict() || status.code == 429 || (500..=599).contains(&status.code)
+        }
+        KubeError::HyperError(_) | KubeError::Service(_) | KubeError::ReadEvents(_) => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -392,7 +407,8 @@ mod tests {
 
     use super::{
         api_resource_for_ref, backend_endpoint_for_service, endpoint_slice_has_ready_endpoint,
-        is_not_found, is_valid_uri_scheme, rendered_service_ref, KubeMaterializerClientConfig,
+        is_not_found, is_valid_uri_scheme, kube_error, rendered_service_ref,
+        KubeMaterializerClientConfig,
     };
 
     #[test]
@@ -529,6 +545,32 @@ mod tests {
         }));
 
         assert!(is_not_found(&error));
+    }
+
+    #[test]
+    fn kube_conflict_errors_are_retryable_materializer_errors() {
+        let error = kube_error(KubeError::Api(Box::new(Status {
+            code: 409,
+            reason: "Conflict".to_owned(),
+            message: "resource version conflict".to_owned(),
+            ..Status::default()
+        })));
+
+        assert!(error.is_retryable());
+        assert!(error.message().contains("resource version conflict"));
+    }
+
+    #[test]
+    fn kube_invalid_errors_are_permanent_materializer_errors() {
+        let error = kube_error(KubeError::Api(Box::new(Status {
+            code: 422,
+            reason: "Invalid".to_owned(),
+            message: "manifest is invalid".to_owned(),
+            ..Status::default()
+        })));
+
+        assert!(!error.is_retryable());
+        assert!(error.message().contains("manifest is invalid"));
     }
 
     #[test]
