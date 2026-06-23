@@ -536,7 +536,100 @@ Done when:
   starts, and tests or CI checks fail if they regress without an explicit update.
 - Dashboards or metric names are documented enough for operators to wire up.
 
-## Milestone 8: Operator and Contributor Documentation
+## Milestone 8: Phase Status Audit
+
+Audit the implementation against every prior milestone before doing more
+feature work.
+
+Scope:
+
+- Review all Milestone 1-7 scope items, sub-phases, and done criteria against
+  the current code, tests, scripts, and kind/container evidence.
+- Mark each prior item explicitly as `Complete`, `Incomplete`, or `Unknown` in
+  this development plan.
+- For every `Complete` item, include concise evidence such as a test name,
+  script name, source file, or command that proves the claim.
+- For every `Incomplete` item, name the missing behavior or missing test.
+- Convert any `Unknown` item into either `Complete` or `Incomplete` before
+  starting documentation.
+
+Sub-phases:
+
+- 8A: Audit Milestones 1-3 covering proxy primitives, control-plane resource
+  model, and frontline route resolution.
+- 8B: Audit Milestones 4-5 covering sidecar idle behavior and Kubernetes
+  materialization.
+- 8C: Audit Milestones 6-7 covering full-platform E2E, hardening, production
+  images, load tests, and soak tests.
+- 8D: Update this plan with explicit status markers and evidence for every
+  prior scope item, sub-phase, and done criterion.
+- 8E: Promote every discovered skipped gate into Milestone 9 or a later
+  explicitly deferred item.
+
+Done when:
+
+- Every prior scope item, sub-phase, and done criterion is marked `Complete` or
+  `Incomplete`; no `Unknown` markers remain.
+- Every `Complete` marker has evidence that a reviewer can run or inspect.
+- Every `Incomplete` marker has a concrete follow-up location in Milestone 9,
+  Milestone 10, or `Deferred`.
+- The plan no longer relies on phase numbers alone as proof that behavior exists.
+
+## Milestone 9: V1 Gap Closure and Workload Sleep Policy
+
+Close the skipped V1 functional gates before writing operator-facing docs. Move
+sidecar sleep timing from runtime-only environment defaults into explicit
+WorkloadClass policy.
+
+Scope:
+
+- Add focused checks for the currently known gaps: sleep finalization after
+  `ReportIdle`, Kubernetes cleanup on delete, full-platform kind E2E, frontline
+  TLS/SNI runtime wiring, and subscribed route update/invalidation delivery.
+- Add WorkloadClass-owned sleep policy for idle timeout, idle report retry
+  backoff, and drain grace.
+- Keep instance-level timeout customization optional and only available through
+  WorkloadClass-approved value schema fields and bounds.
+- Render the resolved policy into sidecar env as
+  `SLEEPYPODS_IDLE_TIMEOUT_MS`, `SLEEPYPODS_IDLE_RETRY_BACKOFF_MS`, and
+  `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS`.
+- Preserve sidecar runtime env defaults as a development fallback, not the
+  operator-facing source of truth.
+
+Sub-phases:
+
+- 9A: Gap-check tests for sleep finalization, delete cleanup, full-platform kind
+  E2E, frontline TLS/SNI runtime wiring, and subscribed route
+  updates/invalidations.
+- 9B: WorkloadClass sleep-policy model, validation, and API/proto mapping.
+- 9C: Optional validated instance-value overrides with bounds.
+- 9D: Manifest rendering of resolved sidecar sleep-policy env.
+- 9E: Component and kind E2E coverage for policy rendering and idle behavior.
+
+Done when:
+
+- Gap-check tests fail against the current incomplete behavior and pass only when
+  the missing V1 behavior is implemented.
+- kind E2E proves `ReportIdle` leads to drain, deletion of rendered Kubernetes
+  objects, materialization state cleanup, and transition back to `Cold`.
+- kind E2E proves deleting an instance cleans up any active materialization and
+  leaves no workload, Service, PVC, or PV objects owned by that instance.
+- full-platform kind E2E uses the real control-plane, frontline, and sidecar
+  images against a real database and Kubernetes API, not fake clients.
+- Runtime tests prove the frontline binary wires HTTP, TLS termination, and
+  TLS/SNI passthrough listeners rather than leaving TLS/SNI as library-only
+  primitives.
+- Subscription tests prove route changes and backend changes are pushed as
+  targeted updates or invalidations to actively subscribed proxies.
+- Operator APIs accept and return WorkloadClass sleep policy.
+- Invalid timeout values and out-of-bounds instance overrides are rejected before
+  manifest rendering.
+- Render tests prove the sidecar container receives the resolved timeout env
+  values.
+- kind E2E proves two workload classes with different idle policies sleep at
+  different configured thresholds.
+
+## Milestone 10: Operator and Contributor Documentation
 
 Write concise documentation for the two supported audiences: operators who run
 and use the platform, and contributors who build and change it.
@@ -562,15 +655,15 @@ Scope:
 
 Sub-phases:
 
-- 8A: Operator-facing concepts, resource model, and request/lifecycle sequence
+- 10A: Operator-facing concepts, resource model, and request/lifecycle sequence
   diagrams.
-- 8B: Operator task guides for workload classes, instances, routes, custom
+- 10B: Operator task guides for workload classes, instances, routes, custom
   domains, HTTP-01, and existing volumes.
-- 8C: Operator installation, configuration, database, Kubernetes, TLS, metrics,
+- 10C: Operator installation, configuration, database, Kubernetes, TLS, metrics,
   and upgrade guide.
-- 8D: Operator troubleshooting and incident runbooks.
-- 8E: Contributor local development and test guide.
-- 8F: Agent-facing repository guide with file map, invariants, and common task
+- 10D: Operator troubleshooting and incident runbooks.
+- 10E: Contributor local development and test guide.
+- 10F: Agent-facing repository guide with file map, invariants, and common task
   entry points.
 
 Done when:
