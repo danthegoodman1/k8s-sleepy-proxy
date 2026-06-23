@@ -13,7 +13,7 @@ http-body-util = { version = "0.1.3", default-features = false, features = ["ful
 hyper = { version = "1.10.1", default-features = false, features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio", "http1", "http2", "server-auto"] }
 proxy-core = { version = "0.1.0", path = "../proxy-core" }
-tokio = { version = "1.52.3", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.52.3", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tonic = { version = "0.14.6", default-features = false, features = ["transport"] }
 
@@ -24,7 +24,7 @@ http-body-util = { version = "0.1.3", default-features = false, features = ["cha
 hyper = { version = "1.10.1", default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["ring"] }
-tokio = { version = "1.52.3", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.52.3", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake"] }
 
 [[bench]]

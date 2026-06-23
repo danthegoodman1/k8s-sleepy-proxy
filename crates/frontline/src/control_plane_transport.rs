@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, error::Error, fmt};
+use std::{collections::VecDeque, error::Error, fmt, time::Duration};
 
 use control_plane::{
     api::pb::{
@@ -24,11 +24,14 @@ const SUBSCRIBE_REQUEST_BUFFER: usize = 16;
 // Matches the request-side buffer so pushed updates are backpressured by proxy
 // demand instead of accumulating unboundedly while the resolver is idle.
 const SUBSCRIBE_RESPONSE_BUFFER: usize = SUBSCRIBE_REQUEST_BUFFER;
+const DEFAULT_SUBSCRIBE_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub struct GrpcProxyControlPlaneClient<T> {
     client: ProxyControlPlaneClient<T>,
     subscription: Option<GrpcRouteSubscriptionSession>,
+    subscribe_reconnect_backoff: Duration,
+    backoff_before_next_subscription: bool,
 }
 
 #[derive(Debug)]
@@ -68,9 +71,18 @@ pub enum GrpcOperatorHttp01ResolverError {
 
 impl<T> GrpcProxyControlPlaneClient<T> {
     pub fn new(client: ProxyControlPlaneClient<T>) -> Self {
+        Self::with_subscribe_reconnect_backoff(client, DEFAULT_SUBSCRIBE_RECONNECT_BACKOFF)
+    }
+
+    pub fn with_subscribe_reconnect_backoff(
+        client: ProxyControlPlaneClient<T>,
+        subscribe_reconnect_backoff: Duration,
+    ) -> Self {
         Self {
             client,
             subscription: None,
+            subscribe_reconnect_backoff,
+            backoff_before_next_subscription: false,
         }
     }
 
@@ -84,6 +96,11 @@ impl<T> GrpcProxyControlPlaneClient<T> {
 
     pub fn into_inner(self) -> ProxyControlPlaneClient<T> {
         self.client
+    }
+
+    fn drop_failed_subscription(&mut self) {
+        self.subscription = None;
+        self.backoff_before_next_subscription = true;
     }
 }
 
@@ -166,7 +183,7 @@ where
             session.requests.send(request).await
         };
         if send_result.is_err() {
-            self.subscription = None;
+            self.drop_failed_subscription();
             return Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed);
         }
 
@@ -201,7 +218,7 @@ where
             session.requests.send(request).await
         };
         if send_result.is_err() {
-            self.subscription = None;
+            self.drop_failed_subscription();
             return Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed);
         }
 
@@ -246,7 +263,7 @@ where
         }
 
         if drop_subscription {
-            self.subscription = None;
+            self.drop_failed_subscription();
         }
         if let Some(error) = protocol_error {
             return Err(GrpcProxyControlPlaneError::Protocol(error));
@@ -269,15 +286,15 @@ where
         match event {
             Some(GrpcRouteSubscriptionEvent::Message(message)) => Ok(message),
             Some(GrpcRouteSubscriptionEvent::ResponseStreamClosed) | None => {
-                self.subscription = None;
+                self.drop_failed_subscription();
                 Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed)
             }
             Some(GrpcRouteSubscriptionEvent::Status(status)) => {
-                self.subscription = None;
+                self.drop_failed_subscription();
                 Err(GrpcProxyControlPlaneError::Status(status))
             }
             Some(GrpcRouteSubscriptionEvent::Protocol(error)) => {
-                self.subscription = None;
+                self.drop_failed_subscription();
                 Err(GrpcProxyControlPlaneError::Protocol(error))
             }
         }
@@ -287,16 +304,24 @@ where
         &mut self,
     ) -> Result<&mut GrpcRouteSubscriptionSession, GrpcProxyControlPlaneError> {
         if self.subscription.is_none() {
+            if self.backoff_before_next_subscription {
+                tokio::time::sleep(self.subscribe_reconnect_backoff).await;
+            }
+
             let (requests, request_stream) = mpsc::channel(SUBSCRIBE_REQUEST_BUFFER);
             let responses = self
                 .client
                 .subscribe(ReceiverStream::new(request_stream))
                 .await
-                .map_err(GrpcProxyControlPlaneError::Status)?
+                .map_err(|status| {
+                    self.backoff_before_next_subscription = true;
+                    GrpcProxyControlPlaneError::Status(status)
+                })?
                 .into_inner();
             let (response_tx, response_rx) = mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
             tokio::spawn(read_subscription_responses(responses, response_tx));
 
+            self.backoff_before_next_subscription = false;
             self.subscription = Some(GrpcRouteSubscriptionSession {
                 requests,
                 responses: response_rx,

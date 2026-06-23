@@ -304,6 +304,64 @@ async fn subscribe_route_after_response_stream_close_opens_new_stream() {
     assert_subscribe_route_request(&requests[1], "req-reconnected", "app.example.com");
 }
 
+#[tokio::test(start_paused = true)]
+async fn subscribe_route_reconnect_waits_for_backoff_after_stream_close() {
+    let backoff = Duration::from_secs(5);
+    let service = FakeProxyControlPlane::default();
+    service.push_subscribe_action(SubscribeAction::close_after(Vec::new()));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "req-after-backoff",
+        "sub-after-backoff",
+    ))]));
+    let mut client = test_client_with_subscribe_reconnect_backoff(service.clone(), backoff);
+
+    let first = client
+        .subscribe_route(
+            route_request_id("req-before-close"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .expect_err("first stream closes before response");
+    assert!(matches!(
+        first,
+        GrpcProxyControlPlaneError::SubscribeResponseStreamClosed
+    ));
+    assert_eq!(service.subscribe_request_count(), 1);
+
+    let mut second = client.subscribe_route(
+        route_request_id("req-after-backoff"),
+        http_identity("app.example.com", None),
+    );
+
+    tokio::select! {
+        biased;
+        result = &mut second => panic!("second subscribe completed before backoff: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert_eq!(service.subscribe_request_count(), 1);
+
+    tokio::time::advance(backoff - Duration::from_millis(1)).await;
+    tokio::select! {
+        biased;
+        result = &mut second => panic!("second subscribe completed before backoff elapsed: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert_eq!(service.subscribe_request_count(), 1);
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let response = second
+        .await
+        .expect("second subscribe opens after backoff elapses");
+    assert!(matches!(
+        response,
+        SubscribeControlPlaneOutput::RouteResolved { .. }
+    ));
+
+    let requests = service.wait_for_subscribe_requests(2).await;
+    assert_subscribe_route_request(&requests[0], "req-before-close", "app.example.com");
+    assert_subscribe_route_request(&requests[1], "req-after-backoff", "app.example.com");
+}
+
 #[tokio::test]
 async fn response_stream_close_after_route_response_is_observed_by_response_reader() {
     let service = FakeProxyControlPlane::default();
@@ -656,6 +714,14 @@ impl FakeProxyControlPlane {
         self.state.lock().expect("fake state").wake_requests.clone()
     }
 
+    fn subscribe_request_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fake state")
+            .subscribe_requests
+            .len()
+    }
+
     async fn wait_for_subscribe_requests(&self, count: usize) -> Vec<pb::ProxySubscribeRequest> {
         let timeout = tokio::time::sleep(Duration::from_secs(1));
         tokio::pin!(timeout);
@@ -800,6 +866,17 @@ fn test_client(
 ) -> GrpcProxyControlPlaneClient<InProcessService<ProxyControlPlaneServer<FakeProxyControlPlane>>> {
     let server = ProxyControlPlaneServer::new(service);
     GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(InProcessService::new(server)))
+}
+
+fn test_client_with_subscribe_reconnect_backoff(
+    service: FakeProxyControlPlane,
+    subscribe_reconnect_backoff: Duration,
+) -> GrpcProxyControlPlaneClient<InProcessService<ProxyControlPlaneServer<FakeProxyControlPlane>>> {
+    let server = ProxyControlPlaneServer::new(service);
+    GrpcProxyControlPlaneClient::with_subscribe_reconnect_backoff(
+        ProxyControlPlaneClient::new(InProcessService::new(server)),
+        subscribe_reconnect_backoff,
+    )
 }
 
 fn test_http01_resolver(
