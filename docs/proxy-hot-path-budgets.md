@@ -18,6 +18,26 @@ For a quick compile-and-smoke run:
 cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
+## Frontline Route Lookup Benchmark
+
+Milestone 9F adds a frontend-owned route lookup benchmark for hot positive
+route-cache hits with thousands of unrelated cached routes present:
+
+```sh
+cargo bench -p frontline --bench route_lookup
+```
+
+For a quick compile-and-smoke run:
+
+```sh
+cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1
+```
+
+The benchmark covers HTTP exact-host lookup, HTTP wildcard-suffix lookup,
+same-host HTTP path-prefix lookup, and SNI lookup. These paths should stay
+indexed by route identity components rather than scanning every cached positive
+route on each hot-cache hit.
+
 ## Production Image Sidecar HTTP Load Smoke
 
 Milestone 7E starts with a small production-image smoke for the sidecar HTTP/1.1
@@ -165,6 +185,7 @@ invalidation behavior, or tail latency.
 | HTTP helper work | `http/prepare_reverse_proxy_request`, `http/strip_hop_by_hop_headers` | Keep request URI rewrite and hop-by-hop header cleanup bounded and simple. |
 | WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Exercise frame relay over in-memory WebSocket streams without an external service. |
 | TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded before TLS routing decisions are added. |
+| Frontline route lookup | `route_lookup/http_exact_host_many_unrelated`, `route_lookup/http_wildcard_suffix_many_unrelated`, `route_lookup/http_same_host_many_paths`, `route_lookup/sni_exact_host_many_unrelated` | Keep hot positive route-cache lookup indexed with many unrelated cached routes present. |
 | Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. |
 | Observability helpers | `observability/label_as_str_and_outcome_mapping` | Keep label and outcome mapping low-cardinality and allocation-free. |
 
@@ -184,6 +205,7 @@ expected.
 | WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | <= 50 us per 1 KiB in-memory binary round trip |
 | TLS ClientHello/SNI parse, single record | `tls/parse_client_hello_sni_single_record` | <= 1 us per complete ClientHello |
 | TLS ClientHello/SNI parse, fragmented records | `tls/parse_client_hello_sni_fragmented_records` | <= 2 us per fragmented ClientHello |
+| Frontline route lookup | `route_lookup/*` | <= 1 us per hot-cache lookup with 4096 unrelated cached routes or same-host path routes |
 | Admission acquire/release | `admission/try_acquire_release` | <= 500 ns per steady-state permit |
 | Active connection track/release | `accounting/track_release` | <= 500 ns per steady-state guard |
 | Observability label/outcome helpers | `observability/label_as_str_and_outcome_mapping` | <= 50 ns per mapping batch |
@@ -203,6 +225,7 @@ budgets describe steady-state helper behavior.
 | HTTP static hop-by-hop cleanup | `strip static hop-by-hop headers` | 0 allocations |
 | TLS ClientHello/SNI parse | `TLS ClientHello SNI parse` | <= 16 allocations for a complete SNI ClientHello |
 
-Local route-key lookup benchmarks become mandatory when Milestone 3A introduces
-route-key and matcher primitives. Phase 1F intentionally does not invent those
-production types.
+Local route-key lookup benchmarks are covered by
+`cargo bench -p frontline --bench route_lookup`. The current harness focuses on
+frontline hot-cache positive lookup; broader route throughput and tail-latency
+gates remain separate load-test work.
