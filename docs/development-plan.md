@@ -141,6 +141,48 @@ Done when:
 - Allocation-sensitive tests or profiles exist for the hot path so regressions
   are visible before the frontline proxy is built on top of these primitives.
 
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Tokio runtime setup and structured shutdown. | `crates/proxy-core/src/shutdown.rs` and `tests/lifecycle.rs` cover cancellation tokens, child tokens, late waiters, and shutdown propagation. |
+| Complete | Bidirectional TCP stream proxying. | `crates/proxy-core/tests/tcp_proxy.rs` proves byte preservation, half-close behavior, and lifecycle accounting. |
+| Complete | HTTP reverse proxy helpers. | `crates/proxy-core/src/http.rs` tests request rewriting and hop-by-hop stripping; `tests/http_proxy.rs` covers basic request/response forwarding and drain rejection. |
+| Complete | WebSocket upgrade and proxying. | `crates/proxy-core/tests/websocket_proxy.rs` covers bidirectional messages, close propagation, lifecycle, and drain rejection. |
+| Complete | Active request and connection accounting. | `crates/proxy-core/src/accounting.rs` and `src/admission.rs` cover guard lifetime, idempotent release, waiters, limits, and cancellation. |
+| Complete | Drain tracker with configurable grace timeout. | `crates/proxy-core/src/drain.rs` covers rejecting new work, waiting for active work, and timeout reporting. |
+| Complete | Timeout and backpressure primitives. | `src/timeout.rs` covers typed timeout results; TCP/WebSocket proxy tests exercise async copy paths. |
+| Complete | TLS ClientHello/SNI extraction helpers. | `src/tls.rs` covers valid SNI, malformed input, missing SNI, invalid hostnames, and fragmented prefix reads. |
+| Complete | Shared metrics and tracing conventions. | `crates/proxy-core/src/observability` descriptor tests assert metric names, labels, and trace fields. |
+| Incomplete | Hot-path latency budgets and benchmark harnesses for proxy primitives. | `crates/proxy-core/benches/proxy_primitives.rs` exists, but the route-key lookup benchmark required by `docs/proxy-hot-path-budgets.md` is absent; follow-up: M9 protocol and hot-path gates. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 1A: TCP stream proxy, active connection accounting, and drain tracker. | `tests/tcp_proxy.rs`, `src/accounting.rs`, and `src/drain.rs` cover the primitive behavior. |
+| Complete | 1B: HTTP reverse proxy helpers and WebSocket upgrade/proxying. | `src/http.rs`, `tests/http_proxy.rs`, and `tests/websocket_proxy.rs` cover helper behavior and core forwarding paths. |
+| Complete | 1C: Timeout, backpressure, structured shutdown, and cancellation behavior. | `src/timeout.rs`, `src/shutdown.rs`, and lifecycle tests cover typed timeout and cancellation; deeper reset/backpressure protocol cases remain done-criteria gaps below. |
+| Complete | 1D: TLS ClientHello/SNI extraction helpers. | `src/tls.rs` tests cover fragmented and malformed ClientHello handling. |
+| Complete | 1E: Shared metrics and tracing conventions. | Observability descriptor tests cover stable metric and trace field definitions. |
+| Incomplete | 1F: Proxy hot-path latency budgets, benchmark harnesses, and allocation checks. | Primitive benches and allocation tests exist, but route-key lookup coverage is missing; follow-up: M9. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Unit tests cover accounting, drain, timeout, and SNI parsing. | `src/accounting.rs`, `src/admission.rs`, `src/drain.rs`, `src/timeout.rs`, and `src/tls.rs` contain targeted tests. |
+| Complete | Integration tests proxy TCP streams, HTTP requests, and WebSocket sessions. | `tests/tcp_proxy.rs`, `tests/http_proxy.rs`, and `tests/websocket_proxy.rs` cover these paths. |
+| Incomplete | TCP tests cover byte preservation, half-close, upstream reset, client reset, timeout, and backpressure. | Byte preservation and half-close are covered; reset, timeout, and backpressure cases are not proven; follow-up: M9 protocol gap tests. |
+| Incomplete | HTTP tests cover keep-alive, chunked/large/streaming bodies, HTTP/2 multiplexing, and cancellation. | Basic HTTP forwarding and helper behavior are covered; this full protocol matrix is missing in `proxy-core`; follow-up: M9. |
+| Incomplete | WebSocket tests cover upgrade failure, bidirectional traffic, close frames, peer disconnect, and backpressure. | Bidirectional traffic and close propagation are covered; upgrade-failure, peer-disconnect, and backpressure cases are missing; follow-up: M9. |
+| Complete | Drain tests prove new work is rejected while existing streams get the grace period. | `src/drain.rs`, `tests/http_proxy.rs`, and `tests/websocket_proxy.rs` cover drain rejection and grace-timeout behavior. |
+| Incomplete | Hot-path benchmarks cover TCP, HTTP, WebSocket, TLS SNI, local route-key lookup, and admission/accounting. | Existing benches cover primitives except local route-key lookup; follow-up: M9. |
+| Complete | Benchmark notes separate hot routing latency from cold wake latency and forbid control-plane calls on hot paths. | `docs/proxy-hot-path-budgets.md` documents hot-path budgets, smoke commands, and current limitations. |
+| Complete | Allocation-sensitive tests or profiles exist for the hot path. | `crates/proxy-core/tests/allocation_hot_paths.rs` covers observability, accounting/admission, HTTP helpers, and TLS SNI parsing. |
+
 ## Milestone 2: Control Plane Resource Model
 
 Introduce the durable model behind the control-plane API.
@@ -204,6 +246,55 @@ Done when:
   expiry, delete, and garbage collection.
 - Manifest rendering tests cover Deployment, StatefulSet, Service, PV, and PVC.
 - WorkloadClass version updates cannot mutate existing pinned instances.
+
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Domain-specific `ControlPlaneStore` trait. | `crates/control-plane/src/store.rs` exposes domain operations for instances, workload classes, route bindings, materialization, dependencies, and HTTP-01 records. |
+| Incomplete | Protobuf API over native gRPC and gRPC-Web for operator-facing methods. | Native generated dispatch and grpc-web wrapping are tested, but store-backed grpc-web parity, CORS/preflight, metadata/auth, and V8 request encoding are missing; follow-up: M9 API transport gates. |
+| Complete | Postgres as first store provider. | `crates/control-plane/src/postgres/`, `crates/control-plane/tests/postgres_store.rs`, and migrations implement the first provider. |
+| Complete | Control-plane config for selecting the store provider. | `runtime.rs` parses `SLEEPYPODS_STORE_PROVIDER` and Postgres URL config, with runtime tests. |
+| Complete | `WorkloadClass` with immutable versions. | Postgres conformance creates and reloads immutable versions and proves v2 does not mutate v1. |
+| Complete | `Instance` pinned to a `WorkloadClass` version. | `create_instance` conformance covers pinned class version and value validation. |
+| Complete | `RouteBinding` for host, wildcard host, SNI, and optional path prefix. | `postgres/route_ops.rs` resolver tests and conformance cover host/SNI/path matching, uniqueness, and misses. |
+| Complete | `Materialization` for active cluster projections. | `postgres/materialization_ops.rs` and conformance cover record/load/complete materialization and backend generation checks. |
+| Complete | HTTP-01 challenge records keyed by `(host, token)`. | `postgres/http01_ops.rs` and conformance cover put, resolve, delete, expiry, and GC. |
+| Complete | Instance state machine with generation checks. | `instance.rs` transition tests and Postgres conformance cover CAS generation failures, stale sidecar reports, and stale materialization updates. |
+| Complete | Structured manifest rendering from `WorkloadClass + Instance.values`. | `crates/control-plane/src/manifest/render.rs` and `manifest/tests.rs` cover templates, Deployment, StatefulSet, Service, PV, and PVC rendering. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 2A: Store trait and provider config shape. | `store.rs` defines the trait and `runtime.rs` parses provider config. |
+| Incomplete | 2B: Protobuf services, native gRPC server, and gRPC-Web operator transport. | Native services and grpc-web wrapper exist, but full grpc-web parity/CORS/auth/V8 gates are not proven; follow-up: M9. |
+| Complete | 2C: Postgres schema, migrations, and store implementation. | Real Postgres conformance applies migrations idempotently and exercises store operations when `SLEEPYPODS_POSTGRES_URL` is set. |
+| Complete | 2D: WorkloadClass versioning, schema validation, and immutability. | Conformance covers class version creation/load, schema validation rejects missing/unknown values, and version immutability. |
+| Complete | 2E: Instance APIs, value validation, generation fields, and idempotent create/update behavior. | Store-backed API and conformance cover create/get/delete, generation fields, idempotent replay/conflict, and rollback. |
+| Complete | 2F: RouteBinding model, resolver, and uniqueness constraints. | Resolver tests cover matching semantics; conformance covers route creation, duplicate rejection, and dependency lookup. |
+| Complete | 2G: Instance state machine with generation/CAS transitions. | `instance.rs` and conformance cover legal/illegal transitions and CAS behavior. |
+| Complete | 2H: HTTP-01 challenge store. | `http01_ops.rs` and conformance cover put, resolve, delete, expiry, and GC. |
+| Complete | 2I: Structured manifest renderer. | `manifest/tests.rs` covers Deployment, StatefulSet, Service, PV, PVC, sidecar config, and validation failures. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Database migrations and store tests pass against a real test database. | `postgres_store_conformance_against_real_database` exists and runs when `SLEEPYPODS_POSTGRES_URL` is configured, but this audit has no current real database run evidence; follow-up: M9 live database gate. |
+| Complete | Store conformance covers idempotency, rollback, duplicate routes, conflicts, CAS, materialization generations, and provider config errors. | `postgres_store.rs` conformance covers these cases, including invalid connection URL and transactional rollback after duplicate route identity. |
+| Complete | Control plane can construct the configured store provider. | `runtime.rs` tests cover env parsing and provider construction paths. |
+| Incomplete | Native gRPC and gRPC-Web integration tests exercise the same operator APIs. | Native generated operator dispatch is tested; grpc-web wrapping is shape-tested but store-backed parity is missing; follow-up: M9. |
+| Incomplete | gRPC-Web tests cover CORS/preflight, metadata/auth, structured errors, and V8-compatible clients/request encoding. | No browser/V8 or CORS/preflight smoke found; follow-up: M9. |
+| Complete | Tests document proxy `Subscribe` is native gRPC-only in V1 and not grpc-web bidi. | `api_transport.rs` tests assert operator grpc-web unary shape and no proxy Subscribe exposure. |
+| Complete | State-machine tests cover wake, running, draining, failed, retry, and delete. | `instance.rs` and Postgres conformance cover lifecycle edges and failed retry/deleting terminal behavior. |
+| Complete | State-machine tests cover concurrent wake, sleep while waking, delete while waking/draining, failed retry, stale sidecar reports, and stale materialization updates. | Postgres conformance includes concurrent CAS, invalid transitions, stale reports, and stale materialization rejection. |
+| Complete | Route resolver tests cover normalization, wildcard precedence/specificity, path-prefix, SNI uniqueness, and misses. | `postgres/route_ops.rs`, `crates/frontline/src/identity.rs`, and matcher tests cover these semantics. |
+| Incomplete | HTTP-01 store tests cover put, overwrite/idempotency, wrong host/token, expiry, delete, and GC. | Put/resolve/delete/expiry/GC are tested and upsert implements overwrite, but wrong host/token and explicit overwrite/idempotency tests are incomplete; follow-up: M9. |
+| Complete | Manifest rendering tests cover Deployment, StatefulSet, Service, PV, and PVC. | `manifest/tests.rs` covers all listed object kinds and serialization. |
+| Complete | WorkloadClass version updates cannot mutate existing pinned instances. | Conformance proves v2 creation does not change v1 and instances remain pinned to the requested version. |
 
 The store trait should express domain operations rather than generic CRUD or a
 generic SQL abstraction. It should include methods for:
@@ -319,6 +410,54 @@ Done when:
 - Unknown Host/SNI negative caching protects the fake control plane from repeat
   misses.
 
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Host/SNI/path identity extraction. | `crates/frontline/src/identity.rs` and `tls.rs` tests cover host normalization, optional ports, trailing dots, path defaults, and SNI canonicalization. |
+| Complete | Canonical route key generation. | `identity.rs`, `matcher.rs`, and route resolver tests use canonical `RouteIdentity` values for cache and lookup. |
+| Complete | Opaque subscription ID storage and invalidation handling. | `subscription.rs` tests cover storing subscription IDs, targeted invalidation, update replacement, stale update rejection, and idempotent unsubscribe. |
+| Complete | Exact host and SNI lookup. | `matcher.rs` and Postgres route resolver tests cover exact host/SNI matches and misses. |
+| Complete | Wildcard host lookup. | `matcher.rs` covers wildcard suffix matching and specificity. |
+| Complete | Longest path-prefix matching. | `matcher.rs` covers longest path-prefix and segment-boundary behavior. |
+| Complete | Bounded local route cache and `Subscribe` subscribe/unsubscribe stream handling. | `cache/tests.rs` and `resolver/tests.rs` cover TTLs, negative cache, eviction, unsubscribe on eviction, and pushed updates/invalidations. |
+| Complete | `SubscribeRoute` fallback on local miss. | `resolver/tests.rs` covers positive/negative cache hits without calls and cache-miss subscribe behavior. |
+| Complete | `WakeInstance` flow when a route is Cold or missing a backend. | `route/tests.rs` and `runtime/tests.rs` cover cold wake, waiting, running-without-backend wake, stale response retry, and errors. |
+| Complete | Stale generation rejection. | `subscription.rs`, `cache/tests.rs`, and `route/tests.rs` reject stale instance/backend generations. |
+| Incomplete | HTTP-01 challenge lookup through `ResolveHTTP01Challenge`. | `http01.rs` helper and store/API methods are tested, but the frontline runtime does not wire HTTP-01 interception to the control-plane lookup; follow-up: M9 HTTP-01 runtime gate. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 3A: Route key normalization and local matcher. | `identity.rs` and `matcher.rs` tests cover normalization, exact/wildcard precedence, and path-prefix matching. |
+| Complete | 3B: Bounded cache, TTLs, and negative caching. | `cache/tests.rs` covers positive/negative TTL, bounded eviction, stale rejection, and reassignment. |
+| Complete | 3C: SubscribeRoute cache miss and opaque subscription IDs. | `resolver/tests.rs` and `subscription.rs` cover resolved/miss handling and subscription ID storage. |
+| Complete | 3D: Subscribe stream with Unsubscribe and targeted invalidations. | `control_plane_transport/tests.rs` and resolver tests cover unsubscribe input, pushed update, and pushed invalidation handling on the client side. |
+| Complete | 3E: WakeInstance flow, Waking wait, and stale generation rejection. | `route/tests.rs` covers cold/running/waking/deleting states, wake failures, stale responses, and retry. |
+| Incomplete | 3F: HTTP/1.1, HTTP/2, h2c gRPC, and WebSocket forwarding. | Forwarding helper tests cover these paths, but the runtime listener is HTTP/1.1-only and the full protocol matrix is not wired end to end; follow-up: M9 protocol gates. |
+| Incomplete | 3G: HTTPS termination, SNI certificate selection, and TLS/SNI passthrough. | `tls.rs` helper tests cover termination/passthrough behavior, but `bin/frontline.rs` does not wire TLS termination or SNI passthrough listeners; follow-up: M9 runtime TLS/SNI wiring. |
+| Incomplete | 3H: HTTP-01 interception and `ResolveHTTP01Challenge` lookup. | `http01.rs` covers helper behavior, but runtime/control-plane lookup wiring is absent; follow-up: M9. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Fake-control-plane tests cover cold wake, hot route, miss, stale generation, targeted update, invalidation, and stream reconnect. | Runtime/resolver tests cover cold/hot/miss/stale and pushed update/invalidation; explicit stream reconnect is missing; follow-up: M9 reconnect gate. |
+| Complete | Route matching tests cover precedence, wildcard specificity, path-prefix, normalization, ports, trailing dots, and misses. | `identity.rs` and `matcher.rs` cover these cases. |
+| Complete | Cache tests cover positive/negative TTL, eviction, unsubscribe on eviction, refresh after invalidation, and stale backend rejection. | `cache/tests.rs` and `resolver/tests.rs` cover the listed cache behavior. |
+| Complete | Subscription tests cover route subscription, miss without subscription ID, unsubscribe, duplicate unsubscribe, and invalidation after resolve. | `subscription.rs` and `resolver/tests.rs` cover these flows. |
+| Incomplete | Subscription tests cover duplicate in-flight SubscribeRoute, reassignment, invalidation during wake, and stream backpressure. | Reassignment is covered, but duplicate in-flight subscribe, invalidation-during-wake, and stream backpressure are not proven; follow-up: M9. |
+| Incomplete | Stream reconnect tests prove lazy resubscribe/rebuild without public cursors. | Resolver can rebuild through lazy subscribe, but no reconnect test proves it; follow-up: M9. |
+| Incomplete | Protocol tests cover HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS termination, SNI passthrough, and HTTP-01. | Helper/component tests cover pieces; runtime TLS/SNI and HTTP-01 wiring plus full E2E protocol coverage are missing; follow-up: M9. |
+| Incomplete | Protocol tests include large/streaming HTTP, HTTP/2 multiplexing, gRPC trailers/status, WebSocket backpressure, TLS passthrough bytes, and TCP half-close. | h2c-shaped gRPC, passthrough bytes, and TCP half-close have partial coverage; full large/streaming/multiplex/backpressure matrix is missing; follow-up: M9. |
+| Incomplete | PostgreSQL/libpq 17+ SNI passthrough with `sslnegotiation=direct`. | No real PostgreSQL/libpq SNI passthrough test or kind gate found; follow-up: M9. |
+| Complete | TLS tests cover certificate selection, missing certificate, cert rotation, and passthrough for non-HTTP TLS traffic. | `crates/frontline/src/tls.rs` helper tests cover canonical certificate selection/rotation, missing SNI/cert rejection, and passthrough prefix preservation. |
+| Complete | HTTP-01 tests cover wrong host/token, expired/deleted challenge, content type, and precedence. | `http01.rs` and store tests cover challenge matching, invalid host/token, miss/expiry/delete behavior, content type, and challenge-path precedence. |
+| Complete | Unknown Host/SNI negative caching protects fake control plane from repeat misses. | `cache/tests.rs` and `resolver/tests.rs` cover negative cache hits and expiry without repeat control-plane calls. |
+
 ## Milestone 4: Sidecar Idle Proxy
 
 Build the sidecar-specific local proxy and idle reporting behavior.
@@ -353,6 +492,40 @@ Done when:
   finish within the grace period.
 - Drain tests cover SIGTERM, upstream failure, client disconnect, grace expiry
   with active streams, and forced shutdown after the hard deadline.
+
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Local forwarding to `127.0.0.1:<app-port>`. | `crates/sidecar/src/tests.rs` and `runtime/tests.rs` cover forwarding to loopback upstreams. |
+| Complete | HTTP and TCP forwarding modes. | `bin/sidecar.rs` selects `http` or `tcp`; component/runtime tests cover both modes. |
+| Complete | Active request and connection tracking. | Sidecar tests hold HTTP bodies/TCP streams open and assert active count behavior. |
+| Complete | Idle detection. | `idle.rs` tests cover no-active timeout, active work suppression, timer reset, and non-duplicated successful reports. |
+| Complete | Drain handling. | Sidecar tests cover rejecting new HTTP/TCP work, waiting for active work, grace timeout, and shutdown-triggered drain. |
+| Complete | `ReportIdle` control-plane call. | `idle/control_plane.rs` and `control_plane_transport/tests.rs` cover accepted, already-draining, stale generation, unavailable, and transport errors. |
+| Complete | Graceful shutdown behavior when the workload is being deleted. | `runtime/tests.rs` covers shutdown stop-accepting behavior, active request wait, and timeout return. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 4A: Local HTTP forwarding. | Sidecar HTTP tests cover request/response forwarding and active request accounting. |
+| Complete | 4B: Local TCP forwarding. | Sidecar TCP tests cover byte forwarding and active connection accounting. |
+| Complete | 4C: Active request and connection tracking. | Component tests cover active HTTP body and open TCP stream tracking. |
+| Complete | 4D: Idle detection and `ReportIdle` call. | `idle.rs` and `idle/control_plane.rs` cover timeout, retry, terminal outcomes, and active-work reset. |
+| Complete | 4E: Drain and graceful shutdown behavior. | Component/runtime tests cover drain rejection, grace timeout, and shutdown-triggered drain. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Active HTTP requests, h2c gRPC streams, WebSockets, and raw TCP connections prevent idle reporting. | HTTP and raw TCP are covered; no sidecar h2c gRPC or WebSocket idle tests found; follow-up: M9 sidecar protocol gates. |
+| Complete | Idle tests prove `ReportIdle` fires after timeout only after active work closes. | `idle.rs` covers active work suppression and reset before reporting. |
+| Incomplete | Idle/report tests cover duplicate reports, stale generation, control-plane rejection, retry/backoff, and sidecar restart. | Duplicate/stale/rejection/retry behavior is covered; runtime restart coverage is only library-level detector re-creation, not a process/restart gate; follow-up: M9. |
+| Complete | Drain tests prove the sidecar stops accepting new work and lets active work finish within the grace period. | `src/tests.rs` and `runtime/tests.rs` cover drain rejection and active-work waiting. |
+| Incomplete | Drain tests cover SIGTERM, upstream failure, client disconnect, grace expiry with active streams, and forced shutdown after hard deadline. | Shutdown and grace-expiry paths are covered; explicit upstream-failure and client-disconnect drain cases are missing; follow-up: M9. |
 
 ## Milestone 5: Kubernetes Materializer
 
@@ -407,6 +580,51 @@ Done when:
 - Readiness tests prove routes are not published until Pods or EndpointSlices are
   ready, and are withdrawn when the materialization becomes unready.
 
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Render PV, PVC, Service, Deployment, and StatefulSet objects. | `crates/control-plane/src/manifest/tests.rs` covers all rendered object kinds and serialization. |
+| Complete | Apply PV/PVC before workloads and wait for PVC Bound. | `materializer.rs` tests apply StatefulSet manifests with PVC-bound wait before Service/workload. |
+| Complete | Validate PV/PVC specs, source, substitution, and intended binding. | Manifest tests cover names, labels, access modes, capacity, reclaim policy, hostPath source, `volumeName`, and template substitution failures. |
+| Complete | Validate workload volume mounts point at rendered PVC and expected mount path. | Manifest tests cover rendered volume mounts for StatefulSet volume templates. |
+| Complete | Inject sidecar into rendered pod templates. | Manifest render tests verify sidecar container/env wiring. |
+| Complete | Service targets the sidecar port. | Manifest tests validate service port and target port wiring. |
+| Complete | Sidecar targets the local app port. | Manifest tests validate sidecar local upstream env and reject app target conflicts. |
+| Complete | Validate Service selectors/target ports and local-only sidecar upstream. | Manifest validation rejects invalid service ports and sidecar/app port conflicts. |
+| Complete | Wait for readiness through Pods or EndpointSlices. | `kube_materializer.rs` and `materializer.rs` tests cover EndpointSlice readiness and backend URI creation. |
+| Incomplete | Delete materialized objects on sleep/delete. | Materializer delete and kind cleanup exist, but control-plane sleep/delete does not invoke Kubernetes cleanup; follow-up: M9 cleanup gates. |
+| Complete | Leave backing provider volumes untouched. | `scripts/test-kind-materializer.sh` deletes rendered objects and rematerializes with preserved hostPath data. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 5A: Structured object rendering. | Manifest tests cover PV, PVC, Service, Deployment, and StatefulSet rendering. |
+| Complete | 5B: Kubernetes apply/update/delete client and ownership labels. | `materializer.rs` and `kube_materializer.rs` tests cover apply/delete refs and ownership/generation labels. |
+| Complete | 5C: PV/PVC correctness, intended binding, apply order, and PVC Bound wait. | Manifest and materializer tests cover validation, apply ordering, and bound wait failures. |
+| Complete | 5D: Deployment/StatefulSet rendering with sidecar injection. | Manifest tests cover both workload kinds and injected sidecar config. |
+| Complete | 5E: Service rendering that targets the sidecar port. | Manifest tests cover service selectors and sidecar target port. |
+| Complete | 5F: Readiness through Pods or EndpointSlices. | Kube materializer readiness tests cover ready EndpointSlice semantics. |
+| Incomplete | 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs. | Delete primitives and materializer-only cleanup exist, but sleep/delete lifecycle wiring is missing; follow-up: M9. |
+| Complete | 5H: kind materialization lifecycle suite with static volume backend. | `scripts/test-kind-materializer.sh` runs the ignored kind materializer lifecycle test with static hostPath data continuity. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Component tests validate rendered objects and ordering. | `manifest/tests.rs` and `materializer.rs` cover object shape and apply order. |
+| Complete | Component tests validate Service wiring, sidecar local upstream env, and no proxy-back-to-Service config. | Manifest tests cover Service target port, sidecar upstream env, and reject conflicting app/sidecar ports. |
+| Complete | Component tests validate PV/PVC fields, labels, and volume mounts. | Manifest tests cover PV/PVC fields, owner/generation labels, and workload mounts. |
+| Incomplete | kind tests prove cold wake creates PV/PVC before StatefulSet and PVC binds intended PV. | Materializer-only kind test proves apply/bind ordering, but not cold wake through the full platform; follow-up: M9 full-platform kind E2E. |
+| Complete | kind tests prove workload can read/write expected mount path. | `scripts/test-kind-materializer.sh` writes and verifies a marker through the mounted hostPath volume. |
+| Incomplete | kind tests prove sleep deletes workload, Service, PVC, and PV. | Materializer-only delete is tested, but sleep-driven cleanup is not wired; follow-up: M9. |
+| Complete | kind tests prove re-wake recreates manifests from same values and preserves static-volume data. | `scripts/test-kind-materializer.sh` rematerializes the manifest and verifies the previous marker remains. |
+| Incomplete | Failure tests cover missing/bad volume handles, PVCs never bind, wrong access modes, and stale manifest generation. | PVC wait/readiness/apply failures and several render validation failures are covered; wrong access mode and stale manifest generation failure gates are incomplete; follow-up: M9. |
+| Incomplete | Readiness tests prove routes are not published until ready and withdrawn when unready. | Materializer readiness returns a backend only after ready, but route publication/withdrawal is not wired to readiness changes; follow-up: M9. |
+
 ## Milestone 6: End-to-End V1
 
 Wire the control plane, frontline proxy, sidecar, and materializer together.
@@ -455,6 +673,45 @@ Done when:
   instance state.
 - Control-plane restart E2E covers restart during wake, sleep, delete, route
   reassignment, and HTTP-01 challenge handling.
+
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Create instance through control-plane API. | Store-backed API/component tests exist, but no full-platform kind E2E creates an instance through the real deployed control plane; follow-up: M9. |
+| Incomplete | Resolve route lazily through the frontline proxy. | Frontline component tests use fake control-plane clients; no full-platform kind route-resolution path exists; follow-up: M9. |
+| Incomplete | Cold request wakes instance. | Frontline wake and control-plane wake are tested separately, but not through deployed frontline/control-plane/materializer/sidecar; follow-up: M9. |
+| Incomplete | Hot request routes from local cache. | Frontline runtime tests cover a fake control-plane hot route, but no full-platform hot-cache E2E exists; follow-up: M9. |
+| Incomplete | Sidecar reports idle. | Sidecar and control-plane ReportIdle tests exist separately, but no full-platform E2E proves the deployed sidecar report path; follow-up: M9. |
+| Incomplete | Control plane drains and sleeps materialization. | `ReportIdle` transitions to Draining, but sleep finalization and Kubernetes cleanup are not wired; follow-up: M9. |
+| Incomplete | Custom host and wildcard host route to right instance. | Matcher/store component tests cover custom/wildcard routing; no full-platform E2E gate exists; follow-up: M9. |
+| Incomplete | HTTP-01 insert, resolve, serve, and delete flow works. | Store/API and frontend helper tests exist, but runtime interception and full flow are not wired; follow-up: M9. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | 6A: Stateless Deployment cold wake, hot route, idle drain, sleep, and re-wake. | No stateless full-platform kind E2E script found; follow-up: M9. |
+| Incomplete | 6B: StatefulSet static PV/PVC lifecycle with data continuity. | Materializer-only kind lifecycle exists, but not full wake/sleep/re-wake through the platform; follow-up: M9. |
+| Incomplete | 6C: Custom host, wildcard host, SNI, and path-prefix routing. | Component coverage exists; full-platform E2E is missing; follow-up: M9. |
+| Incomplete | 6D: Full protocol matrix, including PostgreSQL/libpq SNI passthrough. | Helper/component tests cover pieces; runtime TLS/SNI, grpc-web browser, and PostgreSQL/libpq SNI E2E are missing; follow-up: M9. |
+| Incomplete | 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior. | Store/helper coverage exists; runtime/full-platform flow is missing; follow-up: M9. |
+| Incomplete | 6F: Failure-path matrix. | Component failure tests exist, but full-platform wake/PVC/route/stale/control-plane-restart failures are missing; follow-up: M9. |
+| Incomplete | 6G: Lifecycle race matrix. | Store/frontline components cover some races; full-platform lifecycle race E2E is missing; follow-up: M9. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | kind E2E passes for stateless Deployment. | No full-platform stateless kind E2E found; follow-up: M9. |
+| Incomplete | kind E2E passes for StatefulSet with PV/PVC, mounted IO, sleep, re-wake, and data continuity. | Materializer-only kind test covers PV/PVC IO and rematerialization; full-platform sleep/re-wake is missing; follow-up: M9. |
+| Incomplete | kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, grpc-web, WebSockets, TLS termination, and SNI passthrough. | No full-platform protocol kind E2E found; follow-up: M9. |
+| Incomplete | kind E2E proves real PostgreSQL/libpq 17+ SNI passthrough with pinned image. | No real libpq SNI passthrough test found; follow-up: M9. |
+| Incomplete | Failure-path E2E covers wake timeout, bad route, missing PVC binding, bad volume template, and stale proxy generation. | Component failures exist; full-platform failure E2E is missing; follow-up: M9. |
+| Incomplete | Lifecycle-race E2E prevents stale sidecar, materialization, and proxy cache updates. | Component generation checks exist; full-platform race E2E is missing; follow-up: M9. |
+| Incomplete | Control-plane restart E2E covers restart during wake, sleep, delete, route reassignment, and HTTP-01. | No restart recovery E2E found; follow-up: M9. |
 
 ## Milestone 7: Hardening
 
@@ -536,6 +793,56 @@ Done when:
   starts, and tests or CI checks fail if they regress without an explicit update.
 - Dashboards or metric names are documented enough for operators to wire up.
 
+Milestone 8 audit:
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Metrics and tracing for wake latency, cache hits, control-plane calls, drain duration, active streams, and materialization failures. | `proxy-core` descriptor tests exist, but runtime instrumentation for these lifecycle metrics is incomplete; follow-up: M9 for instrumentation gates and M10 for metric docs. |
+| Incomplete | Structured logs with instance ID, route ID, generation, and cluster. | No structured log/golden assertions found for lifecycle fields; follow-up: M9 implementation gates and M10 runbooks. |
+| Incomplete | Backoff and retry policies. | Sidecar idle retry/backoff is covered; database, Kubernetes, proxy stream, and materializer reconcile retry gates are missing; follow-up: M9. |
+| Incomplete | Proxy `Subscribe` reconnect and lazy cache rebuild. | Resolver can lazy-subscribe, but reconnect behavior is not proven; follow-up: M9. |
+| Incomplete | Control-plane restart recovery from database state. | No restart reconciliation tests or runtime recovery loop found; follow-up: M9. |
+| Incomplete | Minimal production images for control plane, frontline, and sidecar. | Distroless non-root Dockerfiles and `scripts/smoke-images.sh` exist, but images are not used by full kind E2E/soak and full startup/connectivity gates are missing; follow-up: M9. |
+| Incomplete | Load tests for route lookup and hot proxy path. | `scripts/smoke-frontline-load.sh`, sidecar load smokes, and `docs/proxy-hot-path-budgets.md` exist, but route-lookup benchmark, protocol throughput matrix, and stable tail-latency gates are missing; follow-up: M9. |
+| Incomplete | Soak tests for repeated wake/sleep cycles. | `scripts/soak-kind-materializer.sh` is materializer-only, not full wake/sleep; follow-up: M9. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | 7A: Metrics, tracing, and structured log fields. | Descriptor-level observability exists; runtime lifecycle instrumentation and log assertions are missing; follow-up: M9/M10. |
+| Incomplete | 7B: Control-plane restart recovery during wake, sleep, and delete. | No restart recovery gate found; follow-up: M9. |
+| Incomplete | 7C: Proxy Subscribe reconnect, lazy cache rebuild, and stale backend recovery. | Stale backend recovery has component coverage, but reconnect/lazy rebuild is not tested; follow-up: M9. |
+| Incomplete | 7D: Minimal final images and container runtime smoke tests. | Distroless images and smoke script exist, but full startup/connectivity/kind-use and image-size budgets are missing; follow-up: M9. |
+| Incomplete | 7E: Load tests for route lookup and proxy protocols. | Conservative load smokes exist, but route lookup, h2/h2c/gRPC, WebSocket, tail-latency, and regression budgets are incomplete; follow-up: M9. |
+| Incomplete | 7F: kind wake/sleep soak and leaked-object detection. | Existing soak is materializer-only; full wake/sleep soak is missing; follow-up: M9. |
+| Incomplete | 7G: Operator runbook and metric name documentation. | Operator-facing metric/runbook docs are not present; follow-up: M10. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Automated tests cover restart during wake, sleep, and delete. | No restart recovery tests found; follow-up: M9. |
+| Incomplete | Metrics tests assert counters/histograms and labels for lifecycle paths. | Proxy-core descriptor tests exist, but requested lifecycle metrics are not instrumented/tested; follow-up: M9. |
+| Incomplete | Structured log tests/goldens cover lifecycle fields and errors. | No structured log assertions found; follow-up: M9. |
+| Incomplete | Repeated kind wake/sleep soak passes without leaked Kubernetes objects. | Materializer-only soak checks leaked namespaces/PVs; full wake/sleep soak is missing; follow-up: M9. |
+| Incomplete | Load-test targets for route lookup, hot proxy path, and cold wake latency are defined before 7D. | `docs/proxy-hot-path-budgets.md` documents current load smokes and limitations, but route lookup/cold wake/tail targets are incomplete; follow-up: M9. |
+| Incomplete | Proxy load tests use production images and direct-backend baselines. | Production-image load smokes exist with fake control plane/direct comparisons, but full protocol and kind production-image gates are missing; follow-up: M9. |
+| Incomplete | Hot-cache HTTP/1.1 request rate stays within 20% of direct backend. | `scripts/smoke-frontline-load.sh` has a conservative HTTP/1.1 cached-route smoke, but not a stable release-gate budget; follow-up: M9. |
+| Incomplete | Hot-cache h2, h2c, and gRPC request rate stays within 25%. | No h2/h2c/gRPC load gate found; follow-up: M9. |
+| Incomplete | TCP large-stream throughput stays within 10-15%. | Sidecar TCP smoke exists, but no stable large-stream release-gate budget; follow-up: M9. |
+| Incomplete | WebSocket streaming throughput stays within 15-20%. | No WebSocket throughput gate found; follow-up: M9. |
+| Incomplete | Hot-cache p99 added latency stays below documented budget or within 25% baseline. | No stable p99/tail-latency gate found; follow-up: M9. |
+| Incomplete | Benchmark regressions warn above 10-15% and fail above 20-25%. | No regression budget enforcement found; follow-up: M9. |
+| Incomplete | Hot-cache route handling makes zero control-plane calls under load. | Component tests avoid calls on cache hits; no load gate asserts zero calls; follow-up: M9. |
+| Incomplete | Route lookup and hot proxy path meet target latency under load. | Route lookup benchmark is absent; follow-up: M9. |
+| Incomplete | Retry/backoff tests cover transient database errors, Kubernetes conflicts, proxy disconnects, and materializer retries. | Sidecar retry is covered; database/Kubernetes/proxy/materializer retry gates are missing; follow-up: M9. |
+| Incomplete | Container tests prove images start, run non-root, include required files, access CA certs, and are used by kind E2E/soak. | `scripts/smoke-images.sh` checks non-root/no shell/files and expected startup failure without config; full startup/connectivity/kind-use is missing; follow-up: M9. |
+| Incomplete | Image-size budgets are defined and enforced. | No image-size budget gate found; follow-up: M9. |
+| Incomplete | Dashboards or metric names are documented enough for operators. | No operator metric dashboard/runbook doc found; follow-up: M10. |
+
 ## Milestone 8: Phase Status Audit
 
 Audit the implementation against every prior milestone before doing more
@@ -586,6 +893,13 @@ Scope:
 - Add focused checks for the currently known gaps: sleep finalization after
   `ReportIdle`, Kubernetes cleanup on delete, full-platform kind E2E, frontline
   TLS/SNI runtime wiring, and subscribed route update/invalidation delivery.
+- Close Milestone 8 audit gaps marked for M9: proxy/frontline/sidecar protocol
+  matrices, route-key lookup benchmarks, grpc-web parity/browser smoke,
+  HTTP-01 runtime wiring, PostgreSQL/libpq SNI E2E, materializer
+  readiness/failure gates, restart/reconnect/retry behavior, production-image
+  gates, load budgets, and full wake/sleep soak.
+- Add runtime observability and structured-log gates for V1 lifecycle paths
+  before operator-facing docs freeze metric and log names.
 - Add WorkloadClass-owned sleep policy for idle timeout, idle report retry
   backoff, and drain grace.
 - Require every WorkloadClass to specify an idle timeout explicitly; there is no
@@ -608,6 +922,14 @@ Sub-phases:
   bounds.
 - 9D: Manifest rendering of resolved sidecar sleep-policy env.
 - 9E: Component and kind E2E coverage for policy rendering and idle behavior.
+- 9F: Protocol/API/runtime audit gaps: route-key lookup benchmarks, proxy-core
+  reset/backpressure tests, frontline HTTP/2/h2c/WebSocket/TLS/SNI/HTTP-01
+  runtime wiring, HTTP-01 store overwrite/idempotency and wrong host/token
+  tests, sidecar h2c/WebSocket idle coverage, sidecar restart during
+  idle/report behavior, grpc-web parity, and PostgreSQL/libpq SNI E2E.
+- 9G: Hardening audit gaps: materializer readiness/failure route publication,
+  restart/reconnect/retry gates, runtime metrics/log assertions, production
+  image startup/connectivity checks, load budgets, and full wake/sleep soak.
 
 Done when:
 
@@ -619,6 +941,9 @@ Done when:
   leaves no workload, Service, PVC, or PV objects owned by that instance.
 - full-platform kind E2E uses the real control-plane, frontline, and sidecar
   images against a real database and Kubernetes API, not fake clients.
+- Live database gates run the Postgres store conformance suite with
+  `SLEEPYPODS_POSTGRES_URL` set and prove migrations plus store behavior against
+  a real database.
 - Runtime tests prove the frontline binary wires HTTP, TLS termination, and
   TLS/SNI passthrough listeners rather than leaving TLS/SNI as library-only
   primitives.
@@ -634,6 +959,34 @@ Done when:
   values.
 - kind E2E proves two workload classes with different idle policies sleep at
   different configured thresholds.
+- Proxy-core/frontline/sidecar protocol tests cover the incomplete reset,
+  timeout, backpressure, HTTP/2, h2c/gRPC, WebSocket, TLS/SNI, and HTTP-01
+  cases identified by the Milestone 8 audit.
+- Route-key lookup benchmarks and load gates cover hot-cache route lookup, hot
+  proxy paths, cold wake latency, tail latency, and zero control-plane calls on
+  hot-cache hits.
+- grpc-web store-backed integration tests cover operator APIs, CORS/preflight,
+  metadata/auth propagation, structured errors, and V8-compatible request
+  encoding.
+- HTTP-01 runtime tests prove challenge interception calls the control plane and
+  takes precedence over normal route resolution.
+- HTTP-01 store tests prove overwrite/idempotency behavior plus wrong-host and
+  wrong-token misses.
+- PostgreSQL/libpq 17+ SNI passthrough E2E passes with `sslnegotiation=direct`
+  and a pinned test image.
+- Materializer readiness/failure tests prove routes publish only after ready,
+  withdraw on unready, and reject stale or invalid manifests.
+- Restart/reconnect/retry tests cover control-plane recovery, proxy Subscribe
+  reconnect, database errors, Kubernetes conflicts, proxy stream disconnects,
+  and materializer reconcile retries.
+- Sidecar restart tests prove idle/report behavior remains correct across
+  process restart or detector reconstruction, including duplicate report
+  handling and generation checks.
+- Runtime metrics/log tests assert the V1 lifecycle fields that Milestone 10
+  documents.
+- Production-image tests prove the final images start, run as non-root, have the
+  required runtime files and CA roots, meet image-size budgets, and are used by
+  kind E2E/load/soak gates.
 
 ## Milestone 10: Operator and Contributor Documentation
 
@@ -658,6 +1011,8 @@ Scope:
   tests, protocol tests, kind E2E, and code generation.
 - Agent-facing repository guide with file map, invariants, source-of-truth docs,
   generated files, test gates, and common task entry points.
+- Documentation for metric names, structured log fields, load/latency budgets,
+  production-image expectations, and any intentionally deferred limitations.
 
 Sub-phases:
 
