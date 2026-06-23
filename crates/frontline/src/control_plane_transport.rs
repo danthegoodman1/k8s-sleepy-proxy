@@ -103,15 +103,24 @@ where
     pub async fn next_update(
         &mut self,
     ) -> Result<SubscribeControlPlaneOutput, GrpcProxyControlPlaneError> {
-        let session = self.ensure_subscription().await?;
-        if let Some(update) = session.buffered_updates.pop_front() {
-            return Ok(update);
-        }
+        let response = {
+            let session = self.ensure_subscription().await?;
+            if let Some(update) = session.buffered_updates.pop_front() {
+                return Ok(update);
+            }
+            session.responses.message().await
+        };
 
-        let response = match session.responses.message().await {
+        let response = match response {
             Ok(Some(response)) => response,
-            Ok(None) => return Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed),
-            Err(status) => return Err(GrpcProxyControlPlaneError::Status(status)),
+            Ok(None) => {
+                self.subscription = None;
+                return Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed);
+            }
+            Err(status) => {
+                self.subscription = None;
+                return Err(GrpcProxyControlPlaneError::Status(status));
+            }
         };
         let message = proxy_subscribe_response_from_proto(response)
             .map_err(GrpcProxyControlPlaneError::Protocol)?;
@@ -149,18 +158,33 @@ where
             request_id: request_id.clone(),
             identity,
         });
-        let session = self.ensure_subscription().await?;
-        session
-            .requests
-            .send(request)
-            .await
-            .map_err(|_| GrpcProxyControlPlaneError::SubscribeRequestStreamClosed)?;
+        let send_result = {
+            let session = self.ensure_subscription().await?;
+            session.requests.send(request).await
+        };
+        if send_result.is_err() {
+            self.subscription = None;
+            return Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed);
+        }
 
         loop {
-            let response = match session.responses.message().await {
+            let response = {
+                let session = self
+                    .subscription
+                    .as_mut()
+                    .expect("subscription exists after successful request send");
+                session.responses.message().await
+            };
+            let response = match response {
                 Ok(Some(response)) => response,
-                Ok(None) => return Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed),
-                Err(status) => return Err(GrpcProxyControlPlaneError::Status(status)),
+                Ok(None) => {
+                    self.subscription = None;
+                    return Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed);
+                }
+                Err(status) => {
+                    self.subscription = None;
+                    return Err(GrpcProxyControlPlaneError::Status(status));
+                }
             };
             let message = proxy_subscribe_response_from_proto(response)
                 .map_err(GrpcProxyControlPlaneError::Protocol)?;
@@ -172,7 +196,12 @@ where
                         request_id: actual.clone(),
                     });
                 }
-                None => session.buffered_updates.push_back(message),
+                None => self
+                    .subscription
+                    .as_mut()
+                    .expect("subscription exists while buffering pushed updates")
+                    .buffered_updates
+                    .push_back(message),
             }
         }
     }
@@ -183,12 +212,16 @@ where
     ) -> Result<(), GrpcProxyControlPlaneError> {
         let request =
             proxy_subscribe_input_to_proto(ProxySubscribeInput::Unsubscribe { subscription_id });
-        let session = self.ensure_subscription().await?;
-        session
-            .requests
-            .send(request)
-            .await
-            .map_err(|_| GrpcProxyControlPlaneError::SubscribeRequestStreamClosed)
+        let send_result = {
+            let session = self.ensure_subscription().await?;
+            session.requests.send(request).await
+        };
+        if send_result.is_err() {
+            self.subscription = None;
+            return Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed);
+        }
+
+        Ok(())
     }
 
     async fn ensure_subscription(

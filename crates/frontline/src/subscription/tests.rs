@@ -174,6 +174,55 @@ fn newer_duplicate_resolve_for_same_rule_replaces_old_subscription() {
 }
 
 #[test]
+fn duplicate_resolved_response_for_same_identity_keeps_one_active_subscription() {
+    let now = now();
+    let mut state = SubscriptionState::new(4);
+    let matched_identity = http_rule("example.com", Some("/api"));
+
+    state.apply_control_plane_message(
+        SubscribeControlPlaneOutput::RouteResolved {
+            request_id: request_id("req-1"),
+            subscription_id: subscription_id("sub-first"),
+            matched_identity: matched_identity.clone(),
+            entry: route_entry_for_instance("route-current", "instance-a", 3, Some(7)),
+            cache_policy: ttl(10),
+        },
+        now,
+    );
+
+    let outcome = state.apply_control_plane_message(
+        SubscribeControlPlaneOutput::RouteResolved {
+            request_id: request_id("req-2"),
+            subscription_id: subscription_id("sub-duplicate"),
+            matched_identity: matched_identity.clone(),
+            entry: route_entry_for_instance("route-current", "instance-a", 3, Some(7)),
+            cache_policy: ttl(10),
+        },
+        now,
+    );
+
+    assert_eq!(
+        outcome,
+        ApplyControlPlaneMessageOutcome::Resolved(crate::CacheInsertResult {
+            subscriptions_to_unsubscribe: vec![subscription_id("sub-first")]
+        })
+    );
+    assert!(state
+        .cache()
+        .positive_by_subscription(&subscription_id("sub-first"))
+        .is_none());
+    assert_eq!(state.cache().positives().len(), 1);
+    assert_eq!(
+        state
+            .cache()
+            .positive_by_subscription(&subscription_id("sub-duplicate"))
+            .expect("duplicate response becomes active")
+            .matched_identity,
+        matched_identity
+    );
+}
+
+#[test]
 fn stale_duplicate_resolve_for_same_rule_is_not_installed() {
     let now = now();
     let mut state = SubscriptionState::new(4);

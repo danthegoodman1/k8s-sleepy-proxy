@@ -14,9 +14,10 @@ use super::{
     WakeClientFuture,
 };
 use crate::{
-    FrontlineRouteResolver, RouteRequestId, RouteSubscriptionClient, RouteSubscriptionFuture,
-    SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState, WakeInstanceRequest,
-    WakeInstanceResponse, WakeTracker, WakeUnavailableReason, WakeWaitReason,
+    ApplyUpdateOutcome, FrontlineRouteResolver, InvalidationReason, ReadyBackend, RouteRequestId,
+    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
+    SubscriptionState, WakeInstanceRequest, WakeInstanceResponse, WakeResponseDisposition,
+    WakeTracker, WakeUnavailableReason, WakeWaitReason,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -632,6 +633,134 @@ async fn wake_client_error_surfaces_and_clears_pending_for_retry() {
 
     assert!(matches!(retry, FrontlineRouteOutcome::Waking { .. }));
     assert_eq!(coordinator.wake_client().calls.len(), 2);
+}
+
+#[tokio::test]
+async fn invalidation_during_wake_rejects_ready_update_and_leaves_cache_empty() {
+    let now = now();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-1"),
+            http_rule("example.com", None),
+            route_entry(InstanceState::Cold, 12, None),
+        ),
+        now,
+    );
+    let mut coordinator =
+        coordinator_with_state(state, FakeRouteClient::default(), FakeWakeClient::default());
+    let observed_entry = coordinator
+        .resolver()
+        .state()
+        .cache()
+        .positive_by_subscription(&subscription_id("sub-1"))
+        .expect("observed cache entry before wake")
+        .clone();
+
+    coordinator.wake_tracker_mut().admit(wake_request(12));
+    assert_eq!(coordinator.wake_tracker().pending_len(), 1);
+    coordinator
+        .resolver_mut()
+        .apply_control_plane_message(
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id: subscription_id("sub-1"),
+                reason: InvalidationReason::StreamClosed,
+            },
+            now,
+        )
+        .await
+        .expect("stream invalidation applies");
+
+    let error = coordinator
+        .handle_wake_response(
+            observed_entry,
+            WakeResponseDisposition::Ready(ReadyBackend {
+                instance_id: instance_id("instance-a"),
+                instance_generation: Generation::new(12),
+                backend: backend(5),
+                backend_generation: Some(BackendGeneration::new(5)),
+            }),
+            now,
+        )
+        .await
+        .expect_err("ready observation cannot update invalidated subscription");
+
+    assert_eq!(
+        error,
+        FrontlineRouteCoordinatorError::RejectedCacheUpdate(
+            ApplyUpdateOutcome::MissingSubscription
+        )
+    );
+    assert_eq!(coordinator.wake_tracker().pending_len(), 0);
+    assert!(coordinator.resolver().state().cache().is_empty());
+}
+
+#[tokio::test]
+async fn route_after_stream_loss_lazily_resubscribes_and_rebuilds_cache() {
+    let now = now();
+    let request = http_request("app.example.com", "/");
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-old"),
+            http_rule("example.com", None),
+            route_entry(InstanceState::Running, 13, Some(1)),
+        ),
+        now,
+    );
+    let mut route_client = FakeRouteClient::default();
+    route_client.push_subscribe_response(resolved_response(
+        generated_request_id(1),
+        subscription_id("sub-new"),
+        http_rule("example.com", None),
+        route_entry(InstanceState::Running, 13, Some(2)),
+    ));
+    let mut coordinator = coordinator_with_state(state, route_client, FakeWakeClient::default());
+
+    coordinator
+        .resolver_mut()
+        .apply_control_plane_message(
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id: subscription_id("sub-old"),
+                reason: InvalidationReason::StreamClosed,
+            },
+            now,
+        )
+        .await
+        .expect("stream invalidation removes active subscription");
+
+    let outcome = coordinator
+        .route(request.clone(), now)
+        .await
+        .expect("route lazily rebuilds after stream loss");
+
+    assert!(matches!(outcome, FrontlineRouteOutcome::Ready(_)));
+    assert_eq!(
+        coordinator.resolver().client().calls,
+        vec![RouteClientCall::Subscribe {
+            request_id: generated_request_id(1),
+            identity: request,
+        }]
+    );
+    assert!(coordinator
+        .resolver()
+        .state()
+        .cache()
+        .positive_by_subscription(&subscription_id("sub-old"))
+        .is_none());
+    assert_eq!(
+        coordinator
+            .resolver()
+            .state()
+            .cache()
+            .positive_by_subscription(&subscription_id("sub-new"))
+            .expect("rebuilt subscription")
+            .entry
+            .backend_generation,
+        Some(BackendGeneration::new(2))
+    );
 }
 
 #[tokio::test]

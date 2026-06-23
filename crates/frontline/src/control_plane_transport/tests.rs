@@ -260,6 +260,96 @@ async fn closed_subscribe_response_stream_is_surfaced() {
 }
 
 #[tokio::test]
+async fn subscribe_route_after_response_stream_close_opens_new_stream() {
+    let service = FakeProxyControlPlane::default();
+    service.push_subscribe_action(SubscribeAction::close_after(Vec::new()));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "req-reconnected",
+        "sub-reconnected",
+    ))]));
+    let mut client = test_client(service.clone());
+
+    let first = client
+        .subscribe_route(
+            route_request_id("req-closed"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .expect_err("first stream closes before response");
+    assert!(matches!(
+        first,
+        GrpcProxyControlPlaneError::SubscribeResponseStreamClosed
+    ));
+
+    let response = client
+        .subscribe_route(
+            route_request_id("req-reconnected"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .expect("next subscribe uses a fresh stream");
+
+    assert_eq!(
+        response,
+        SubscribeControlPlaneOutput::RouteResolved {
+            request_id: route_request_id("req-reconnected"),
+            subscription_id: subscription_id("sub-reconnected"),
+            matched_identity: http_identity("app.example.com", None),
+            entry: route_entry(),
+            cache_policy: cache_policy(10_000),
+        }
+    );
+    let requests = service.wait_for_subscribe_requests(2).await;
+    assert_subscribe_route_request(&requests[0], "req-closed", "app.example.com");
+    assert_subscribe_route_request(&requests[1], "req-reconnected", "app.example.com");
+}
+
+#[tokio::test]
+async fn pushed_updates_over_response_buffer_are_drained_without_public_cursor() {
+    let service = FakeProxyControlPlane::default();
+    let mut responses = (0..20)
+        .map(|index| Ok(route_updated_response(&format!("sub-update-{index}"))))
+        .collect::<Vec<_>>();
+    responses.push(Ok(route_resolved_response(
+        "req-after-updates",
+        "sub-route",
+    )));
+    service.push_subscribe_action(SubscribeAction::respond(responses));
+    let mut client = test_client(service);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe_route(
+            route_request_id("req-after-updates"),
+            http_identity("app.example.com", None),
+        ),
+    )
+    .await
+    .expect("subscribe completes while upstream response sender backpressures")
+    .expect("route response succeeds");
+    assert!(matches!(
+        response,
+        SubscribeControlPlaneOutput::RouteResolved { .. }
+    ));
+
+    for index in 0..20 {
+        let update = tokio::time::timeout(Duration::from_secs(1), client.next_update())
+            .await
+            .expect("buffered update is delivered")
+            .expect("buffered update maps");
+        assert_eq!(
+            update,
+            SubscribeControlPlaneOutput::RouteUpdated {
+                subscription_id: subscription_id(&format!("sub-update-{index}")),
+                matched_identity: http_identity("app.example.com", None),
+                entry: route_entry(),
+                cache_policy: cache_policy(15_000),
+            }
+        );
+    }
+}
+
+#[tokio::test]
 async fn closed_subscribe_request_stream_is_surfaced() {
     let service = FakeProxyControlPlane::default();
     let mut client = test_client(service);
