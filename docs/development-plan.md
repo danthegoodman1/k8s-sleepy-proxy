@@ -595,7 +595,7 @@ Scope:
 | Complete | Sidecar targets the local app port. | Manifest tests validate sidecar local upstream env and reject app target conflicts. |
 | Complete | Validate Service selectors/target ports and local-only sidecar upstream. | Manifest validation rejects invalid service ports and sidecar/app port conflicts. |
 | Complete | Wait for readiness through Pods or EndpointSlices. | `kube_materializer.rs` and `materializer.rs` tests cover EndpointSlice readiness and backend URI creation. |
-| Incomplete | Delete materialized objects on sleep/delete. | Materializer delete and kind cleanup exist, but control-plane sleep/delete does not invoke Kubernetes cleanup; follow-up: M9 cleanup gates. |
+| Incomplete | Delete materialized objects on sleep/delete. | Control-plane sleep finalization now invokes Kubernetes cleanup from `ReportIdle`, but operator delete still removes store state without materializer cleanup; follow-up: wire delete cleanup through a materializer-aware operator lifecycle surface. |
 | Complete | Leave backing provider volumes untouched. | `scripts/test-kind-materializer.sh` deletes rendered objects and rematerializes with preserved hostPath data. |
 
 Sub-phases:
@@ -608,7 +608,7 @@ Sub-phases:
 | Complete | 5D: Deployment/StatefulSet rendering with sidecar injection. | Manifest tests cover both workload kinds and injected sidecar config. |
 | Complete | 5E: Service rendering that targets the sidecar port. | Manifest tests cover service selectors and sidecar target port. |
 | Complete | 5F: Readiness through Pods or EndpointSlices. | Kube materializer readiness tests cover ready EndpointSlice semantics. |
-| Incomplete | 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs. | Delete primitives and materializer-only cleanup exist, but sleep/delete lifecycle wiring is missing; follow-up: M9. |
+| Incomplete | 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs. | Sleep cleanup is wired through sidecar `ReportIdle`; delete cleanup is still not wired because the operator delete API currently has only store access, not materializer/target context. |
 | Complete | 5H: kind materialization lifecycle suite with static volume backend. | `scripts/test-kind-materializer.sh` runs the ignored kind materializer lifecycle test with static hostPath data continuity. |
 
 Done criteria:
@@ -620,7 +620,7 @@ Done criteria:
 | Complete | Component tests validate PV/PVC fields, labels, and volume mounts. | Manifest tests cover PV/PVC fields, owner/generation labels, and workload mounts. |
 | Incomplete | kind tests prove cold wake creates PV/PVC before StatefulSet and PVC binds intended PV. | Materializer-only kind test proves apply/bind ordering, but not cold wake through the full platform; follow-up: M9 full-platform kind E2E. |
 | Complete | kind tests prove workload can read/write expected mount path. | `scripts/test-kind-materializer.sh` writes and verifies a marker through the mounted hostPath volume. |
-| Incomplete | kind tests prove sleep deletes workload, Service, PVC, and PV. | Materializer-only delete is tested, but sleep-driven cleanup is not wired; follow-up: M9. |
+| Incomplete | kind tests prove sleep deletes workload, Service, PVC, and PV. | Sleep-driven cleanup is covered by component transport tests, but no kind/full-platform `ReportIdle` cleanup gate proves deletion of real workload, Service, PVC, and PV objects. |
 | Complete | kind tests prove re-wake recreates manifests from same values and preserves static-volume data. | `scripts/test-kind-materializer.sh` rematerializes the manifest and verifies the previous marker remains. |
 | Complete | Failure tests cover missing/bad volume handles, PVCs never bind, wrong access modes, and stale manifest generation. | Manifest tests reject missing/empty CSI volume handles plus unsupported/duplicate access modes; materializer tests cover PVC bind failures and stale generation labels/annotations being rejected before apply. |
 | Incomplete | Readiness tests prove routes are not published until ready and withdrawn when unready. | Materializer readiness returns a backend only after ready, but route publication/withdrawal is not wired to readiness changes; follow-up: M9. |
@@ -685,7 +685,7 @@ Scope:
 | Incomplete | Cold request wakes instance. | Frontline wake and control-plane wake are tested separately, but not through deployed frontline/control-plane/materializer/sidecar; follow-up: M9. |
 | Incomplete | Hot request routes from local cache. | Frontline runtime tests cover a fake control-plane hot route, but no full-platform hot-cache E2E exists; follow-up: M9. |
 | Incomplete | Sidecar reports idle. | Sidecar and control-plane ReportIdle tests exist separately, but no full-platform E2E proves the deployed sidecar report path; follow-up: M9. |
-| Incomplete | Control plane drains and sleeps materialization. | `ReportIdle` transitions to Draining, but sleep finalization and Kubernetes cleanup are not wired; follow-up: M9. |
+| Complete | Control plane drains and sleeps materialization. | `sidecar_api_transport.rs` covers `ReportIdle` beginning sleep, deleting rendered Kubernetes object refs through the materializer, marking the materialization deleted, and returning the instance to `Cold`; `wake::tests` covers the Draining/deleting wake guard. |
 | Incomplete | Custom host and wildcard host route to right instance. | Matcher/store component tests cover custom/wildcard routing; no full-platform E2E gate exists; follow-up: M9. |
 | Incomplete | HTTP-01 insert, resolve, serve, and delete flow works. | Store/API/runtime/transport tests cover insert, resolve lookup, serve behavior, delete/expiry, and precedence; full-platform kind E2E remains missing; follow-up: M9 full-platform gate. |
 

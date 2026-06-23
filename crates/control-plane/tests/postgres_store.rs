@@ -4,21 +4,24 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use control_plane::materialization::LoadReadyMaterializationRequest;
+use control_plane::materialization::{
+    LoadActiveMaterializationRequest, LoadReadyMaterializationRequest,
+};
 use control_plane::{
-    render_manifests, BackendEndpoint, BackendGeneration, CompareAndSwapInstanceStateRequest,
-    CompleteWakeRequest, ContainerPortTemplate, ContainerTemplate, ControlPlaneStore,
-    CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
-    DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
-    ExpireHttp01ChallengesRequest, Generation, GetInstanceRequest, GetRouteBindingRequest,
-    Http01ChallengeKey, IdempotencyKey, IdleTimeoutOverridePolicy, InstanceId, InstanceState,
-    ManifestTemplate, MaterializationState, MaterializationTarget, PathPrefix, PostgresStore,
-    PostgresStoreConfig, ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest,
-    RenderManifestRequest, RenderedObjectRef, RouteBindingId, RouteBindingSpec,
-    RouteDependencyLookup, RouteHost, RouteIdentity, RouteResolution, ServicePortTemplate,
-    ServiceTemplate, SidecarTemplate, StateTransitionReason, StoreError, TemplateText,
-    TemplateTextPart, WorkloadClassId, WorkloadClassVersion, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    render_manifests, BackendEndpoint, BackendGeneration, BeginSleepRequest,
+    CompareAndSwapInstanceStateRequest, CompleteWakeRequest, ContainerPortTemplate,
+    ContainerTemplate, ControlPlaneStore, CreateInstanceRequest, CreateRouteBindingRequest,
+    CreateWorkloadClassVersionRequest, DeleteInstanceRequest, DeleteRouteBindingRequest,
+    EnvVarTemplate, ExpireHttp01ChallengesRequest, FinalizeSleepRequest, Generation,
+    GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey,
+    IdleTimeoutOverridePolicy, InstanceId, InstanceState, ManifestTemplate, MaterializationState,
+    MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute,
+    PutHttp01ChallengeRequest, RecordMaterializationRequest, RenderManifestRequest,
+    RenderedObjectRef, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
+    RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+    StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
+    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -1172,6 +1175,134 @@ async fn exercise_complete_wake(
     assert_eq!(
         dependencies.materialization_generation,
         Some(BackendGeneration::new(7))
+    );
+
+    let sleep_started = store
+        .begin_sleep(BeginSleepRequest::new(
+            completed.instance.id.clone(),
+            completed.instance.generation,
+            target.clone(),
+        ))
+        .await?;
+    assert_eq!(sleep_started.instance.state, InstanceState::Draining);
+    assert_eq!(sleep_started.instance.generation, Generation::new(3));
+    let deleting_materialization = sleep_started
+        .materialization
+        .expect("active materialization is marked deleting");
+    assert_eq!(
+        deleting_materialization.state,
+        MaterializationState::Deleting
+    );
+    assert_eq!(deleting_materialization.backend, None);
+    assert_eq!(deleting_materialization.rendered_objects, rendered_objects);
+    let active = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            completed.instance.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .expect("deleting materialization remains active until cleanup finalizes");
+    assert_eq!(active.state, MaterializationState::Deleting);
+
+    let sleep_finalized = store
+        .finalize_sleep(FinalizeSleepRequest::new(
+            completed.instance.id.clone(),
+            sleep_started.instance.generation,
+            target.clone(),
+        ))
+        .await?;
+    assert_eq!(sleep_finalized.instance.state, InstanceState::Cold);
+    assert_eq!(sleep_finalized.instance.generation, Generation::new(4));
+    let deleted_materialization = sleep_finalized
+        .materialization
+        .expect("materialization is marked deleted");
+    assert_eq!(deleted_materialization.state, MaterializationState::Deleted);
+    assert_eq!(
+        deleted_materialization.instance_generation,
+        Generation::new(4)
+    );
+    assert_eq!(deleted_materialization.backend, None);
+    assert!(deleted_materialization.rendered_objects.is_empty());
+    assert!(
+        store
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                completed.instance.id.clone(),
+                target.clone(),
+            ))
+            .await?
+            .is_none(),
+        "deleted materialization is no longer active"
+    );
+
+    let stale_sleep = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-begin-sleep-stale-materialization",
+        "instance-begin-sleep-stale-materialization",
+    )
+    .await?;
+    let stale_sleep_id = stale_sleep.instance.id.clone();
+    let stale_sleep_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            stale_sleep_id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let stale_sleep_target =
+        MaterializationTarget::new("cluster-complete", "stale-sleep").expect("valid target");
+    let stale_sleep_materialization = store
+        .record_materialization(RecordMaterializationRequest::new(
+            stale_sleep_id.clone(),
+            stale_sleep_waking.generation,
+            stale_sleep_target.clone(),
+            MaterializationState::Ready,
+            BackendGeneration::new(1),
+        ))
+        .await?;
+    assert_eq!(
+        stale_sleep_materialization.instance_generation,
+        Generation::new(1)
+    );
+    let stale_sleep_running = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            stale_sleep_id.clone(),
+            stale_sleep_waking.generation,
+            InstanceState::Running,
+            StateTransitionReason::MaterializationReady,
+        ))
+        .await?;
+    assert_eq!(stale_sleep_running.generation, Generation::new(2));
+    let stale_sleep_error = store
+        .begin_sleep(BeginSleepRequest::new(
+            stale_sleep_id.clone(),
+            stale_sleep_running.generation,
+            stale_sleep_target.clone(),
+        ))
+        .await
+        .expect_err("begin_sleep rejects stale active materialization generation");
+    match stale_sleep_error {
+        StoreError::GenerationConflict { expected, actual } => {
+            assert_eq!(expected, Generation::new(2));
+            assert_eq!(actual, Generation::new(1));
+        }
+        other => panic!("expected stale materialization generation conflict, got {other}"),
+    }
+    let active_after_rejected_sleep = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            stale_sleep_id,
+            stale_sleep_target,
+        ))
+        .await?
+        .expect("stale materialization remains active after rejected sleep");
+    assert_eq!(
+        active_after_rejected_sleep.state,
+        MaterializationState::Ready
+    );
+    assert_eq!(
+        active_after_rejected_sleep.instance_generation,
+        Generation::new(1)
     );
 
     let stale = create_lifecycle_instance(

@@ -46,9 +46,41 @@ pub struct LoadReadyMaterializationRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadActiveMaterializationRequest {
+    pub instance_id: InstanceId,
+    pub target: MaterializationTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginSleepRequest {
+    pub instance_id: InstanceId,
+    pub expected_running_generation: Generation,
+    pub target: MaterializationTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeSleepRequest {
+    pub instance_id: InstanceId,
+    pub expected_draining_generation: Generation,
+    pub target: MaterializationTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompleteWakeResult {
     pub instance: InstanceRecord,
     pub materialization: MaterializationRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginSleepResult {
+    pub instance: InstanceRecord,
+    pub materialization: Option<MaterializationRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeSleepResult {
+    pub instance: InstanceRecord,
+    pub materialization: Option<MaterializationRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +164,43 @@ impl LoadReadyMaterializationRequest {
         Self {
             instance_id,
             instance_generation,
+            target,
+        }
+    }
+}
+
+impl LoadActiveMaterializationRequest {
+    pub fn new(instance_id: InstanceId, target: MaterializationTarget) -> Self {
+        Self {
+            instance_id,
+            target,
+        }
+    }
+}
+
+impl BeginSleepRequest {
+    pub fn new(
+        instance_id: InstanceId,
+        expected_running_generation: Generation,
+        target: MaterializationTarget,
+    ) -> Self {
+        Self {
+            instance_id,
+            expected_running_generation,
+            target,
+        }
+    }
+}
+
+impl FinalizeSleepRequest {
+    pub fn new(
+        instance_id: InstanceId,
+        expected_draining_generation: Generation,
+        target: MaterializationTarget,
+    ) -> Self {
+        Self {
+            instance_id,
+            expected_draining_generation,
             target,
         }
     }

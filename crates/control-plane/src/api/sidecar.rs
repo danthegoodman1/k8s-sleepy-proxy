@@ -6,32 +6,52 @@ use crate::{
     api::pb::{self, sidecar_control_plane_server::SidecarControlPlaneServer},
     idle::{self, ReportIdleError, ReportIdleResult, ReportIdleUnavailableReason},
     ids::{Generation, InstanceId},
+    materialization::MaterializationTarget,
+    materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     store::{ControlPlaneStore, StoreError},
 };
 
 pub const SIDECAR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.SidecarControlPlane";
 
 #[derive(Clone)]
-pub struct StoreBackedSidecarApi {
+pub struct StoreBackedSidecarApi<C> {
     store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
 }
 
-impl StoreBackedSidecarApi {
-    pub fn new(store: Arc<dyn ControlPlaneStore>) -> Self {
-        Self { store }
+impl<C> StoreBackedSidecarApi<C> {
+    pub fn new(
+        store: Arc<dyn ControlPlaneStore>,
+        materializer: KubernetesMaterializer<C>,
+        target: MaterializationTarget,
+    ) -> Self {
+        Self {
+            store,
+            materializer,
+            target,
+        }
     }
 }
 
-pub type StoreBackedSidecarGrpcService = SidecarControlPlaneServer<StoreBackedSidecarApi>;
+pub type StoreBackedSidecarGrpcService<C> = SidecarControlPlaneServer<StoreBackedSidecarApi<C>>;
 
-pub fn sidecar_grpc_service_with_store(
+pub fn sidecar_grpc_service_with_store<C>(
     store: Arc<dyn ControlPlaneStore>,
-) -> StoreBackedSidecarGrpcService {
-    SidecarControlPlaneServer::new(StoreBackedSidecarApi::new(store))
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+) -> StoreBackedSidecarGrpcService<C>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    SidecarControlPlaneServer::new(StoreBackedSidecarApi::new(store, materializer, target))
 }
 
 #[tonic::async_trait]
-impl pb::sidecar_control_plane_server::SidecarControlPlane for StoreBackedSidecarApi {
+impl<C> pb::sidecar_control_plane_server::SidecarControlPlane for StoreBackedSidecarApi<C>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
     async fn report_idle(
         &self,
         request: Request<pb::SidecarReportIdleRequest>,
@@ -39,7 +59,14 @@ impl pb::sidecar_control_plane_server::SidecarControlPlane for StoreBackedSideca
         let request = report_idle_request_from_proto(request.into_inner())?;
         let request_instance_id = request.instance_id.as_str().to_owned();
 
-        match idle::report_idle(self.store.as_ref(), request).await {
+        match idle::report_idle(
+            self.store.as_ref(),
+            &self.materializer,
+            self.target.clone(),
+            request,
+        )
+        .await
+        {
             Ok(result) => Ok(Response::new(report_idle_result_to_proto(result))),
             Err(error) => report_idle_error_response(request_instance_id, error).map(Response::new),
         }
@@ -112,6 +139,10 @@ fn report_idle_error_response(
                 ),
             })
         }
+        ReportIdleError::Materializer { instance, source } => Err(Status::unavailable(format!(
+            "sleep cleanup failed for instance {}: {source}",
+            instance.id.as_str()
+        ))),
         ReportIdleError::Store(error) => Err(store_error_to_status(error)),
     }
 }

@@ -1,9 +1,11 @@
 use crate::{
     ids::{Generation, InstanceId},
-    instance::{
-        CompareAndSwapInstanceStateRequest, GetInstanceRequest, InstanceRecord, InstanceState,
-        StateTransitionReason,
+    instance::{GetInstanceRequest, InstanceRecord, InstanceState},
+    materialization::{
+        BeginSleepRequest, FinalizeSleepRequest, LoadActiveMaterializationRequest,
+        MaterializationRecord, MaterializationState, MaterializationTarget,
     },
+    materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     store::{ControlPlaneStore, StoreError},
 };
 
@@ -48,6 +50,10 @@ pub enum ReportIdleError {
         expected: Generation,
         actual: Generation,
     },
+    Materializer {
+        instance: InstanceRecord,
+        source: MaterializerError,
+    },
     Store(StoreError),
 }
 
@@ -65,10 +71,16 @@ impl ReportIdleRequest {
     }
 }
 
-pub async fn report_idle(
-    store: &dyn ControlPlaneStore,
+pub async fn report_idle<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    target: MaterializationTarget,
     request: ReportIdleRequest,
-) -> Result<ReportIdleResult, ReportIdleError> {
+) -> Result<ReportIdleResult, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
     if request.active_count > 0 {
         return Err(ReportIdleError::ActiveRequestsPresent {
             active_count: request.active_count,
@@ -77,11 +89,13 @@ pub async fn report_idle(
 
     let current = load_instance(store, request.instance_id.clone()).await?;
     if current.generation != request.expected_generation {
-        return generation_mismatch_result(&request, current);
+        return generation_mismatch_result(store, materializer, target, &request, current).await;
     }
 
     match current.state {
-        InstanceState::Running => transition_running_to_draining(store, request).await,
+        InstanceState::Running => {
+            finalize_running_sleep(store, materializer, target, request).await
+        }
         state => Ok(ReportIdleResult::Unavailable {
             instance: current,
             reason: unavailable_reason_for_state(state),
@@ -89,43 +103,98 @@ pub async fn report_idle(
     }
 }
 
-async fn transition_running_to_draining(
-    store: &dyn ControlPlaneStore,
+async fn finalize_running_sleep<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    target: MaterializationTarget,
     request: ReportIdleRequest,
-) -> Result<ReportIdleResult, ReportIdleError> {
-    match store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+) -> Result<ReportIdleResult, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    let begin = match store
+        .begin_sleep(BeginSleepRequest::new(
             request.instance_id.clone(),
             request.expected_generation,
-            InstanceState::Draining,
-            StateTransitionReason::IdleReported,
+            target.clone(),
         ))
         .await
     {
-        Ok(instance) => Ok(ReportIdleResult::Accepted { instance }),
+        Ok(begin) => Ok(begin),
         Err(StoreError::NotFound { .. }) => Err(ReportIdleError::NotFound),
         Err(StoreError::GenerationConflict { expected, actual }) => {
             if actual == expected.next() {
                 let current = load_instance(store, request.instance_id.clone()).await?;
-                if current.generation == actual && current.state == InstanceState::Draining {
-                    return Ok(ReportIdleResult::AlreadyDraining { instance: current });
+                if current.generation == actual {
+                    return generation_mismatch_result(
+                        store,
+                        materializer,
+                        target,
+                        &request,
+                        current,
+                    )
+                    .await;
                 }
             }
 
             Err(ReportIdleError::GenerationConflict { expected, actual })
         }
         Err(error) => Err(ReportIdleError::Store(error)),
-    }
+    }?;
+
+    cleanup_and_finalize_sleep(
+        store,
+        materializer,
+        target,
+        begin.instance,
+        begin.materialization,
+    )
+    .await
 }
 
-fn generation_mismatch_result(
+async fn generation_mismatch_result<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    target: MaterializationTarget,
     request: &ReportIdleRequest,
     current: InstanceRecord,
-) -> Result<ReportIdleResult, ReportIdleError> {
-    if current.generation == request.expected_generation.next()
-        && current.state == InstanceState::Draining
-    {
-        return Ok(ReportIdleResult::AlreadyDraining { instance: current });
+) -> Result<ReportIdleResult, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    if current.generation == request.expected_generation.next() {
+        if current.state == InstanceState::Draining {
+            let materialization = store
+                .load_active_materialization(LoadActiveMaterializationRequest::new(
+                    request.instance_id.clone(),
+                    target.clone(),
+                ))
+                .await
+                .map_err(ReportIdleError::Store)?;
+
+            if materialization.as_ref().is_some_and(|materialization| {
+                materialization.state == MaterializationState::Deleting
+            }) {
+                return cleanup_and_finalize_sleep(
+                    store,
+                    materializer,
+                    target,
+                    current,
+                    materialization,
+                )
+                .await;
+            }
+
+            return Ok(ReportIdleResult::AlreadyDraining { instance: current });
+        }
+    }
+
+    if current.generation == request.expected_generation.next().next() {
+        if current.state == InstanceState::Cold {
+            return Ok(ReportIdleResult::Accepted { instance: current });
+        }
     }
 
     Err(ReportIdleError::GenerationConflict {
@@ -134,10 +203,48 @@ fn generation_mismatch_result(
     })
 }
 
-async fn load_instance(
-    store: &dyn ControlPlaneStore,
+async fn cleanup_and_finalize_sleep<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    instance: InstanceRecord,
+    materialization: Option<MaterializationRecord>,
+) -> Result<ReportIdleResult, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    if let Some(materialization) = materialization.as_ref() {
+        materializer
+            .delete_rendered_objects(&materialization.rendered_objects)
+            .await
+            .map_err(|source| ReportIdleError::Materializer {
+                instance: instance.clone(),
+                source,
+            })?;
+    }
+
+    let finalized = store
+        .finalize_sleep(FinalizeSleepRequest::new(
+            instance.id,
+            instance.generation,
+            target,
+        ))
+        .await
+        .map_err(map_finalize_store_error)?;
+
+    Ok(ReportIdleResult::Accepted {
+        instance: finalized.instance,
+    })
+}
+
+async fn load_instance<S>(
+    store: &S,
     instance_id: InstanceId,
-) -> Result<InstanceRecord, ReportIdleError> {
+) -> Result<InstanceRecord, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+{
     store
         .get_instance(GetInstanceRequest::new(instance_id))
         .await
@@ -156,5 +263,15 @@ fn unavailable_reason_for_state(state: InstanceState) -> ReportIdleUnavailableRe
         InstanceState::Failed => ReportIdleUnavailableReason::Failed,
         InstanceState::Deleting => ReportIdleUnavailableReason::Deleting,
         InstanceState::Deleted => ReportIdleUnavailableReason::Deleted,
+    }
+}
+
+fn map_finalize_store_error(error: StoreError) -> ReportIdleError {
+    match error {
+        StoreError::NotFound { .. } => ReportIdleError::NotFound,
+        StoreError::GenerationConflict { expected, actual } => {
+            ReportIdleError::GenerationConflict { expected, actual }
+        }
+        other => ReportIdleError::Store(other),
     }
 }

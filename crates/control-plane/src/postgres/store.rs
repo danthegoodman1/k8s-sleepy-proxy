@@ -8,8 +8,9 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
-        MaterializationRecord, RecordMaterializationRequest,
+        BeginSleepRequest, BeginSleepResult, CompleteWakeRequest, CompleteWakeResult,
+        FinalizeSleepRequest, FinalizeSleepResult, LoadActiveMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationRecord, RecordMaterializationRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
@@ -111,11 +112,34 @@ impl ControlPlaneStore for PostgresStore {
         )
     }
 
+    fn load_active_materialization<'a>(
+        &'a self,
+        request: LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(
+            async move { materialization_ops::load_active_materialization(self, request).await },
+        )
+    }
+
     fn complete_wake<'a>(
         &'a self,
         request: CompleteWakeRequest,
     ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
         Box::pin(async move { materialization_ops::complete_wake(self, request).await })
+    }
+
+    fn begin_sleep<'a>(
+        &'a self,
+        request: BeginSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
+        Box::pin(async move { materialization_ops::begin_sleep(self, request).await })
+    }
+
+    fn finalize_sleep<'a>(
+        &'a self,
+        request: FinalizeSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        Box::pin(async move { materialization_ops::finalize_sleep(self, request).await })
     }
 
     fn lookup_route_dependencies<'a>(

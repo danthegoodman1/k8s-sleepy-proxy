@@ -10,9 +10,12 @@ use control_plane::api::{
     OPERATOR_UNARY_METHODS, SIDECAR_SERVICE_NAME,
 };
 use control_plane::{
-    ControlPlaneStore, Generation, InstanceId, InstanceRecord,
-    InstanceState as DomainInstanceState, StateTransitionReason, StoreError, StoreFuture,
-    StoreResult,
+    BackendEndpoint, BeginSleepRequest, BeginSleepResult, ControlPlaneStore, FinalizeSleepRequest,
+    FinalizeSleepResult, Generation, InstanceId, InstanceRecord,
+    InstanceState as DomainInstanceState, KubernetesClientFuture, KubernetesClientResult,
+    KubernetesMaterializer, KubernetesMaterializerClient, MaterializationId, MaterializationRecord,
+    MaterializationState, MaterializationTarget, RenderedObjectRef, StateTransitionReason,
+    StoreError, StoreFuture, StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -45,7 +48,7 @@ fn generated_api_contains_sidecar_report_idle_shape_without_operator_surface_cha
         Some(sidecar_report_idle_response::Outcome::Accepted(_))
     ));
     assert_eq!(
-        <StoreBackedSidecarGrpcService as NamedService>::NAME,
+        <StoreBackedSidecarGrpcService<FakeKubernetesClient> as NamedService>::NAME,
         SIDECAR_SERVICE_NAME
     );
     assert!(!OPERATOR_UNARY_METHODS.contains(&"ReportIdle"));
@@ -60,7 +63,9 @@ async fn report_idle_running_instance_transitions_to_draining() {
         DomainInstanceState::Running,
         7,
     ));
-    let service = StoreBackedSidecarApi::new(store.clone());
+    store.seed_materialization(ready_materialization("instance-running", 7));
+    let client = FakeKubernetesClient::default();
+    let service = sidecar_api(store.clone(), client.clone());
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -74,16 +79,90 @@ async fn report_idle_running_instance_transitions_to_draining() {
 
     let accepted = expect_accepted(response);
     assert_eq!(accepted.instance_id, "instance-running");
-    assert_eq!(accepted.instance_generation, 8);
+    assert_eq!(accepted.instance_generation, 9);
 
     let instance = store.instance();
-    assert_eq!(instance.state, DomainInstanceState::Draining);
-    assert_eq!(instance.generation, Generation::new(8));
+    assert_eq!(instance.state, DomainInstanceState::Cold);
+    assert_eq!(instance.generation, Generation::new(9));
     let transitions = store.transition_requests();
-    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions.len(), 2);
     assert_eq!(transitions[0].expected_generation, Generation::new(7));
     assert_eq!(transitions[0].next_state, DomainInstanceState::Draining);
     assert_eq!(transitions[0].reason, StateTransitionReason::IdleReported);
+    assert_eq!(transitions[1].expected_generation, Generation::new(8));
+    assert_eq!(transitions[1].next_state, DomainInstanceState::Cold);
+    assert_eq!(transitions[1].reason, StateTransitionReason::DrainCompleted);
+    assert_eq!(
+        client.deleted_objects(),
+        vec![object_ref(
+            "apps/v1",
+            "Deployment",
+            "apps",
+            "instance-running"
+        )]
+    );
+    let materialization = store
+        .materialization()
+        .expect("materialization remains recorded");
+    assert_eq!(materialization.state, MaterializationState::Deleted);
+    assert!(materialization.rendered_objects.is_empty());
+}
+
+#[tokio::test]
+async fn report_idle_delete_failure_stays_draining_and_retry_resumes_cleanup() {
+    let store = Arc::new(FakeSidecarStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-retry",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_materialization(ready_materialization("instance-delete-retry", 7));
+    let client = FakeKubernetesClient::failing_deletes(1);
+    let service = sidecar_api(store.clone(), client.clone());
+    let request = SidecarReportIdleRequest {
+        instance_id: "instance-delete-retry".to_owned(),
+        expected_generation: 7,
+        active_count: 0,
+    };
+
+    let error = service
+        .report_idle(tonic::Request::new(request.clone()))
+        .await
+        .expect_err("first delete failure is retryable");
+
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("sleep cleanup failed"));
+    assert_eq!(store.instance().state, DomainInstanceState::Draining);
+    assert_eq!(store.instance().generation, Generation::new(8));
+    let materialization = store
+        .materialization()
+        .expect("materialization remains after failed delete");
+    assert_eq!(materialization.state, MaterializationState::Deleting);
+    assert_eq!(
+        materialization.rendered_objects,
+        vec![object_ref(
+            "apps/v1",
+            "Deployment",
+            "apps",
+            "instance-delete-retry"
+        )]
+    );
+
+    let response = service
+        .report_idle(tonic::Request::new(request))
+        .await
+        .expect("retry resumes cleanup")
+        .into_inner();
+
+    let accepted = expect_accepted(response);
+    assert_eq!(accepted.instance_id, "instance-delete-retry");
+    assert_eq!(accepted.instance_generation, 9);
+    assert_eq!(store.instance().state, DomainInstanceState::Cold);
+    let materialization = store
+        .materialization()
+        .expect("materialization remains recorded");
+    assert_eq!(materialization.state, MaterializationState::Deleted);
+    assert!(materialization.rendered_objects.is_empty());
 }
 
 #[tokio::test]
@@ -94,7 +173,7 @@ async fn report_idle_nonzero_active_count_returns_failed_precondition_without_mu
         DomainInstanceState::Running,
         7,
     ));
-    let service = StoreBackedSidecarApi::new(store.clone());
+    let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
 
     let error = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -121,7 +200,7 @@ async fn report_idle_duplicate_at_next_draining_generation_is_idempotent() {
         DomainInstanceState::Draining,
         8,
     ));
-    let service = StoreBackedSidecarApi::new(store.clone());
+    let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -149,7 +228,7 @@ async fn report_idle_stale_generation_conflict_is_structured_response() {
         DomainInstanceState::Draining,
         8,
     ));
-    let service = StoreBackedSidecarApi::new(store.clone());
+    let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -176,7 +255,7 @@ async fn report_idle_non_running_matching_generation_returns_unavailable() {
         DomainInstanceState::Waking,
         4,
     ));
-    let service = StoreBackedSidecarApi::new(store.clone());
+    let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -201,7 +280,10 @@ async fn report_idle_non_running_matching_generation_returns_unavailable() {
 
 #[tokio::test]
 async fn report_idle_invalid_instance_id_returns_invalid_argument() {
-    let service = StoreBackedSidecarApi::new(Arc::new(FakeSidecarStore::default()));
+    let service = sidecar_api(
+        Arc::new(FakeSidecarStore::default()),
+        FakeKubernetesClient::default(),
+    );
 
     let error = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -220,7 +302,7 @@ async fn report_idle_invalid_instance_id_returns_invalid_argument() {
 async fn report_idle_store_unavailable_returns_grpc_unavailable() {
     let store = Arc::new(FakeSidecarStore::default());
     store.fail_get_with(FakeStoreError::Unavailable("database is down"));
-    let service = StoreBackedSidecarApi::new(store);
+    let service = sidecar_api(store, FakeKubernetesClient::default());
 
     let error = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -244,18 +326,22 @@ async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
         2,
     ));
 
-    let response = sidecar_grpc_service_with_store(store.clone())
-        .oneshot(grpc_sidecar_report_idle_request(
-            SidecarReportIdleRequest {
-                instance_id: "instance-transport".to_owned(),
-                expected_generation: 2,
-                active_count: 0,
-            },
-            "application/grpc",
-            Version::HTTP_2,
-        ))
-        .await
-        .expect("native gRPC request should route through sidecar service");
+    let response = sidecar_grpc_service_with_store(
+        store.clone(),
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        target(),
+    )
+    .oneshot(grpc_sidecar_report_idle_request(
+        SidecarReportIdleRequest {
+            instance_id: "instance-transport".to_owned(),
+            expected_generation: 2,
+            active_count: 0,
+        },
+        "application/grpc",
+        Version::HTTP_2,
+    ))
+    .await
+    .expect("native gRPC request should route through sidecar service");
     let headers = response.headers().clone();
     let collected = response
         .into_body()
@@ -274,8 +360,8 @@ async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
         collected.to_bytes().as_ref(),
     ));
     assert_eq!(accepted.instance_id, "instance-transport");
-    assert_eq!(accepted.instance_generation, 3);
-    assert_eq!(store.instance().state, DomainInstanceState::Draining);
+    assert_eq!(accepted.instance_generation, 4);
+    assert_eq!(store.instance().state, DomainInstanceState::Cold);
 }
 
 fn grpc_sidecar_report_idle_request(
@@ -312,6 +398,13 @@ fn decode_grpc_sidecar_report_idle_response(bytes: &[u8]) -> SidecarReportIdleRe
             .expect("gRPC response frame has a length prefix"),
     ) as usize;
     SidecarReportIdleResponse::decode(&bytes[5..5 + length]).expect("gRPC response decodes")
+}
+
+fn sidecar_api(
+    store: Arc<FakeSidecarStore>,
+    client: FakeKubernetesClient,
+) -> StoreBackedSidecarApi<FakeKubernetesClient> {
+    StoreBackedSidecarApi::new(store, KubernetesMaterializer::new(client), target())
 }
 
 fn expect_accepted(
@@ -360,9 +453,84 @@ enum FakeStoreError {
     Unavailable(&'static str),
 }
 
+#[derive(Clone, Debug, Default)]
+struct FakeKubernetesClient {
+    deleted_objects: Arc<Mutex<Vec<RenderedObjectRef>>>,
+    failing_deletes: Arc<Mutex<usize>>,
+}
+
+impl FakeKubernetesClient {
+    fn failing_deletes(count: usize) -> Self {
+        Self {
+            deleted_objects: Arc::new(Mutex::new(Vec::new())),
+            failing_deletes: Arc::new(Mutex::new(count)),
+        }
+    }
+
+    fn deleted_objects(&self) -> Vec<RenderedObjectRef> {
+        self.deleted_objects
+            .lock()
+            .expect("fake kubernetes lock is available")
+            .clone()
+    }
+}
+
+impl KubernetesMaterializerClient for FakeKubernetesClient {
+    fn apply_object<'a>(
+        &'a self,
+        _object: &'a control_plane::KubernetesObject,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn delete_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            let mut failing_deletes = self
+                .failing_deletes
+                .lock()
+                .expect("fake kubernetes lock is available");
+            if *failing_deletes > 0 {
+                *failing_deletes -= 1;
+                return Err(control_plane::KubernetesClientError::new(
+                    "transient delete failure",
+                ));
+            }
+            drop(failing_deletes);
+
+            self.deleted_objects
+                .lock()
+                .expect("fake kubernetes lock is available")
+                .push(object.clone());
+            Ok(())
+        })
+    }
+
+    fn wait_for_pvc_bound<'a>(
+        &'a self,
+        _namespace: &'a str,
+        _name: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn wait_for_readiness<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
+        Box::pin(async {
+            BackendEndpoint::new("http://example")
+                .map_err(|error| control_plane::KubernetesClientError::new(error.to_string()))
+        })
+    }
+}
+
 #[derive(Default)]
 struct FakeSidecarStore {
     instance: Mutex<Option<InstanceRecord>>,
+    materialization: Mutex<Option<MaterializationRecord>>,
     transition_requests: Mutex<Vec<control_plane::CompareAndSwapInstanceStateRequest>>,
     get_error: Mutex<Option<FakeStoreError>>,
 }
@@ -370,6 +538,13 @@ struct FakeSidecarStore {
 impl FakeSidecarStore {
     fn seed_instance(&self, instance: InstanceRecord) {
         *self.instance.lock().expect("fake store lock is available") = Some(instance);
+    }
+
+    fn seed_materialization(&self, materialization: MaterializationRecord) {
+        *self
+            .materialization
+            .lock()
+            .expect("fake store lock is available") = Some(materialization);
     }
 
     fn fail_get_with(&self, error: FakeStoreError) {
@@ -389,6 +564,87 @@ impl FakeSidecarStore {
             .lock()
             .expect("fake store lock is available")
             .clone()
+    }
+
+    fn materialization(&self) -> Option<MaterializationRecord> {
+        self.materialization
+            .lock()
+            .expect("fake store lock is available")
+            .clone()
+    }
+
+    fn transition_instance(
+        &self,
+        instance_id: InstanceId,
+        expected_generation: Generation,
+        next_state: DomainInstanceState,
+        reason: StateTransitionReason,
+    ) -> StoreResult<InstanceRecord> {
+        let mut instance = self.instance.lock().expect("fake store lock is available");
+        let instance = instance.as_mut().ok_or(StoreError::NotFound {
+            resource: "instance",
+        })?;
+        if instance.id != instance_id {
+            return Err(StoreError::NotFound {
+                resource: "instance",
+            });
+        }
+        if instance.generation != expected_generation {
+            return Err(StoreError::GenerationConflict {
+                expected: expected_generation,
+                actual: instance.generation,
+            });
+        }
+
+        control_plane::instance::validate_instance_state_transition(
+            instance.state,
+            next_state,
+            &reason,
+        )
+        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+
+        self.transition_requests
+            .lock()
+            .expect("fake store lock is available")
+            .push(control_plane::CompareAndSwapInstanceStateRequest {
+                instance_id,
+                expected_generation,
+                next_state,
+                reason,
+            });
+        instance.state = next_state;
+        instance.generation = expected_generation.next();
+        Ok(instance.clone())
+    }
+
+    fn mark_materialization(
+        &self,
+        instance_id: InstanceId,
+        target: MaterializationTarget,
+        state: MaterializationState,
+        instance_generation: Option<Generation>,
+        rendered_objects: Option<Vec<RenderedObjectRef>>,
+    ) -> Option<MaterializationRecord> {
+        let mut materialization = self
+            .materialization
+            .lock()
+            .expect("fake store lock is available");
+        let materialization = materialization.as_mut().filter(|materialization| {
+            materialization.instance_id == instance_id
+                && materialization.target == target
+                && materialization.state != MaterializationState::Deleted
+        })?;
+
+        materialization.state = state;
+        materialization.backend = None;
+        if let Some(instance_generation) = instance_generation {
+            materialization.instance_generation = instance_generation;
+        }
+        if let Some(rendered_objects) = rendered_objects {
+            materialization.rendered_objects = rendered_objects;
+        }
+
+        Some(materialization.clone())
     }
 }
 
@@ -522,11 +778,82 @@ impl ControlPlaneStore for FakeSidecarStore {
         Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
     }
 
+    fn load_active_materialization<'a>(
+        &'a self,
+        request: control_plane::LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .materialization
+                .lock()
+                .expect("fake store lock is available")
+                .as_ref()
+                .filter(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.target == request.target
+                        && materialization.state != MaterializationState::Deleted
+                })
+                .cloned())
+        })
+    }
+
     fn complete_wake<'a>(
         &'a self,
         _request: control_plane::CompleteWakeRequest,
     ) -> StoreFuture<'a, StoreResult<control_plane::CompleteWakeResult>> {
         Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn begin_sleep<'a>(
+        &'a self,
+        request: BeginSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
+        Box::pin(async move {
+            let updated = self.transition_instance(
+                request.instance_id.clone(),
+                request.expected_running_generation,
+                DomainInstanceState::Draining,
+                StateTransitionReason::IdleReported,
+            )?;
+            let materialization = self.mark_materialization(
+                request.instance_id,
+                request.target,
+                MaterializationState::Deleting,
+                None,
+                None,
+            );
+
+            Ok(BeginSleepResult {
+                instance: updated,
+                materialization,
+            })
+        })
+    }
+
+    fn finalize_sleep<'a>(
+        &'a self,
+        request: FinalizeSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        Box::pin(async move {
+            let updated = self.transition_instance(
+                request.instance_id.clone(),
+                request.expected_draining_generation,
+                DomainInstanceState::Cold,
+                StateTransitionReason::DrainCompleted,
+            )?;
+            let materialization = self.mark_materialization(
+                request.instance_id,
+                request.target,
+                MaterializationState::Deleted,
+                Some(updated.generation),
+                Some(Vec::new()),
+            );
+
+            Ok(FinalizeSleepResult {
+                instance: updated,
+                materialization,
+            })
+        })
     }
 
     fn lookup_route_dependencies<'a>(
@@ -575,5 +902,32 @@ fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> Ins
         values: Default::default(),
         state,
         generation: Generation::new(generation),
+    }
+}
+
+fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationRecord {
+    MaterializationRecord {
+        id: MaterializationId::new(format!("{}:cluster-a:apps", instance_id))
+            .expect("materialization id is valid"),
+        instance_id: InstanceId::new(instance_id).expect("instance id is valid"),
+        instance_generation: Generation::new(generation),
+        target: target(),
+        state: MaterializationState::Ready,
+        backend: Some(BackendEndpoint::new("http://example").expect("backend is valid")),
+        backend_generation: control_plane::BackendGeneration::new(generation),
+        rendered_objects: vec![object_ref("apps/v1", "Deployment", "apps", instance_id)],
+    }
+}
+
+fn target() -> MaterializationTarget {
+    MaterializationTarget::new("cluster-a", "apps").expect("target is valid")
+}
+
+fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
+    RenderedObjectRef {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
     }
 }

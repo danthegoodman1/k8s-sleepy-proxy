@@ -4,8 +4,10 @@ use crate::{
     ids::Generation,
     instance::{validate_instance_state_transition, InstanceState, StateTransitionReason},
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
-        MaterializationRecord, MaterializationState, RecordMaterializationRequest,
+        BeginSleepRequest, BeginSleepResult, CompleteWakeRequest, CompleteWakeResult,
+        FinalizeSleepRequest, FinalizeSleepResult, LoadActiveMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationRecord, MaterializationState,
+        RecordMaterializationRequest,
     },
     store::{StoreError, StoreResult},
 };
@@ -60,6 +62,15 @@ pub(crate) async fn load_ready_materialization(
         .map_err(map_postgres_error)?;
 
     row.as_ref().map(materialization_from_row).transpose()
+}
+
+pub(crate) async fn load_active_materialization(
+    store: &PostgresStore,
+    request: LoadActiveMaterializationRequest,
+) -> StoreResult<Option<MaterializationRecord>> {
+    let client = store.client().await?;
+
+    load_active_materialization_from_client(&client, &request).await
 }
 
 pub(crate) async fn complete_wake(
@@ -141,6 +152,158 @@ pub(crate) async fn complete_wake(
     })
 }
 
+pub(crate) async fn begin_sleep(
+    store: &PostgresStore,
+    request: BeginSleepRequest,
+) -> StoreResult<BeginSleepResult> {
+    let mut client = store.client().await?;
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    let instance_id = request.instance_id.as_str();
+    let current = transaction
+        .query_opt(
+            "
+            SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
+            FROM instances
+            WHERE instance_id = $1
+            FOR UPDATE
+            ",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(row) = current else {
+        return Err(StoreError::NotFound {
+            resource: "instance",
+        });
+    };
+    let current = instance_from_row(&row)?;
+
+    if current.generation != request.expected_running_generation {
+        return Err(StoreError::GenerationConflict {
+            expected: request.expected_running_generation,
+            actual: current.generation,
+        });
+    }
+
+    validate_instance_state_transition(
+        current.state,
+        InstanceState::Draining,
+        &StateTransitionReason::IdleReported,
+    )
+    .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+
+    let draining_generation = request.expected_running_generation.next();
+    let draining_generation_db = generation_to_i64(draining_generation)?;
+    let draining_state = instance_state_to_db(InstanceState::Draining);
+    let row = transaction
+        .query_one(
+            "
+            UPDATE instances
+            SET state = $2,
+                generation = $3,
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1
+            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
+            ",
+            &[&instance_id, &draining_state, &draining_generation_db],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let instance = instance_from_row(&row)?;
+    let materialization = mark_active_materialization_deleting_for_sleep(
+        &transaction,
+        &request.instance_id,
+        &request.target,
+        request.expected_running_generation,
+    )
+    .await?;
+
+    transaction.commit().await.map_err(map_postgres_error)?;
+
+    Ok(BeginSleepResult {
+        instance,
+        materialization,
+    })
+}
+
+pub(crate) async fn finalize_sleep(
+    store: &PostgresStore,
+    request: FinalizeSleepRequest,
+) -> StoreResult<FinalizeSleepResult> {
+    let mut client = store.client().await?;
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    let instance_id = request.instance_id.as_str();
+    let current = transaction
+        .query_opt(
+            "
+            SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
+            FROM instances
+            WHERE instance_id = $1
+            FOR UPDATE
+            ",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(row) = current else {
+        return Err(StoreError::NotFound {
+            resource: "instance",
+        });
+    };
+    let current = instance_from_row(&row)?;
+
+    if current.generation != request.expected_draining_generation {
+        return Err(StoreError::GenerationConflict {
+            expected: request.expected_draining_generation,
+            actual: current.generation,
+        });
+    }
+
+    validate_instance_state_transition(
+        current.state,
+        InstanceState::Cold,
+        &StateTransitionReason::DrainCompleted,
+    )
+    .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+
+    let cold_generation = request.expected_draining_generation.next();
+    let cold_generation_db = generation_to_i64(cold_generation)?;
+    let cold_state = instance_state_to_db(InstanceState::Cold);
+    let row = transaction
+        .query_one(
+            "
+            UPDATE instances
+            SET state = $2,
+                generation = $3,
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1
+            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
+            ",
+            &[&instance_id, &cold_state, &cold_generation_db],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let instance = instance_from_row(&row)?;
+    let materialization = mark_active_materialization_state(
+        &transaction,
+        &request.instance_id,
+        &request.target,
+        MaterializationState::Deleted,
+        Some(cold_generation),
+        Some(&[]),
+    )
+    .await?;
+
+    transaction.commit().await.map_err(map_postgres_error)?;
+
+    Ok(FinalizeSleepResult {
+        instance,
+        materialization,
+    })
+}
+
 async fn upsert_materialization(
     client: &impl GenericClient,
     request: &RecordMaterializationRequest,
@@ -211,6 +374,172 @@ async fn upsert_materialization(
     };
 
     materialization_from_row(&row)
+}
+
+async fn load_active_materialization_from_client(
+    client: &impl GenericClient,
+    request: &LoadActiveMaterializationRequest,
+) -> StoreResult<Option<MaterializationRecord>> {
+    let instance_id = request.instance_id.as_str();
+    let cluster_id = request.target.cluster_id();
+    let namespace = request.target.namespace();
+    let row = client
+        .query_opt(
+            "
+            SELECT materialization_id, instance_id, instance_generation, cluster_id,
+                namespace, state, backend_uri, backend_generation, rendered_objects
+            FROM materializations
+            WHERE instance_id = $1
+                AND cluster_id = $2
+                AND namespace = $3
+                AND state <> 'deleted'
+            ",
+            &[&instance_id, &cluster_id, &namespace],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.as_ref().map(materialization_from_row).transpose()
+}
+
+async fn mark_active_materialization_state(
+    client: &impl GenericClient,
+    instance_id: &crate::ids::InstanceId,
+    target: &crate::materialization::MaterializationTarget,
+    state: MaterializationState,
+    instance_generation: Option<Generation>,
+    rendered_objects: Option<&[crate::materialization::RenderedObjectRef]>,
+) -> StoreResult<Option<MaterializationRecord>> {
+    let instance_id = instance_id.as_str();
+    let cluster_id = target.cluster_id();
+    let namespace = target.namespace();
+    let state = materialization_state_to_db(state);
+    let rendered_objects = rendered_objects.map(rendered_objects_to_json);
+
+    let row = if let Some(instance_generation) = instance_generation {
+        let instance_generation = generation_to_i64(instance_generation)?;
+        client
+            .query_opt(
+                "
+                UPDATE materializations
+                SET state = $4,
+                    instance_generation = $5,
+                    backend_uri = NULL,
+                    rendered_objects = COALESCE($6, rendered_objects),
+                    updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                WHERE instance_id = $1
+                    AND cluster_id = $2
+                    AND namespace = $3
+                    AND state <> 'deleted'
+                RETURNING materialization_id, instance_id, instance_generation, cluster_id,
+                    namespace, state, backend_uri, backend_generation, rendered_objects
+                ",
+                &[
+                    &instance_id,
+                    &cluster_id,
+                    &namespace,
+                    &state,
+                    &instance_generation,
+                    &rendered_objects,
+                ],
+            )
+            .await
+            .map_err(map_postgres_error)?
+    } else {
+        client
+            .query_opt(
+                "
+                UPDATE materializations
+                SET state = $4,
+                    backend_uri = NULL,
+                    updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                WHERE instance_id = $1
+                    AND cluster_id = $2
+                    AND namespace = $3
+                    AND state <> 'deleted'
+                RETURNING materialization_id, instance_id, instance_generation, cluster_id,
+                    namespace, state, backend_uri, backend_generation, rendered_objects
+                ",
+                &[&instance_id, &cluster_id, &namespace, &state],
+            )
+            .await
+            .map_err(map_postgres_error)?
+    };
+
+    row.as_ref().map(materialization_from_row).transpose()
+}
+
+async fn mark_active_materialization_deleting_for_sleep(
+    client: &impl GenericClient,
+    instance_id: &crate::ids::InstanceId,
+    target: &crate::materialization::MaterializationTarget,
+    expected_instance_generation: Generation,
+) -> StoreResult<Option<MaterializationRecord>> {
+    let instance_id_value = instance_id.as_str();
+    let cluster_id = target.cluster_id();
+    let namespace = target.namespace();
+    let state = materialization_state_to_db(MaterializationState::Deleting);
+    let expected_generation_db = generation_to_i64(expected_instance_generation)?;
+    let row = client
+        .query_opt(
+            "
+            UPDATE materializations
+            SET state = $5,
+                backend_uri = NULL,
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1
+                AND cluster_id = $2
+                AND namespace = $3
+                AND instance_generation = $4
+                AND state <> 'deleted'
+            RETURNING materialization_id, instance_id, instance_generation, cluster_id,
+                namespace, state, backend_uri, backend_generation, rendered_objects
+            ",
+            &[
+                &instance_id_value,
+                &cluster_id,
+                &namespace,
+                &expected_generation_db,
+                &state,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    if let Some(row) = row {
+        return materialization_from_row(&row).map(Some);
+    }
+
+    reject_active_materialization_generation_mismatch(
+        client,
+        instance_id,
+        target,
+        expected_instance_generation,
+    )
+    .await?;
+
+    Ok(None)
+}
+
+async fn reject_active_materialization_generation_mismatch(
+    client: &impl GenericClient,
+    instance_id: &crate::ids::InstanceId,
+    target: &crate::materialization::MaterializationTarget,
+    expected_instance_generation: Generation,
+) -> StoreResult<()> {
+    let request = LoadActiveMaterializationRequest::new(instance_id.clone(), target.clone());
+    let Some(active) = load_active_materialization_from_client(client, &request).await? else {
+        return Ok(());
+    };
+
+    if active.instance_generation == expected_instance_generation {
+        return Ok(());
+    }
+
+    Err(StoreError::GenerationConflict {
+        expected: expected_instance_generation,
+        actual: active.instance_generation,
+    })
 }
 
 async fn ensure_instance_generation(

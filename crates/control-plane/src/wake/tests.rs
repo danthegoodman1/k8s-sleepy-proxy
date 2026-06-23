@@ -16,8 +16,9 @@ use crate::{
         WorkloadKind, WorkloadTemplate,
     },
     materialization::{
-        BackendEndpoint, LoadReadyMaterializationRequest, MaterializationRecord,
-        MaterializationState, RecordMaterializationRequest,
+        BackendEndpoint, BeginSleepRequest, BeginSleepResult, FinalizeSleepRequest,
+        FinalizeSleepResult, LoadActiveMaterializationRequest, LoadReadyMaterializationRequest,
+        MaterializationRecord, MaterializationState, RecordMaterializationRequest,
     },
     materializer::{
         KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
@@ -64,6 +65,10 @@ enum StoreEvent {
         expected_waking_generation: Generation,
         backend_generation: BackendGeneration,
         rendered_objects: Vec<RenderedObjectRef>,
+    },
+    LoadActiveMaterialization {
+        instance_id: InstanceId,
+        target: MaterializationTarget,
     },
     LoadReadyMaterialization {
         instance_id: InstanceId,
@@ -401,14 +406,27 @@ async fn failed_and_draining_instances_can_start_wake() {
 
         assert_eq!(result.instance().state, InstanceState::Running);
         assert_eq!(result.instance().generation, Generation::new(14));
-        assert_eq!(
-            store.events()[0],
-            StoreEvent::Cas {
-                expected: Generation::new(12),
-                next_state: InstanceState::Waking,
-                reason: StateTransitionReason::WakeRequested,
-            }
-        );
+        let mut expected_events = Vec::new();
+        if state == InstanceState::Draining {
+            expected_events.push(StoreEvent::LoadActiveMaterialization {
+                instance_id: instance_id("instance-a"),
+                target: target("cluster-a", "apps"),
+            });
+        }
+        expected_events.push(StoreEvent::Cas {
+            expected: Generation::new(12),
+            next_state: InstanceState::Waking,
+            reason: StateTransitionReason::WakeRequested,
+        });
+        expected_events.push(StoreEvent::Complete {
+            expected_waking_generation: Generation::new(13),
+            backend_generation: BackendGeneration::new(13),
+            rendered_objects: vec![
+                object_ref("v1", "Service", "apps", "svc-acme"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            ],
+        });
+        assert_eq!(store.events(), expected_events);
         assert_eq!(client.applied_objects().len(), 2);
     }
 }
@@ -498,6 +516,9 @@ async fn materializer_failure_marks_waking_generation_failed() {
                 StoreEvent::LoadReadyMaterialization { .. } => {
                     panic!("cold wake failure must not load materialization")
                 }
+                StoreEvent::LoadActiveMaterialization { .. } => {
+                    panic!("cold wake failure must not load active materialization")
+                }
             })
             .collect::<Vec<_>>(),
         vec![
@@ -586,6 +607,46 @@ async fn deleting_and_deleted_are_unavailable_and_do_not_apply() {
         assert!(store.events().is_empty());
         assert!(client.applied_objects().is_empty());
     }
+}
+
+#[tokio::test]
+async fn draining_with_deleting_materialization_waits_for_sleep_cleanup() {
+    let draining = instance("instance-a", InstanceState::Draining, 13);
+    let store = FakeStore::new(draining.clone(), Some(workload_class()));
+    store.set_materialization(materialization(
+        "instance-a",
+        12,
+        target("cluster-a", "apps"),
+        MaterializationState::Deleting,
+        None,
+    ));
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let result = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(13),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect("deleting materialization is treated as in-progress wake/sleep work");
+
+    assert_eq!(
+        result,
+        WakeInstanceResult::AlreadyWaking { instance: draining }
+    );
+    assert_eq!(
+        store.events(),
+        vec![StoreEvent::LoadActiveMaterialization {
+            instance_id: instance_id("instance-a"),
+            target: target("cluster-a", "apps"),
+        }]
+    );
+    assert!(client.applied_objects().is_empty());
 }
 
 impl FakeStore {
@@ -770,6 +831,28 @@ impl ControlPlaneStore for FakeStore {
         })
     }
 
+    fn load_active_materialization<'a>(
+        &'a self,
+        request: LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().expect("fake store lock not poisoned");
+            inner.events.push(StoreEvent::LoadActiveMaterialization {
+                instance_id: request.instance_id.clone(),
+                target: request.target.clone(),
+            });
+            Ok(inner
+                .materialization
+                .as_ref()
+                .filter(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.target == request.target
+                        && materialization.state != MaterializationState::Deleted
+                })
+                .cloned())
+        })
+    }
+
     fn complete_wake<'a>(
         &'a self,
         request: CompleteWakeRequest,
@@ -823,6 +906,20 @@ impl ControlPlaneStore for FakeStore {
                 materialization,
             })
         })
+    }
+
+    fn begin_sleep<'a>(
+        &'a self,
+        _request: BeginSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
+        Box::pin(async { Err(StoreError::internal("not implemented")) })
+    }
+
+    fn finalize_sleep<'a>(
+        &'a self,
+        _request: FinalizeSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        Box::pin(async { Err(StoreError::internal("not implemented")) })
     }
 
     fn lookup_route_dependencies<'a>(

@@ -120,10 +120,10 @@ where
         .add_service(operator_grpc_service_with_store(Arc::clone(&store)))
         .add_service(proxy_grpc_service_with_store(
             Arc::clone(&store),
-            materializer,
-            target,
+            materializer.clone(),
+            target.clone(),
         ))
-        .add_service(sidecar_grpc_service_with_store(store))
+        .add_service(sidecar_grpc_service_with_store(store, materializer, target))
 }
 
 pub fn operator_grpc_web_router(store: Arc<dyn ControlPlaneStore>) -> OperatorGrpcWebRouter {
@@ -564,10 +564,31 @@ mod tests {
             not_implemented()
         }
 
+        fn load_active_materialization<'a>(
+            &'a self,
+            _request: crate::LoadActiveMaterializationRequest,
+        ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+            not_implemented()
+        }
+
         fn complete_wake<'a>(
             &'a self,
             _request: CompleteWakeRequest,
         ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+            not_implemented()
+        }
+
+        fn begin_sleep<'a>(
+            &'a self,
+            _request: crate::BeginSleepRequest,
+        ) -> StoreFuture<'a, StoreResult<crate::BeginSleepResult>> {
+            not_implemented()
+        }
+
+        fn finalize_sleep<'a>(
+            &'a self,
+            _request: crate::FinalizeSleepRequest,
+        ) -> StoreFuture<'a, StoreResult<crate::FinalizeSleepResult>> {
             not_implemented()
         }
 

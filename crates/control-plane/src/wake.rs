@@ -8,8 +8,9 @@ use crate::{
     },
     manifest::{render_manifests, ManifestRenderError, RenderManifestRequest},
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, LoadReadyMaterializationRequest,
-        MaterializationRecord, MaterializationTarget,
+        CompleteWakeRequest, CompleteWakeResult, LoadActiveMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationRecord, MaterializationState,
+        MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     sleep_policy::SleepPolicyError,
@@ -139,7 +140,21 @@ where
                 reason: WakeUnavailableReason::Deleted,
             });
         }
-        InstanceState::Cold | InstanceState::Failed | InstanceState::Draining => {}
+        InstanceState::Draining => {
+            if let Some(materialization) = store
+                .load_active_materialization(LoadActiveMaterializationRequest::new(
+                    request.instance_id.clone(),
+                    request.target.clone(),
+                ))
+                .await
+                .map_err(map_store_error)?
+            {
+                if materialization.state == MaterializationState::Deleting {
+                    return Ok(WakeInstanceResult::AlreadyWaking { instance });
+                }
+            }
+        }
+        InstanceState::Cold | InstanceState::Failed => {}
     }
 
     let waking = store

@@ -1074,6 +1074,25 @@ impl ControlPlaneStore for FakeWakeStore {
         })
     }
 
+    fn load_active_materialization<'a>(
+        &'a self,
+        request: control_plane::LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .materializations
+                .lock()
+                .expect("fake store lock is available")
+                .iter()
+                .find(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.target == request.target
+                        && materialization.state != MaterializationState::Deleted
+                })
+                .cloned())
+        })
+    }
+
     fn complete_wake<'a>(
         &'a self,
         request: control_plane::CompleteWakeRequest,
@@ -1121,6 +1140,20 @@ impl ControlPlaneStore for FakeWakeStore {
                 materialization,
             })
         })
+    }
+
+    fn begin_sleep<'a>(
+        &'a self,
+        _request: control_plane::BeginSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::BeginSleepResult>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn finalize_sleep<'a>(
+        &'a self,
+        _request: control_plane::FinalizeSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::FinalizeSleepResult>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
     }
 
     fn lookup_route_dependencies<'a>(
