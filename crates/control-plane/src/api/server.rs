@@ -3,8 +3,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{
+    codegen::http::{header, HeaderName, Method},
+    transport::Server,
+    Request, Response, Status,
+};
 use tower::layer::util::{Identity, Stack};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
     api::pb::{
@@ -61,7 +66,8 @@ impl StoreBackedOperatorApi {
 
 pub type OperatorGrpcService = OperatorControlPlaneServer<OperatorApiPlaceholder>;
 pub type StoreBackedOperatorGrpcService = OperatorControlPlaneServer<StoreBackedOperatorApi>;
-pub type OperatorGrpcWebServerBuilder = Server<Stack<tonic_web::GrpcWebLayer, Identity>>;
+pub type OperatorGrpcWebServerBuilder =
+    Server<Stack<CorsLayer, Stack<tonic_web::GrpcWebLayer, Identity>>>;
 
 pub fn operator_grpc_service() -> OperatorGrpcService {
     OperatorControlPlaneServer::new(OperatorApiPlaceholder::new())
@@ -81,6 +87,26 @@ pub fn operator_grpc_web_server_builder() -> OperatorGrpcWebServerBuilder {
     Server::builder()
         .accept_http1(true)
         .layer(tonic_web::GrpcWebLayer::new())
+        .layer(operator_grpc_web_cors_layer())
+}
+
+pub fn operator_grpc_web_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("grpc-timeout"),
+            HeaderName::from_static("x-grpc-web"),
+            HeaderName::from_static("x-sleepypods-operator"),
+            HeaderName::from_static("x-user-agent"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("grpc-status"),
+            HeaderName::from_static("grpc-message"),
+            HeaderName::from_static("grpc-status-details-bin"),
+        ])
 }
 
 fn placeholder_status(method: &'static str) -> Status {

@@ -4,23 +4,25 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
     operator_grpc_server_builder, operator_grpc_service, operator_grpc_service_with_store,
-    operator_grpc_web_server_builder,
+    operator_grpc_web_cors_layer, operator_grpc_web_server_builder,
     pb::{
-        operator_control_plane_server::OperatorControlPlane, persistent_volume_source_template,
-        route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
-        CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
-        CsiVolumeSourceTemplate, DeleteHttp01ChallengeRequest, DeleteInstanceRequest,
-        DeleteRouteBindingRequest, EnvVarTemplate, ExpireHttp01ChallengesRequest,
-        GetInstanceRequest, GetRouteBindingRequest, GetWorkloadClassVersionRequest,
-        HostPathVolumeSourceTemplate, Http01ChallengeKey, HttpRouteIdentity,
-        IdleTimeoutOverridePolicy, Instance, InstanceState, ManifestTemplate,
-        PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
-        ProtocolRoute, PutHttp01ChallengeRequest, ResolveHttp01ChallengeRequest, RouteBinding,
-        RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate,
-        SidecarTemplate, SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate,
+        operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
+        persistent_volume_source_template, route_identity, template_text_part,
+        ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
+        CreateWorkloadClassVersionRequest, CsiVolumeSourceTemplate, DeleteHttp01ChallengeRequest,
+        DeleteHttp01ChallengeResponse, DeleteInstanceRequest, DeleteInstanceResponse,
+        DeleteRouteBindingRequest, DeleteRouteBindingResponse, EnvVarTemplate,
+        ExpireHttp01ChallengesRequest, GetInstanceRequest, GetRouteBindingRequest,
+        GetWorkloadClassVersionRequest, HostPathVolumeSourceTemplate, Http01Challenge,
+        Http01ChallengeKey, HttpRouteIdentity, IdleTimeoutOverridePolicy, Instance, InstanceState,
+        ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+        PersistentVolumeSourceTemplate, ProtocolRoute, PutHttp01ChallengeRequest,
+        ResolveHttp01ChallengeRequest, ResolveHttp01ChallengeResponse, RouteBinding, RouteHost,
+        RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+        SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersion,
         WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
         WorkloadValueFieldRule, WorkloadValueSchema,
     },
@@ -33,9 +35,9 @@ use control_plane::{
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use tonic::body::Body;
-use tonic::codegen::http::{header, Request, Version};
+use tonic::codegen::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 use tonic::server::NamedService;
-use tonic::Code;
+use tonic::{Code, Response, Status};
 use tower::{Layer, ServiceExt};
 
 #[test]
@@ -614,6 +616,458 @@ fn grpc_web_server_wraps_same_operator_service_surface() {
 }
 
 #[tokio::test]
+async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
+    let store: Arc<dyn ControlPlaneStore> = Arc::new(FakeInstanceStore::default());
+    let template = stateful_manifest_template_proto();
+
+    let created_class: WorkloadClassVersion = grpc_web_store_unary(
+        Arc::clone(&store),
+        "CreateWorkloadClassVersion",
+        CreateWorkloadClassVersionRequest {
+            idempotency_key: "grpc-web-create-class".to_owned(),
+            class_id: "class-grpc-web".to_owned(),
+            version: 11,
+            default_values: [("image".to_owned(), "example/app:grpc-web".to_owned())].into(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: [(
+                    "tenant".to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )]
+                .into(),
+                allow_extra: false,
+            }),
+            template_generation: 5,
+            template: Some(template.clone()),
+            sleep_policy: Some(sleep_policy_proto()),
+        },
+    )
+    .await;
+    assert_eq!(created_class.template_generation, 5);
+
+    let loaded_class: WorkloadClassVersion = grpc_web_store_unary(
+        Arc::clone(&store),
+        "GetWorkloadClassVersion",
+        GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "class-grpc-web".to_owned(),
+                version: 11,
+            }),
+        },
+    )
+    .await;
+    assert_eq!(loaded_class, created_class);
+
+    let created_instance: Instance = grpc_web_store_unary(
+        Arc::clone(&store),
+        "CreateInstance",
+        CreateInstanceRequest {
+            idempotency_key: "grpc-web-create-instance".to_owned(),
+            instance_id: "instance-grpc-web".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-grpc-web".to_owned(),
+                version: 11,
+            }),
+            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+        },
+    )
+    .await;
+    assert_eq!(created_instance.instance_id, "instance-grpc-web");
+    assert_eq!(created_instance.state, InstanceState::Cold as i32);
+
+    let loaded_instance: Instance = grpc_web_store_unary(
+        Arc::clone(&store),
+        "GetInstance",
+        GetInstanceRequest {
+            instance_id: "instance-grpc-web".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(loaded_instance, created_instance);
+
+    let created_route: RouteBinding = grpc_web_store_unary(
+        Arc::clone(&store),
+        "CreateRouteBinding",
+        CreateRouteBindingRequest {
+            idempotency_key: "grpc-web-create-route".to_owned(),
+            route_binding_id: "route-grpc-web".to_owned(),
+            instance_id: "instance-grpc-web".to_owned(),
+            identity: Some(http_identity("App.Example.COM.", Some("/app"))),
+            protocol: ProtocolRoute::Http as i32,
+        },
+    )
+    .await;
+    assert_eq!(created_route.route_binding_id, "route-grpc-web");
+
+    let loaded_route: RouteBinding = grpc_web_store_unary(
+        Arc::clone(&store),
+        "GetRouteBinding",
+        GetRouteBindingRequest {
+            route_binding_id: "route-grpc-web".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(loaded_route, created_route);
+
+    let challenge: Http01Challenge = grpc_web_store_unary(
+        Arc::clone(&store),
+        "PutHttp01Challenge",
+        PutHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "Acme.Example.COM.".to_owned(),
+                token: "token-grpc-web".to_owned(),
+            }),
+            key_authorization: "key-auth-grpc-web".to_owned(),
+            expires_at_unix_millis: 4_102_444_800_000,
+        },
+    )
+    .await;
+    assert_eq!(
+        challenge.key.as_ref().expect("HTTP-01 key returned").host,
+        "acme.example.com"
+    );
+
+    let resolved: ResolveHttp01ChallengeResponse = grpc_web_store_unary(
+        Arc::clone(&store),
+        "ResolveHttp01Challenge",
+        ResolveHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "acme.example.com".to_owned(),
+                token: "token-grpc-web".to_owned(),
+            }),
+        },
+    )
+    .await;
+    assert_eq!(
+        resolved
+            .challenge
+            .as_ref()
+            .expect("HTTP-01 challenge resolves")
+            .key_authorization,
+        "key-auth-grpc-web"
+    );
+
+    let deleted_challenge: DeleteHttp01ChallengeResponse = grpc_web_store_unary(
+        Arc::clone(&store),
+        "DeleteHttp01Challenge",
+        DeleteHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "acme.example.com".to_owned(),
+                token: "token-grpc-web".to_owned(),
+            }),
+        },
+    )
+    .await;
+    assert!(deleted_challenge.deleted);
+
+    let deleted_route: DeleteRouteBindingResponse = grpc_web_store_unary(
+        Arc::clone(&store),
+        "DeleteRouteBinding",
+        DeleteRouteBindingRequest {
+            route_binding_id: "route-grpc-web".to_owned(),
+        },
+    )
+    .await;
+    assert!(deleted_route.deleted);
+
+    let deleted_instance: DeleteInstanceResponse = grpc_web_store_unary(
+        store,
+        "DeleteInstance",
+        DeleteInstanceRequest {
+            instance_id: "instance-grpc-web".to_owned(),
+        },
+    )
+    .await;
+    assert!(deleted_instance.deleted);
+}
+
+#[tokio::test]
+async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
+    let store: Arc<dyn ControlPlaneStore> = Arc::new(FakeInstanceStore::default());
+    let template = stateful_manifest_template_proto();
+
+    let created_class: WorkloadClassVersion = grpc_store_unary(
+        Arc::clone(&store),
+        "CreateWorkloadClassVersion",
+        CreateWorkloadClassVersionRequest {
+            idempotency_key: "native-create-class".to_owned(),
+            class_id: "class-native".to_owned(),
+            version: 13,
+            default_values: [("image".to_owned(), "example/app:native".to_owned())].into(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: [(
+                    "tenant".to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )]
+                .into(),
+                allow_extra: false,
+            }),
+            template_generation: 6,
+            template: Some(template.clone()),
+            sleep_policy: Some(sleep_policy_proto()),
+        },
+    )
+    .await;
+    assert_eq!(created_class.template_generation, 6);
+
+    let loaded_class: WorkloadClassVersion = grpc_store_unary(
+        Arc::clone(&store),
+        "GetWorkloadClassVersion",
+        GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "class-native".to_owned(),
+                version: 13,
+            }),
+        },
+    )
+    .await;
+    assert_eq!(loaded_class, created_class);
+
+    let created_instance: Instance = grpc_store_unary(
+        Arc::clone(&store),
+        "CreateInstance",
+        CreateInstanceRequest {
+            idempotency_key: "native-create-instance".to_owned(),
+            instance_id: "instance-native".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-native".to_owned(),
+                version: 13,
+            }),
+            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+        },
+    )
+    .await;
+    assert_eq!(created_instance.instance_id, "instance-native");
+    assert_eq!(created_instance.state, InstanceState::Cold as i32);
+
+    let loaded_instance: Instance = grpc_store_unary(
+        Arc::clone(&store),
+        "GetInstance",
+        GetInstanceRequest {
+            instance_id: "instance-native".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(loaded_instance, created_instance);
+
+    let created_route: RouteBinding = grpc_store_unary(
+        Arc::clone(&store),
+        "CreateRouteBinding",
+        CreateRouteBindingRequest {
+            idempotency_key: "native-create-route".to_owned(),
+            route_binding_id: "route-native".to_owned(),
+            instance_id: "instance-native".to_owned(),
+            identity: Some(http_identity("Native.Example.COM.", Some("/app"))),
+            protocol: ProtocolRoute::Http as i32,
+        },
+    )
+    .await;
+    assert_eq!(created_route.route_binding_id, "route-native");
+
+    let loaded_route: RouteBinding = grpc_store_unary(
+        Arc::clone(&store),
+        "GetRouteBinding",
+        GetRouteBindingRequest {
+            route_binding_id: "route-native".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(loaded_route, created_route);
+
+    let challenge: Http01Challenge = grpc_store_unary(
+        Arc::clone(&store),
+        "PutHttp01Challenge",
+        PutHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "Native-Acme.Example.COM.".to_owned(),
+                token: "token-native".to_owned(),
+            }),
+            key_authorization: "key-auth-native".to_owned(),
+            expires_at_unix_millis: 4_102_444_800_000,
+        },
+    )
+    .await;
+    assert_eq!(
+        challenge.key.as_ref().expect("HTTP-01 key returned").host,
+        "native-acme.example.com"
+    );
+
+    let resolved: ResolveHttp01ChallengeResponse = grpc_store_unary(
+        Arc::clone(&store),
+        "ResolveHttp01Challenge",
+        ResolveHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "native-acme.example.com".to_owned(),
+                token: "token-native".to_owned(),
+            }),
+        },
+    )
+    .await;
+    assert_eq!(
+        resolved
+            .challenge
+            .as_ref()
+            .expect("HTTP-01 challenge resolves")
+            .key_authorization,
+        "key-auth-native"
+    );
+
+    let deleted_challenge: DeleteHttp01ChallengeResponse = grpc_store_unary(
+        Arc::clone(&store),
+        "DeleteHttp01Challenge",
+        DeleteHttp01ChallengeRequest {
+            key: Some(Http01ChallengeKey {
+                host: "native-acme.example.com".to_owned(),
+                token: "token-native".to_owned(),
+            }),
+        },
+    )
+    .await;
+    assert!(deleted_challenge.deleted);
+
+    let deleted_route: DeleteRouteBindingResponse = grpc_store_unary(
+        Arc::clone(&store),
+        "DeleteRouteBinding",
+        DeleteRouteBindingRequest {
+            route_binding_id: "route-native".to_owned(),
+        },
+    )
+    .await;
+    assert!(deleted_route.deleted);
+
+    let deleted_instance: DeleteInstanceResponse = grpc_store_unary(
+        store,
+        "DeleteInstance",
+        DeleteInstanceRequest {
+            instance_id: "instance-native".to_owned(),
+        },
+    )
+    .await;
+    assert!(deleted_instance.deleted);
+}
+
+#[tokio::test]
+async fn grpc_web_cors_preflight_allows_browser_operator_headers() {
+    let response = operator_grpc_web_cors_layer()
+        .layer(
+            tonic_web::GrpcWebLayer::new().layer(operator_grpc_service_with_store(Arc::new(
+                FakeInstanceStore::default(),
+            ))),
+        )
+        .oneshot(grpc_web_preflight_request("CreateInstance"))
+        .await
+        .expect("CORS preflight should be handled by grpc-web router");
+
+    assert!(response.status().is_success());
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("allow-origin is returned"),
+        "*"
+    );
+    let allow_methods = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+        .expect("allow-methods is returned")
+        .to_str()
+        .expect("allow-methods is valid");
+    assert!(allow_methods.contains("POST"));
+    assert!(allow_methods.contains("OPTIONS"));
+
+    let allow_headers = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+        .expect("allow-headers is returned")
+        .to_str()
+        .expect("allow-headers is valid")
+        .to_ascii_lowercase();
+    assert!(allow_headers.contains("authorization"));
+    assert!(allow_headers.contains("content-type"));
+    assert!(allow_headers.contains("x-grpc-web"));
+    assert!(allow_headers.contains("x-sleepypods-operator"));
+}
+
+#[tokio::test]
+async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
+    let captured_metadata = Arc::new(Mutex::new(Vec::new()));
+    let service = tonic_web::GrpcWebLayer::new().layer(OperatorControlPlaneServer::new(
+        MetadataCapturingOperatorApi::new(Arc::clone(&captured_metadata)),
+    ));
+
+    let response = service
+        .oneshot(grpc_web_operator_request(
+            "CreateInstance",
+            CreateInstanceRequest {
+                idempotency_key: "metadata-create-instance".to_owned(),
+                instance_id: "metadata-instance".to_owned(),
+                workload_class: Some(WorkloadClassVersionRef {
+                    class_id: "metadata-class".to_owned(),
+                    version: 1,
+                }),
+                values: Default::default(),
+            },
+        ))
+        .await
+        .expect("gRPC-Web request with metadata should reach service");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("metadata response body should collect");
+    let trailers = collected.trailers().cloned();
+    let body = collected.to_bytes();
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
+
+    let captured = captured_metadata
+        .lock()
+        .expect("captured metadata lock is available");
+    assert!(captured
+        .iter()
+        .any(|(name, value)| { name == "authorization" && value == "Bearer operator-token" }));
+    assert!(captured
+        .iter()
+        .any(|(name, value)| { name == "x-sleepypods-operator" && value == "tenant-a" }));
+}
+
+#[tokio::test]
+async fn grpc_web_store_backed_errors_return_structured_status() {
+    let response = operator_grpc_web_cors_layer()
+        .layer(
+            tonic_web::GrpcWebLayer::new().layer(operator_grpc_service_with_store(Arc::new(
+                FakeInstanceStore::default(),
+            ))),
+        )
+        .oneshot(grpc_web_operator_request(
+            "GetInstance",
+            GetInstanceRequest {
+                instance_id: "missing-instance".to_owned(),
+            },
+        ))
+        .await
+        .expect("gRPC-Web missing instance request should route to store-backed service");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("error response body should collect");
+    let trailers = collected.trailers().cloned();
+    let body = collected.to_bytes();
+
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "5");
+    let message = grpc_header_value(&headers, trailers.as_ref(), body.as_ref(), "grpc-message")
+        .expect("structured grpc-message is returned");
+    assert!(message.contains("instance%20not%20found"));
+}
+
+#[tokio::test]
 async fn native_grpc_and_grpc_web_requests_dispatch_to_same_placeholder_method() {
     let native_response = operator_grpc_service()
         .oneshot(grpc_request("application/grpc", Version::HTTP_2))
@@ -698,6 +1152,72 @@ fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
     assert!(!OPERATOR_UNARY_METHODS.contains(&"CompareAndSwapInstanceState"));
 }
 
+async fn grpc_web_store_unary<M, R>(
+    store: Arc<dyn ControlPlaneStore>,
+    method: &'static str,
+    request: R,
+) -> M
+where
+    M: Message + Default,
+    R: Message,
+{
+    let response = operator_grpc_web_cors_layer()
+        .layer(tonic_web::GrpcWebLayer::new().layer(operator_grpc_service_with_store(store)))
+        .oneshot(grpc_web_operator_request(method, request))
+        .await
+        .expect("gRPC-Web request should route through store-backed service");
+    let headers = response.headers().clone();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("gRPC-Web content type")
+        .clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("gRPC-Web response body should collect");
+    let trailers = collected.trailers().cloned();
+    let body = collected.to_bytes();
+
+    assert_eq!(content_type, "application/grpc-web+proto");
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
+
+    decode_grpc_message(body.as_ref())
+}
+
+async fn grpc_store_unary<M, R>(
+    store: Arc<dyn ControlPlaneStore>,
+    method: &'static str,
+    request: R,
+) -> M
+where
+    M: Message + Default,
+    R: Message,
+{
+    let response = operator_grpc_service_with_store(store)
+        .oneshot(grpc_operator_unary_request(
+            request,
+            method,
+            "application/grpc",
+            Version::HTTP_2,
+        ))
+        .await
+        .expect("native gRPC request should route through store-backed service");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native gRPC response body should collect");
+    let trailers = collected.trailers().cloned();
+    let body = collected.to_bytes();
+
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
+
+    decode_grpc_message(body.as_ref())
+}
+
 fn grpc_request(content_type: &'static str, version: Version) -> Request<Body> {
     grpc_create_instance_request(CreateInstanceRequest::default(), content_type, version)
 }
@@ -707,12 +1227,7 @@ fn grpc_create_instance_request(
     content_type: &'static str,
     version: Version,
 ) -> Request<Body> {
-    grpc_unary_request(
-        request,
-        "/sleepypods.controlplane.v1.OperatorControlPlane/CreateInstance",
-        content_type,
-        version,
-    )
+    grpc_operator_unary_request(request, "CreateInstance", content_type, version)
 }
 
 fn grpc_create_route_binding_request(
@@ -720,17 +1235,62 @@ fn grpc_create_route_binding_request(
     content_type: &'static str,
     version: Version,
 ) -> Request<Body> {
-    grpc_unary_request(
+    grpc_operator_unary_request(request, "CreateRouteBinding", content_type, version)
+}
+
+fn grpc_web_operator_request<M: Message>(method: &'static str, request: M) -> Request<Body> {
+    let mut request = grpc_operator_unary_request(
         request,
-        "/sleepypods.controlplane.v1.OperatorControlPlane/CreateRouteBinding",
-        content_type,
-        version,
-    )
+        method,
+        "application/grpc-web+proto",
+        Version::HTTP_11,
+    );
+    request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://operator.example"),
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-grpc-web"),
+        HeaderValue::from_static("1"),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer operator-token"),
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-sleepypods-operator"),
+        HeaderValue::from_static("tenant-a"),
+    );
+    request
+}
+
+fn grpc_web_preflight_request(method: &'static str) -> Request<Body> {
+    Request::builder()
+        .version(Version::HTTP_11)
+        .method(Method::OPTIONS)
+        .uri(operator_method_uri(method))
+        .header(header::ORIGIN, "https://operator.example")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization,content-type,x-grpc-web,x-sleepypods-operator",
+        )
+        .body(Body::new(Full::new(Bytes::new())))
+        .expect("preflight request builds")
+}
+
+fn grpc_operator_unary_request<M: Message>(
+    request: M,
+    method: &'static str,
+    content_type: &'static str,
+    version: Version,
+) -> Request<Body> {
+    grpc_unary_request(request, operator_method_uri(method), content_type, version)
 }
 
 fn grpc_unary_request<M: Message>(
     request: M,
-    uri: &'static str,
+    uri: String,
     content_type: &'static str,
     version: Version,
 ) -> Request<Body> {
@@ -751,6 +1311,10 @@ fn grpc_unary_request<M: Message>(
         .expect("request builds")
 }
 
+fn operator_method_uri(method: &'static str) -> String {
+    format!("/{OPERATOR_SERVICE_NAME}/{method}")
+}
+
 fn decode_grpc_instance_response(bytes: &[u8]) -> Instance {
     decode_grpc_message(bytes)
 }
@@ -767,6 +1331,60 @@ fn decode_grpc_message<M: Message + Default>(bytes: &[u8]) -> M {
             .expect("gRPC response frame has a length prefix"),
     ) as usize;
     M::decode(&bytes[5..5 + length]).expect("gRPC response decodes")
+}
+
+fn assert_grpc_status(
+    headers: &HeaderMap,
+    trailers: Option<&HeaderMap>,
+    body: &[u8],
+    expected: &str,
+) {
+    let status =
+        grpc_header_value(headers, trailers, body, "grpc-status").expect("gRPC status is returned");
+    assert_eq!(status, expected);
+}
+
+fn grpc_header_value(
+    headers: &HeaderMap,
+    trailers: Option<&HeaderMap>,
+    body: &[u8],
+    name: &str,
+) -> Option<String> {
+    headers
+        .get(name)
+        .or_else(|| trailers.and_then(|trailers| trailers.get(name)))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| grpc_web_trailer_value(body, name))
+}
+
+fn grpc_web_trailer_value(bytes: &[u8], name: &str) -> Option<String> {
+    let mut offset = 0;
+    while offset + 5 <= bytes.len() {
+        let frame_type = bytes[offset];
+        let length = u32::from_be_bytes(
+            bytes[offset + 1..offset + 5]
+                .try_into()
+                .expect("gRPC-Web frame has a length prefix"),
+        ) as usize;
+        offset += 5;
+        if offset + length > bytes.len() {
+            return None;
+        }
+
+        if frame_type & 0x80 != 0 {
+            let trailers = std::str::from_utf8(&bytes[offset..offset + length]).ok()?;
+            for line in trailers.split("\r\n").filter(|line| !line.is_empty()) {
+                let (key, value) = line.split_once(':')?;
+                if key.eq_ignore_ascii_case(name) {
+                    return Some(value.trim_start().to_owned());
+                }
+            }
+        }
+        offset += length;
+    }
+
+    None
 }
 
 fn http_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
@@ -901,6 +1519,144 @@ fn composed_text(prefix: &str, field: &str) -> TemplateText {
                 kind: Some(template_text_part::Kind::InstanceValue(field.to_owned())),
             },
         ],
+    }
+}
+
+#[derive(Clone)]
+struct MetadataCapturingOperatorApi {
+    captured: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl MetadataCapturingOperatorApi {
+    fn new(captured: Arc<Mutex<Vec<(String, String)>>>) -> Self {
+        Self { captured }
+    }
+
+    fn capture_metadata<T>(&self, request: &tonic::Request<T>) {
+        let mut captured = self
+            .captured
+            .lock()
+            .expect("captured metadata lock is available");
+        for name in ["authorization", "x-sleepypods-operator"] {
+            if let Some(value) = request
+                .metadata()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+            {
+                captured.push((name.to_owned(), value.to_owned()));
+            }
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl OperatorControlPlane for MetadataCapturingOperatorApi {
+    async fn create_workload_class_version(
+        &self,
+        _request: tonic::Request<CreateWorkloadClassVersionRequest>,
+    ) -> Result<Response<WorkloadClassVersion>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn get_workload_class_version(
+        &self,
+        _request: tonic::Request<GetWorkloadClassVersionRequest>,
+    ) -> Result<Response<WorkloadClassVersion>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn create_instance(
+        &self,
+        request: tonic::Request<CreateInstanceRequest>,
+    ) -> Result<Response<Instance>, Status> {
+        self.capture_metadata(&request);
+
+        Ok(Response::new(Instance::default()))
+    }
+
+    async fn get_instance(
+        &self,
+        _request: tonic::Request<GetInstanceRequest>,
+    ) -> Result<Response<Instance>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn delete_instance(
+        &self,
+        _request: tonic::Request<DeleteInstanceRequest>,
+    ) -> Result<Response<DeleteInstanceResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn create_route_binding(
+        &self,
+        _request: tonic::Request<CreateRouteBindingRequest>,
+    ) -> Result<Response<RouteBinding>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn get_route_binding(
+        &self,
+        _request: tonic::Request<GetRouteBindingRequest>,
+    ) -> Result<Response<RouteBinding>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn delete_route_binding(
+        &self,
+        _request: tonic::Request<DeleteRouteBindingRequest>,
+    ) -> Result<Response<DeleteRouteBindingResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn put_http01_challenge(
+        &self,
+        _request: tonic::Request<PutHttp01ChallengeRequest>,
+    ) -> Result<Response<Http01Challenge>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn resolve_http01_challenge(
+        &self,
+        _request: tonic::Request<ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<ResolveHttp01ChallengeResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn delete_http01_challenge(
+        &self,
+        _request: tonic::Request<DeleteHttp01ChallengeRequest>,
+    ) -> Result<Response<DeleteHttp01ChallengeResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn expire_http01_challenges(
+        &self,
+        _request: tonic::Request<ExpireHttp01ChallengesRequest>,
+    ) -> Result<Response<control_plane::api::pb::ExpireHttp01ChallengesResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
     }
 }
 

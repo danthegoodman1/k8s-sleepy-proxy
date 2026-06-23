@@ -18,6 +18,7 @@ tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
 tonic-web = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

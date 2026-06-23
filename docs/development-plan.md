@@ -254,7 +254,7 @@ Scope:
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
 | Complete | Domain-specific `ControlPlaneStore` trait. | `crates/control-plane/src/store.rs` exposes domain operations for instances, workload classes, route bindings, materialization, dependencies, and HTTP-01 records. |
-| Incomplete | Protobuf API over native gRPC and gRPC-Web for operator-facing methods. | Native generated dispatch and grpc-web wrapping are tested, but store-backed grpc-web parity, CORS/preflight, metadata/auth, and V8 request encoding are missing; follow-up: M9 API transport gates. |
+| Complete | Protobuf API over native gRPC and gRPC-Web for operator-facing methods. | `crates/control-plane/tests/api_transport.rs` covers native generated dispatch plus store-backed gRPC-Web HTTP/1.1 `application/grpc-web+proto` framed unary calls for workload class, instance, route binding, and HTTP-01 operator APIs. |
 | Complete | Postgres as first store provider. | `crates/control-plane/src/postgres/`, `crates/control-plane/tests/postgres_store.rs`, and migrations implement the first provider. |
 | Complete | Control-plane config for selecting the store provider. | `runtime.rs` parses `SLEEPYPODS_STORE_PROVIDER` and Postgres URL config, with runtime tests. |
 | Complete | `WorkloadClass` with immutable versions. | Postgres conformance creates and reloads immutable versions and proves v2 does not mutate v1. |
@@ -270,7 +270,7 @@ Sub-phases:
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
 | Complete | 2A: Store trait and provider config shape. | `store.rs` defines the trait and `runtime.rs` parses provider config. |
-| Incomplete | 2B: Protobuf services, native gRPC server, and gRPC-Web operator transport. | Native services and grpc-web wrapper exist, but full grpc-web parity/CORS/auth/V8 gates are not proven; follow-up: M9. |
+| Complete | 2B: Protobuf services, native gRPC server, and gRPC-Web operator transport. | `server.rs` builds native gRPC and gRPC-Web operator transports; `api_transport.rs` covers store-backed parity, CORS preflight, metadata/auth header propagation, structured errors, and V8-compatible framed HTTP/1.1 requests. |
 | Complete | 2C: Postgres schema, migrations, and store implementation. | Real Postgres conformance applies migrations idempotently and exercises store operations when `SLEEPYPODS_POSTGRES_URL` is set. |
 | Complete | 2D: WorkloadClass versioning, schema validation, and immutability. | Conformance covers class version creation/load, schema validation rejects missing/unknown values, and version immutability. |
 | Complete | 2E: Instance APIs, value validation, generation fields, and idempotent create/update behavior. | Store-backed API and conformance cover create/get/delete, generation fields, idempotent replay/conflict, and rollback. |
@@ -286,8 +286,8 @@ Done criteria:
 | Incomplete | Database migrations and store tests pass against a real test database. | `postgres_store_conformance_against_real_database` exists and runs when `SLEEPYPODS_POSTGRES_URL` is configured, but this audit has no current real database run evidence; follow-up: M9 live database gate. |
 | Complete | Store conformance covers idempotency, rollback, duplicate routes, conflicts, CAS, materialization generations, and provider config errors. | `postgres_store.rs` conformance covers these cases, including invalid connection URL and transactional rollback after duplicate route identity. |
 | Complete | Control plane can construct the configured store provider. | `runtime.rs` tests cover env parsing and provider construction paths. |
-| Incomplete | Native gRPC and gRPC-Web integration tests exercise the same operator APIs. | Native generated operator dispatch is tested; grpc-web wrapping is shape-tested but store-backed parity is missing; follow-up: M9. |
-| Incomplete | gRPC-Web tests cover CORS/preflight, metadata/auth, structured errors, and V8-compatible clients/request encoding. | No browser/V8 or CORS/preflight smoke found; follow-up: M9. |
+| Complete | Native gRPC and gRPC-Web integration tests exercise the same operator APIs. | `api_transport.rs` covers native store-backed dispatch and gRPC-Web store-backed unary calls for representative workload class, instance create/get/delete, route binding create/get/delete, and HTTP-01 put/resolve/delete flows. |
+| Complete | gRPC-Web tests cover CORS/preflight, metadata/auth, structured errors, and V8-compatible clients/request encoding. | `api_transport.rs` covers CORS preflight, authorization/custom metadata header propagation through the gRPC-Web layer, store-backed `NotFound` status/message mapping, HTTP/1.1, `application/grpc-web+proto`, and framed protobuf unary bodies. |
 | Complete | Tests document proxy `Subscribe` is native gRPC-only in V1 and not grpc-web bidi. | `api_transport.rs` tests assert operator grpc-web unary shape and no proxy Subscribe exposure. |
 | Complete | State-machine tests cover wake, running, draining, failed, retry, and delete. | `instance.rs` and Postgres conformance cover lifecycle edges and failed retry/deleting terminal behavior. |
 | Complete | State-machine tests cover concurrent wake, sleep while waking, delete while waking/draining, failed retry, stale sidecar reports, and stale materialization updates. | Postgres conformance includes concurrent CAS, invalid transitions, stale reports, and stale materialization rejection. |
@@ -696,7 +696,7 @@ Sub-phases:
 | Incomplete | 6A: Stateless Deployment cold wake, hot route, idle drain, sleep, and re-wake. | No stateless full-platform kind E2E script found; follow-up: M9. |
 | Incomplete | 6B: StatefulSet static PV/PVC lifecycle with data continuity. | Materializer-only kind lifecycle exists, but not full wake/sleep/re-wake through the platform; follow-up: M9. |
 | Incomplete | 6C: Custom host, wildcard host, SNI, and path-prefix routing. | Component coverage exists; full-platform E2E is missing; follow-up: M9. |
-| Incomplete | 6D: Full protocol matrix, including PostgreSQL/libpq SNI passthrough. | Helper/component tests cover pieces; runtime TLS/SNI, grpc-web browser, and PostgreSQL/libpq SNI E2E are missing; follow-up: M9. |
+| Incomplete | 6D: Full protocol matrix, including PostgreSQL/libpq SNI passthrough. | Helper/component tests cover pieces, including gRPC-Web operator transport; runtime TLS/SNI, full-platform browser/kind protocol coverage, and PostgreSQL/libpq SNI E2E are missing; follow-up: M9. |
 | Incomplete | 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior. | Store/helper/runtime/transport coverage exists; full-platform deployed flow is missing; follow-up: M9 full-platform gate. |
 | Incomplete | 6F: Failure-path matrix. | Component failure tests exist, but full-platform wake/PVC/route/stale/control-plane-restart failures are missing; follow-up: M9. |
 | Incomplete | 6G: Lifecycle race matrix. | Store/frontline components cover some races; full-platform lifecycle race E2E is missing; follow-up: M9. |
@@ -707,7 +707,7 @@ Done criteria:
 | --- | --- | --- |
 | Incomplete | kind E2E passes for stateless Deployment. | No full-platform stateless kind E2E found; follow-up: M9. |
 | Incomplete | kind E2E passes for StatefulSet with PV/PVC, mounted IO, sleep, re-wake, and data continuity. | Materializer-only kind test covers PV/PVC IO and rematerialization; full-platform sleep/re-wake is missing; follow-up: M9. |
-| Incomplete | kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, grpc-web, WebSockets, TLS termination, and SNI passthrough. | No full-platform protocol kind E2E found; follow-up: M9. |
+| Incomplete | kind E2E passes for HTTP/1.1, HTTP/2, h2c gRPC, grpc-web, WebSockets, TLS termination, and SNI passthrough. | Component gRPC-Web transport coverage exists in `api_transport.rs`, but no full-platform protocol kind E2E found; follow-up: M9. |
 | Incomplete | kind E2E proves real PostgreSQL/libpq 17+ SNI passthrough with pinned image. | No real libpq SNI passthrough test found; follow-up: M9. |
 | Incomplete | Failure-path E2E covers wake timeout, bad route, missing PVC binding, bad volume template, and stale proxy generation. | Component failures exist; full-platform failure E2E is missing; follow-up: M9. |
 | Incomplete | Lifecycle-race E2E prevents stale sidecar, materialization, and proxy cache updates. | Component generation checks exist; full-platform race E2E is missing; follow-up: M9. |
