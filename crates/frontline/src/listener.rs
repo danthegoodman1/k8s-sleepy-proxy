@@ -1,18 +1,21 @@
 use std::{convert::Infallible, error::Error, fmt, io, net::SocketAddr, time::Instant};
 
+use bytes::Bytes;
+use http::{header::CONNECTION, header::UPGRADE, Method, StatusCode};
+use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
-use proxy_core::{DrainError, Shutdown};
+use proxy_core::{websocket_upgrade_response, DrainError, Shutdown};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinSet};
 
 use crate::{
     is_http01_challenge_candidate_path,
     runtime::{resolve_http01_response, resolve_http_route, route_outcome_or_forward_response},
-    FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator, Http01ChallengeResolver,
-    RouteSubscriptionClient, WakeClient,
+    FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteOutcome,
+    Http01ChallengeResolver, RouteSubscriptionClient, WakeClient,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +35,7 @@ struct SharedFrontlineHttpRuntime<RouteClient, Wake, Http01> {
     coordinator: std::sync::Arc<Mutex<FrontlineRouteCoordinator<RouteClient, Wake>>>,
     http01_resolver: std::sync::Arc<Mutex<Http01>>,
     forwarder: FrontlineForwarder,
+    websocket_tasks: std::sync::Arc<Mutex<JoinSet<()>>>,
 }
 
 impl FrontlineHttpListenerConfig {
@@ -85,6 +89,7 @@ where
         coordinator: std::sync::Arc::new(Mutex::new(coordinator)),
         http01_resolver: std::sync::Arc::new(Mutex::new(http01_resolver)),
         forwarder,
+        websocket_tasks: std::sync::Arc::new(Mutex::new(JoinSet::new())),
     };
     let mut connections = JoinSet::new();
     let mut exit_error = None;
@@ -110,9 +115,9 @@ where
                             Ok::<_, Infallible>(runtime.handle(request).await)
                         }
                     });
-                    let mut builder = auto::Builder::new(TokioExecutor::new());
-                    builder.http1().keep_alive(false);
-                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    let connection =
+                        builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
                     tokio::pin!(connection);
 
                     tokio::select! {
@@ -130,6 +135,11 @@ where
     }
 
     let drain_result = drain.drain().await;
+    {
+        let mut websocket_tasks = shared.websocket_tasks.lock().await;
+        websocket_tasks.abort_all();
+        while websocket_tasks.join_next().await.is_some() {}
+    }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
 
@@ -146,6 +156,7 @@ impl<RouteClient, Wake, Http01> Clone for SharedFrontlineHttpRuntime<RouteClient
             coordinator: self.coordinator.clone(),
             http01_resolver: self.http01_resolver.clone(),
             forwarder: self.forwarder.clone(),
+            websocket_tasks: self.websocket_tasks.clone(),
         }
     }
 }
@@ -175,6 +186,10 @@ where
             }
         }
 
+        if is_websocket_upgrade_candidate(&request) {
+            return self.handle_websocket(request).await;
+        }
+
         let outcome = {
             let mut coordinator = self.coordinator.lock().await;
             resolve_http_route(&mut coordinator, &request, Instant::now()).await
@@ -187,6 +202,107 @@ where
             Err(error) => crate::runtime::route_resolution_error_response(error),
         }
     }
+
+    async fn handle_websocket(
+        &self,
+        mut request: http::Request<Incoming>,
+    ) -> http::Response<crate::FrontlineRuntimeBody> {
+        let switching_protocols = match websocket_upgrade_response(&request, empty_body()) {
+            Ok(response) => response,
+            Err(_error) => return status_response(StatusCode::BAD_REQUEST),
+        };
+
+        let outcome = {
+            let mut coordinator = self.coordinator.lock().await;
+            resolve_http_route(&mut coordinator, &request, Instant::now()).await
+        };
+
+        match outcome {
+            Ok(FrontlineRouteOutcome::Ready(ready)) => {
+                let path_and_query = request
+                    .uri()
+                    .path_and_query()
+                    .map(|value| value.as_str().to_owned())
+                    .unwrap_or_else(|| "/".to_owned());
+                let upgraded = hyper::upgrade::on(&mut request);
+                let forwarder = self.forwarder.clone();
+
+                let mut websocket_tasks = self.websocket_tasks.lock().await;
+                reap_completed_tasks(&mut websocket_tasks);
+                websocket_tasks.spawn(async move {
+                    let Ok(upgraded) = upgraded.await else {
+                        return;
+                    };
+                    let _ = forwarder
+                        .forward_accepted_websocket(&ready, TokioIo::new(upgraded), &path_and_query)
+                        .await;
+                });
+
+                switching_protocols
+            }
+            Ok(outcome) => route_outcome_response(outcome),
+            Err(error) => crate::runtime::route_resolution_error_response(error),
+        }
+    }
+}
+
+fn reap_completed_tasks(tasks: &mut JoinSet<()>) {
+    while tasks.try_join_next().is_some() {}
+}
+
+fn is_websocket_upgrade_candidate(request: &http::Request<Incoming>) -> bool {
+    request.method() == Method::GET
+        && header_contains_token(request.headers(), CONNECTION, "upgrade")
+        && header_contains_token(request.headers(), UPGRADE, "websocket")
+}
+
+fn header_contains_token(
+    headers: &http::HeaderMap,
+    name: http::header::HeaderName,
+    token: &str,
+) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+        .unwrap_or(false)
+}
+
+fn route_outcome_response(
+    outcome: FrontlineRouteOutcome,
+) -> http::Response<crate::FrontlineRuntimeBody> {
+    match outcome {
+        FrontlineRouteOutcome::Ready(_) => {
+            unreachable!("ready route outcomes are upgraded before response mapping")
+        }
+        FrontlineRouteOutcome::Miss(_) => status_response(StatusCode::NOT_FOUND),
+        FrontlineRouteOutcome::Waiting(_)
+        | FrontlineRouteOutcome::Waking { .. }
+        | FrontlineRouteOutcome::Unavailable(_)
+        | FrontlineRouteOutcome::WakeFailed { .. }
+        | FrontlineRouteOutcome::WakeUnavailable { .. }
+        | FrontlineRouteOutcome::GenerationConflict { .. }
+        | FrontlineRouteOutcome::RejectedWakeObservation(_) => {
+            status_response(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+fn status_response(status: StatusCode) -> http::Response<crate::FrontlineRuntimeBody> {
+    http::Response::builder()
+        .status(status)
+        .body(empty_body())
+        .expect("status-only frontline listener response builds")
+}
+
+fn empty_body() -> crate::FrontlineRuntimeBody {
+    Full::new(Bytes::new())
+        .map_err(|error| match error {})
+        .boxed_unsync()
 }
 
 impl fmt::Display for FrontlineHttpListenerError {

@@ -80,6 +80,22 @@ impl FrontlineForwarder {
             .await
             .map_err(FrontlineForwardError::WebSocket)
     }
+
+    pub async fn forward_accepted_websocket<Client>(
+        &self,
+        ready: &ReadyBackend,
+        client: Client,
+        upstream_path_and_query: &str,
+    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
+        self.websocket
+            .proxy_accepted_upgrade(client, &upstream_url)
+            .await
+            .map_err(FrontlineForwardError::WebSocket)
+    }
 }
 
 pub fn http_upstream_origin(ready: &ReadyBackend) -> Result<Uri, BackendForwardError> {

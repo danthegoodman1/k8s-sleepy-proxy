@@ -1,9 +1,11 @@
 use std::{error::Error, fmt};
 
 use futures_util::{SinkExt, StreamExt};
+use http::{Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
     accept_async, connect_async,
+    tungstenite::{handshake::server::create_response_with_body, protocol::Role},
     tungstenite::{Error as TungsteniteError, Message},
     WebSocketStream,
 };
@@ -60,6 +62,32 @@ impl WebSocketProxy {
             .await
             .map_err(WebSocketProxyError::Proxy)
     }
+
+    pub async fn proxy_accepted_upgrade<Client>(
+        &self,
+        client: Client,
+        upstream_url: &str,
+    ) -> Result<WebSocketProxyStats, WebSocketProxyError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        let _permit = self.drain.try_acquire()?;
+        let client = WebSocketStream::from_raw_socket(client, Role::Server, None).await;
+        let (upstream, _) = connect_async(upstream_url)
+            .await
+            .map_err(WebSocketProxyError::UpstreamConnect)?;
+
+        proxy_websocket_streams(client, upstream)
+            .await
+            .map_err(WebSocketProxyError::Proxy)
+    }
+}
+
+pub fn websocket_upgrade_response<B, R>(
+    request: &Request<B>,
+    body: R,
+) -> Result<Response<R>, WebSocketProxyError> {
+    create_response_with_body(request, || body).map_err(WebSocketProxyError::ClientHandshake)
 }
 
 pub async fn proxy_websocket_streams<Client, Upstream>(

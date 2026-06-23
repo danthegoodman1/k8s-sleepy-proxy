@@ -13,6 +13,7 @@ use control_plane::{
     Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
     RouteHost, RouteIdentity,
 };
+use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{channel::Channel, BodyExt, Full};
 use hyper::client::conn::http2 as client_http2;
@@ -27,7 +28,16 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{oneshot, Mutex as TokioMutex},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
+};
+use tokio_tungstenite::{
+    accept_hdr_async, connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
+        protocol::CloseFrame,
+        Bytes as WsBytes, Message,
+    },
 };
 
 use super::serve_http_listener;
@@ -368,6 +378,146 @@ async fn listener_h2c_grpc_shaped_request_routes_and_preserves_body_trailers() {
 }
 
 #[tokio::test]
+async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_closes() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream binds");
+    let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+    let route_client = FakeRouteClient::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-websocket"),
+            http_identity("ws.example.com", "/socket"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{upstream_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let (path_seen_tx, path_seen_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+        let mut path_seen_tx = Some(path_seen_tx);
+        let mut websocket =
+            accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
+                assert_eq!(
+                    request
+                        .uri()
+                        .path_and_query()
+                        .expect("websocket path query")
+                        .as_str(),
+                    "/socket?room=blue"
+                );
+                path_seen_tx
+                    .take()
+                    .expect("path signal unused")
+                    .send(())
+                    .expect("test waits for websocket path");
+                Ok(response)
+            })
+            .await
+            .expect("upstream accepts websocket");
+
+        let text = websocket
+            .next()
+            .await
+            .expect("upstream receives text")
+            .expect("text frame valid");
+        assert_eq!(text, Message::Text("frontline text".into()));
+        websocket
+            .send(Message::Text("backend text".into()))
+            .await
+            .expect("upstream sends text");
+
+        let binary = websocket
+            .next()
+            .await
+            .expect("upstream receives binary")
+            .expect("binary frame valid");
+        assert_eq!(
+            binary,
+            Message::Binary(WsBytes::from_static(b"frontline bytes"))
+        );
+        websocket
+            .send(Message::Binary(WsBytes::from_static(b"backend bytes")))
+            .await
+            .expect("upstream sends binary");
+
+        let close = websocket
+            .next()
+            .await
+            .expect("upstream receives close")
+            .expect("close frame valid");
+        assert!(matches!(close, Message::Close(Some(_))));
+        websocket.flush().await.expect("upstream flushes close");
+    });
+    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let mut request = format!("ws://{addr}/socket?room=blue")
+        .into_client_request()
+        .expect("websocket request builds");
+    request
+        .headers_mut()
+        .insert("host", "ws.example.com".parse().expect("host header"));
+
+    let (mut client, response) = connect_async(request)
+        .await
+        .expect("client connects through listener websocket");
+
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    path_seen_rx.await.expect("upstream saw websocket path");
+
+    client
+        .send(Message::Text("frontline text".into()))
+        .await
+        .expect("client sends text");
+    let from_upstream = client
+        .next()
+        .await
+        .expect("client receives text")
+        .expect("text frame valid");
+    assert_eq!(from_upstream, Message::Text("backend text".into()));
+
+    client
+        .send(Message::Binary(WsBytes::from_static(b"frontline bytes")))
+        .await
+        .expect("client sends binary");
+    let from_upstream = client
+        .next()
+        .await
+        .expect("client receives binary")
+        .expect("binary frame valid");
+    assert_eq!(
+        from_upstream,
+        Message::Binary(WsBytes::from_static(b"backend bytes"))
+    );
+
+    client
+        .send(Message::Close(Some(CloseFrame {
+            code: 1000.into(),
+            reason: "done".into(),
+        })))
+        .await
+        .expect("client sends close");
+    let close = client
+        .next()
+        .await
+        .expect("client receives close")
+        .expect("close frame valid");
+    assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "done"));
+    assert!(route_client.calls().is_empty());
+
+    upstream_task.await.expect("upstream task joins");
+    shutdown.shutdown();
+    task.await
+        .expect("listener task joins")
+        .expect("listener exits");
+}
+
+#[tokio::test]
 async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;
@@ -475,6 +625,51 @@ async fn listener_invalid_or_missing_host_returns_bad_request_without_control_pl
     task.await
         .expect("listener task joins")
         .expect("listener exits");
+}
+
+#[tokio::test]
+async fn listener_websocket_invalid_or_missing_host_rejects_without_control_plane_call() {
+    let route_client = FakeRouteClient::default();
+    let (addr, shutdown, task) =
+        spawn_frontline_listener(SubscriptionState::new(4), route_client.clone()).await;
+
+    let missing_host_status = raw_websocket_upgrade_status(addr, None).await;
+    assert!(
+        missing_host_status.starts_with("HTTP/1.1 400"),
+        "{missing_host_status}"
+    );
+
+    let invalid_host_status = raw_websocket_upgrade_status(addr, Some("localhost")).await;
+    assert!(
+        invalid_host_status.starts_with("HTTP/1.1 400"),
+        "{invalid_host_status}"
+    );
+
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("listener task joins")
+        .expect("listener exits");
+}
+
+#[tokio::test]
+async fn listener_websocket_task_reaper_drops_completed_entries_without_blocking() {
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async {});
+    tokio::task::yield_now().await;
+
+    super::reap_completed_tasks(&mut tasks);
+    assert_eq!(tasks.len(), 0);
+
+    tasks.spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    super::reap_completed_tasks(&mut tasks);
+    assert_eq!(tasks.len(), 1);
+
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 #[tokio::test]
@@ -652,6 +847,30 @@ async fn listener_request(addr: SocketAddr, host: &str, path: &str) -> Response<
         )
         .await
         .expect("listener request succeeds")
+}
+
+async fn raw_websocket_upgrade_status(addr: SocketAddr, host: Option<&str>) -> String {
+    let mut stream = TcpStream::connect(addr).await.expect("raw client connects");
+    let host = host
+        .map(|host| format!("Host: {host}\r\n"))
+        .unwrap_or_default();
+    stream
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\n\
+                 {host}\
+                 Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 \r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("raw websocket request writes");
+
+    read_status_line(&mut stream).await
 }
 
 async fn spawn_http_upstream(
