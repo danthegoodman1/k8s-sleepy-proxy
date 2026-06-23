@@ -521,11 +521,11 @@ Done criteria:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Active HTTP requests, h2c gRPC streams, WebSockets, and raw TCP connections prevent idle reporting. | HTTP and raw TCP are covered; no sidecar h2c gRPC or WebSocket idle tests found; follow-up: M9 sidecar protocol gates. |
+| Complete | Active HTTP requests, h2c gRPC streams, WebSockets, and raw TCP connections prevent idle reporting. | `runtime/tests.rs` covers HTTP, raw TCP, h2c gRPC-shaped streams, and WebSocket sessions delaying idle reports until active work closes. |
 | Complete | Idle tests prove `ReportIdle` fires after timeout only after active work closes. | `idle.rs` covers active work suppression and reset before reporting. |
-| Incomplete | Idle/report tests cover duplicate reports, stale generation, control-plane rejection, retry/backoff, and sidecar restart. | Duplicate/stale/rejection/retry behavior is covered; runtime restart coverage is only library-level detector re-creation, not a process/restart gate; follow-up: M9. |
+| Incomplete | Idle/report tests cover duplicate reports, stale generation, control-plane rejection, retry/backoff, and sidecar restart. | Duplicate reports, stale generation, rejection/unavailable outcomes, retry/backoff, and detector reconstruction are covered; an actual sidecar process restart gate is still missing; follow-up: M9. |
 | Complete | Drain tests prove the sidecar stops accepting new work and lets active work finish within the grace period. | `src/tests.rs` and `runtime/tests.rs` cover drain rejection and active-work waiting. |
-| Incomplete | Drain tests cover SIGTERM, upstream failure, client disconnect, grace expiry with active streams, and forced shutdown after hard deadline. | Shutdown and grace-expiry paths are covered; explicit upstream-failure and client-disconnect drain cases are missing; follow-up: M9. |
+| Incomplete | Drain tests cover SIGTERM, upstream failure, client disconnect, grace expiry with active streams, and forced shutdown after hard deadline. | Shutdown-triggered drain, grace expiry, upstream HTTP disconnect, and TCP client disconnect are covered; explicit OS SIGTERM and process hard-deadline coverage remain missing; follow-up: M9. |
 
 ## Milestone 5: Kubernetes Materializer
 

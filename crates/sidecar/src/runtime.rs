@@ -1,13 +1,29 @@
-use std::{convert::Infallible, error::Error, fmt, io, net::SocketAddr, time::Duration};
+use std::{
+    convert::Infallible,
+    error::Error,
+    fmt, io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
-use hyper::{body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use hyper::{
+    body::Incoming,
+    server::conn::{http1, http2},
+    service::service_fn,
+};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use proxy_core::{DrainError, DrainTracker, HttpProxyError, Shutdown};
 use sleepypods_types::{Generation, InstanceId};
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+};
 
 use crate::{
     IdleDetector, IdleReportConfig, ReportIdleClient, SidecarConfigError, SidecarProxy,
@@ -16,6 +32,8 @@ use crate::{
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type RuntimeBody = UnsyncBoxBody<Bytes, BoxError>;
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const MAX_HTTP1_HEADER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SidecarRuntimeConfig {
@@ -154,24 +172,7 @@ where
                 let proxy = proxy.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
-                    let service = service_fn(move |request| {
-                        let proxy = proxy.clone();
-                        async move { Ok::<_, Infallible>(forward_or_error(proxy, request).await) }
-                    });
-                    let mut builder = http1::Builder::new();
-                    builder.keep_alive(false);
-                    let connection = builder.serve_connection(TokioIo::new(stream), service);
-                    tokio::pin!(connection);
-
-                    tokio::select! {
-                        result = connection.as_mut() => {
-                            let _ = result;
-                        }
-                        _ = connection_shutdown.cancelled() => {
-                            connection.as_mut().graceful_shutdown();
-                            let _ = connection.await;
-                        }
-                    }
+                    serve_http_connection(proxy, stream, connection_shutdown).await;
                 });
             }
         }
@@ -188,6 +189,231 @@ where
     }
 
     drain_result.map_err(SidecarRuntimeError::Drain)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptedProtocol {
+    Http1,
+    Http2,
+    WebSocket,
+}
+
+async fn serve_http_connection(proxy: SidecarProxy, stream: TcpStream, shutdown: Shutdown) {
+    let Some(accepted) = detect_protocol(stream, &shutdown).await else {
+        return;
+    };
+
+    match accepted.protocol {
+        AcceptedProtocol::WebSocket => {
+            let _ = proxy.forward_websocket(accepted.into_stream()).await;
+        }
+        AcceptedProtocol::Http2 => {
+            serve_http2_connection(proxy, accepted.into_stream(), shutdown).await;
+        }
+        AcceptedProtocol::Http1 => {
+            serve_http1_connection(proxy, accepted.into_stream(), shutdown).await
+        }
+    }
+}
+
+async fn serve_http1_connection(
+    proxy: SidecarProxy,
+    stream: PrefixedTcpStream,
+    shutdown: Shutdown,
+) {
+    let service = service_fn(move |request| {
+        let proxy = proxy.clone();
+        async move { Ok::<_, Infallible>(forward_or_error(proxy, request).await) }
+    });
+    let mut builder = http1::Builder::new();
+    builder.keep_alive(false);
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+
+    tokio::select! {
+        result = connection.as_mut() => {
+            let _ = result;
+        }
+        _ = shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
+    }
+}
+
+async fn serve_http2_connection(
+    proxy: SidecarProxy,
+    stream: PrefixedTcpStream,
+    shutdown: Shutdown,
+) {
+    let service = service_fn(move |request| {
+        let proxy = proxy.clone();
+        async move { Ok::<_, Infallible>(forward_or_error(proxy, request).await) }
+    });
+    let connection =
+        http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+
+    tokio::select! {
+        result = connection.as_mut() => {
+            let _ = result;
+        }
+        _ = shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
+    }
+}
+
+struct AcceptedStream {
+    protocol: AcceptedProtocol,
+    stream: PrefixedTcpStream,
+}
+
+impl AcceptedStream {
+    fn into_stream(self) -> PrefixedTcpStream {
+        self.stream
+    }
+}
+
+async fn detect_protocol(stream: TcpStream, shutdown: &Shutdown) -> Option<AcceptedStream> {
+    let mut prefix = Vec::with_capacity(HTTP2_PREFACE.len());
+
+    loop {
+        if prefix == HTTP2_PREFACE {
+            return Some(accepted(AcceptedProtocol::Http2, prefix, stream));
+        }
+
+        if !HTTP2_PREFACE.starts_with(&prefix) {
+            break;
+        }
+
+        prefix.push(read_one(&stream, shutdown).await?);
+    }
+
+    while !headers_complete(&prefix) && prefix.len() < MAX_HTTP1_HEADER_BYTES {
+        prefix.push(read_one(&stream, shutdown).await?);
+    }
+
+    let protocol = if is_websocket_upgrade(&prefix) {
+        AcceptedProtocol::WebSocket
+    } else {
+        AcceptedProtocol::Http1
+    };
+
+    Some(accepted(protocol, prefix, stream))
+}
+
+async fn read_one(stream: &TcpStream, shutdown: &Shutdown) -> Option<u8> {
+    loop {
+        let mut byte = [0; 1];
+        match stream.try_read(&mut byte) {
+            Ok(0) => return None,
+            Ok(_) => return Some(byte[0]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_error) => return None,
+        }
+
+        tokio::select! {
+            result = stream.readable() => {
+                if result.is_err() {
+                    return None;
+                }
+            }
+            _ = shutdown.cancelled() => return None,
+        }
+    }
+}
+
+fn accepted(protocol: AcceptedProtocol, prefix: Vec<u8>, stream: TcpStream) -> AcceptedStream {
+    AcceptedStream {
+        protocol,
+        stream: PrefixedTcpStream::new(prefix, stream),
+    }
+}
+
+fn headers_complete(buffer: &[u8]) -> bool {
+    buffer.windows(4).any(|window| window == b"\r\n\r\n")
+}
+
+fn is_websocket_upgrade(buffer: &[u8]) -> bool {
+    let headers = String::from_utf8_lossy(buffer);
+    let mut has_connection_upgrade = false;
+    let mut has_upgrade_websocket = false;
+
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+
+        if name == "connection"
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            has_connection_upgrade = true;
+        }
+
+        if name == "upgrade" && value == "websocket" {
+            has_upgrade_websocket = true;
+        }
+    }
+
+    has_connection_upgrade && has_upgrade_websocket
+}
+
+struct PrefixedTcpStream {
+    prefix: Vec<u8>,
+    prefix_offset: usize,
+    stream: TcpStream,
+}
+
+impl PrefixedTcpStream {
+    fn new(prefix: Vec<u8>, stream: TcpStream) -> Self {
+        Self {
+            prefix,
+            prefix_offset: 0,
+            stream,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.prefix_offset < self.prefix.len() {
+            let available = &self.prefix[self.prefix_offset..];
+            let copy_len = available.len().min(buffer.remaining());
+            buffer.put_slice(&available[..copy_len]);
+            self.prefix_offset += copy_len;
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for PrefixedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, data)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 pub async fn serve_tcp_listener_with_idle<Client>(

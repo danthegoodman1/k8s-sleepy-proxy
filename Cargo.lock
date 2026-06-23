@@ -2303,6 +2303,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "control-plane",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -2311,6 +2312,7 @@ dependencies = [
  "proxy-core",
  "sleepypods-types",
  "tokio",
+ "tokio-tungstenite",
  "tonic",
 ]
 

@@ -26,9 +26,13 @@ pub use idle::{
 };
 use proxy_core::{
     DrainError, DrainTracker, HttpProxy, HttpProxyError, Shutdown, TcpProxy, TcpProxyConfig,
-    TcpProxyError, TcpProxyStats, TrackedBody,
+    TcpProxyError, TcpProxyStats, TrackedBody, WebSocketProxy, WebSocketProxyError,
+    WebSocketProxyStats,
 };
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -36,6 +40,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub struct SidecarProxyConfig {
     app_port: NonZeroU16,
     http_upstream_origin: Uri,
+    websocket_upstream_url: String,
     tcp_upstream_addr: SocketAddr,
     tcp_connect_timeout: Duration,
 }
@@ -50,6 +55,7 @@ pub struct SidecarProxy {
     config: SidecarProxyConfig,
     drain: DrainTracker,
     http: HttpProxy,
+    websocket: WebSocketProxy,
     tcp: TcpProxy,
 }
 
@@ -66,11 +72,13 @@ impl SidecarProxyConfig {
         let http_upstream_origin = format!("http://127.0.0.1:{app_port}")
             .parse()
             .expect("loopback HTTP origin built from a non-zero u16 is valid");
+        let websocket_upstream_url = format!("ws://127.0.0.1:{app_port}");
         let tcp_upstream_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), app_port.get());
 
         Ok(Self {
             app_port,
             http_upstream_origin,
+            websocket_upstream_url,
             tcp_upstream_addr,
             tcp_connect_timeout,
         })
@@ -82,6 +90,10 @@ impl SidecarProxyConfig {
 
     pub fn http_upstream_origin(&self) -> &Uri {
         &self.http_upstream_origin
+    }
+
+    pub fn websocket_upstream_url(&self) -> &str {
+        &self.websocket_upstream_url
     }
 
     pub fn tcp_upstream_addr(&self) -> SocketAddr {
@@ -96,6 +108,7 @@ impl SidecarProxyConfig {
 impl SidecarProxy {
     pub fn new(config: SidecarProxyConfig, drain: DrainTracker) -> Self {
         let http = HttpProxy::new(drain.clone());
+        let websocket = WebSocketProxy::new(drain.clone());
         let tcp = TcpProxy::new(
             drain.clone(),
             TcpProxyConfig {
@@ -107,6 +120,7 @@ impl SidecarProxy {
             config,
             drain,
             http,
+            websocket,
             tcp,
         }
     }
@@ -164,6 +178,18 @@ impl SidecarProxy {
     pub async fn forward_tcp(&self, client: TcpStream) -> Result<TcpProxyStats, TcpProxyError> {
         self.tcp
             .proxy(client, self.config.tcp_upstream_addr())
+            .await
+    }
+
+    pub async fn forward_websocket<Client>(
+        &self,
+        client: Client,
+    ) -> Result<WebSocketProxyStats, WebSocketProxyError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.websocket
+            .accept_and_proxy(client, self.config.websocket_upstream_url())
             .await
     }
 }

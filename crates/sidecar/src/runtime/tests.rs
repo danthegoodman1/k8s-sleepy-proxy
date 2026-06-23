@@ -2,17 +2,28 @@ use std::{
     convert::Infallible,
     error::Error,
     fmt,
-    future::pending,
+    future::{pending, Future},
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
-use http_body_util::Full;
-use hyper::{body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use futures_util::{SinkExt, StreamExt};
+use http::{Request, Response, StatusCode, Uri};
+use http_body::{Body, Frame};
+use http_body_util::{BodyExt, Full};
+use hyper::{
+    body::Incoming,
+    server::conn::{http1, http2},
+    service::service_fn,
+};
+use hyper_util::{
+    client::legacy::Client,
+    rt::{TokioExecutor, TokioIo},
+};
 use proxy_core::{DrainError, Shutdown};
 use sleepypods_types::{Generation, InstanceId};
 use tokio::{
@@ -21,11 +32,15 @@ use tokio::{
     sync::oneshot,
     task::JoinHandle,
 };
+use tokio_tungstenite::{
+    accept_async, connect_async,
+    tungstenite::{protocol::CloseFrame, Message},
+};
 
 use crate::{
     runtime::{
-        serve_http_listener_with_idle, serve_tcp_listener_with_idle, SidecarRuntimeConfig,
-        SidecarRuntimeError,
+        detect_protocol, serve_http_listener_with_idle, serve_tcp_listener_with_idle,
+        AcceptedProtocol, SidecarRuntimeConfig, SidecarRuntimeError,
     },
     IdleReportConfig, ReportIdleClient, ReportIdleFuture, ReportIdleRequest, ReportIdleResponse,
 };
@@ -33,8 +48,10 @@ use crate::{
 const IDLE_TIMEOUT: Duration = Duration::from_millis(50);
 const RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const DRAIN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_REQUEST: &[u8] = b"runtime tcp request bytes";
 const TCP_RESPONSE: &[u8] = b"runtime tcp response bytes";
+const GRPC_MESSAGE: &[u8] = b"\0\0\0\0\0";
 
 type RecordedRequests = Arc<Mutex<Vec<ReportIdleRequest>>>;
 
@@ -109,6 +126,206 @@ async fn idle_report_fires_without_http_activity() {
         .await
         .expect("runtime task joins")
         .expect("runtime exits");
+}
+
+#[tokio::test]
+async fn protocol_detection_handles_segmented_h2c_preface_and_replays_it() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("detector listener binds");
+    let addr = listener.local_addr().expect("detector listener has addr");
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("detector client connects");
+        client
+            .write_all(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..5])
+            .await
+            .expect("client writes partial h2 preface");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        client
+            .write_all(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[5..])
+            .await
+            .expect("client writes remaining h2 preface");
+    });
+    let (server, _) = listener.accept().await.expect("detector accepts client");
+    let shutdown = Shutdown::new();
+
+    let accepted = expect_within(
+        detect_protocol(server, &shutdown),
+        "segmented h2c protocol detection",
+    )
+    .await
+    .expect("protocol is detected");
+    assert_eq!(accepted.protocol, AcceptedProtocol::Http2);
+
+    let mut stream = accepted.into_stream();
+    let mut replayed = vec![0; b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".len()];
+    stream
+        .read_exact(&mut replayed)
+        .await
+        .expect("buffered h2 preface replays");
+    assert_eq!(replayed, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    client_task.await.expect("client task completed");
+}
+
+#[tokio::test]
+async fn protocol_detection_handles_large_websocket_upgrade_headers_and_replays_them() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("detector listener binds");
+    let addr = listener.local_addr().expect("detector listener has addr");
+    let padding = "a".repeat(4096);
+    let request = format!(
+        "GET /socket HTTP/1.1\r\nhost: localhost\r\nx-padding: {padding}\r\nconnection: keep-alive,  Upgrade\r\nupgrade:   WebSocket\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n"
+    );
+    let expected = request.clone();
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("detector client connects");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("client writes websocket upgrade");
+    });
+    let (server, _) = listener.accept().await.expect("detector accepts client");
+    let shutdown = Shutdown::new();
+
+    let accepted = expect_within(
+        detect_protocol(server, &shutdown),
+        "large websocket protocol detection",
+    )
+    .await
+    .expect("protocol is detected");
+    assert_eq!(accepted.protocol, AcceptedProtocol::WebSocket);
+
+    let mut stream = accepted.into_stream();
+    let mut replayed = vec![0; expected.len()];
+    stream
+        .read_exact(&mut replayed)
+        .await
+        .expect("buffered websocket headers replay");
+    assert_eq!(replayed, expected.as_bytes());
+    client_task.await.expect("client task completed");
+}
+
+#[tokio::test]
+async fn h2c_grpc_shaped_stream_delays_idle_report_until_stream_closes() {
+    let (release_upstream, upstream_released) = oneshot::channel();
+    let (upstream_received, upstream_received_rx) = oneshot::channel();
+    let (upstream_addr, upstream_task) =
+        spawn_blocked_h2_grpc_upstream(upstream_released, upstream_received).await;
+    let shutdown = Shutdown::new();
+    let client = FakeReportIdleClient::new();
+    let requests = client.requests();
+    let (runtime_addr, runtime_task) =
+        spawn_runtime(upstream_addr.port(), client, shutdown.clone()).await;
+
+    let h2_client = Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build_http::<Full<Bytes>>();
+    let uri: Uri = format!("http://{runtime_addr}/grpc.health.v1.Health/Watch")
+        .parse()
+        .expect("h2 URI parses");
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from_static(GRPC_MESSAGE)))
+        .expect("h2 grpc-shaped request builds");
+
+    let response_task = tokio::spawn(async move { h2_client.request(request).await });
+    expect_within(upstream_received_rx, "h2 upstream request receipt")
+        .await
+        .expect("upstream receives h2 request");
+
+    let mut response = expect_within(response_task, "h2 response headers")
+        .await
+        .expect("h2 response task joins")
+        .expect("h2 request succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .expect("grpc content type is preserved"),
+        "application/grpc"
+    );
+
+    let frame = expect_within(
+        response.body_mut().frame(),
+        "initial h2 grpc response frame",
+    )
+    .await
+    .expect("h2 response has initial frame")
+    .expect("initial h2 response frame is valid");
+    assert_eq!(
+        frame.data_ref().expect("initial h2 frame has data"),
+        &Bytes::from_static(GRPC_MESSAGE)
+    );
+
+    tokio::time::sleep(IDLE_TIMEOUT + RETRY_BACKOFF).await;
+    assert_recorded_count(&requests, 0);
+
+    release_upstream.send(()).expect("upstream release sent");
+    expect_within(response.into_body().collect(), "h2 response body release")
+        .await
+        .expect("h2 response body is readable")
+        .to_bytes();
+    wait_for_recorded_count(&requests, 1).await;
+
+    shutdown.shutdown();
+    runtime_task
+        .await
+        .expect("runtime task joins")
+        .expect("runtime exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn websocket_session_delays_idle_report_until_session_closes() {
+    let (release_upstream, upstream_released) = oneshot::channel();
+    let (upstream_received, upstream_received_rx) = oneshot::channel();
+    let (upstream_addr, upstream_task) =
+        spawn_blocked_websocket_upstream(upstream_released, upstream_received).await;
+    let shutdown = Shutdown::new();
+    let client = FakeReportIdleClient::new();
+    let requests = client.requests();
+    let (runtime_addr, runtime_task) =
+        spawn_runtime(upstream_addr.port(), client, shutdown.clone()).await;
+
+    let (mut websocket, _) = connect_async(format!("ws://{runtime_addr}/socket"))
+        .await
+        .expect("client connects to runtime websocket");
+    websocket
+        .send(Message::Text("active websocket".into()))
+        .await
+        .expect("client sends websocket message");
+    expect_within(upstream_received_rx, "websocket upstream message receipt")
+        .await
+        .expect("upstream receives websocket message");
+
+    tokio::time::sleep(IDLE_TIMEOUT + RETRY_BACKOFF).await;
+    assert_recorded_count(&requests, 0);
+
+    release_upstream.send(()).expect("upstream release sent");
+    let close = expect_within(websocket.next(), "websocket close frame")
+        .await
+        .expect("client receives close")
+        .expect("close frame is valid");
+    assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "idle-test-done"));
+    drop(websocket);
+    wait_for_recorded_count(&requests, 1).await;
+
+    shutdown.shutdown();
+    runtime_task
+        .await
+        .expect("runtime task joins")
+        .expect("runtime exits");
+    upstream_task.await.expect("upstream task joins");
 }
 
 #[tokio::test]
@@ -350,6 +567,40 @@ impl fmt::Display for FakeReportIdleError {
 
 impl Error for FakeReportIdleError {}
 
+struct HeldGrpcBody {
+    sent_message: bool,
+    release: oneshot::Receiver<()>,
+}
+
+impl HeldGrpcBody {
+    fn new(release: oneshot::Receiver<()>) -> Self {
+        Self {
+            sent_message: false,
+            release,
+        }
+    }
+}
+
+impl Body for HeldGrpcBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if !self.sent_message {
+            self.sent_message = true;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(GRPC_MESSAGE)))));
+        }
+
+        match Pin::new(&mut self.release).poll(cx) {
+            Poll::Ready(_) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 async fn spawn_runtime(
     app_port: u16,
     client: FakeReportIdleClient,
@@ -542,6 +793,126 @@ async fn spawn_hanging_upstream(
     (addr, task)
 }
 
+async fn spawn_blocked_h2_grpc_upstream(
+    release: oneshot::Receiver<()>,
+    received: oneshot::Sender<()>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("h2 upstream listener binds");
+    let addr = listener
+        .local_addr()
+        .expect("h2 upstream listener has addr");
+    let received = Arc::new(Mutex::new(Some(received)));
+    let release = Arc::new(Mutex::new(Some(release)));
+
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("h2 upstream accepts runtime");
+
+        http2::Builder::new(TokioExecutor::new())
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |mut request: Request<Incoming>| {
+                    let received = Arc::clone(&received);
+                    let release = Arc::clone(&release);
+
+                    async move {
+                        assert_eq!(request.version(), http::Version::HTTP_2);
+                        assert_eq!(request.method(), "POST");
+                        assert_eq!(request.uri().path(), "/grpc.health.v1.Health/Watch");
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("content-type")
+                                .expect("grpc content type is preserved"),
+                            "application/grpc"
+                        );
+                        let body = request
+                            .body_mut()
+                            .collect()
+                            .await
+                            .expect("upstream reads grpc-shaped body")
+                            .to_bytes();
+                        assert_eq!(body, Bytes::from_static(GRPC_MESSAGE));
+
+                        if let Some(received) = received
+                            .lock()
+                            .expect("received lock is not poisoned")
+                            .take()
+                        {
+                            received.send(()).expect("test waits for h2 request");
+                        }
+
+                        let release = release
+                            .lock()
+                            .expect("release lock is not poisoned")
+                            .take()
+                            .expect("upstream handles one h2 request");
+
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/grpc")
+                                .body(HeldGrpcBody::new(release))
+                                .expect("h2 grpc-shaped response builds"),
+                        )
+                    }
+                }),
+            )
+            .await
+            .expect("h2 upstream serves request");
+    });
+
+    (addr, task)
+}
+
+async fn spawn_blocked_websocket_upstream(
+    release: oneshot::Receiver<()>,
+    received: oneshot::Sender<()>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("websocket upstream listener binds");
+    let addr = listener
+        .local_addr()
+        .expect("websocket upstream listener has addr");
+
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("websocket upstream accepts runtime");
+        let mut websocket = accept_async(stream)
+            .await
+            .expect("websocket upstream accepts handshake");
+
+        let message = expect_within(websocket.next(), "websocket upstream message")
+            .await
+            .expect("websocket upstream receives message")
+            .expect("websocket message is valid");
+        assert_eq!(message, Message::Text("active websocket".into()));
+        received.send(()).expect("test waits for websocket message");
+
+        release.await.expect("websocket upstream release received");
+        websocket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1000.into(),
+                reason: "idle-test-done".into(),
+            })))
+            .await
+            .expect("websocket upstream sends close");
+        websocket
+            .flush()
+            .await
+            .expect("websocket upstream flushes close");
+    });
+
+    (addr, task)
+}
+
 async fn spawn_tcp_response_upstream() -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -657,6 +1028,15 @@ async fn wait_for_recorded_count(requests: &RecordedRequests, expected: usize) {
     .expect("recorded request count reached before timeout");
 
     assert_recorded_count(requests, expected);
+}
+
+async fn expect_within<F>(future: F, label: &'static str) -> F::Output
+where
+    F: Future,
+{
+    tokio::time::timeout(TEST_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("{label} timed out"))
 }
 
 fn assert_recorded_count(requests: &RecordedRequests, expected: usize) {
