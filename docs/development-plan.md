@@ -816,7 +816,7 @@ Sub-phases:
 | Incomplete | 7A: Metrics, tracing, and structured log fields. | Descriptor-level observability exists; runtime lifecycle instrumentation and log assertions are missing; follow-up: M9/M10. |
 | Incomplete | 7B: Control-plane restart recovery during wake, sleep, and delete. | No restart recovery gate found; follow-up: M9. |
 | Complete | 7C: Proxy Subscribe reconnect, lazy cache rebuild, and stale backend recovery. | Transport reconnect and stale backend recovery have component coverage; actual stream-close-driven active cache invalidation before TTL expiry and lazy rebuild on the next request are covered by transport and resolver tests. |
-| Incomplete | 7D: Minimal final images and container runtime smoke tests. | Distroless images and smoke script exist, but full startup/connectivity/kind-use and image-size budgets are missing; follow-up: M9. |
+| Incomplete | 7D: Minimal final images and container runtime smoke tests. | Distroless images and `scripts/smoke-images.sh` enforce non-root/runtime-file/startup-error checks plus image-size budgets, but full startup/connectivity/kind-use gates are missing; follow-up: M9. |
 | Incomplete | 7E: Load tests for route lookup and proxy protocols. | Conservative load smokes and the route lookup benchmark exist, but h2/h2c/gRPC, WebSocket, cold-wake, tail-latency, and enforced regression budgets are incomplete; follow-up: M9. |
 | Incomplete | 7F: kind wake/sleep soak and leaked-object detection. | Existing soak is materializer-only; full wake/sleep soak is missing; follow-up: M9. |
 | Incomplete | 7G: Operator runbook and metric name documentation. | Operator-facing metric/runbook docs are not present; follow-up: M10. |
@@ -842,7 +842,7 @@ Done criteria:
 | Complete | Hot-cache route lookup avoids scanning every positive cached route. | `RouteCache::lookup` narrows positive candidates through `PositiveRouteIndex` by host/suffix/path/SNI before ranking, with cache tests preserving match semantics and route lookup benchmarks covering many unrelated cached routes. |
 | Incomplete | Retry/backoff tests cover transient database errors, Kubernetes conflicts, proxy disconnects, and materializer retries. | Proxy Subscribe transport reconnect after disconnect, stream-close invalidation/lazy rebuild, and sidecar retry are covered; database retry, Kubernetes conflict retry, proxy reconnect backoff policy, and materializer retry gates are still missing; follow-up: M9. |
 | Incomplete | Container tests prove images start, run non-root, include required files, access CA certs, and are used by kind E2E/soak. | `scripts/smoke-images.sh` checks non-root/no shell/files and expected startup failure without config; full startup/connectivity/kind-use is missing; follow-up: M9. |
-| Incomplete | Image-size budgets are defined and enforced. | No image-size budget gate found; follow-up: M9. |
+| Complete | Image-size budgets are defined and enforced. | `scripts/smoke-images.sh` enforces Docker inspect `.Size` against positive-integer byte budgets with a 256 MiB default and per-component overrides; `scripts/smoke-images.sh` passed on 2026-06-23 with control-plane 49,541,581 bytes, frontline 39,084,845 bytes, and sidecar 39,504,389 bytes. |
 | Incomplete | Dashboards or metric names are documented enough for operators. | No operator metric dashboard/runbook doc found; follow-up: M10. |
 
 ## Milestone 8: Phase Status Audit

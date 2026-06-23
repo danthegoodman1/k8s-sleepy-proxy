@@ -5,6 +5,71 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-dev}"
 components=(control-plane frontline sidecar)
+shared_image_size_budget="${SLEEPYPODS_IMAGE_SIZE_BUDGET_BYTES:-268435456}"
+control_plane_image_size_budget="${SLEEPYPODS_CONTROL_PLANE_IMAGE_SIZE_BUDGET_BYTES:-${shared_image_size_budget}}"
+frontline_image_size_budget="${SLEEPYPODS_FRONTLINE_IMAGE_SIZE_BUDGET_BYTES:-${shared_image_size_budget}}"
+sidecar_image_size_budget="${SLEEPYPODS_SIDECAR_IMAGE_SIZE_BUDGET_BYTES:-${shared_image_size_budget}}"
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${name} must be a positive integer, got ${value}" >&2
+    exit 1
+  fi
+}
+
+format_bytes() {
+  local bytes="$1"
+
+  awk -v bytes="${bytes}" '
+    BEGIN {
+      split("B KiB MiB GiB", units, " ")
+      size = bytes + 0
+      unit = 1
+      while (size >= 1024 && unit < 4) {
+        size = size / 1024
+        unit++
+      }
+
+      if (unit == 1) {
+        printf "%d %s", size, units[unit]
+      } else {
+        printf "%.2f %s", size, units[unit]
+      }
+    }'
+}
+
+image_size_budget() {
+  case "$1" in
+    control-plane) echo "${control_plane_image_size_budget}" ;;
+    frontline) echo "${frontline_image_size_budget}" ;;
+    sidecar) echo "${sidecar_image_size_budget}" ;;
+    *) return 1 ;;
+  esac
+}
+
+assert_image_size_budget() {
+  local image="$1"
+  local component="$2"
+  local budget image_size
+
+  budget="$(image_size_budget "${component}")"
+  image_size="$(docker image inspect "${image}" --format '{{.Size}}')"
+
+  echo "${image} size: $(format_bytes "${image_size}") (${image_size} bytes), budget: $(format_bytes "${budget}") (${budget} bytes)"
+
+  if (( image_size > budget )); then
+    echo "${image} exceeds image-size budget" >&2
+    exit 1
+  fi
+}
+
+require_positive_integer SLEEPYPODS_IMAGE_SIZE_BUDGET_BYTES "${shared_image_size_budget}"
+require_positive_integer SLEEPYPODS_CONTROL_PLANE_IMAGE_SIZE_BUDGET_BYTES "${control_plane_image_size_budget}"
+require_positive_integer SLEEPYPODS_FRONTLINE_IMAGE_SIZE_BUDGET_BYTES "${frontline_image_size_budget}"
+require_positive_integer SLEEPYPODS_SIDECAR_IMAGE_SIZE_BUDGET_BYTES "${sidecar_image_size_budget}"
 
 expected_error() {
   case "$1" in
@@ -91,6 +156,8 @@ for component in "${components[@]}"; do
     --tag "${image}" \
     --file "${repo_root}/Dockerfile" \
     "${repo_root}"
+
+  assert_image_size_budget "${image}" "${component}"
 
   user="$(docker image inspect "${image}" --format '{{.Config.User}}')"
   if [[ -z "${user}" || "${user}" == "0" || "${user}" == "root" || "${user}" == "0:0" ]]; then
