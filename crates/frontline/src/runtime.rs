@@ -179,12 +179,23 @@ where
 fn http_request_identity<B>(
     request: &Request<B>,
 ) -> Result<RouteRequestIdentity, RequestIdentityError> {
-    let host = request
+    let host_header = request
         .headers()
         .get(HOST)
-        .ok_or(RequestIdentityError::EmptyHost)?
-        .to_str()
-        .map_err(|_| RequestIdentityError::UnsupportedHostSyntax)?;
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| RequestIdentityError::UnsupportedHostSyntax)
+        })
+        .transpose()?;
+    let host = host_header
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+        .ok_or(RequestIdentityError::EmptyHost)?;
     let path = request.uri().path_and_query().map(|value| value.path());
 
     RouteRequestIdentity::http(host, path)

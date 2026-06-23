@@ -1,7 +1,10 @@
 use std::{convert::Infallible, error::Error, fmt, io, net::SocketAddr, time::Instant};
 
-use hyper::{body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use hyper::{body::Incoming, service::service_fn};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
 use proxy_core::{DrainError, Shutdown};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinSet};
 
@@ -107,8 +110,8 @@ where
                             Ok::<_, Infallible>(runtime.handle(request).await)
                         }
                     });
-                    let mut builder = http1::Builder::new();
-                    builder.keep_alive(false);
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    builder.http1().keep_alive(false);
                     let connection = builder.serve_connection(TokioIo::new(stream), service);
                     tokio::pin!(connection);
 

@@ -13,8 +13,10 @@ use control_plane::{
     Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
     RouteHost, RouteIdentity,
 };
-use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http::{HeaderMap, Request, Response, StatusCode, Version};
+use http_body_util::{channel::Channel, BodyExt, Full};
+use hyper::client::conn::http2 as client_http2;
+use hyper::server::conn::http2;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{
     client::legacy::Client,
@@ -284,6 +286,81 @@ async fn listener_forwards_http_request_through_ready_route() {
     assert!(route_client.calls().is_empty());
 
     shutdown.shutdown();
+    task.await
+        .expect("listener task joins")
+        .expect("listener exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn listener_h2c_grpc_shaped_request_routes_and_preserves_body_trailers() {
+    let (upstream_addr, upstream_task) = spawn_h2c_grpc_upstream().await;
+    let route_client = FakeRouteClient::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-h2c"),
+            http_identity("grpc.example.com", "/grpc.Test/Echo"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{upstream_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let stream = TcpStream::connect(addr).await.expect("h2c client connects");
+    let (mut sender, connection) =
+        client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("h2c client handshake");
+    let client_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let response = sender
+        .send_request(
+            Request::builder()
+                .version(Version::HTTP_2)
+                .method("POST")
+                .uri("http://grpc.example.com/grpc.Test/Echo")
+                .header("content-type", "application/grpc")
+                .body(Full::new(Bytes::from_static(b"\0\0\0\0\x05world")))
+                .expect("grpc request builds"),
+        )
+        .await
+        .expect("h2c listener request succeeds");
+
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .expect("content-type"),
+        "application/grpc"
+    );
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body and trailers read");
+    let trailers = collected
+        .trailers()
+        .cloned()
+        .expect("grpc trailers forwarded");
+    assert_eq!(
+        collected.to_bytes(),
+        Bytes::from_static(b"\0\0\0\0\x05hello")
+    );
+    assert_eq!(trailers.get("grpc-status").expect("grpc-status"), "0");
+    assert_eq!(trailers.get("grpc-message").expect("grpc-message"), "ok");
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    client_task.await.expect("h2c client task joins");
     task.await
         .expect("listener task joins")
         .expect("listener exits");
@@ -609,6 +686,69 @@ async fn spawn_http_upstream(
                 .await
                 .expect("upstream serves");
         }
+    });
+
+    (addr, task)
+}
+
+async fn spawn_h2c_grpc_upstream() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream binds");
+    let addr = listener.local_addr().expect("upstream addr");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("upstream accepts");
+
+        http2::Builder::new(TokioExecutor::new())
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|mut request: Request<Incoming>| async move {
+                    assert_eq!(request.version(), Version::HTTP_2);
+                    assert_eq!(
+                        request.uri().path_and_query().expect("path query").as_str(),
+                        "/grpc.Test/Echo"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("content-type")
+                            .expect("grpc content-type"),
+                        "application/grpc"
+                    );
+                    let body = request
+                        .body_mut()
+                        .collect()
+                        .await
+                        .expect("request body reads")
+                        .to_bytes();
+                    assert_eq!(body, Bytes::from_static(b"\0\0\0\0\x05world"));
+
+                    let (mut sender, body) = Channel::<Bytes, Infallible>::new(2);
+                    tokio::spawn(async move {
+                        sender
+                            .send_data(Bytes::from_static(b"\0\0\0\0\x05hello"))
+                            .await
+                            .expect("sends grpc response body");
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert("grpc-status", "0".parse().expect("status header"));
+                        trailers.insert("grpc-message", "ok".parse().expect("message header"));
+                        sender
+                            .send_trailers(trailers)
+                            .await
+                            .expect("sends grpc trailers");
+                    });
+
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .expect("response builds"),
+                    )
+                }),
+            )
+            .await
+            .expect("upstream serves h2");
     });
 
     (addr, task)
