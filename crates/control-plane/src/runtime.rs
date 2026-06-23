@@ -22,7 +22,7 @@ use crate::{
         KubernetesMaterializer, KubernetesMaterializerClient, RetryingKubernetesMaterializerClient,
     },
     postgres::PostgresStore,
-    store::ControlPlaneStore,
+    store::{ControlPlaneStore, RetryingControlPlaneStore},
     KubeMaterializerClient,
 };
 
@@ -209,7 +209,10 @@ async fn connect_store(
     match config {
         StoreProviderConfig::Postgres(config) => {
             let store = PostgresStore::connect(config).await?;
-            Ok(Arc::new(store))
+            let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
+            Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
+                store,
+            )))
         }
     }
 }

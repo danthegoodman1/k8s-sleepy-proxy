@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod materialization;
 pub mod materializer;
 pub mod postgres;
+pub mod retry;
 pub mod route;
 pub mod runtime;
 pub mod sleep_policy;
@@ -57,9 +58,10 @@ pub use materialization::{
 pub use materializer::{
     rendered_object_ref, AppliedMaterialization, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
-    MaterializerError, RetryPolicy, RetryingKubernetesMaterializerClient,
+    MaterializerError, RetryingKubernetesMaterializerClient,
 };
 pub use postgres::PostgresStore;
+pub use retry::RetryPolicy;
 pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
     PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteDependencyLookup,
@@ -68,7 +70,9 @@ pub use route::{
 pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,
 };
-pub use store::{ControlPlaneStore, StoreError, StoreFuture, StoreResult};
+pub use store::{
+    ControlPlaneStore, RetryingControlPlaneStore, StoreError, StoreFuture, StoreResult,
+};
 pub use workload::{
     CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, ValueSchemaError,
     WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,

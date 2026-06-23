@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin, time::Duration};
+use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
 
 use crate::{
     manifest::{
@@ -6,6 +6,7 @@ use crate::{
         ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
     },
     materialization::{BackendEndpoint, RenderedObjectRef},
+    retry::RetryPolicy,
 };
 
 pub type KubernetesClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -37,13 +38,6 @@ pub trait KubernetesMaterializerClient: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct KubernetesMaterializer<C> {
     client: C,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RetryPolicy {
-    max_attempts: usize,
-    initial_backoff: Duration,
-    max_backoff: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -205,62 +199,6 @@ where
     }
 }
 
-impl RetryPolicy {
-    pub fn new(max_attempts: usize, initial_backoff: Duration, max_backoff: Duration) -> Self {
-        Self {
-            max_attempts,
-            initial_backoff,
-            max_backoff,
-        }
-    }
-
-    pub fn max_attempts(&self) -> usize {
-        self.max_attempts
-    }
-
-    pub fn initial_backoff(&self) -> Duration {
-        self.initial_backoff
-    }
-
-    pub fn max_backoff(&self) -> Duration {
-        self.max_backoff
-    }
-
-    async fn retry<T, O, Fut>(&self, mut operation: O) -> KubernetesClientResult<T>
-    where
-        O: FnMut() -> Fut,
-        Fut: Future<Output = KubernetesClientResult<T>>,
-    {
-        let max_attempts = self.max_attempts.max(1);
-        let mut attempts = 0;
-        let mut backoff = self.initial_backoff;
-
-        loop {
-            attempts += 1;
-            match operation().await {
-                Ok(value) => return Ok(value),
-                Err(error) if attempts < max_attempts && error.is_retryable() => {
-                    if !backoff.is_zero() {
-                        tokio::time::sleep(backoff).await;
-                    }
-                    backoff = next_backoff(backoff, self.max_backoff);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 4,
-            initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(2),
-        }
-    }
-}
-
 impl<C> RetryingKubernetesMaterializerClient<C> {
     pub fn new(inner: C, policy: RetryPolicy) -> Self {
         Self { inner, policy }
@@ -289,7 +227,14 @@ where
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         let inner = &self.inner;
         let policy = self.policy;
-        Box::pin(async move { policy.retry(|| inner.apply_object(object)).await })
+        Box::pin(async move {
+            policy
+                .retry_if(
+                    || inner.apply_object(object),
+                    KubernetesClientError::is_retryable,
+                )
+                .await
+        })
     }
 
     fn delete_object<'a>(
@@ -298,7 +243,14 @@ where
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         let inner = &self.inner;
         let policy = self.policy;
-        Box::pin(async move { policy.retry(|| inner.delete_object(object)).await })
+        Box::pin(async move {
+            policy
+                .retry_if(
+                    || inner.delete_object(object),
+                    KubernetesClientError::is_retryable,
+                )
+                .await
+        })
     }
 
     fn wait_for_pvc_bound<'a>(
@@ -310,7 +262,10 @@ where
         let policy = self.policy;
         Box::pin(async move {
             policy
-                .retry(|| inner.wait_for_pvc_bound(namespace, name))
+                .retry_if(
+                    || inner.wait_for_pvc_bound(namespace, name),
+                    KubernetesClientError::is_retryable,
+                )
                 .await
         })
     }
@@ -321,7 +276,14 @@ where
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
         let inner = &self.inner;
         let policy = self.policy;
-        Box::pin(async move { policy.retry(|| inner.wait_for_readiness(objects)).await })
+        Box::pin(async move {
+            policy
+                .retry_if(
+                    || inner.wait_for_readiness(objects),
+                    KubernetesClientError::is_retryable,
+                )
+                .await
+        })
     }
 }
 
@@ -381,14 +343,6 @@ impl fmt::Display for KubernetesClientError {
 }
 
 impl Error for KubernetesClientError {}
-
-fn next_backoff(current: Duration, max: Duration) -> Duration {
-    if current.is_zero() || max.is_zero() {
-        return Duration::ZERO;
-    }
-
-    current.checked_mul(2).unwrap_or(max).min(max)
-}
 
 impl fmt::Display for MaterializerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

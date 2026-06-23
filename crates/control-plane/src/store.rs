@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, future::Future, pin::Pin};
+use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     http01::{
@@ -22,6 +22,7 @@ use crate::{
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
     },
+    RetryPolicy,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -134,6 +135,12 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> StoreFuture<'a, StoreResult<usize>>;
 }
 
+#[derive(Clone)]
+pub struct RetryingControlPlaneStore {
+    inner: Arc<dyn ControlPlaneStore>,
+    policy: RetryPolicy,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     InvalidArgument {
@@ -176,6 +183,244 @@ impl StoreError {
             message: message.into(),
         }
     }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+}
+
+impl RetryingControlPlaneStore {
+    pub fn new(inner: Arc<dyn ControlPlaneStore>, policy: RetryPolicy) -> Self {
+        Self { inner, policy }
+    }
+
+    pub fn with_default_policy(inner: Arc<dyn ControlPlaneStore>) -> Self {
+        Self::new(inner, RetryPolicy::default())
+    }
+
+    pub fn inner(&self) -> &Arc<dyn ControlPlaneStore> {
+        &self.inner
+    }
+
+    pub fn policy(&self) -> RetryPolicy {
+        self.policy
+    }
+}
+
+impl fmt::Debug for RetryingControlPlaneStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetryingControlPlaneStore")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneStore for RetryingControlPlaneStore {
+    fn create_instance<'a>(
+        &'a self,
+        request: CreateInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.create_instance(request.clone())
+        })
+    }
+
+    fn get_instance<'a>(
+        &'a self,
+        request: GetInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.get_instance(request.clone())
+        })
+    }
+
+    fn delete_instance<'a>(
+        &'a self,
+        request: DeleteInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.delete_instance(request.clone())
+        })
+    }
+
+    fn create_workload_class_version<'a>(
+        &'a self,
+        request: CreateWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.create_workload_class_version(request.clone())
+        })
+    }
+
+    fn load_workload_class_version<'a>(
+        &'a self,
+        request: LoadWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.load_workload_class_version(request.clone())
+        })
+    }
+
+    fn create_route_binding<'a>(
+        &'a self,
+        request: CreateRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.create_route_binding(request.clone())
+        })
+    }
+
+    fn get_route_binding<'a>(
+        &'a self,
+        request: GetRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.get_route_binding(request.clone())
+        })
+    }
+
+    fn delete_route_binding<'a>(
+        &'a self,
+        request: DeleteRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.delete_route_binding(request.clone())
+        })
+    }
+
+    fn resolve_route<'a>(
+        &'a self,
+        identity: RouteIdentity,
+    ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.resolve_route(identity.clone())
+        })
+    }
+
+    fn compare_and_swap_instance_state<'a>(
+        &'a self,
+        request: CompareAndSwapInstanceStateRequest,
+    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.compare_and_swap_instance_state(request.clone())
+        })
+    }
+
+    fn record_materialization<'a>(
+        &'a self,
+        request: RecordMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.record_materialization(request.clone())
+        })
+    }
+
+    fn load_ready_materialization<'a>(
+        &'a self,
+        request: LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.load_ready_materialization(request.clone())
+        })
+    }
+
+    fn load_active_materialization<'a>(
+        &'a self,
+        request: LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.load_active_materialization(request.clone())
+        })
+    }
+
+    fn complete_wake<'a>(
+        &'a self,
+        request: CompleteWakeRequest,
+    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.complete_wake(request.clone())
+        })
+    }
+
+    fn begin_sleep<'a>(
+        &'a self,
+        request: BeginSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.begin_sleep(request.clone())
+        })
+    }
+
+    fn finalize_sleep<'a>(
+        &'a self,
+        request: FinalizeSleepRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.finalize_sleep(request.clone())
+        })
+    }
+
+    fn lookup_route_dependencies<'a>(
+        &'a self,
+        request: RouteDependencyLookup,
+    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.lookup_route_dependencies(request.clone())
+        })
+    }
+
+    fn put_http01_challenge<'a>(
+        &'a self,
+        request: PutHttp01ChallengeRequest,
+    ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.put_http01_challenge(request.clone())
+        })
+    }
+
+    fn resolve_http01_challenge<'a>(
+        &'a self,
+        key: Http01ChallengeKey,
+    ) -> StoreFuture<'a, StoreResult<Option<Http01ChallengeRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.resolve_http01_challenge(key.clone())
+        })
+    }
+
+    fn delete_http01_challenge<'a>(
+        &'a self,
+        request: DeleteHttp01ChallengeRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.delete_http01_challenge(request.clone())
+        })
+    }
+
+    fn expire_http01_challenges<'a>(
+        &'a self,
+        request: ExpireHttp01ChallengesRequest,
+    ) -> StoreFuture<'a, StoreResult<usize>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.expire_http01_challenges(request.clone())
+        })
+    }
+}
+
+fn retry_store_operation<'a, T, O, Fut>(
+    inner: &'a Arc<dyn ControlPlaneStore>,
+    policy: RetryPolicy,
+    mut operation: O,
+) -> StoreFuture<'a, StoreResult<T>>
+where
+    T: Send + 'a,
+    O: FnMut(&'a dyn ControlPlaneStore) -> Fut + Send + 'a,
+    Fut: Future<Output = StoreResult<T>> + Send + 'a,
+{
+    Box::pin(async move {
+        policy
+            .retry_if(|| operation(inner.as_ref()), StoreError::is_retryable)
+            .await
+    })
 }
 
 impl fmt::Display for StoreError {
@@ -203,12 +448,271 @@ impl Error for StoreError {}
 
 #[cfg(test)]
 mod tests {
-    use super::ControlPlaneStore;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use crate::InstanceId;
+
+    use super::*;
 
     fn assert_dyn_safe<T: ControlPlaneStore + ?Sized>() {}
 
     #[test]
     fn control_plane_store_trait_is_dyn_safe() {
         assert_dyn_safe::<dyn ControlPlaneStore>();
+    }
+
+    #[tokio::test]
+    async fn retrying_control_plane_store_retries_unavailable_until_success() {
+        let inner = Arc::new(FakeRetryStore::with_get_instance_errors(vec![
+            StoreError::unavailable("database is starting"),
+            StoreError::unavailable("database is still starting"),
+        ]));
+        let store = RetryingControlPlaneStore::new(inner.clone(), immediate_retry_policy());
+
+        let result = store
+            .get_instance(GetInstanceRequest {
+                instance_id: InstanceId::new("retry-instance").expect("instance id"),
+            })
+            .await
+            .expect("transient unavailable errors are retried");
+
+        assert_eq!(result, None);
+        assert_eq!(inner.get_instance_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn retrying_control_plane_store_does_not_retry_permanent_errors() {
+        let inner = Arc::new(FakeRetryStore::with_get_instance_errors(vec![
+            StoreError::invalid_argument("bad instance id"),
+        ]));
+        let store = RetryingControlPlaneStore::new(inner.clone(), immediate_retry_policy());
+
+        let error = store
+            .get_instance(GetInstanceRequest {
+                instance_id: InstanceId::new("retry-instance").expect("instance id"),
+            })
+            .await
+            .expect_err("permanent errors are not retried");
+
+        assert!(matches!(error, StoreError::InvalidArgument { .. }));
+        assert_eq!(inner.get_instance_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn retrying_control_plane_store_stops_after_max_attempts() {
+        let inner = Arc::new(FakeRetryStore::with_get_instance_errors(vec![
+            StoreError::unavailable("database is down"),
+            StoreError::unavailable("database is still down"),
+            StoreError::unavailable("database remains down"),
+        ]));
+        let store = RetryingControlPlaneStore::new(
+            inner.clone(),
+            RetryPolicy::new(2, Duration::ZERO, Duration::ZERO),
+        );
+
+        let error = store
+            .get_instance(GetInstanceRequest {
+                instance_id: InstanceId::new("retry-instance").expect("instance id"),
+            })
+            .await
+            .expect_err("last transient error is returned after attempts are exhausted");
+
+        assert!(matches!(error, StoreError::Unavailable { .. }));
+        assert_eq!(inner.get_instance_calls(), 2);
+    }
+
+    fn immediate_retry_policy() -> RetryPolicy {
+        RetryPolicy::new(4, Duration::ZERO, Duration::ZERO)
+    }
+
+    #[derive(Debug)]
+    struct FakeRetryStore {
+        get_instance_errors: Mutex<VecDeque<StoreError>>,
+        get_instance_calls: AtomicUsize,
+    }
+
+    impl FakeRetryStore {
+        fn with_get_instance_errors(errors: Vec<StoreError>) -> Self {
+            Self {
+                get_instance_errors: Mutex::new(VecDeque::from(errors)),
+                get_instance_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_instance_calls(&self) -> usize {
+            self.get_instance_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ControlPlaneStore for FakeRetryStore {
+        fn create_instance<'a>(
+            &'a self,
+            _request: CreateInstanceRequest,
+        ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
+            not_implemented()
+        }
+
+        fn get_instance<'a>(
+            &'a self,
+            _request: GetInstanceRequest,
+        ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
+            self.get_instance_calls.fetch_add(1, Ordering::SeqCst);
+            let error = self
+                .get_instance_errors
+                .lock()
+                .expect("fake store lock")
+                .pop_front();
+
+            Box::pin(async move {
+                match error {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                }
+            })
+        }
+
+        fn delete_instance<'a>(
+            &'a self,
+            _request: DeleteInstanceRequest,
+        ) -> StoreFuture<'a, StoreResult<bool>> {
+            not_implemented()
+        }
+
+        fn create_workload_class_version<'a>(
+            &'a self,
+            _request: CreateWorkloadClassVersionRequest,
+        ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>> {
+            not_implemented()
+        }
+
+        fn load_workload_class_version<'a>(
+            &'a self,
+            _request: LoadWorkloadClassVersionRequest,
+        ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
+            not_implemented()
+        }
+
+        fn create_route_binding<'a>(
+            &'a self,
+            _request: CreateRouteBindingRequest,
+        ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
+            not_implemented()
+        }
+
+        fn get_route_binding<'a>(
+            &'a self,
+            _request: GetRouteBindingRequest,
+        ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>> {
+            not_implemented()
+        }
+
+        fn delete_route_binding<'a>(
+            &'a self,
+            _request: DeleteRouteBindingRequest,
+        ) -> StoreFuture<'a, StoreResult<bool>> {
+            not_implemented()
+        }
+
+        fn resolve_route<'a>(
+            &'a self,
+            _identity: RouteIdentity,
+        ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+            not_implemented()
+        }
+
+        fn compare_and_swap_instance_state<'a>(
+            &'a self,
+            _request: CompareAndSwapInstanceStateRequest,
+        ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
+            not_implemented()
+        }
+
+        fn record_materialization<'a>(
+            &'a self,
+            _request: RecordMaterializationRequest,
+        ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
+            not_implemented()
+        }
+
+        fn load_ready_materialization<'a>(
+            &'a self,
+            _request: LoadReadyMaterializationRequest,
+        ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+            not_implemented()
+        }
+
+        fn load_active_materialization<'a>(
+            &'a self,
+            _request: LoadActiveMaterializationRequest,
+        ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+            not_implemented()
+        }
+
+        fn complete_wake<'a>(
+            &'a self,
+            _request: CompleteWakeRequest,
+        ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+            not_implemented()
+        }
+
+        fn begin_sleep<'a>(
+            &'a self,
+            _request: BeginSleepRequest,
+        ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
+            not_implemented()
+        }
+
+        fn finalize_sleep<'a>(
+            &'a self,
+            _request: FinalizeSleepRequest,
+        ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+            not_implemented()
+        }
+
+        fn lookup_route_dependencies<'a>(
+            &'a self,
+            _request: RouteDependencyLookup,
+        ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
+            not_implemented()
+        }
+
+        fn put_http01_challenge<'a>(
+            &'a self,
+            _request: PutHttp01ChallengeRequest,
+        ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>> {
+            not_implemented()
+        }
+
+        fn resolve_http01_challenge<'a>(
+            &'a self,
+            _key: Http01ChallengeKey,
+        ) -> StoreFuture<'a, StoreResult<Option<Http01ChallengeRecord>>> {
+            not_implemented()
+        }
+
+        fn delete_http01_challenge<'a>(
+            &'a self,
+            _request: DeleteHttp01ChallengeRequest,
+        ) -> StoreFuture<'a, StoreResult<bool>> {
+            not_implemented()
+        }
+
+        fn expire_http01_challenges<'a>(
+            &'a self,
+            _request: ExpireHttp01ChallengesRequest,
+        ) -> StoreFuture<'a, StoreResult<usize>> {
+            not_implemented()
+        }
+    }
+
+    fn not_implemented<'a, T>() -> StoreFuture<'a, StoreResult<T>> {
+        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
     }
 }
