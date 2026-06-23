@@ -2,8 +2,11 @@ use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
     ids::{Generation, IdempotencyKey, InstanceId},
+    materialization::{LoadActiveMaterializationRequest, MaterializationTarget},
+    materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     route::{RouteBindingRecord, RouteBindingSpec},
     sleep_policy::SleepPolicyError,
+    store::{ControlPlaneStore, StoreError},
     workload::{ValueSchemaError, WorkloadClassVersion, WorkloadClassVersionRef},
 };
 
@@ -209,6 +212,49 @@ pub enum CreateInstanceValidationError {
     SleepPolicy(SleepPolicyError),
 }
 
+#[derive(Debug)]
+pub enum DeleteInstanceError {
+    Materializer {
+        instance_id: InstanceId,
+        source: MaterializerError,
+    },
+    Store(StoreError),
+}
+
+pub async fn delete_instance<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    request: DeleteInstanceRequest,
+) -> Result<bool, DeleteInstanceError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    let materialization = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            request.instance_id.clone(),
+            target,
+        ))
+        .await
+        .map_err(DeleteInstanceError::Store)?;
+
+    if let Some(materialization) = materialization.as_ref() {
+        materializer
+            .delete_rendered_objects(&materialization.rendered_objects)
+            .await
+            .map_err(|source| DeleteInstanceError::Materializer {
+                instance_id: request.instance_id.clone(),
+                source,
+            })?;
+    }
+
+    store
+        .delete_instance(request)
+        .await
+        .map_err(DeleteInstanceError::Store)
+}
+
 impl fmt::Display for CreateInstanceValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -229,6 +275,31 @@ impl From<ValueSchemaError> for CreateInstanceValidationError {
 impl From<SleepPolicyError> for CreateInstanceValidationError {
     fn from(error: SleepPolicyError) -> Self {
         Self::SleepPolicy(error)
+    }
+}
+
+impl fmt::Display for DeleteInstanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Materializer {
+                instance_id,
+                source,
+            } => write!(
+                f,
+                "Kubernetes cleanup failed for instance {}: {source}",
+                instance_id.as_str()
+            ),
+            Self::Store(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for DeleteInstanceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Materializer { source, .. } => Some(source),
+            Self::Store(error) => Some(error),
+        }
     }
 }
 

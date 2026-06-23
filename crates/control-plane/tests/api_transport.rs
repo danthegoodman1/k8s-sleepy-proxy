@@ -29,8 +29,11 @@ use control_plane::api::{
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
 use control_plane::{
-    ControlPlaneStore, CreateInstanceResult, Generation, InstanceRecord,
-    InstanceState as DomainInstanceState, StoreError, StoreFuture, StoreResult,
+    BackendEndpoint, BackendGeneration, ControlPlaneStore, CreateInstanceResult, Generation,
+    InstanceId, InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientError,
+    KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
+    KubernetesMaterializerClient, MaterializationId, MaterializationRecord, MaterializationState,
+    MaterializationTarget, RenderedObjectRef, StoreError, StoreFuture, StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -39,6 +42,94 @@ use tonic::codegen::http::{header, HeaderMap, HeaderName, HeaderValue, Method, R
 use tonic::server::NamedService;
 use tonic::{Code, Response, Status};
 use tower::{Layer, ServiceExt};
+
+fn store_operator_api(
+    store: Arc<dyn ControlPlaneStore>,
+) -> StoreBackedOperatorApi<FakeKubernetesClient> {
+    StoreBackedOperatorApi::new(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        target(),
+    )
+}
+
+fn store_operator_grpc_service(
+    store: Arc<dyn ControlPlaneStore>,
+) -> control_plane::api::server::StoreBackedOperatorGrpcService<FakeKubernetesClient> {
+    operator_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        target(),
+    )
+}
+
+fn operator_materializer(
+    client: FakeKubernetesClient,
+) -> KubernetesMaterializer<FakeKubernetesClient> {
+    KubernetesMaterializer::new(client)
+}
+
+fn target() -> MaterializationTarget {
+    MaterializationTarget::new("cluster-a", "apps").expect("target is valid")
+}
+
+fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> InstanceRecord {
+    InstanceRecord {
+        id: InstanceId::new(id).expect("instance id is valid"),
+        workload_class: control_plane::WorkloadClassVersionRef::new(
+            control_plane::WorkloadClassId::new("class-1").expect("class id is valid"),
+            Generation::new(1),
+        ),
+        values: Default::default(),
+        state,
+        generation: Generation::new(generation),
+    }
+}
+
+fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationRecord {
+    materialization(
+        instance_id,
+        generation,
+        target(),
+        MaterializationState::Ready,
+    )
+}
+
+fn materialization(
+    instance_id: &str,
+    generation: u64,
+    target: MaterializationTarget,
+    state: MaterializationState,
+) -> MaterializationRecord {
+    MaterializationRecord {
+        id: MaterializationId::new(format!(
+            "{}:{}:{}",
+            instance_id,
+            target.cluster_id(),
+            target.namespace()
+        ))
+        .expect("materialization id is valid"),
+        instance_id: InstanceId::new(instance_id).expect("instance id is valid"),
+        instance_generation: Generation::new(generation),
+        target,
+        state,
+        backend: Some(BackendEndpoint::new("http://example").expect("backend is valid")),
+        backend_generation: BackendGeneration::new(generation),
+        rendered_objects: vec![
+            object_ref("v1", "Service", "apps", &format!("{instance_id}-svc")),
+            object_ref("apps/v1", "Deployment", "apps", instance_id),
+        ],
+    }
+}
+
+fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
+    RenderedObjectRef {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
+    }
+}
 
 #[test]
 fn generated_api_contains_expected_v1_resource_shape() {
@@ -135,7 +226,7 @@ async fn placeholder_methods_are_explicitly_unimplemented() {
 #[tokio::test]
 async fn store_backed_instance_methods_create_get_and_delete_instances() {
     let store = Arc::new(FakeInstanceStore::default());
-    let service = StoreBackedOperatorApi::new(store);
+    let service = store_operator_api(store);
 
     let created = service
         .create_instance(tonic::Request::new(CreateInstanceRequest {
@@ -191,8 +282,255 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 }
 
 #[tokio::test]
+async fn operator_delete_cleans_active_materialization_before_store_delete() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-active",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_materialization(ready_materialization("instance-delete-active", 7));
+    let client = FakeKubernetesClient::default();
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let response = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-active".to_owned(),
+        }))
+        .await
+        .expect("delete instance succeeds")
+        .into_inner();
+
+    assert!(response.deleted);
+    assert!(!store.instance_exists("instance-delete-active"));
+    assert_eq!(
+        client.deleted(),
+        vec![
+            object_ref("apps/v1", "Deployment", "apps", "instance-delete-active"),
+            object_ref("v1", "Service", "apps", "instance-delete-active-svc"),
+        ]
+    );
+    assert_eq!(store.delete_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn operator_delete_without_active_materialization_deletes_store_only() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-cold",
+        DomainInstanceState::Cold,
+        0,
+    ));
+    let client = FakeKubernetesClient::default();
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let response = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-cold".to_owned(),
+        }))
+        .await
+        .expect("delete instance succeeds")
+        .into_inner();
+
+    assert!(response.deleted);
+    assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
+
+    let missing = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-cold".to_owned(),
+        }))
+        .await
+        .expect("missing delete remains idempotent")
+        .into_inner();
+
+    assert!(!missing.deleted);
+    assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
+}
+
+#[tokio::test]
+async fn operator_delete_ignores_materialization_for_other_target() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-other-target",
+        DomainInstanceState::Running,
+        3,
+    ));
+    store.seed_materialization(materialization(
+        "instance-delete-other-target",
+        3,
+        MaterializationTarget::new("cluster-b", "apps").expect("target is valid"),
+        MaterializationState::Ready,
+    ));
+    let client = FakeKubernetesClient::default();
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let response = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-other-target".to_owned(),
+        }))
+        .await
+        .expect("delete instance succeeds")
+        .into_inner();
+
+    assert!(response.deleted);
+    assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
+}
+
+#[tokio::test]
+async fn operator_delete_cleans_stale_generation_active_materialization_for_target() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-stale-generation",
+        DomainInstanceState::Running,
+        9,
+    ));
+    store.seed_materialization(ready_materialization("instance-delete-stale-generation", 8));
+    let client = FakeKubernetesClient::default();
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let response = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-stale-generation".to_owned(),
+        }))
+        .await
+        .expect("delete instance succeeds")
+        .into_inner();
+
+    assert!(response.deleted);
+    assert!(!store.instance_exists("instance-delete-stale-generation"));
+    assert_eq!(
+        client.deleted(),
+        vec![
+            object_ref(
+                "apps/v1",
+                "Deployment",
+                "apps",
+                "instance-delete-stale-generation"
+            ),
+            object_ref(
+                "v1",
+                "Service",
+                "apps",
+                "instance-delete-stale-generation-svc"
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn operator_delete_kubernetes_failure_preserves_store_state_for_retry() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-fails",
+        DomainInstanceState::Running,
+        5,
+    ));
+    store.seed_materialization(ready_materialization("instance-delete-fails", 5));
+    let client = FakeKubernetesClient::default();
+    client.fail_delete(object_ref(
+        "v1",
+        "Service",
+        "apps",
+        "instance-delete-fails-svc",
+    ));
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let error = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-fails".to_owned(),
+        }))
+        .await
+        .expect_err("Kubernetes cleanup failure rejects delete");
+
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("delete cleanup failed"));
+    assert!(store.instance_exists("instance-delete-fails"));
+    assert_eq!(store.delete_requests(), Vec::new());
+    assert_eq!(
+        client.deleted(),
+        vec![
+            object_ref("apps/v1", "Deployment", "apps", "instance-delete-fails"),
+            object_ref("v1", "Service", "apps", "instance-delete-fails-svc"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn operator_delete_retry_replays_cleanup_then_finalizes_store_delete() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-retry",
+        DomainInstanceState::Running,
+        8,
+    ));
+    store.seed_materialization(ready_materialization("instance-delete-retry", 8));
+    let failing_client = FakeKubernetesClient::default();
+    failing_client.fail_delete(object_ref(
+        "v1",
+        "Service",
+        "apps",
+        "instance-delete-retry-svc",
+    ));
+    let failing_service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(failing_client),
+        target(),
+    );
+    failing_service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-retry".to_owned(),
+        }))
+        .await
+        .expect_err("first cleanup attempt fails");
+
+    let retry_client = FakeKubernetesClient::default();
+    let retry_service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(retry_client.clone()),
+        target(),
+    );
+    let response = retry_service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-retry".to_owned(),
+        }))
+        .await
+        .expect("retry cleanup succeeds")
+        .into_inner();
+
+    assert!(response.deleted);
+    assert!(!store.instance_exists("instance-delete-retry"));
+    assert_eq!(
+        retry_client.deleted(),
+        vec![
+            object_ref("apps/v1", "Deployment", "apps", "instance-delete-retry"),
+            object_ref("v1", "Service", "apps", "instance-delete-retry-svc"),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
-    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
     let template = stateful_manifest_template_proto();
 
     let created_class = service
@@ -391,7 +729,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
 
 #[tokio::test]
 async fn store_backed_workload_class_api_round_trips_host_path_template() {
-    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
     let template = host_path_manifest_template_proto();
 
     let created = service
@@ -436,7 +774,7 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
 
 #[tokio::test]
 async fn store_backed_workload_class_api_rejects_empty_template_static_strings() {
-    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
     let mut template = stateful_manifest_template_proto();
     template
         .workload
@@ -468,7 +806,7 @@ async fn store_backed_workload_class_api_rejects_empty_template_static_strings()
 
 #[tokio::test]
 async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
-    let service = StoreBackedOperatorApi::new(Arc::new(FakeInstanceStore::default()));
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
     let mut template = stateful_manifest_template_proto();
     template
         .workload
@@ -496,7 +834,7 @@ async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
 
 #[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
-    let response = operator_grpc_service_with_store(Arc::new(FakeInstanceStore::default()))
+    let response = store_operator_grpc_service(Arc::new(FakeInstanceStore::default()))
         .oneshot(grpc_create_instance_request(
             CreateInstanceRequest {
                 idempotency_key: "create-instance-transport".to_owned(),
@@ -536,7 +874,7 @@ async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
 
 #[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
-    let response = operator_grpc_service_with_store(Arc::new(FakeInstanceStore::default()))
+    let response = store_operator_grpc_service(Arc::new(FakeInstanceStore::default()))
         .oneshot(grpc_create_route_binding_request(
             CreateRouteBindingRequest {
                 idempotency_key: "create-route-transport".to_owned(),
@@ -595,12 +933,14 @@ fn native_grpc_server_can_be_constructed_with_operator_service() {
 
 #[test]
 fn native_grpc_server_can_be_constructed_with_store_backed_operator_service() {
-    let _router = operator_grpc_server_builder().add_service(operator_grpc_service_with_store(
+    let _router = operator_grpc_server_builder().add_service(store_operator_grpc_service(
         Arc::new(FakeInstanceStore::default()),
     ));
 
     assert_eq!(
-        <control_plane::api::server::StoreBackedOperatorGrpcService as NamedService>::NAME,
+        <control_plane::api::server::StoreBackedOperatorGrpcService<
+            FakeKubernetesClient,
+        > as NamedService>::NAME,
         OPERATOR_SERVICE_NAME
     );
 }
@@ -955,7 +1295,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
 async fn grpc_web_cors_preflight_allows_browser_operator_headers() {
     let response = operator_grpc_web_cors_layer()
         .layer(
-            tonic_web::GrpcWebLayer::new().layer(operator_grpc_service_with_store(Arc::new(
+            tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(Arc::new(
                 FakeInstanceStore::default(),
             ))),
         )
@@ -1040,7 +1380,7 @@ async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
 async fn grpc_web_store_backed_errors_return_structured_status() {
     let response = operator_grpc_web_cors_layer()
         .layer(
-            tonic_web::GrpcWebLayer::new().layer(operator_grpc_service_with_store(Arc::new(
+            tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(Arc::new(
                 FakeInstanceStore::default(),
             ))),
         )
@@ -1162,7 +1502,7 @@ where
     R: Message,
 {
     let response = operator_grpc_web_cors_layer()
-        .layer(tonic_web::GrpcWebLayer::new().layer(operator_grpc_service_with_store(store)))
+        .layer(tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(store)))
         .oneshot(grpc_web_operator_request(method, request))
         .await
         .expect("gRPC-Web request should route through store-backed service");
@@ -1195,7 +1535,7 @@ where
     M: Message + Default,
     R: Message,
 {
-    let response = operator_grpc_service_with_store(store)
+    let response = store_operator_grpc_service(store)
         .oneshot(grpc_operator_unary_request(
             request,
             method,
@@ -1665,7 +2005,112 @@ struct FakeInstanceStore {
     instances: Mutex<BTreeMap<String, InstanceRecord>>,
     workload_classes: Mutex<BTreeMap<(String, u64), control_plane::WorkloadClassVersion>>,
     route_bindings: Mutex<BTreeMap<String, control_plane::RouteBindingRecord>>,
+    materialization: Mutex<Option<MaterializationRecord>>,
+    delete_requests: Mutex<Vec<control_plane::DeleteInstanceRequest>>,
     http01: Mutex<BTreeMap<(String, String), control_plane::Http01ChallengeRecord>>,
+}
+
+impl FakeInstanceStore {
+    fn seed_instance(&self, instance: InstanceRecord) {
+        self.instances
+            .lock()
+            .expect("fake store lock is available")
+            .insert(instance.id.as_str().to_owned(), instance);
+    }
+
+    fn seed_materialization(&self, materialization: MaterializationRecord) {
+        *self
+            .materialization
+            .lock()
+            .expect("fake store lock is available") = Some(materialization);
+    }
+
+    fn instance_exists(&self, instance_id: &str) -> bool {
+        self.instances
+            .lock()
+            .expect("fake store lock is available")
+            .contains_key(instance_id)
+    }
+
+    fn delete_requests(&self) -> Vec<control_plane::DeleteInstanceRequest> {
+        self.delete_requests
+            .lock()
+            .expect("fake store lock is available")
+            .clone()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FakeKubernetesClient {
+    deleted: Arc<Mutex<Vec<RenderedObjectRef>>>,
+    fail_delete: Arc<Mutex<Option<RenderedObjectRef>>>,
+}
+
+impl FakeKubernetesClient {
+    fn fail_delete(&self, object: RenderedObjectRef) {
+        *self
+            .fail_delete
+            .lock()
+            .expect("fake client lock is available") = Some(object);
+    }
+
+    fn deleted(&self) -> Vec<RenderedObjectRef> {
+        self.deleted
+            .lock()
+            .expect("fake client lock is available")
+            .clone()
+    }
+}
+
+impl KubernetesMaterializerClient for FakeKubernetesClient {
+    fn apply_object<'a>(
+        &'a self,
+        _object: &'a control_plane::KubernetesObject,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn delete_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            self.deleted
+                .lock()
+                .expect("fake client lock is available")
+                .push(object.clone());
+            if self
+                .fail_delete
+                .lock()
+                .expect("fake client lock is available")
+                .as_ref()
+                == Some(object)
+            {
+                return Err(KubernetesClientError::new("delete failed"));
+            }
+
+            Ok(())
+        })
+    }
+
+    fn wait_for_pvc_bound<'a>(
+        &'a self,
+        _namespace: &'a str,
+        _name: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn wait_for_readiness<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
+        Box::pin(async {
+            BackendEndpoint::new("http://example").map_err(|error| {
+                KubernetesClientError::new(format!("invalid backend endpoint: {error}"))
+            })
+        })
+    }
 }
 
 impl ControlPlaneStore for FakeInstanceStore {
@@ -1713,6 +2158,10 @@ impl ControlPlaneStore for FakeInstanceStore {
         request: control_plane::DeleteInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
         Box::pin(async move {
+            self.delete_requests
+                .lock()
+                .expect("fake store lock is available")
+                .push(request.clone());
             Ok(self
                 .instances
                 .lock()
@@ -1837,9 +2286,21 @@ impl ControlPlaneStore for FakeInstanceStore {
 
     fn load_active_materialization<'a>(
         &'a self,
-        _request: control_plane::LoadActiveMaterializationRequest,
+        request: control_plane::LoadActiveMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            Ok(self
+                .materialization
+                .lock()
+                .expect("fake store lock is available")
+                .as_ref()
+                .filter(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.target == request.target
+                        && materialization.state != MaterializationState::Deleted
+                })
+                .cloned())
+        })
     }
 
     fn complete_wake<'a>(

@@ -19,6 +19,8 @@ use crate::{
     http01 as domain_http01,
     ids::{IdempotencyKey, InstanceId, WorkloadClassId},
     instance::{self as domain_instance, InstanceState},
+    materialization::MaterializationTarget,
+    materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     route as domain_route,
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{ControlPlaneStore, StoreError},
@@ -48,8 +50,10 @@ pub const OPERATOR_UNARY_METHODS: &[&str] = &[
 pub struct OperatorApiPlaceholder;
 
 #[derive(Clone)]
-pub struct StoreBackedOperatorApi {
+pub struct StoreBackedOperatorApi<C> {
     store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
 }
 
 impl OperatorApiPlaceholder {
@@ -58,14 +62,22 @@ impl OperatorApiPlaceholder {
     }
 }
 
-impl StoreBackedOperatorApi {
-    pub fn new(store: Arc<dyn ControlPlaneStore>) -> Self {
-        Self { store }
+impl<C> StoreBackedOperatorApi<C> {
+    pub fn new(
+        store: Arc<dyn ControlPlaneStore>,
+        materializer: KubernetesMaterializer<C>,
+        target: MaterializationTarget,
+    ) -> Self {
+        Self {
+            store,
+            materializer,
+            target,
+        }
     }
 }
 
 pub type OperatorGrpcService = OperatorControlPlaneServer<OperatorApiPlaceholder>;
-pub type StoreBackedOperatorGrpcService = OperatorControlPlaneServer<StoreBackedOperatorApi>;
+pub type StoreBackedOperatorGrpcService<C> = OperatorControlPlaneServer<StoreBackedOperatorApi<C>>;
 pub type OperatorGrpcWebServerBuilder =
     Server<Stack<CorsLayer, Stack<tonic_web::GrpcWebLayer, Identity>>>;
 
@@ -73,10 +85,15 @@ pub fn operator_grpc_service() -> OperatorGrpcService {
     OperatorControlPlaneServer::new(OperatorApiPlaceholder::new())
 }
 
-pub fn operator_grpc_service_with_store(
+pub fn operator_grpc_service_with_store<C>(
     store: Arc<dyn ControlPlaneStore>,
-) -> StoreBackedOperatorGrpcService {
-    OperatorControlPlaneServer::new(StoreBackedOperatorApi::new(store))
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+) -> StoreBackedOperatorGrpcService<C>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    OperatorControlPlaneServer::new(StoreBackedOperatorApi::new(store, materializer, target))
 }
 
 pub fn operator_grpc_server_builder() -> Server {
@@ -203,7 +220,10 @@ impl OperatorControlPlane for OperatorApiPlaceholder {
 }
 
 #[tonic::async_trait]
-impl OperatorControlPlane for StoreBackedOperatorApi {
+impl<C> OperatorControlPlane for StoreBackedOperatorApi<C>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
     async fn create_workload_class_version(
         &self,
         request: Request<pb::CreateWorkloadClassVersionRequest>,
@@ -277,11 +297,14 @@ impl OperatorControlPlane for StoreBackedOperatorApi {
         let request = domain_instance::DeleteInstanceRequest::new(parse_instance_id(
             request.into_inner().instance_id,
         )?);
-        let deleted = self
-            .store
-            .delete_instance(request)
-            .await
-            .map_err(store_error_to_status)?;
+        let deleted = domain_instance::delete_instance(
+            self.store.as_ref(),
+            &self.materializer,
+            self.target.clone(),
+            request,
+        )
+        .await
+        .map_err(delete_instance_error_to_status)?;
 
         Ok(Response::new(pb::DeleteInstanceResponse { deleted }))
     }
@@ -784,6 +807,19 @@ fn parse_route_binding_id(value: String) -> Result<crate::ids::RouteBindingId, S
 
 fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
     Status::invalid_argument(error.to_string())
+}
+
+fn delete_instance_error_to_status(error: domain_instance::DeleteInstanceError) -> Status {
+    match error {
+        domain_instance::DeleteInstanceError::Materializer {
+            instance_id,
+            source,
+        } => Status::unavailable(format!(
+            "delete cleanup failed for instance {}: {source}",
+            instance_id.as_str()
+        )),
+        domain_instance::DeleteInstanceError::Store(error) => store_error_to_status(error),
+    }
 }
 
 fn store_error_to_status(error: StoreError) -> Status {

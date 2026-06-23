@@ -595,7 +595,7 @@ Scope:
 | Complete | Sidecar targets the local app port. | Manifest tests validate sidecar local upstream env and reject app target conflicts. |
 | Complete | Validate Service selectors/target ports and local-only sidecar upstream. | Manifest validation rejects invalid service ports and sidecar/app port conflicts. |
 | Complete | Wait for readiness through Pods or EndpointSlices. | `kube_materializer.rs` and `materializer.rs` tests cover EndpointSlice readiness and backend URI creation. |
-| Incomplete | Delete materialized objects on sleep/delete. | Control-plane sleep finalization now invokes Kubernetes cleanup from `ReportIdle`, but operator delete still removes store state without materializer cleanup; follow-up: wire delete cleanup through a materializer-aware operator lifecycle surface. |
+| Complete | Delete materialized objects on sleep/delete. | Component paths now clean recorded Kubernetes refs before finalizing state: `sidecar_api_transport.rs` covers `ReportIdle` sleep cleanup, and `api_transport.rs` covers operator delete cleanup success, no-active-materialization, target filtering, stale active materialization generation handling, failure preservation, and retry. |
 | Complete | Leave backing provider volumes untouched. | `scripts/test-kind-materializer.sh` deletes rendered objects and rematerializes with preserved hostPath data. |
 
 Sub-phases:
@@ -608,7 +608,7 @@ Sub-phases:
 | Complete | 5D: Deployment/StatefulSet rendering with sidecar injection. | Manifest tests cover both workload kinds and injected sidecar config. |
 | Complete | 5E: Service rendering that targets the sidecar port. | Manifest tests cover service selectors and sidecar target port. |
 | Complete | 5F: Readiness through Pods or EndpointSlices. | Kube materializer readiness tests cover ready EndpointSlice semantics. |
-| Incomplete | 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs. | Sleep cleanup is wired through sidecar `ReportIdle`; delete cleanup is still not wired because the operator delete API currently has only store access, not materializer/target context. |
+| Complete | 5G: Sleep/delete cleanup for workloads, Services, PVCs, and PVs. | Sleep cleanup is wired through sidecar `ReportIdle`; operator delete cleanup now receives materializer/target context and deletes recorded refs before store deletion, with component tests for success, no active materialization, target filtering, stale active materialization generation handling, failure preservation, and retry. |
 | Complete | 5H: kind materialization lifecycle suite with static volume backend. | `scripts/test-kind-materializer.sh` runs the ignored kind materializer lifecycle test with static hostPath data continuity. |
 
 Done criteria:

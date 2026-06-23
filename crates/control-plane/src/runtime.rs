@@ -117,7 +117,11 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     tonic::transport::Server::builder()
-        .add_service(operator_grpc_service_with_store(Arc::clone(&store)))
+        .add_service(operator_grpc_service_with_store(
+            Arc::clone(&store),
+            materializer.clone(),
+            target.clone(),
+        ))
         .add_service(proxy_grpc_service_with_store(
             Arc::clone(&store),
             materializer.clone(),
@@ -126,8 +130,19 @@ where
         .add_service(sidecar_grpc_service_with_store(store, materializer, target))
 }
 
-pub fn operator_grpc_web_router(store: Arc<dyn ControlPlaneStore>) -> OperatorGrpcWebRouter {
-    operator_grpc_web_server_builder().add_service(operator_grpc_service_with_store(store))
+pub fn operator_grpc_web_router<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+) -> OperatorGrpcWebRouter
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    operator_grpc_web_server_builder().add_service(operator_grpc_service_with_store(
+        store,
+        materializer,
+        target,
+    ))
 }
 
 pub async fn run_from_env() -> RuntimeResult<()> {
@@ -149,8 +164,11 @@ pub async fn serve<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    let native_router =
-        native_control_plane_router(Arc::clone(&store), materializer, config.target.clone());
+    let native_router = native_control_plane_router(
+        Arc::clone(&store),
+        materializer.clone(),
+        config.target.clone(),
+    );
     let (shutdown_tx, _) = watch::channel(false);
     let native_shutdown = shutdown_tx.subscribe();
 
@@ -160,7 +178,8 @@ where
     });
 
     if let Some(operator_grpc_web_addr) = config.operator_grpc_web_listen_addr {
-        let operator_grpc_web_router = operator_grpc_web_router(store);
+        let operator_grpc_web_router =
+            operator_grpc_web_router(store, materializer.clone(), config.target.clone());
         let operator_grpc_web_shutdown = native_shutdown.clone();
 
         tokio::try_join!(
@@ -415,8 +434,9 @@ mod tests {
         let materializer = KubernetesMaterializer::new(NoopKubernetesClient);
         let target = MaterializationTarget::new("cluster-a", "apps").expect("target");
 
-        let _native = native_control_plane_router(Arc::clone(&store), materializer, target);
-        let _operator_grpc_web = operator_grpc_web_router(store);
+        let _native =
+            native_control_plane_router(Arc::clone(&store), materializer.clone(), target.clone());
+        let _operator_grpc_web = operator_grpc_web_router(store, materializer, target);
     }
 
     fn valid_env() -> Vec<(&'static str, &'static str)> {
