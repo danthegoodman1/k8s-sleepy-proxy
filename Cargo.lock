@@ -344,6 +344,7 @@ dependencies = [
  "kube",
  "prost",
  "protoc-bin-vendored",
+ "proxy-core",
  "rustls",
  "serde",
  "serde_json",

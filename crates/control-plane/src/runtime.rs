@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use proxy_core::observability::recorder::ObservabilityRecorder;
 use tokio::sync::watch;
 use tonic::transport::server::Router;
 use tower::layer::util::{Identity, Stack};
@@ -148,6 +149,7 @@ where
 }
 
 pub async fn run_from_env() -> RuntimeResult<()> {
+    let _ = ObservabilityRecorder::install_stderr_global();
     let config = RuntimeConfig::from_env()?;
     let store = connect_store(&config.control_plane.store).await?;
     let kube_client = KubeMaterializerClient::try_default().await?;

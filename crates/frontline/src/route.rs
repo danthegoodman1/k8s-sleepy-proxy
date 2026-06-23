@@ -1,6 +1,11 @@
 use std::{fmt, future::Future, pin::Pin, time::Instant};
 
 use control_plane::{CachePolicy, InstanceState, RouteEntry, RouteIdentity};
+use proxy_core::observability::{
+    metrics::RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
+    recorder::{MetricObservation, ObservabilityRecorder},
+    Operation, Outcome,
+};
 
 use crate::{
     route_wake_decision, validate_wake_response, ApplyUpdateOutcome, FrontlineRouteResolution,
@@ -21,11 +26,12 @@ pub trait WakeClient {
     ) -> WakeClientFuture<'_, WakeInstanceResponse, Self::Error>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct FrontlineRouteCoordinator<RouteClient, Wake> {
     resolver: FrontlineRouteResolver<RouteClient>,
     wake_tracker: WakeTracker,
     wake_client: Wake,
+    observability: ObservabilityRecorder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +80,21 @@ impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
             resolver,
             wake_tracker,
             wake_client,
+            observability: ObservabilityRecorder::default(),
+        }
+    }
+
+    pub fn with_observability(
+        resolver: FrontlineRouteResolver<RouteClient>,
+        wake_tracker: WakeTracker,
+        wake_client: Wake,
+        observability: ObservabilityRecorder,
+    ) -> Self {
+        Self {
+            resolver,
+            wake_tracker,
+            wake_client,
+            observability,
         }
     }
 
@@ -139,6 +160,7 @@ where
                         let response = match self.wake_client.wake_instance(request.clone()).await {
                             Ok(response) => response,
                             Err(error) => {
+                                self.record_wake_instance_call(Outcome::Error);
                                 self.wake_tracker
                                     .complete(&request.instance_id, request.expected_generation);
                                 return Err(FrontlineRouteCoordinatorError::Wake(error));
@@ -146,12 +168,24 @@ where
                         };
 
                         let disposition = validate_wake_response(&cache_entry.entry, response);
+                        self.record_wake_instance_call(wake_response_outcome(&disposition));
                         self.handle_wake_response(cache_entry, disposition, now)
                             .await
                     }
                 }
             }
         }
+    }
+
+    fn record_wake_instance_call(&self, outcome: Outcome) {
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
+            vec![
+                Operation::WakeInstance.metric_label(),
+                outcome.metric_label(),
+            ],
+            1.0,
+        ));
     }
 
     async fn handle_wake_response(
@@ -277,6 +311,37 @@ fn ready_route_entry(observed: &RouteEntry, backend: ReadyBackend) -> RouteEntry
         backend: Some(backend.backend),
         backend_generation: backend.backend_generation,
     }
+}
+
+fn wake_response_outcome(disposition: &WakeResponseDisposition) -> Outcome {
+    match disposition {
+        WakeResponseDisposition::Ready(_) => Outcome::Success,
+        WakeResponseDisposition::WakeStarted { .. } => Outcome::Started,
+        WakeResponseDisposition::StillWaking { .. } => Outcome::AlreadyWaking,
+        WakeResponseDisposition::Failed { .. }
+        | WakeResponseDisposition::Unavailable { .. }
+        | WakeResponseDisposition::GenerationConflict { .. } => Outcome::Rejected,
+        WakeResponseDisposition::Rejected(_) => Outcome::Error,
+    }
+}
+
+impl<RouteClient, Wake> PartialEq for FrontlineRouteCoordinator<RouteClient, Wake>
+where
+    RouteClient: PartialEq,
+    Wake: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.resolver == other.resolver
+            && self.wake_tracker == other.wake_tracker
+            && self.wake_client == other.wake_client
+    }
+}
+
+impl<RouteClient, Wake> Eq for FrontlineRouteCoordinator<RouteClient, Wake>
+where
+    RouteClient: Eq,
+    Wake: Eq,
+{
 }
 
 impl<RouteClientError, WakeClientError> fmt::Display

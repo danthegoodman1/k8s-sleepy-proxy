@@ -1,7 +1,7 @@
 use std::{env, error::Error, process, time::Duration};
 
 use control_plane::api::pb::sidecar_control_plane_client::SidecarControlPlaneClient;
-use proxy_core::Shutdown;
+use proxy_core::{observability::recorder::ObservabilityRecorder, Shutdown};
 use sidecar::{
     runtime::{serve_http_with_idle, serve_tcp_with_idle, SidecarRuntimeConfig},
     GrpcSidecarControlPlaneClient, IdleReportConfig,
@@ -18,21 +18,14 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _ = ObservabilityRecorder::install_stderr_global();
     let env = EnvConfig::from_env()?;
     let channel = Endpoint::from_shared(env.control_plane_endpoint.clone())?
         .connect()
         .await?;
     let client = GrpcSidecarControlPlaneClient::new(SidecarControlPlaneClient::new(channel));
     let shutdown = Shutdown::new();
-
-    tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            if shutdown_signal().await.is_ok() {
-                shutdown.shutdown();
-            }
-        }
-    });
+    let _shutdown_task = spawn_shutdown_signal(shutdown.clone())?;
 
     match env.runtime_mode {
         SidecarRuntimeMode::Http => serve_http_with_idle(env.runtime, client, shutdown).await?,
@@ -43,21 +36,34 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), Box<dyn Error + Send + Sync>> {
+fn spawn_shutdown_signal(
+    shutdown: Shutdown,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn Error + Send + Sync>> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        _ = terminate.recv() => {}
-    }
-
-    Ok(())
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if result.is_ok() {
+                    shutdown.shutdown();
+                }
+            },
+            _ = terminate.recv() => {
+                shutdown.shutdown();
+            }
+        }
+    }))
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() -> Result<(), Box<dyn Error + Send + Sync>> {
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+fn spawn_shutdown_signal(
+    shutdown: Shutdown,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn Error + Send + Sync>> {
+    Ok(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.shutdown();
+        }
+    }))
 }
 
 #[derive(Debug)]

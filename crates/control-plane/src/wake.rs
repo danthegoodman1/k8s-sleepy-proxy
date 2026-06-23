@@ -1,4 +1,13 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, time::Instant};
+
+use proxy_core::observability::{
+    metrics::{RUNTIME_MATERIALIZATION_FAILURES_TOTAL, RUNTIME_WAKE_LATENCY_SECONDS},
+    recorder::{
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
+        EVENT_MATERIALIZATION_FAILURE, EVENT_WAKE,
+    },
+    Operation, Outcome,
+};
 
 use crate::{
     ids::{BackendGeneration, Generation, InstanceId},
@@ -82,7 +91,29 @@ pub enum WakeInstanceError {
     },
 }
 
-pub async fn wake_instance<S, C>(
+pub async fn wake_instance_with_observability<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    request: WakeInstanceRequest,
+    observability: ObservabilityRecorder,
+) -> Result<WakeInstanceResult, WakeInstanceError>
+where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    let started = Instant::now();
+    let request_fields = vec![
+        LogField::instance_id(request.instance_id.as_str()),
+        LogField::generation(request.expected_generation.get()),
+        LogField::cluster_id(request.target.cluster_id()),
+        LogField::namespace(request.target.namespace()),
+    ];
+    let result = wake_instance(store, materializer, request).await;
+    record_wake_observation(&observability, started, &request_fields, &result);
+    result
+}
+
+async fn wake_instance<S, C>(
     store: &S,
     materializer: &KubernetesMaterializer<C>,
     request: WakeInstanceRequest,
@@ -255,6 +286,66 @@ where
         .await
         .map(|result| WakeInstanceResult::Completed { result })
         .map_err(map_store_error)
+}
+
+fn record_wake_observation(
+    observability: &ObservabilityRecorder,
+    started: Instant,
+    request_fields: &[LogField],
+    result: &Result<WakeInstanceResult, WakeInstanceError>,
+) {
+    let outcome = match result {
+        Ok(WakeInstanceResult::Completed { .. }) => Outcome::Success,
+        Ok(WakeInstanceResult::AlreadyRunning { .. }) => Outcome::AlreadyRunning,
+        Ok(WakeInstanceResult::AlreadyWaking { .. }) => Outcome::AlreadyWaking,
+        Err(WakeInstanceError::GenerationConflict { .. })
+        | Err(WakeInstanceError::Unavailable { .. }) => Outcome::Rejected,
+        Err(_) => Outcome::Error,
+    };
+    observability.record_metric(MetricObservation::new(
+        RUNTIME_WAKE_LATENCY_SECONDS,
+        vec![outcome.metric_label()],
+        started.elapsed().as_secs_f64(),
+    ));
+
+    let mut fields = request_fields.to_vec();
+    if let Err(error) = result {
+        fields.push(LogField::error_reason(wake_error_reason(error)));
+    }
+    observability.record_log(LifecycleLogEvent::new(EVENT_WAKE, fields));
+
+    if let Err(WakeInstanceError::Materializer { source, instance }) = result {
+        observability.record_metric(MetricObservation::new(
+            RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
+            vec![
+                Operation::Materialize.metric_label(),
+                Outcome::Error.metric_label(),
+            ],
+            1.0,
+        ));
+        observability.record_log(LifecycleLogEvent::new(
+            EVENT_MATERIALIZATION_FAILURE,
+            vec![
+                LogField::instance_id(instance.id.as_str()),
+                LogField::generation(instance.generation.get()),
+                LogField::error_reason(source.to_string()),
+            ],
+        ));
+    }
+}
+
+fn wake_error_reason(error: &WakeInstanceError) -> &'static str {
+    match error {
+        WakeInstanceError::NotFound => "not_found",
+        WakeInstanceError::GenerationConflict { .. } => "generation_conflict",
+        WakeInstanceError::Unavailable { .. } => "unavailable",
+        WakeInstanceError::ReadyMaterializationNotFound { .. } => "ready_materialization_not_found",
+        WakeInstanceError::WorkloadClassNotFound { .. } => "workload_class_not_found",
+        WakeInstanceError::Store(_) => "store",
+        WakeInstanceError::Render { .. } => "render",
+        WakeInstanceError::SleepPolicy { .. } => "sleep_policy",
+        WakeInstanceError::Materializer { .. } => "materializer",
+    }
 }
 
 impl WakeInstanceRequest {

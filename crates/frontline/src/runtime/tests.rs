@@ -16,7 +16,13 @@ use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use proxy_core::DrainTracker;
+use proxy_core::{
+    observability::{
+        metrics::RUNTIME_HTTP01_RESULTS_TOTAL_NAME,
+        recorder::{InMemoryObservability, ObservabilityEvent, EVENT_HTTP01},
+    },
+    DrainTracker,
+};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use super::FrontlineHttpRuntime;
@@ -481,6 +487,51 @@ async fn http01_challenge_hit_calls_resolver_before_route_resolution() {
     );
     assert!(runtime.coordinator().resolver().client().calls.is_empty());
     assert!(runtime.coordinator().wake_client().calls.is_empty());
+}
+
+#[tokio::test]
+async fn http01_challenge_hit_records_result_metric_and_log_event() {
+    let key = Http01ChallengeKey::new("app.example.com", "token-a").expect("HTTP-01 key");
+    let mut http01_resolver = FakeHttp01Resolver::default();
+    http01_resolver.push_response(Some(challenge_record(key, "token-a.key")));
+    let sink = InMemoryObservability::default();
+    let mut runtime = FrontlineHttpRuntime::with_http01_resolver_and_observability(
+        FrontlineRouteCoordinator::new(
+            FrontlineRouteResolver::from_parts(
+                SubscriptionState::new(4),
+                FakeRouteClient::default(),
+            ),
+            WakeTracker::new(),
+            FakeWakeClient::default(),
+        ),
+        http01_resolver,
+        DrainTracker::new(Duration::from_secs(5)),
+        sink.recorder(),
+    );
+
+    let response = runtime
+        .handle_http(
+            Request::builder()
+                .uri("/.well-known/acme-challenge/token-a")
+                .header("host", "app.example.com")
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+            now(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_HTTP01_RESULTS_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "success")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Log(log) if log.name() == EVENT_HTTP01
+    )));
 }
 
 #[tokio::test]

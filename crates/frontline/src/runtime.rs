@@ -4,6 +4,13 @@ use bytes::Bytes;
 use http::{header::HOST, Request, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use proxy_core::observability::{
+    metrics::RUNTIME_HTTP01_RESULTS_TOTAL,
+    recorder::{
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder, EVENT_HTTP01,
+    },
+    Outcome,
+};
 use proxy_core::DrainTracker;
 
 use crate::{
@@ -24,6 +31,7 @@ pub struct FrontlineHttpRuntime<RouteClient, Wake, Http01 = NoopHttp01ChallengeR
     http01_resolver: Http01,
     forwarder: FrontlineForwarder,
     drain: DrainTracker,
+    observability: ObservabilityRecorder,
 }
 
 impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake, NoopHttp01ChallengeResolver> {
@@ -46,6 +54,22 @@ impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01> 
             http01_resolver,
             forwarder: FrontlineForwarder::new(drain.clone()),
             drain,
+            observability: ObservabilityRecorder::default(),
+        }
+    }
+
+    pub fn with_http01_resolver_and_observability(
+        coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
+        http01_resolver: Http01,
+        drain: DrainTracker,
+        observability: ObservabilityRecorder,
+    ) -> Self {
+        Self {
+            coordinator,
+            http01_resolver,
+            forwarder: FrontlineForwarder::new(drain.clone()),
+            drain,
+            observability,
         }
     }
 
@@ -106,9 +130,15 @@ where
         B::Error: Into<BoxError>,
     {
         match resolve_http01_response(&mut self.http01_resolver, &request).await {
-            Ok(Some(response)) => return response,
+            Ok(Some(response)) => {
+                record_http01_response(&self.observability, response.status());
+                return response;
+            }
             Ok(None) => {}
-            Err(error) => return http01_intercept_error_response(error),
+            Err(error) => {
+                record_http01_error(&self.observability, &error);
+                return http01_intercept_error_response(error);
+            }
         }
 
         let outcome = match resolve_http_route(&mut self.coordinator, &request, now).await {
@@ -118,6 +148,43 @@ where
 
         route_outcome_or_forward_response(&self.forwarder, outcome, request).await
     }
+}
+
+fn record_http01_response(observability: &ObservabilityRecorder, status: StatusCode) {
+    let outcome = if status == StatusCode::OK {
+        Outcome::Success
+    } else {
+        Outcome::Miss
+    };
+    observability.record_metric(MetricObservation::new(
+        RUNTIME_HTTP01_RESULTS_TOTAL,
+        vec![outcome.metric_label()],
+        1.0,
+    ));
+    observability.record_log(LifecycleLogEvent::new(
+        EVENT_HTTP01,
+        vec![LogField::new("http.status", status.as_u16())],
+    ));
+}
+
+fn record_http01_error<E>(observability: &ObservabilityRecorder, error: &Http01InterceptError<E>) {
+    let reason = match error {
+        Http01InterceptError::MissingHost => "missing_host",
+        Http01InterceptError::InvalidHostHeader => "invalid_host_header",
+        Http01InterceptError::InvalidTokenSegment => "invalid_token_segment",
+        Http01InterceptError::InvalidHost(_) => "invalid_host",
+        Http01InterceptError::InvalidChallenge(_) => "invalid_challenge",
+        Http01InterceptError::Resolve(_) => "resolve",
+    };
+    observability.record_metric(MetricObservation::new(
+        RUNTIME_HTTP01_RESULTS_TOTAL,
+        vec![Outcome::Error.metric_label()],
+        1.0,
+    ));
+    observability.record_log(LifecycleLogEvent::new(
+        EVENT_HTTP01,
+        vec![LogField::error_reason(reason)],
+    ));
 }
 
 pub(crate) async fn resolve_http01_response<Http01, B>(

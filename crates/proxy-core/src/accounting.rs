@@ -125,6 +125,10 @@ impl Default for ActiveConnectionCounter {
 }
 
 impl ActiveConnection {
+    pub fn is_active(&self) -> bool {
+        self.inner.is_some()
+    }
+
     pub fn release(&mut self) {
         let Some(inner) = self.inner.take() else {
             return;

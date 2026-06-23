@@ -8,6 +8,10 @@ use control_plane::{
     BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
     PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
 };
+use proxy_core::observability::{
+    metrics::RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME,
+    recorder::{InMemoryObservability, ObservabilityEvent},
+};
 
 use super::{
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome, WakeClient,
@@ -320,6 +324,41 @@ async fn cold_lazy_subscribe_wakes_updates_cache_and_next_route_is_hot() {
     assert!(matches!(outcome, FrontlineRouteOutcome::Ready(_)));
     assert_eq!(coordinator.resolver().client().calls.len(), 1);
     assert_eq!(coordinator.wake_client().calls.len(), 1);
+}
+
+#[tokio::test]
+async fn cold_wake_records_control_plane_wake_call_metric() {
+    let now = now();
+    let sink = InMemoryObservability::default();
+    let request = http_request("app.example.com", "/api/users");
+    let mut route_client = FakeRouteClient::default();
+    route_client.push_subscribe_response(resolved_response(
+        generated_request_id(1),
+        subscription_id("sub-1"),
+        http_rule("example.com", Some("/api")),
+        route_entry(InstanceState::Cold, 4, None),
+    ));
+    let mut wake_client = FakeWakeClient::default();
+    wake_client.push_response(ready_wake_response(4, 9));
+    let mut coordinator = FrontlineRouteCoordinator::with_observability(
+        FrontlineRouteResolver::new(4, route_client),
+        WakeTracker::new(),
+        wake_client,
+        sink.recorder(),
+    );
+
+    coordinator
+        .route(request, now)
+        .await
+        .expect("cold route wakes");
+
+    assert!(sink.events().iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "wake_instance")
+                && metric.labels().iter().any(|label| label.value() == "success")
+    )));
 }
 
 #[tokio::test]

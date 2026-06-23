@@ -8,7 +8,7 @@ use frontline::{
     serve_http, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
     FrontlineRouteResolver, GrpcOperatorHttp01Resolver, GrpcProxyControlPlaneClient, WakeTracker,
 };
-use proxy_core::{DrainTracker, Shutdown};
+use proxy_core::{observability::recorder::ObservabilityRecorder, DrainTracker, Shutdown};
 use tonic::transport::Endpoint;
 
 #[tokio::main]
@@ -20,6 +20,8 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _ = ObservabilityRecorder::install_stderr_global();
+    let observability = ObservabilityRecorder::global();
     let env = FrontlineEnvConfig::from_env()?;
     let channel = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?
         .connect()
@@ -29,10 +31,24 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let wake_client =
         GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel.clone()));
     let http01_resolver = GrpcOperatorHttp01Resolver::new(OperatorControlPlaneClient::new(channel));
-    let resolver = FrontlineRouteResolver::new(env.route_cache_capacity(), route_client);
-    let coordinator = FrontlineRouteCoordinator::new(resolver, WakeTracker::new(), wake_client);
-    let drain = DrainTracker::new(env.drain_grace_timeout());
-    let runtime = FrontlineHttpRuntime::with_http01_resolver(coordinator, http01_resolver, drain);
+    let resolver = FrontlineRouteResolver::with_observability(
+        env.route_cache_capacity(),
+        route_client,
+        observability.clone(),
+    );
+    let coordinator = FrontlineRouteCoordinator::with_observability(
+        resolver,
+        WakeTracker::new(),
+        wake_client,
+        observability.clone(),
+    );
+    let drain = DrainTracker::with_observability(env.drain_grace_timeout(), observability.clone());
+    let runtime = FrontlineHttpRuntime::with_http01_resolver_and_observability(
+        coordinator,
+        http01_resolver,
+        drain,
+        observability,
+    );
     let shutdown = Shutdown::new();
 
     tokio::spawn({

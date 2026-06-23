@@ -43,6 +43,18 @@ pub const PROXY_FORWARDED_MESSAGES_TOTAL_NAME: &str = "sleepypods_proxy_forwarde
 pub const PROXY_OPERATION_DURATION_SECONDS_NAME: &str =
     "sleepypods_proxy_operation_duration_seconds";
 pub const PROXY_TLS_CLIENT_HELLO_TOTAL_NAME: &str = "sleepypods_proxy_tls_client_hello_total";
+pub const RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME: &str =
+    "sleepypods_runtime_control_plane_calls_total";
+pub const RUNTIME_ACTIVE_STREAMS_NAME: &str = "sleepypods_runtime_active_streams";
+pub const RUNTIME_DRAIN_DURATION_SECONDS_NAME: &str = "sleepypods_runtime_drain_duration_seconds";
+pub const RUNTIME_HTTP01_RESULTS_TOTAL_NAME: &str = "sleepypods_runtime_http01_results_total";
+pub const RUNTIME_MATERIALIZATION_FAILURES_TOTAL_NAME: &str =
+    "sleepypods_runtime_materialization_failures_total";
+pub const RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME: &str =
+    "sleepypods_runtime_route_cache_lookups_total";
+pub const RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL_NAME: &str =
+    "sleepypods_runtime_subscribe_stream_events_total";
+pub const RUNTIME_WAKE_LATENCY_SECONDS_NAME: &str = "sleepypods_runtime_wake_latency_seconds";
 
 const PROTOCOL_LABELS: &[LabelKey] = &[LabelKey::Protocol];
 const PROTOCOL_OUTCOME_LABELS: &[LabelKey] = &[LabelKey::Protocol, LabelKey::Outcome];
@@ -50,6 +62,9 @@ const PROTOCOL_DIRECTION_LABELS: &[LabelKey] = &[LabelKey::Protocol, LabelKey::D
 const PROTOCOL_OPERATION_OUTCOME_LABELS: &[LabelKey] =
     &[LabelKey::Protocol, LabelKey::Operation, LabelKey::Outcome];
 const STATE_OUTCOME_LABELS: &[LabelKey] = &[LabelKey::State, LabelKey::Outcome];
+const OPERATION_OUTCOME_LABELS: &[LabelKey] = &[LabelKey::Operation, LabelKey::Outcome];
+const OUTCOME_LABELS: &[LabelKey] = &[LabelKey::Outcome];
+const NO_LABELS: &[LabelKey] = &[];
 
 pub const PROXY_ACTIVE_STREAMS: MetricDescriptor = MetricDescriptor::new(
     PROXY_ACTIVE_STREAMS_NAME,
@@ -107,6 +122,70 @@ pub const PROXY_TLS_CLIENT_HELLO_TOTAL: MetricDescriptor = MetricDescriptor::new
     PROTOCOL_OUTCOME_LABELS,
 );
 
+pub const RUNTIME_CONTROL_PLANE_CALLS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("calls"),
+    "Control-plane calls made by runtime components.",
+    OPERATION_OUTCOME_LABELS,
+);
+
+pub const RUNTIME_ACTIVE_STREAMS: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_ACTIVE_STREAMS_NAME,
+    MetricKind::Gauge,
+    Some("streams"),
+    "Protocol-neutral active runtime streams currently holding drain permits.",
+    NO_LABELS,
+);
+
+pub const RUNTIME_DRAIN_DURATION_SECONDS: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_DRAIN_DURATION_SECONDS_NAME,
+    MetricKind::Histogram,
+    Some("seconds"),
+    "Runtime drain duration from drain start to idle completion or timeout.",
+    OUTCOME_LABELS,
+);
+
+pub const RUNTIME_HTTP01_RESULTS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_HTTP01_RESULTS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("results"),
+    "HTTP-01 challenge resolution outcomes observed by runtime components.",
+    OUTCOME_LABELS,
+);
+
+pub const RUNTIME_MATERIALIZATION_FAILURES_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_MATERIALIZATION_FAILURES_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("failures"),
+    "Materialization failures grouped by bounded operation and outcome.",
+    OPERATION_OUTCOME_LABELS,
+);
+
+pub const RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("lookups"),
+    "Frontline route-cache lookup outcomes.",
+    OUTCOME_LABELS,
+);
+
+pub const RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("events"),
+    "Proxy Subscribe stream lifecycle events and invalidations.",
+    OUTCOME_LABELS,
+);
+
+pub const RUNTIME_WAKE_LATENCY_SECONDS: MetricDescriptor = MetricDescriptor::new(
+    RUNTIME_WAKE_LATENCY_SECONDS_NAME,
+    MetricKind::Histogram,
+    Some("seconds"),
+    "Control-plane wake latency grouped by bounded outcome.",
+    OUTCOME_LABELS,
+);
+
 pub const ALL_METRICS: &[MetricDescriptor] = &[
     PROXY_ACTIVE_STREAMS,
     PROXY_ADMISSION_DECISIONS_TOTAL,
@@ -115,6 +194,14 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     PROXY_FORWARDED_MESSAGES_TOTAL,
     PROXY_OPERATION_DURATION_SECONDS,
     PROXY_TLS_CLIENT_HELLO_TOTAL,
+    RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
+    RUNTIME_ACTIVE_STREAMS,
+    RUNTIME_DRAIN_DURATION_SECONDS,
+    RUNTIME_HTTP01_RESULTS_TOTAL,
+    RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
+    RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
+    RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+    RUNTIME_WAKE_LATENCY_SECONDS,
 ];
 
 impl LabelKey {
@@ -288,6 +375,54 @@ mod tests {
                 MetricKind::Counter,
                 Some("client_hellos"),
                 &[LabelKey::Protocol, LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_control_plane_calls_total",
+                MetricKind::Counter,
+                Some("calls"),
+                &[LabelKey::Operation, LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_active_streams",
+                MetricKind::Gauge,
+                Some("streams"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_drain_duration_seconds",
+                MetricKind::Histogram,
+                Some("seconds"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_http01_results_total",
+                MetricKind::Counter,
+                Some("results"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_materialization_failures_total",
+                MetricKind::Counter,
+                Some("failures"),
+                &[LabelKey::Operation, LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_route_cache_lookups_total",
+                MetricKind::Counter,
+                Some("lookups"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_subscribe_stream_events_total",
+                MetricKind::Counter,
+                Some("events"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_wake_latency_seconds",
+                MetricKind::Histogram,
+                Some("seconds"),
+                &[LabelKey::Outcome],
             ),
         ];
 

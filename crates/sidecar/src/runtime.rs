@@ -17,7 +17,10 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use proxy_core::{DrainError, DrainTracker, HttpProxyError, Shutdown};
+use proxy_core::{
+    observability::recorder::ObservabilityRecorder, DrainError, DrainTracker, HttpProxyError,
+    Shutdown,
+};
 use sleepypods_types::{Generation, InstanceId};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -145,13 +148,16 @@ where
     Client: ReportIdleClient + Send + 'static,
     Client::Error: Send + 'static,
 {
-    let drain = DrainTracker::new(config.drain_grace_timeout());
+    let observability = ObservabilityRecorder::global();
+    let drain =
+        DrainTracker::with_observability(config.drain_grace_timeout(), observability.clone());
     let proxy = SidecarProxy::new(config.proxy().clone(), drain.clone());
-    let mut idle = IdleDetector::new(
+    let mut idle = IdleDetector::with_observability(
         config.instance_id().clone(),
         config.generation(),
         config.idle_report(),
         drain,
+        observability,
     );
     let idle_task =
         tokio::spawn(async move { idle.report_to_control_plane_when_idle(&mut client).await });
@@ -426,13 +432,16 @@ where
     Client: ReportIdleClient + Send + 'static,
     Client::Error: Send + 'static,
 {
-    let drain = DrainTracker::new(config.drain_grace_timeout());
+    let observability = ObservabilityRecorder::global();
+    let drain =
+        DrainTracker::with_observability(config.drain_grace_timeout(), observability.clone());
     let proxy = SidecarProxy::new(config.proxy().clone(), drain.clone());
-    let mut idle = IdleDetector::new(
+    let mut idle = IdleDetector::with_observability(
         config.instance_id().clone(),
         config.generation(),
         config.idle_report(),
         drain,
+        observability,
     );
     let idle_task =
         tokio::spawn(async move { idle.report_to_control_plane_when_idle(&mut client).await });

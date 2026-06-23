@@ -1,6 +1,17 @@
 use std::{error::Error, fmt, future::Future, pin::Pin, time::Instant};
 
 use control_plane::RouteIdentity;
+use proxy_core::observability::{
+    metrics::{
+        RUNTIME_CONTROL_PLANE_CALLS_TOTAL, RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
+        RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+    },
+    recorder::{
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
+        EVENT_ROUTE_CACHE_LOOKUP, EVENT_SUBSCRIBE_STREAM,
+    },
+    Operation, Outcome,
+};
 
 use crate::{
     matcher::rank_match, ApplyControlPlaneMessageOutcome, CacheInsertResult, CacheLookup,
@@ -80,12 +91,26 @@ pub enum UnexpectedSubscribeResponseKind {
     RouteInvalidated,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct FrontlineRouteResolver<Client> {
     state: SubscriptionState,
     client: Client,
     next_request_id: u64,
+    observability: ObservabilityRecorder,
 }
+
+impl<Client> PartialEq for FrontlineRouteResolver<Client>
+where
+    Client: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.state == other.state
+            && self.client == other.client
+            && self.next_request_id == other.next_request_id
+    }
+}
+
+impl<Client> Eq for FrontlineRouteResolver<Client> where Client: Eq {}
 
 impl<Client> FrontlineRouteResolver<Client> {
     pub fn new(cache_capacity: usize, client: Client) -> Self {
@@ -93,14 +118,37 @@ impl<Client> FrontlineRouteResolver<Client> {
             state: SubscriptionState::new(cache_capacity),
             client,
             next_request_id: 0,
+            observability: ObservabilityRecorder::default(),
         }
     }
 
     pub fn from_parts(state: SubscriptionState, client: Client) -> Self {
+        Self::from_parts_with_observability(state, client, ObservabilityRecorder::default())
+    }
+
+    pub fn with_observability(
+        cache_capacity: usize,
+        client: Client,
+        observability: ObservabilityRecorder,
+    ) -> Self {
+        Self {
+            state: SubscriptionState::new(cache_capacity),
+            client,
+            next_request_id: 0,
+            observability,
+        }
+    }
+
+    pub fn from_parts_with_observability(
+        state: SubscriptionState,
+        client: Client,
+        observability: ObservabilityRecorder,
+    ) -> Self {
         Self {
             state,
             client,
             next_request_id: 0,
+            observability,
         }
     }
 
@@ -141,7 +189,9 @@ where
         let expired = self.state.cache_mut().expire(now);
         self.unsubscribe_all(expired).await?;
 
-        match self.state.cache().lookup(&identity, now) {
+        let lookup = self.state.cache().lookup(&identity, now);
+        self.record_cache_lookup(&lookup);
+        match lookup {
             CacheLookup::Hit(CacheLookupHit::Positive(entry)) => {
                 return Ok(FrontlineRouteResolution::Resolved(entry));
             }
@@ -152,11 +202,20 @@ where
         }
 
         let request_id = self.next_request_id();
-        let message = self
+        let message = match self
             .client
             .subscribe_route(request_id.clone(), identity.clone())
             .await
-            .map_err(FrontlineRouteResolverError::Subscribe)?;
+        {
+            Ok(message) => {
+                self.record_control_plane_call(Operation::SubscribeRoute, Outcome::Success);
+                message
+            }
+            Err(error) => {
+                self.record_control_plane_call(Operation::SubscribeRoute, Outcome::Error);
+                return Err(FrontlineRouteResolverError::Subscribe(error));
+            }
+        };
 
         match &message {
             SubscribeControlPlaneOutput::RouteResolved {
@@ -262,10 +321,12 @@ where
         for event in events {
             match event {
                 RouteSubscriptionEvent::Update(message) => {
+                    self.record_subscribe_message(&message);
                     let outcome = self.state.apply_control_plane_message(message, now);
                     self.unsubscribe_outcome(&outcome).await?;
                 }
                 RouteSubscriptionEvent::StreamClosed => {
+                    self.record_subscribe_stream_closed();
                     self.state
                         .invalidate_active_subscriptions(InvalidationReason::StreamClosed, now);
                 }
@@ -304,13 +365,95 @@ where
             self.client
                 .unsubscribe(subscription_id.clone())
                 .await
-                .map_err(|source| FrontlineRouteResolverError::Unsubscribe {
-                    subscription_id,
-                    source,
+                .map(|()| {
+                    self.record_control_plane_call(Operation::Unsubscribe, Outcome::Success);
+                })
+                .map_err(|source| {
+                    self.record_control_plane_call(Operation::Unsubscribe, Outcome::Error);
+                    FrontlineRouteResolverError::Unsubscribe {
+                        subscription_id,
+                        source,
+                    }
                 })?;
         }
 
         Ok(())
+    }
+
+    fn record_cache_lookup(&self, lookup: &CacheLookup) {
+        let (outcome, fields) = match lookup {
+            CacheLookup::Hit(CacheLookupHit::Positive(entry)) => (
+                Outcome::Hit,
+                vec![
+                    LogField::subscription_id(entry.subscription_id.as_str()),
+                    LogField::route_id(entry.entry.route_binding_id.as_str()),
+                    LogField::instance_id(entry.entry.instance_id.as_str()),
+                    LogField::generation(entry.entry.instance_generation.get()),
+                ],
+            ),
+            CacheLookup::Hit(CacheLookupHit::Negative(_)) => (Outcome::Hit, Vec::new()),
+            CacheLookup::Expired | CacheLookup::Absent => (Outcome::Miss, Vec::new()),
+        };
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
+            vec![outcome.metric_label()],
+            1.0,
+        ));
+        self.observability
+            .record_log(LifecycleLogEvent::new(EVENT_ROUTE_CACHE_LOOKUP, fields));
+    }
+
+    fn record_control_plane_call(&self, operation: Operation, outcome: Outcome) {
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
+            vec![operation.metric_label(), outcome.metric_label()],
+            1.0,
+        ));
+    }
+
+    fn record_subscribe_message(&self, message: &SubscribeControlPlaneOutput) {
+        let (outcome, fields) = match message {
+            SubscribeControlPlaneOutput::RouteUpdated {
+                subscription_id,
+                entry,
+                ..
+            } => (
+                Outcome::Updated,
+                vec![
+                    LogField::subscription_id(subscription_id.as_str()),
+                    LogField::route_id(entry.route_binding_id.as_str()),
+                    LogField::instance_id(entry.instance_id.as_str()),
+                    LogField::generation(entry.instance_generation.get()),
+                ],
+            ),
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id, ..
+            } => (
+                Outcome::Invalidated,
+                vec![LogField::subscription_id(subscription_id.as_str())],
+            ),
+            SubscribeControlPlaneOutput::RouteResolved { .. }
+            | SubscribeControlPlaneOutput::RouteMiss { .. } => return,
+        };
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+            vec![outcome.metric_label()],
+            1.0,
+        ));
+        self.observability
+            .record_log(LifecycleLogEvent::new(EVENT_SUBSCRIBE_STREAM, fields));
+    }
+
+    fn record_subscribe_stream_closed(&self) {
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+            vec![Outcome::Closed.metric_label()],
+            1.0,
+        ));
+        self.observability.record_log(LifecycleLogEvent::new(
+            EVENT_SUBSCRIBE_STREAM,
+            vec![LogField::error_reason("response_stream_closed")],
+        ));
     }
 }
 

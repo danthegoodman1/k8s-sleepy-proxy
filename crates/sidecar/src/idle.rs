@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, future::Future, time::Duration};
 
-use proxy_core::DrainTracker;
+use proxy_core::{observability::recorder::ObservabilityRecorder, DrainTracker};
 use sleepypods_types::{Generation, InstanceId};
 use tokio::time::timeout;
 
@@ -44,6 +44,7 @@ pub struct IdleDetector {
     config: IdleReportConfig,
     drain: DrainTracker,
     reported: bool,
+    observability: ObservabilityRecorder,
 }
 
 impl IdleReportConfig {
@@ -127,6 +128,24 @@ impl IdleDetector {
             config,
             drain,
             reported: false,
+            observability: ObservabilityRecorder::default(),
+        }
+    }
+
+    pub fn with_observability(
+        instance_id: InstanceId,
+        generation: Generation,
+        config: IdleReportConfig,
+        drain: DrainTracker,
+        observability: ObservabilityRecorder,
+    ) -> Self {
+        Self {
+            instance_id,
+            generation,
+            config,
+            drain,
+            reported: false,
+            observability,
         }
     }
 

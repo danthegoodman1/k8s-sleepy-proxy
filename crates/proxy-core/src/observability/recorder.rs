@@ -1,0 +1,340 @@
+use std::{
+    fmt,
+    sync::{Arc, Mutex, OnceLock},
+};
+
+use super::metrics::{MetricDescriptor, MetricLabel};
+
+pub const EVENT_DRAIN_STARTED: &str = "runtime.drain.started";
+pub const EVENT_DRAIN_COMPLETED: &str = "runtime.drain.completed";
+pub const EVENT_DRAIN_TIMEOUT: &str = "runtime.drain.timeout";
+pub const EVENT_ROUTE_CACHE_LOOKUP: &str = "runtime.route_cache.lookup";
+pub const EVENT_SUBSCRIBE_STREAM: &str = "runtime.subscribe_stream.event";
+pub const EVENT_WAKE: &str = "runtime.wake.event";
+pub const EVENT_MATERIALIZATION_FAILURE: &str = "runtime.materialization.failure";
+pub const EVENT_IDLE_REPORT: &str = "runtime.idle_report.event";
+pub const EVENT_HTTP01: &str = "runtime.http01.event";
+
+pub const FIELD_INSTANCE_ID: &str = "instance.id";
+pub const FIELD_ROUTE_ID: &str = "route.id";
+pub const FIELD_SUBSCRIPTION_ID: &str = "subscription.id";
+pub const FIELD_GENERATION: &str = "generation";
+pub const FIELD_BACKEND_GENERATION: &str = "backend.generation";
+pub const FIELD_CLUSTER_ID: &str = "cluster.id";
+pub const FIELD_NAMESPACE: &str = "namespace";
+pub const FIELD_ERROR_REASON: &str = "error.reason";
+pub const FIELD_ACTIVE_COUNT: &str = "active.count";
+pub const FIELD_DURATION_MS: &str = "duration.ms";
+
+pub const LIFECYCLE_FIELDS: &[&str] = &[
+    FIELD_INSTANCE_ID,
+    FIELD_ROUTE_ID,
+    FIELD_SUBSCRIPTION_ID,
+    FIELD_GENERATION,
+    FIELD_BACKEND_GENERATION,
+    FIELD_CLUSTER_ID,
+    FIELD_NAMESPACE,
+    FIELD_ERROR_REASON,
+    FIELD_ACTIVE_COUNT,
+    FIELD_DURATION_MS,
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricObservation {
+    name: &'static str,
+    labels: Vec<MetricLabel>,
+    value: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleLogEvent {
+    name: &'static str,
+    fields: Vec<LogField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogField {
+    key: &'static str,
+    value: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObservabilityEvent {
+    Metric(MetricObservation),
+    Log(LifecycleLogEvent),
+}
+
+pub trait ObservabilitySink: Send + Sync {
+    fn record(&self, event: ObservabilityEvent);
+}
+
+#[derive(Clone)]
+pub struct ObservabilityRecorder {
+    sink: Arc<dyn ObservabilitySink>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryObservability {
+    events: Arc<Mutex<Vec<ObservabilityEvent>>>,
+}
+
+#[derive(Debug)]
+struct NoopObservabilitySink;
+#[derive(Debug)]
+pub struct StderrObservabilitySink;
+
+static GLOBAL_OBSERVABILITY_SINK: OnceLock<Arc<dyn ObservabilitySink>> = OnceLock::new();
+
+impl MetricObservation {
+    pub fn new(descriptor: MetricDescriptor, labels: Vec<MetricLabel>, value: f64) -> Self {
+        Self {
+            name: descriptor.name(),
+            labels,
+            value,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn labels(&self) -> &[MetricLabel] {
+        &self.labels
+    }
+
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+}
+
+impl LifecycleLogEvent {
+    pub fn new(name: &'static str, fields: Vec<LogField>) -> Self {
+        Self { name, fields }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn fields(&self) -> &[LogField] {
+        &self.fields
+    }
+
+    pub fn field_value(&self, key: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.value.as_str())
+    }
+}
+
+impl LogField {
+    pub fn new(key: &'static str, value: impl ToString) -> Self {
+        Self {
+            key,
+            value: value.to_string(),
+        }
+    }
+
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn instance_id(value: impl ToString) -> Self {
+        Self::new(FIELD_INSTANCE_ID, value)
+    }
+
+    pub fn route_id(value: impl ToString) -> Self {
+        Self::new(FIELD_ROUTE_ID, value)
+    }
+
+    pub fn subscription_id(value: impl ToString) -> Self {
+        Self::new(FIELD_SUBSCRIPTION_ID, value)
+    }
+
+    pub fn generation(value: impl ToString) -> Self {
+        Self::new(FIELD_GENERATION, value)
+    }
+
+    pub fn backend_generation(value: impl ToString) -> Self {
+        Self::new(FIELD_BACKEND_GENERATION, value)
+    }
+
+    pub fn cluster_id(value: impl ToString) -> Self {
+        Self::new(FIELD_CLUSTER_ID, value)
+    }
+
+    pub fn namespace(value: impl ToString) -> Self {
+        Self::new(FIELD_NAMESPACE, value)
+    }
+
+    pub fn error_reason(value: impl ToString) -> Self {
+        Self::new(FIELD_ERROR_REASON, value)
+    }
+
+    pub fn active_count(value: impl ToString) -> Self {
+        Self::new(FIELD_ACTIVE_COUNT, value)
+    }
+
+    pub fn duration_ms(value: impl ToString) -> Self {
+        Self::new(FIELD_DURATION_MS, value)
+    }
+}
+
+impl ObservabilityRecorder {
+    pub fn noop() -> Self {
+        Self {
+            sink: Arc::new(NoopObservabilitySink),
+        }
+    }
+
+    pub fn new(sink: Arc<dyn ObservabilitySink>) -> Self {
+        Self { sink }
+    }
+
+    pub fn stderr() -> Self {
+        Self::new(Arc::new(StderrObservabilitySink))
+    }
+
+    pub fn global() -> Self {
+        GLOBAL_OBSERVABILITY_SINK
+            .get()
+            .cloned()
+            .map(Self::new)
+            .unwrap_or_else(Self::noop)
+    }
+
+    pub fn install_global(sink: Arc<dyn ObservabilitySink>) -> bool {
+        GLOBAL_OBSERVABILITY_SINK.set(sink).is_ok()
+    }
+
+    pub fn install_stderr_global() -> bool {
+        Self::install_global(Arc::new(StderrObservabilitySink))
+    }
+
+    pub fn record_metric(&self, observation: MetricObservation) {
+        self.sink.record(ObservabilityEvent::Metric(observation));
+    }
+
+    pub fn record_log(&self, event: LifecycleLogEvent) {
+        self.sink.record(ObservabilityEvent::Log(event));
+    }
+}
+
+impl Default for ObservabilityRecorder {
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+impl fmt::Debug for ObservabilityRecorder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObservabilityRecorder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InMemoryObservability {
+    pub fn recorder(&self) -> ObservabilityRecorder {
+        ObservabilityRecorder::new(Arc::new(self.clone()))
+    }
+
+    pub fn events(&self) -> Vec<ObservabilityEvent> {
+        self.events
+            .lock()
+            .expect("observability event lock not poisoned")
+            .clone()
+    }
+}
+
+impl ObservabilitySink for InMemoryObservability {
+    fn record(&self, event: ObservabilityEvent) {
+        self.events
+            .lock()
+            .expect("observability event lock not poisoned")
+            .push(event);
+    }
+}
+
+impl ObservabilitySink for NoopObservabilitySink {
+    fn record(&self, _event: ObservabilityEvent) {}
+}
+
+impl ObservabilitySink for StderrObservabilitySink {
+    fn record(&self, event: ObservabilityEvent) {
+        match event {
+            ObservabilityEvent::Metric(metric) => {
+                let labels = metric
+                    .labels()
+                    .iter()
+                    .map(|label| format!("{}={}", label.key().as_str(), label.value()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "observability.type=metric metric.name={} metric.value={} metric.labels={}",
+                    metric.name(),
+                    metric.value(),
+                    labels
+                );
+            }
+            ObservabilityEvent::Log(log) => {
+                let fields = log
+                    .fields()
+                    .iter()
+                    .map(|field| format!("{}={}", field.key(), field.value()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "observability.type=event event.name={} {}",
+                    log.name(),
+                    fields
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        InMemoryObservability, LifecycleLogEvent, LogField, ObservabilityEvent, FIELD_INSTANCE_ID,
+        LIFECYCLE_FIELDS,
+    };
+
+    #[test]
+    fn lifecycle_log_fields_include_required_identity_context() {
+        for field in [
+            "instance.id",
+            "route.id",
+            "subscription.id",
+            "generation",
+            "backend.generation",
+            "cluster.id",
+            "namespace",
+            "error.reason",
+        ] {
+            assert!(LIFECYCLE_FIELDS.contains(&field));
+        }
+    }
+
+    #[test]
+    fn in_memory_recorder_captures_lifecycle_log_fields() {
+        let sink = InMemoryObservability::default();
+        let recorder = sink.recorder();
+
+        recorder.record_log(LifecycleLogEvent::new(
+            "runtime.test",
+            vec![LogField::instance_id("instance-a")],
+        ));
+
+        let events = sink.events();
+        let ObservabilityEvent::Log(event) = &events[0] else {
+            panic!("expected log event");
+        };
+        assert_eq!(event.field_value(FIELD_INSTANCE_ID), Some("instance-a"));
+    }
+}

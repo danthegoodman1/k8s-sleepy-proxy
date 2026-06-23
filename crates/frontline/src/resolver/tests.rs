@@ -4,6 +4,16 @@ use std::{
 };
 
 use control_plane::{CachePolicy, PathPrefix, RouteHost, RouteIdentity};
+use proxy_core::observability::{
+    metrics::{
+        RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME, RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME,
+        RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL_NAME,
+    },
+    recorder::{
+        InMemoryObservability, ObservabilityEvent, EVENT_ROUTE_CACHE_LOOKUP, FIELD_ROUTE_ID,
+        FIELD_SUBSCRIPTION_ID,
+    },
+};
 
 use super::{
     FrontlineRouteResolution, FrontlineRouteResolver, FrontlineRouteResolverError,
@@ -193,6 +203,45 @@ async fn positive_cache_hit_returns_cached_route_without_client_call() {
 }
 
 #[tokio::test]
+async fn positive_cache_hit_records_lookup_metric_and_route_fields() {
+    let now = now();
+    let sink = InMemoryObservability::default();
+    let request = http_request("app.example.com", "/api/users");
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-1"),
+            http_rule("example.com", Some("/api")),
+            "route-1",
+        ),
+        now,
+    );
+    let mut resolver = FrontlineRouteResolver::from_parts_with_observability(
+        state,
+        FakeRouteSubscriptionClient::default(),
+        sink.recorder(),
+    );
+
+    resolver.resolve(request, now).await.expect("cache hit");
+
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "hit")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Log(log)
+            if log.name() == EVENT_ROUTE_CACHE_LOOKUP
+                && log.field_value(FIELD_ROUTE_ID) == Some("route-1")
+                && log.field_value(FIELD_SUBSCRIPTION_ID) == Some("sub-1")
+    )));
+}
+
+#[tokio::test]
 async fn negative_cache_hit_returns_miss_without_client_call() {
     let now = now();
     let request = http_request("missing.example.com", "/");
@@ -247,6 +296,40 @@ async fn absent_route_subscribes_installs_resolved_route_and_reuses_cache() {
         .await
         .expect("later lookup uses cache");
     assert_eq!(resolver.client().calls.len(), 1);
+}
+
+#[tokio::test]
+async fn absent_route_records_cache_miss_and_control_plane_call() {
+    let now = now();
+    let sink = InMemoryObservability::default();
+    let request = http_request("app.example.com", "/api/users");
+    let client = FakeRouteSubscriptionClient::with_subscribe_response(resolved_response(
+        generated_request_id(1),
+        subscription_id("sub-1"),
+        http_rule("example.com", Some("/api")),
+        "route-1",
+    ));
+    let mut resolver = FrontlineRouteResolver::with_observability(4, client, sink.recorder());
+
+    resolver
+        .resolve(request, now)
+        .await
+        .expect("subscribe resolves");
+
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "miss")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "subscribe_route")
+                && metric.labels().iter().any(|label| label.value() == "success")
+    )));
 }
 
 #[tokio::test]
@@ -733,6 +816,7 @@ async fn apply_control_plane_message_unsubscribes_evicted_subscriptions() {
 #[tokio::test]
 async fn stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebuilds() {
     let now = now();
+    let sink = InMemoryObservability::default();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
     state.apply_control_plane_message(
@@ -751,7 +835,8 @@ async fn stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebui
         "route-new",
     ));
     client.push_events(vec![RouteSubscriptionEvent::StreamClosed]);
-    let mut resolver = FrontlineRouteResolver::from_parts(state, client);
+    let mut resolver =
+        FrontlineRouteResolver::from_parts_with_observability(state, client, sink.recorder());
 
     let result = resolver
         .resolve(request.clone(), now)
@@ -775,4 +860,10 @@ async fn stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebui
             identity: request,
         }]
     );
+    assert!(sink.events().iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "closed")
+    )));
 }

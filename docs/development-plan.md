@@ -799,8 +799,8 @@ Scope:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Metrics and tracing for wake latency, cache hits, control-plane calls, drain duration, active streams, and materialization failures. | `proxy-core` descriptor tests exist, but runtime instrumentation for these lifecycle metrics is incomplete; follow-up: M9 for instrumentation gates and M10 for metric docs. |
-| Incomplete | Structured logs with instance ID, route ID, generation, and cluster. | No structured log/golden assertions found for lifecycle fields; follow-up: M9 implementation gates and M10 runbooks. |
+| Complete | Metrics and tracing for wake latency, cache hits, control-plane calls, drain duration, active streams, and materialization failures. | Backend-neutral runtime observability records and tests V1 lifecycle metrics for wake latency/outcomes, route-cache hit/miss, control-plane calls including frontend wake RPCs, Subscribe stream close/update/invalidation, active streams, drain duration, materialization failures, sidecar idle reports, and HTTP-01 results; production binaries install the process-wide stderr sink boundary, while exporter/dashboard docs remain M10. |
+| Complete | Structured logs with instance ID, route ID, generation, and cluster. | Production runtime entrypoints now emit through the same process-wide recorder boundary, and lifecycle log-event assertions cover route/subscription IDs in frontline cache and Subscribe paths, instance/generation/cluster/namespace/error fields in control-plane wake/materialization failures, sidecar idle-report identity fields, drain fields, and HTTP-01 result events. |
 | Complete | Backoff and retry policies. | Sidecar idle retry/backoff, proxy Subscribe reconnect/lazy rebuild with reconnect backoff, materializer client retry for transient Kubernetes apply/delete/PVC/readiness failures, and runtime `RetryingControlPlaneStore` retry for transient `StoreError::Unavailable` are covered. |
 | Complete | Proxy `Subscribe` reconnect and lazy cache rebuild. | `control_plane_transport.rs` covers reconnect after a closed Subscribe response stream and drains actual stream close as a terminal event; resolver tests prove active cached positives are invalidated before TTL and lazily rebuilt by the next request. |
 | Incomplete | Control-plane restart recovery from database state. | No restart reconciliation tests or runtime recovery loop found; follow-up: M9. |
@@ -813,7 +813,7 @@ Sub-phases:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | 7A: Metrics, tracing, and structured log fields. | Descriptor-level observability exists; runtime lifecycle instrumentation and log assertions are missing; follow-up: M9/M10. |
+| Complete | 7A: Metrics, tracing, and structured log fields. | Backend-neutral runtime observability facade, process-wide stderr sink wiring in production entrypoints, stable lifecycle metric descriptors, and focused assertions now cover wake, route cache, control-plane calls, Subscribe events, drain, active streams, materialization failures, sidecar idle reports, and HTTP-01 result paths; exporter/dashboard docs remain tracked by 7G/M10. |
 | Incomplete | 7B: Control-plane restart recovery during wake, sleep, and delete. | No restart recovery gate found; follow-up: M9. |
 | Complete | 7C: Proxy Subscribe reconnect, lazy cache rebuild, and stale backend recovery. | Transport reconnect and stale backend recovery have component coverage; actual stream-close-driven active cache invalidation before TTL expiry and lazy rebuild on the next request are covered by transport and resolver tests. |
 | Incomplete | 7D: Minimal final images and container runtime smoke tests. | Distroless images and `scripts/smoke-images.sh` enforce non-root/runtime-file/startup-error checks plus image-size budgets, but full startup/connectivity/kind-use gates are missing; follow-up: M9. |
@@ -826,8 +826,8 @@ Done criteria:
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
 | Incomplete | Automated tests cover restart during wake, sleep, and delete. | No restart recovery tests found; follow-up: M9. |
-| Incomplete | Metrics tests assert counters/histograms and labels for lifecycle paths. | Proxy-core descriptor tests exist, but requested lifecycle metrics are not instrumented/tested; follow-up: M9. |
-| Incomplete | Structured log tests/goldens cover lifecycle fields and errors. | No structured log assertions found; follow-up: M9. |
+| Complete | Metrics tests assert counters/histograms and labels for lifecycle paths. | Tests assert emitted backend-neutral observations and low-cardinality labels for route cache, control-plane calls including frontend wake RPCs, Subscribe stream events, wake latency, materialization failures, drain duration, active streams, sidecar idle reports, and HTTP-01 results. |
+| Complete | Structured log tests/goldens cover lifecycle fields and errors. | Tests assert emitted lifecycle log fields for route ID, subscription ID, instance ID, generation, cluster, namespace, active count, duration, and error reason across frontline, control-plane, sidecar, drain, and HTTP-01 paths. |
 | Incomplete | Repeated kind wake/sleep soak passes without leaked Kubernetes objects. | Materializer-only soak checks leaked namespaces/PVs; full wake/sleep soak is missing; follow-up: M9. |
 | Incomplete | Load-test targets for route lookup, hot proxy path, and cold wake latency are defined before 7D. | `docs/proxy-hot-path-budgets.md` documents route lookup and current load-smoke limitations, but cold wake and stable tail-latency targets are incomplete; follow-up: M9. |
 | Incomplete | Proxy load tests use production images and direct-backend baselines. | Production-image load smokes exist with fake control plane/direct comparisons, but full protocol and kind production-image gates are missing; follow-up: M9. |

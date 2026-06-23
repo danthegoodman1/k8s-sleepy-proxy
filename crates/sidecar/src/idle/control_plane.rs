@@ -1,3 +1,8 @@
+use proxy_core::observability::{
+    metrics::RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
+    recorder::{LifecycleLogEvent, LogField, MetricObservation, EVENT_IDLE_REPORT},
+    Operation, Outcome,
+};
 use sleepypods_types::Generation;
 
 use crate::control_plane_transport::{
@@ -42,10 +47,13 @@ impl IdleDetector {
 
                 match client.report_idle(request.clone()).await {
                     Ok(response) => {
+                        self.record_idle_report(&request, idle_report_outcome(&response));
                         self.reported = true;
                         return control_plane_idle_report_outcome(request, response);
                     }
-                    Err(_error) => {}
+                    Err(_error) => {
+                        self.record_idle_report(&request, Outcome::Error);
+                    }
                 }
 
                 if self
@@ -55,6 +63,34 @@ impl IdleDetector {
                     break;
                 }
             }
+        }
+    }
+}
+
+impl IdleDetector {
+    fn record_idle_report(&self, request: &ReportIdleRequest, outcome: Outcome) {
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
+            vec![Operation::ReportIdle.metric_label(), outcome.metric_label()],
+            1.0,
+        ));
+        self.observability.record_log(LifecycleLogEvent::new(
+            EVENT_IDLE_REPORT,
+            vec![
+                LogField::instance_id(request.instance_id().as_str()),
+                LogField::generation(request.generation().get()),
+                LogField::active_count(request.observation().active_count()),
+            ],
+        ));
+    }
+}
+
+fn idle_report_outcome(response: &ReportIdleResponse) -> Outcome {
+    match response {
+        ReportIdleResponse::Accepted { .. } => Outcome::Success,
+        ReportIdleResponse::AlreadyDraining { .. } => Outcome::AlreadyDraining,
+        ReportIdleResponse::GenerationConflict { .. } | ReportIdleResponse::Unavailable { .. } => {
+            Outcome::Rejected
         }
     }
 }
@@ -92,7 +128,16 @@ mod tests {
         time::Duration,
     };
 
-    use proxy_core::DrainTracker;
+    use proxy_core::{
+        observability::{
+            metrics::RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME,
+            recorder::{
+                InMemoryObservability, ObservabilityEvent, EVENT_IDLE_REPORT, FIELD_ACTIVE_COUNT,
+                FIELD_INSTANCE_ID,
+            },
+        },
+        DrainTracker,
+    };
     use sleepypods_types::{Generation, InstanceId};
 
     use crate::{
@@ -143,6 +188,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn accepted_idle_report_records_metric_and_identity_fields() {
+        let sink = InMemoryObservability::default();
+        let mut detector = IdleDetector::with_observability(
+            instance_id(),
+            generation(),
+            config(),
+            drain_tracker(),
+            sink.recorder(),
+        );
+        let mut client = FakeReportIdleClient::new([Ok(accepted_response())]);
+
+        let (_outcome, ()) = tokio::join!(
+            detector.report_to_control_plane_when_idle(&mut client),
+            async {
+                yield_now().await;
+                advance(IDLE_TIMEOUT).await;
+            }
+        );
+
+        let events = sink.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObservabilityEvent::Metric(metric)
+                if metric.name() == RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME
+                    && metric.labels().iter().any(|label| label.value() == "report_idle")
+                    && metric.labels().iter().any(|label| label.value() == "success")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObservabilityEvent::Log(log)
+                if log.name() == EVENT_IDLE_REPORT
+                    && log.field_value(FIELD_INSTANCE_ID) == Some("instance-a")
+                    && log.field_value(FIELD_ACTIVE_COUNT) == Some("0")
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn already_draining_marks_reported() {
         let mut detector = detector_for(drain_tracker());
         let mut client = FakeReportIdleClient::new([Ok(already_draining_response())]);
@@ -162,6 +244,35 @@ mod tests {
         );
         assert!(detector.has_reported());
         assert_recorded_count(&requests, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn already_draining_records_distinct_idle_report_outcome() {
+        let sink = InMemoryObservability::default();
+        let mut detector = IdleDetector::with_observability(
+            instance_id(),
+            generation(),
+            config(),
+            drain_tracker(),
+            sink.recorder(),
+        );
+        let mut client = FakeReportIdleClient::new([Ok(already_draining_response())]);
+
+        let (_outcome, ()) = tokio::join!(
+            detector.report_to_control_plane_when_idle(&mut client),
+            async {
+                yield_now().await;
+                advance(IDLE_TIMEOUT).await;
+            }
+        );
+
+        assert!(sink.events().iter().any(|event| matches!(
+            event,
+            ObservabilityEvent::Metric(metric)
+                if metric.name() == RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME
+                    && metric.labels().iter().any(|label| label.value() == "report_idle")
+                    && metric.labels().iter().any(|label| label.value() == "already_draining")
+        )));
     }
 
     #[tokio::test(start_paused = true)]

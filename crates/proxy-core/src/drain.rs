@@ -2,10 +2,18 @@ use std::{
     error::Error,
     fmt,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::accounting::{ActiveConnection, ActiveConnectionCounter, IdleActivityWatch};
+use crate::observability::{
+    metrics::{RUNTIME_ACTIVE_STREAMS, RUNTIME_DRAIN_DURATION_SECONDS},
+    recorder::{
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
+        EVENT_DRAIN_COMPLETED, EVENT_DRAIN_STARTED, EVENT_DRAIN_TIMEOUT,
+    },
+    Outcome,
+};
 use crate::timeout::with_timeout;
 
 /// Tracks active sessions and rejects new work once drain starts.
@@ -19,6 +27,7 @@ struct Inner {
     state: Mutex<State>,
     active: ActiveConnectionCounter,
     grace_timeout: Duration,
+    observability: ObservabilityRecorder,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +40,7 @@ struct State {
 #[must_use = "dropping the permit releases the active connection count"]
 pub struct DrainPermit {
     active: ActiveConnection,
+    tracker: DrainTracker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +56,21 @@ impl DrainTracker {
                 state: Mutex::new(State::default()),
                 active: ActiveConnectionCounter::new(),
                 grace_timeout,
+                observability: ObservabilityRecorder::default(),
+            }),
+        }
+    }
+
+    pub fn with_observability(
+        grace_timeout: Duration,
+        observability: ObservabilityRecorder,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                state: Mutex::new(State::default()),
+                active: ActiveConnectionCounter::new(),
+                grace_timeout,
+                observability,
             }),
         }
     }
@@ -77,8 +102,12 @@ impl DrainTracker {
             return Err(DrainError::Draining);
         }
 
+        let active = self.inner.active.track();
+        self.record_active_streams();
+
         Ok(DrainPermit {
-            active: self.inner.active.track(),
+            active,
+            tracker: self.clone(),
         })
     }
 
@@ -107,8 +136,37 @@ impl DrainTracker {
     }
 
     pub async fn drain(&self) -> Result<(), DrainError> {
+        let started = Instant::now();
         self.start_drain();
-        self.wait_for_idle().await
+        self.inner.observability.record_log(LifecycleLogEvent::new(
+            EVENT_DRAIN_STARTED,
+            vec![LogField::active_count(self.active_count())],
+        ));
+        let result = self.wait_for_idle().await;
+        let duration = started.elapsed();
+        let outcome = match &result {
+            Ok(()) => Outcome::Success,
+            Err(error) => Outcome::from(error),
+        };
+        self.inner
+            .observability
+            .record_metric(MetricObservation::new(
+                RUNTIME_DRAIN_DURATION_SECONDS,
+                vec![outcome.metric_label()],
+                duration.as_secs_f64(),
+            ));
+        self.inner.observability.record_log(LifecycleLogEvent::new(
+            match &result {
+                Ok(()) => EVENT_DRAIN_COMPLETED,
+                Err(DrainError::GraceTimeout { .. }) => EVENT_DRAIN_TIMEOUT,
+                Err(DrainError::Draining) => EVENT_DRAIN_TIMEOUT,
+            },
+            vec![
+                LogField::active_count(self.active_count()),
+                LogField::duration_ms(duration.as_millis()),
+            ],
+        ));
+        result
     }
 
     pub async fn wait_for_active_count(&self, expected: usize) {
@@ -118,11 +176,33 @@ impl DrainTracker {
     pub fn watch_for_activity_after_idle(&self) -> Option<IdleActivityWatch> {
         self.inner.active.watch_for_activity_after_idle()
     }
+
+    fn record_active_streams(&self) {
+        self.inner
+            .observability
+            .record_metric(MetricObservation::new(
+                RUNTIME_ACTIVE_STREAMS,
+                Vec::new(),
+                self.active_count() as f64,
+            ));
+    }
 }
 
 impl DrainPermit {
     pub fn release(&mut self) {
-        self.active.release();
+        if self.active.is_active() {
+            self.active.release();
+            self.tracker.record_active_streams();
+        }
+    }
+}
+
+impl Drop for DrainPermit {
+    fn drop(&mut self) {
+        if self.active.is_active() {
+            self.active.release();
+            self.tracker.record_active_streams();
+        }
     }
 }
 
@@ -144,6 +224,13 @@ impl Error for DrainError {}
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use crate::observability::{
+        metrics::{RUNTIME_ACTIVE_STREAMS_NAME, RUNTIME_DRAIN_DURATION_SECONDS_NAME},
+        recorder::{
+            InMemoryObservability, ObservabilityEvent, EVENT_DRAIN_COMPLETED, EVENT_DRAIN_STARTED,
+        },
+    };
 
     use super::{DrainError, DrainTracker};
 
@@ -194,5 +281,54 @@ mod tests {
                 active: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn drain_records_duration_metric_and_lifecycle_logs() {
+        let sink = InMemoryObservability::default();
+        let tracker = DrainTracker::with_observability(Duration::from_secs(5), sink.recorder());
+
+        tracker.drain().await.expect("idle drain succeeds");
+
+        let events = sink.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObservabilityEvent::Log(log) if log.name() == EVENT_DRAIN_STARTED
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObservabilityEvent::Log(log) if log.name() == EVENT_DRAIN_COMPLETED
+                && log.field_value("active.count") == Some("0")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObservabilityEvent::Metric(metric)
+                if metric.name() == RUNTIME_DRAIN_DURATION_SECONDS_NAME
+                    && metric.labels().iter().any(|label| label.value() == "success")
+        )));
+    }
+
+    #[test]
+    fn drain_permit_records_active_stream_gauge_on_acquire_and_release() {
+        let sink = InMemoryObservability::default();
+        let tracker = DrainTracker::with_observability(Duration::from_secs(5), sink.recorder());
+
+        let permit = tracker.try_acquire().expect("work admitted");
+        drop(permit);
+
+        let values = sink
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ObservabilityEvent::Metric(metric)
+                    if metric.name() == RUNTIME_ACTIVE_STREAMS_NAME =>
+                {
+                    Some(metric.value())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec![1.0, 0.0]);
     }
 }

@@ -1,5 +1,13 @@
 use std::sync::{Arc, Mutex};
 
+use proxy_core::observability::{
+    metrics::{RUNTIME_MATERIALIZATION_FAILURES_TOTAL_NAME, RUNTIME_WAKE_LATENCY_SECONDS_NAME},
+    recorder::{
+        InMemoryObservability, ObservabilityEvent, EVENT_MATERIALIZATION_FAILURE, EVENT_WAKE,
+        FIELD_CLUSTER_ID, FIELD_ERROR_REASON, FIELD_INSTANCE_ID, FIELD_NAMESPACE,
+    },
+};
+
 use crate::{
     http01::{
         DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
@@ -526,6 +534,63 @@ async fn materializer_failure_marks_waking_generation_failed() {
             (Generation::new(7), InstanceState::Failed),
         ]
     );
+}
+
+#[tokio::test]
+async fn materializer_failure_records_wake_and_failure_observability_fields() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 6),
+        Some(workload_class()),
+    );
+    let client = FakeKubernetesClient::default();
+    client.fail_readiness();
+    let materializer = KubernetesMaterializer::new(client.clone());
+    let sink = InMemoryObservability::default();
+
+    let error = wake_instance_with_observability(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(6),
+            target("cluster-a", "apps"),
+        ),
+        sink.recorder(),
+    )
+    .await
+    .expect_err("readiness failure fails wake");
+
+    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_WAKE_LATENCY_SECONDS_NAME
+                && metric.labels().iter().any(|label| label.value() == "error")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Metric(metric)
+            if metric.name() == RUNTIME_MATERIALIZATION_FAILURES_TOTAL_NAME
+                && metric.labels().iter().any(|label| label.value() == "materialize")
+                && metric.labels().iter().any(|label| label.value() == "error")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Log(log)
+            if log.name() == EVENT_WAKE
+                && log.field_value(FIELD_INSTANCE_ID) == Some("instance-a")
+                && log.field_value(FIELD_CLUSTER_ID) == Some("cluster-a")
+                && log.field_value(FIELD_NAMESPACE) == Some("apps")
+                && log.field_value(FIELD_ERROR_REASON) == Some("materializer")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Log(log)
+            if log.name() == EVENT_MATERIALIZATION_FAILURE
+                && log.field_value(FIELD_INSTANCE_ID) == Some("instance-a")
+                && log.field_value(FIELD_ERROR_REASON).is_some()
+    )));
 }
 
 #[tokio::test]

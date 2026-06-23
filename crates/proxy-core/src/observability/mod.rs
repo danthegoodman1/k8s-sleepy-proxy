@@ -1,8 +1,8 @@
-//! Shared observability conventions for proxy primitives.
+//! Shared observability conventions and a tiny runtime recording boundary.
 //!
-//! This module defines stable names, low-cardinality labels, and tracing field
-//! conventions only. Frontline and sidecar binaries choose the metrics backend,
-//! tracing subscriber, and exporter wiring.
+//! This module defines stable names, low-cardinality labels, tracing field
+//! conventions, and a backend-neutral recorder. Binaries may install the
+//! process-wide stderr sink until a real metrics backend/exporter is wired.
 
 use std::fmt;
 
@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub mod metrics;
+pub mod recorder;
 pub mod trace;
 
 /// Proxy protocol family for metrics and tracing.
@@ -42,6 +43,14 @@ pub enum Operation {
     RewriteRequest,
     Drain,
     TlsClientHello,
+    RouteCacheLookup,
+    SubscribeRoute,
+    Unsubscribe,
+    SubscribeStream,
+    WakeInstance,
+    Materialize,
+    Http01Resolve,
+    ReportIdle,
 }
 
 /// Generic low-cardinality operation outcomes.
@@ -52,6 +61,15 @@ pub enum Outcome {
     Timeout,
     Rejected,
     Canceled,
+    Hit,
+    Miss,
+    Started,
+    Closed,
+    Updated,
+    Invalidated,
+    AlreadyRunning,
+    AlreadyWaking,
+    AlreadyDraining,
 }
 
 /// Bounded proxy lifecycle states.
@@ -110,6 +128,14 @@ impl Operation {
         Self::RewriteRequest,
         Self::Drain,
         Self::TlsClientHello,
+        Self::RouteCacheLookup,
+        Self::SubscribeRoute,
+        Self::Unsubscribe,
+        Self::SubscribeStream,
+        Self::WakeInstance,
+        Self::Materialize,
+        Self::Http01Resolve,
+        Self::ReportIdle,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -121,6 +147,14 @@ impl Operation {
             Self::RewriteRequest => "rewrite_request",
             Self::Drain => "drain",
             Self::TlsClientHello => "tls_client_hello",
+            Self::RouteCacheLookup => "route_cache_lookup",
+            Self::SubscribeRoute => "subscribe_route",
+            Self::Unsubscribe => "unsubscribe",
+            Self::SubscribeStream => "subscribe_stream",
+            Self::WakeInstance => "wake_instance",
+            Self::Materialize => "materialize",
+            Self::Http01Resolve => "http01_resolve",
+            Self::ReportIdle => "report_idle",
         }
     }
 }
@@ -132,6 +166,15 @@ impl Outcome {
         Self::Timeout,
         Self::Rejected,
         Self::Canceled,
+        Self::Hit,
+        Self::Miss,
+        Self::Started,
+        Self::Closed,
+        Self::Updated,
+        Self::Invalidated,
+        Self::AlreadyRunning,
+        Self::AlreadyWaking,
+        Self::AlreadyDraining,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -141,6 +184,15 @@ impl Outcome {
             Self::Timeout => "timeout",
             Self::Rejected => "rejected",
             Self::Canceled => "canceled",
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Started => "started",
+            Self::Closed => "closed",
+            Self::Updated => "updated",
+            Self::Invalidated => "invalidated",
+            Self::AlreadyRunning => "already_running",
+            Self::AlreadyWaking => "already_waking",
+            Self::AlreadyDraining => "already_draining",
         }
     }
 }
@@ -293,7 +345,15 @@ mod tests {
                 "forward",
                 "rewrite_request",
                 "drain",
-                "tls_client_hello"
+                "tls_client_hello",
+                "route_cache_lookup",
+                "subscribe_route",
+                "unsubscribe",
+                "subscribe_stream",
+                "wake_instance",
+                "materialize",
+                "http01_resolve",
+                "report_idle"
             ]
         );
         assert_eq!(
@@ -301,7 +361,22 @@ mod tests {
                 .iter()
                 .map(|value| value.as_str())
                 .collect::<Vec<_>>(),
-            ["success", "error", "timeout", "rejected", "canceled"]
+            [
+                "success",
+                "error",
+                "timeout",
+                "rejected",
+                "canceled",
+                "hit",
+                "miss",
+                "started",
+                "closed",
+                "updated",
+                "invalidated",
+                "already_running",
+                "already_waking",
+                "already_draining"
+            ]
         );
         assert_eq!(
             ProxyState::ALL

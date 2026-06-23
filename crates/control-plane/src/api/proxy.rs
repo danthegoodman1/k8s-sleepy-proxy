@@ -1,5 +1,6 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
+use proxy_core::observability::recorder::ObservabilityRecorder;
 use tonic::{
     codegen::tokio_stream::{self, wrappers::ReceiverStream},
     Request, Response, Status,
@@ -35,6 +36,7 @@ pub struct StoreBackedProxyApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
+    observability: ObservabilityRecorder,
 }
 
 impl<C> StoreBackedProxyApi<C> {
@@ -43,10 +45,25 @@ impl<C> StoreBackedProxyApi<C> {
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
+        Self::with_observability(
+            store,
+            materializer,
+            target,
+            ObservabilityRecorder::default(),
+        )
+    }
+
+    pub fn with_observability(
+        store: Arc<dyn ControlPlaneStore>,
+        materializer: KubernetesMaterializer<C>,
+        target: MaterializationTarget,
+        observability: ObservabilityRecorder,
+    ) -> Self {
         Self {
             store,
             materializer,
             target,
+            observability,
         }
     }
 }
@@ -61,7 +78,12 @@ pub fn proxy_grpc_service_with_store<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    ProxyControlPlaneServer::new(StoreBackedProxyApi::new(store, materializer, target))
+    ProxyControlPlaneServer::new(StoreBackedProxyApi::with_observability(
+        store,
+        materializer,
+        target,
+        ObservabilityRecorder::global(),
+    ))
 }
 
 #[tonic::async_trait]
@@ -78,7 +100,13 @@ where
         let request = proxy_wake_request_from_proto(request.into_inner(), self.target.clone())?;
         let instance_id = request.instance_id.as_str().to_owned();
 
-        let result = wake::wake_instance(self.store.as_ref(), &self.materializer, request).await;
+        let result = wake::wake_instance_with_observability(
+            self.store.as_ref(),
+            &self.materializer,
+            request,
+            self.observability.clone(),
+        )
+        .await;
         let response = match result {
             Ok(WakeInstanceResult::Completed { result }) => {
                 proxy_ready_response(&result.instance, &result.materialization)?
