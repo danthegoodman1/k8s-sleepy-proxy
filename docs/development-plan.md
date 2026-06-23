@@ -545,13 +545,13 @@ Scope:
 
 - Review all Milestone 1-7 scope items, sub-phases, and done criteria against
   the current code, tests, scripts, and kind/container evidence.
-- Mark each prior item explicitly as `Complete`, `Incomplete`, or `Unknown` in
-  this development plan.
+- Mark each prior item explicitly as either `Complete` or `Incomplete` in this
+  development plan.
 - For every `Complete` item, include concise evidence such as a test name,
   script name, source file, or command that proves the claim.
 - For every `Incomplete` item, name the missing behavior or missing test.
-- Convert any `Unknown` item into either `Complete` or `Incomplete` before
-  starting documentation.
+- Do enough inspection to make a definitive status call; absence of evidence is
+  `Incomplete`.
 
 Sub-phases:
 
@@ -569,7 +569,7 @@ Sub-phases:
 Done when:
 
 - Every prior scope item, sub-phase, and done criterion is marked `Complete` or
-  `Incomplete`; no `Unknown` markers remain.
+  `Incomplete`.
 - Every `Complete` marker has evidence that a reviewer can run or inspect.
 - Every `Incomplete` marker has a concrete follow-up location in Milestone 9,
   Milestone 10, or `Deferred`.
