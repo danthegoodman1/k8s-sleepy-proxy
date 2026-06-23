@@ -17,10 +17,14 @@ use super::{
 };
 
 const SIDECAR_PORT_NAME: &str = "sleepypods";
+const CONTROL_PLANE_SERVICE_NAME: &str = "sleepypods-control-plane";
+const CONTROL_PLANE_GRPC_PORT: u16 = 50051;
 const ENV_LISTEN_PORT: &str = "SLEEPYPODS_LISTEN_PORT";
+const ENV_SIDECAR_LISTEN_ADDR: &str = "SLEEPYPODS_SIDECAR_LISTEN_ADDR";
 const ENV_APP_PORT: &str = "SLEEPYPODS_APP_PORT";
 const ENV_INSTANCE_ID: &str = "SLEEPYPODS_INSTANCE_ID";
 const ENV_INSTANCE_GENERATION: &str = "SLEEPYPODS_INSTANCE_GENERATION";
+const ENV_CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
 const ENV_IDLE_TIMEOUT_MS: &str = "SLEEPYPODS_IDLE_TIMEOUT_MS";
 const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
 const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
@@ -134,6 +138,7 @@ pub fn render_manifests(
                     &request.template.sidecar,
                     request.instance,
                     &sidecar,
+                    request.namespace,
                     request.sleep_policy,
                 )?,
             ],
@@ -427,6 +432,7 @@ fn render_sidecar_container(
     template: &SidecarTemplate,
     instance: &InstanceRecord,
     config: &SidecarRenderConfig,
+    namespace: &str,
     sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
 ) -> Result<Container, ManifestRenderError> {
     Ok(Container {
@@ -442,6 +448,10 @@ fn render_sidecar_container(
                 value: config.listen_port.to_string(),
             },
             EnvVar {
+                name: ENV_SIDECAR_LISTEN_ADDR.to_owned(),
+                value: format!("0.0.0.0:{}", config.listen_port),
+            },
+            EnvVar {
                 name: ENV_APP_PORT.to_owned(),
                 value: config.app_port.to_string(),
             },
@@ -452,6 +462,12 @@ fn render_sidecar_container(
             EnvVar {
                 name: ENV_INSTANCE_GENERATION.to_owned(),
                 value: instance.generation.to_string(),
+            },
+            EnvVar {
+                name: ENV_CONTROL_PLANE_ENDPOINT.to_owned(),
+                value: format!(
+                    "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
+                ),
             },
             EnvVar {
                 name: ENV_IDLE_TIMEOUT_MS.to_owned(),

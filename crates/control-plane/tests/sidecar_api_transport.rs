@@ -109,6 +109,50 @@ async fn report_idle_running_instance_transitions_to_draining() {
 }
 
 #[tokio::test]
+async fn report_idle_from_rendered_waking_generation_sleeps_current_running_instance() {
+    let store = Arc::new(FakeSidecarStore::default());
+    store.seed_instance(domain_instance(
+        "instance-rendered-generation",
+        DomainInstanceState::Running,
+        8,
+    ));
+    store.seed_materialization(ready_materialization("instance-rendered-generation", 8));
+    let client = FakeKubernetesClient::default();
+    let service = sidecar_api(store.clone(), client.clone());
+
+    let response = service
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            instance_id: "instance-rendered-generation".to_owned(),
+            expected_generation: 7,
+            active_count: 0,
+        }))
+        .await
+        .expect("idle report from rendered wake generation succeeds")
+        .into_inner();
+
+    let accepted = expect_accepted(response);
+    assert_eq!(accepted.instance_id, "instance-rendered-generation");
+    assert_eq!(accepted.instance_generation, 10);
+    assert_eq!(store.instance().state, DomainInstanceState::Cold);
+    assert_eq!(store.instance().generation, Generation::new(10));
+    let transitions = store.transition_requests();
+    assert_eq!(transitions.len(), 2);
+    assert_eq!(transitions[0].expected_generation, Generation::new(8));
+    assert_eq!(transitions[0].next_state, DomainInstanceState::Draining);
+    assert_eq!(transitions[1].expected_generation, Generation::new(9));
+    assert_eq!(transitions[1].next_state, DomainInstanceState::Cold);
+    assert_eq!(
+        client.deleted_objects(),
+        vec![object_ref(
+            "apps/v1",
+            "Deployment",
+            "apps",
+            "instance-rendered-generation"
+        )]
+    );
+}
+
+#[tokio::test]
 async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
     let store = Arc::new(FakeSidecarStore::default());
     store.seed_instance(domain_instance(

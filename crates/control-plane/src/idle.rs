@@ -2,8 +2,9 @@ use crate::{
     ids::{Generation, InstanceId},
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
     materialization::{
-        BeginSleepRequest, FinalizeSleepRequest, LoadActiveMaterializationRequest,
-        MaterializationRecord, MaterializationState, MaterializationTarget,
+        BeginSleepRequest, BeginSleepResult, FinalizeSleepRequest,
+        LoadActiveMaterializationRequest, MaterializationRecord, MaterializationState,
+        MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     store::{ControlPlaneStore, StoreError},
@@ -165,6 +166,24 @@ where
     C: KubernetesMaterializerClient,
 {
     if current.generation == request.expected_generation.next() {
+        if current.state == InstanceState::Running {
+            let begin = begin_sleep_at_generation(
+                store,
+                request.instance_id.clone(),
+                current.generation,
+                target.clone(),
+            )
+            .await?;
+            return cleanup_and_finalize_sleep(
+                store,
+                materializer,
+                target,
+                begin.instance,
+                begin.materialization,
+            )
+            .await;
+        }
+
         if current.state == InstanceState::Draining {
             let materialization = store
                 .load_active_materialization(LoadActiveMaterializationRequest::new(
@@ -201,6 +220,28 @@ where
         expected: request.expected_generation,
         actual: current.generation,
     })
+}
+
+async fn begin_sleep_at_generation<S>(
+    store: &S,
+    instance_id: InstanceId,
+    generation: Generation,
+    target: MaterializationTarget,
+) -> Result<BeginSleepResult, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+{
+    match store
+        .begin_sleep(BeginSleepRequest::new(instance_id, generation, target))
+        .await
+    {
+        Ok(begin) => Ok(begin),
+        Err(StoreError::NotFound { .. }) => Err(ReportIdleError::NotFound),
+        Err(StoreError::GenerationConflict { expected, actual }) => {
+            Err(ReportIdleError::GenerationConflict { expected, actual })
+        }
+        Err(error) => Err(ReportIdleError::Store(error)),
+    }
 }
 
 async fn cleanup_and_finalize_sleep<S, C>(

@@ -18,6 +18,7 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
+    control_plane::install_rustls_crypto_provider();
     let _ = ObservabilityRecorder::install_stderr_global();
     let env = EnvConfig::from_env()?;
     let channel = Endpoint::from_shared(env.control_plane_endpoint.clone())?

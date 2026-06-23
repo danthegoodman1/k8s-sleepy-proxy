@@ -154,6 +154,11 @@ fn renders_deployment_and_service_without_volumes() {
     );
     assert_env(
         &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_SIDECAR_LISTEN_ADDR",
+        "0.0.0.0:15000",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
         "SLEEPYPODS_APP_PORT",
         "8080",
     );
@@ -166,6 +171,11 @@ fn renders_deployment_and_service_without_volumes() {
         &deployment.spec.template.spec.containers[1].env,
         "SLEEPYPODS_INSTANCE_GENERATION",
         "7",
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
+        "http://sleepypods-control-plane.apps.svc.cluster.local:50051",
     );
     assert_env(
         &deployment.spec.template.spec.containers[1].env,

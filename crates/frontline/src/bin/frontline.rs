@@ -21,6 +21,7 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
+    control_plane::install_rustls_crypto_provider();
     let _ = ObservabilityRecorder::install_stderr_global();
     let observability = ObservabilityRecorder::global();
     let env = FrontlineEnvConfig::from_env()?;
