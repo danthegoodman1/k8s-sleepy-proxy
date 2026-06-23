@@ -9,8 +9,9 @@ use std::{
 
 use bytes::Bytes;
 use control_plane::{
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
-    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
+    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
+    RouteHost, RouteIdentity,
 };
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -29,10 +30,10 @@ use tokio::{
 
 use super::serve_http_listener;
 use crate::{
-    FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteResolver, RouteRequestId,
-    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
-    SubscriptionState, WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
-    WakeTracker,
+    FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteResolver,
+    Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteRequestId, RouteSubscriptionClient,
+    RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
+    WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse, WakeTracker,
 };
 
 const READY_RESPONSE: &[u8] = b"ready-from-listener-upstream";
@@ -64,6 +65,11 @@ struct FakeWakeClient {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestWakeError;
+
+#[derive(Clone, Debug, Default)]
+struct FakeHttp01Resolver {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
 
 impl FakeRouteClient {
     fn push_subscribe_response(&self, response: SubscribeControlPlaneOutput) {
@@ -111,6 +117,27 @@ impl RouteSubscriptionClient for FakeRouteClient {
             .expect("calls lock")
             .push(RouteClientCall::Unsubscribe { subscription_id });
         Box::pin(async { Ok(()) })
+    }
+}
+
+impl FakeHttp01Resolver {
+    fn calls(&self) -> Vec<(String, String)> {
+        self.calls.lock().expect("HTTP-01 calls lock").clone()
+    }
+}
+
+impl Http01ChallengeResolver for FakeHttp01Resolver {
+    type Error = Infallible;
+
+    fn resolve_http01_challenge(
+        &mut self,
+        key: Http01ChallengeKey,
+    ) -> Http01ChallengeResolveFuture<'_, Self::Error> {
+        self.calls
+            .lock()
+            .expect("HTTP-01 calls lock")
+            .push((key.host().as_str().to_owned(), key.token().to_owned()));
+        Box::pin(async { Ok::<Option<Http01ChallengeRecord>, Infallible>(None) })
     }
 }
 
@@ -175,6 +202,64 @@ async fn listener_forwards_http_request_through_ready_route() {
             .to_bytes(),
         Bytes::from_static(READY_RESPONSE)
     );
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("listener task joins")
+        .expect("listener exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
+    let (upstream_addr, upstream_task) =
+        spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;
+    let route_client = FakeRouteClient::default();
+    let http01_resolver = FakeHttp01Resolver::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-normal"),
+            http_identity("app.example.com", "/normal"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{upstream_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener binds");
+    let addr = listener.local_addr().expect("listener addr");
+    let shutdown = Shutdown::new();
+    let runtime = FrontlineHttpRuntime::with_http01_resolver(
+        FrontlineRouteCoordinator::new(
+            FrontlineRouteResolver::from_parts(state, route_client.clone()),
+            WakeTracker::new(),
+            FakeWakeClient::default(),
+        ),
+        http01_resolver.clone(),
+        DrainTracker::new(Duration::from_secs(5)),
+    );
+    let task = tokio::spawn(serve_http_listener(listener, runtime, shutdown.clone()));
+
+    let response = listener_request(addr, "app.example.com", "/normal").await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body reads")
+            .to_bytes(),
+        Bytes::from_static(READY_RESPONSE)
+    );
+    assert!(http01_resolver.calls().is_empty());
     assert!(route_client.calls().is_empty());
 
     shutdown.shutdown();

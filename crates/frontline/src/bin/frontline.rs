@@ -1,9 +1,12 @@
 use std::{error::Error, process};
 
-use control_plane::api::pb::proxy_control_plane_client::ProxyControlPlaneClient;
+use control_plane::api::pb::{
+    operator_control_plane_client::OperatorControlPlaneClient,
+    proxy_control_plane_client::ProxyControlPlaneClient,
+};
 use frontline::{
     serve_http, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
-    FrontlineRouteResolver, GrpcProxyControlPlaneClient, WakeTracker,
+    FrontlineRouteResolver, GrpcOperatorHttp01Resolver, GrpcProxyControlPlaneClient, WakeTracker,
 };
 use proxy_core::{DrainTracker, Shutdown};
 use tonic::transport::Endpoint;
@@ -23,11 +26,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
     let route_client =
         GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel.clone()));
-    let wake_client = GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel));
+    let wake_client =
+        GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel.clone()));
+    let http01_resolver = GrpcOperatorHttp01Resolver::new(OperatorControlPlaneClient::new(channel));
     let resolver = FrontlineRouteResolver::new(env.route_cache_capacity(), route_client);
     let coordinator = FrontlineRouteCoordinator::new(resolver, WakeTracker::new(), wake_client);
     let drain = DrainTracker::new(env.drain_grace_timeout());
-    let runtime = FrontlineHttpRuntime::new(coordinator, drain);
+    let runtime = FrontlineHttpRuntime::with_http01_resolver(coordinator, http01_resolver, drain);
     let shutdown = Shutdown::new();
 
     tokio::spawn({

@@ -1,4 +1,4 @@
-use std::{convert::Infallible, error::Error, fmt, future::Future};
+use std::{convert::Infallible, error::Error, fmt, future::Future, pin::Pin};
 
 use bytes::Bytes;
 use control_plane::{
@@ -13,6 +13,21 @@ use crate::{RequestIdentityError, RouteRequestIdentity};
 
 pub const HTTP01_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 pub const HTTP01_CONTENT_TYPE: &str = "text/plain";
+
+pub type Http01ChallengeResolveFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Option<Http01ChallengeRecord>, E>> + Send + 'a>>;
+
+pub trait Http01ChallengeResolver {
+    type Error;
+
+    fn resolve_http01_challenge(
+        &mut self,
+        key: Http01ChallengeKey,
+    ) -> Http01ChallengeResolveFuture<'_, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoopHttp01ChallengeResolver;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Http01InterceptDecision {
@@ -49,9 +64,13 @@ where
     F: FnOnce(Http01ChallengeKey) -> Fut,
     Fut: Future<Output = Result<Option<Http01ChallengeRecord>, E>>,
 {
-    let Some(token) = http01_challenge_token(request.uri().path()) else {
+    let path = request.uri().path();
+    let Some(token) = path.strip_prefix(HTTP01_CHALLENGE_PREFIX) else {
         return Ok(Http01InterceptDecision::PassThrough);
     };
+    if token.contains('/') {
+        return Err(Http01InterceptError::InvalidTokenSegment);
+    }
 
     let key = http01_challenge_key_for_resolver(request_host(request)?, token)?;
     match resolver(key.clone())
@@ -73,6 +92,21 @@ pub fn http01_challenge_token(path: &str) -> Option<&str> {
     }
 
     Some(token)
+}
+
+pub fn is_http01_challenge_candidate_path(path: &str) -> bool {
+    path.starts_with(HTTP01_CHALLENGE_PREFIX)
+}
+
+impl Http01ChallengeResolver for NoopHttp01ChallengeResolver {
+    type Error = Infallible;
+
+    fn resolve_http01_challenge(
+        &mut self,
+        _key: Http01ChallengeKey,
+    ) -> Http01ChallengeResolveFuture<'_, Self::Error> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 pub fn http01_challenge_key(

@@ -7,9 +7,11 @@ use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use proxy_core::DrainTracker;
 
 use crate::{
-    FrontlineForwardError, FrontlineForwarder, FrontlineRouteCoordinator,
-    FrontlineRouteCoordinatorError, FrontlineRouteOutcome, ReadyBackend, RequestIdentityError,
-    RouteRequestIdentity, RouteSubscriptionClient, WakeClient,
+    intercept_http01_challenge, FrontlineForwardError, FrontlineForwarder,
+    FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
+    Http01ChallengeResolver, Http01InterceptDecision, Http01InterceptError,
+    NoopHttp01ChallengeResolver, ReadyBackend, RequestIdentityError, RouteRequestIdentity,
+    RouteSubscriptionClient, WakeClient,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -17,19 +19,31 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub type FrontlineRuntimeBody = UnsyncBoxBody<Bytes, BoxError>;
 
 #[derive(Clone, Debug)]
-pub struct FrontlineHttpRuntime<RouteClient, Wake> {
+pub struct FrontlineHttpRuntime<RouteClient, Wake, Http01 = NoopHttp01ChallengeResolver> {
     coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
+    http01_resolver: Http01,
     forwarder: FrontlineForwarder,
     drain: DrainTracker,
 }
 
-impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake> {
+impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake, NoopHttp01ChallengeResolver> {
     pub fn new(
         coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
         drain: DrainTracker,
     ) -> Self {
+        Self::with_http01_resolver(coordinator, NoopHttp01ChallengeResolver, drain)
+    }
+}
+
+impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01> {
+    pub fn with_http01_resolver(
+        coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
+        http01_resolver: Http01,
+        drain: DrainTracker,
+    ) -> Self {
         Self {
             coordinator,
+            http01_resolver,
             forwarder: FrontlineForwarder::new(drain.clone()),
             drain,
         }
@@ -41,6 +55,14 @@ impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake> {
 
     pub fn coordinator_mut(&mut self) -> &mut FrontlineRouteCoordinator<RouteClient, Wake> {
         &mut self.coordinator
+    }
+
+    pub fn http01_resolver(&self) -> &Http01 {
+        &self.http01_resolver
+    }
+
+    pub fn http01_resolver_mut(&mut self) -> &mut Http01 {
+        &mut self.http01_resolver
     }
 
     pub fn forwarder(&self) -> &FrontlineForwarder {
@@ -55,17 +77,24 @@ impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake> {
         self,
     ) -> (
         FrontlineRouteCoordinator<RouteClient, Wake>,
+        Http01,
         FrontlineForwarder,
         DrainTracker,
     ) {
-        (self.coordinator, self.forwarder, self.drain)
+        (
+            self.coordinator,
+            self.http01_resolver,
+            self.forwarder,
+            self.drain,
+        )
     }
 }
 
-impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake>
+impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01>
 where
     RouteClient: RouteSubscriptionClient,
     Wake: WakeClient,
+    Http01: Http01ChallengeResolver,
 {
     pub async fn handle_http<B>(
         &mut self,
@@ -76,12 +105,34 @@ where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<BoxError>,
     {
+        match resolve_http01_response(&mut self.http01_resolver, &request).await {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => return http01_intercept_error_response(error),
+        }
+
         let outcome = match resolve_http_route(&mut self.coordinator, &request, now).await {
             Ok(outcome) => outcome,
             Err(error) => return route_resolution_error_response(error),
         };
 
         route_outcome_or_forward_response(&self.forwarder, outcome, request).await
+    }
+}
+
+pub(crate) async fn resolve_http01_response<Http01, B>(
+    resolver: &mut Http01,
+    request: &Request<B>,
+) -> Result<Option<Response<FrontlineRuntimeBody>>, Http01InterceptError<Http01::Error>>
+where
+    Http01: Http01ChallengeResolver,
+{
+    match intercept_http01_challenge(request, |key| resolver.resolve_http01_challenge(key)).await? {
+        Http01InterceptDecision::PassThrough => Ok(None),
+        Http01InterceptDecision::Miss { .. } => Ok(Some(status_response(StatusCode::NOT_FOUND))),
+        Http01InterceptDecision::Serve { response, .. } => {
+            Ok(Some(response.into_http_response().map(full_runtime_body)))
+        }
     }
 }
 
@@ -183,6 +234,19 @@ pub(crate) fn route_resolution_error_response<RouteClientError, WakeClientError>
     }
 }
 
+pub(crate) fn http01_intercept_error_response<E>(
+    error: Http01InterceptError<E>,
+) -> Response<FrontlineRuntimeBody> {
+    match error {
+        Http01InterceptError::MissingHost
+        | Http01InterceptError::InvalidHostHeader
+        | Http01InterceptError::InvalidTokenSegment
+        | Http01InterceptError::InvalidHost(_)
+        | Http01InterceptError::InvalidChallenge(_) => status_response(StatusCode::BAD_REQUEST),
+        Http01InterceptError::Resolve(_) => status_response(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
 fn forward_error_response(error: FrontlineForwardError) -> Response<FrontlineRuntimeBody> {
     let status = match error {
         FrontlineForwardError::Http(proxy_core::HttpProxyError::Drain(_)) => {
@@ -215,6 +279,12 @@ where
     B::Error: Into<BoxError>,
 {
     body.map_err(Into::into).boxed_unsync()
+}
+
+fn full_runtime_body(body: Bytes) -> FrontlineRuntimeBody {
+    Full::new(body)
+        .map_err(|error| match error {})
+        .boxed_unsync()
 }
 
 fn empty_body() -> FrontlineRuntimeBody {

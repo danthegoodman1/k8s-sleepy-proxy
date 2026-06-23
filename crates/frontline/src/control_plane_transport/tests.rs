@@ -9,11 +9,13 @@ use std::{
 use control_plane::{
     api::pb::{
         self,
+        operator_control_plane_client::OperatorControlPlaneClient,
+        operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
         proxy_control_plane_client::ProxyControlPlaneClient,
         proxy_control_plane_server::{ProxyControlPlane, ProxyControlPlaneServer},
     },
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
-    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey, InstanceId,
+    InstanceState, PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
 };
 use tokio::sync::mpsc;
 use tonic::{
@@ -21,11 +23,17 @@ use tonic::{
     Request, Response, Status,
 };
 
-use super::{GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError};
-use crate::{
-    InvalidationReason, RouteRequestId, RouteSubscriptionClient, SubscribeControlPlaneOutput,
-    SubscriptionId, WakeClient, WakeInstanceRequest, WakeInstanceResponse,
+use super::{
+    GrpcOperatorHttp01Resolver, GrpcOperatorHttp01ResolverError, GrpcProxyControlPlaneClient,
+    GrpcProxyControlPlaneError,
 };
+use crate::{
+    Http01ChallengeResolver, InvalidationReason, RouteRequestId, RouteSubscriptionClient,
+    SubscribeControlPlaneOutput, SubscriptionId, WakeClient, WakeInstanceRequest,
+    WakeInstanceResponse,
+};
+
+const HTTP01_EXPIRES_AT_UNIX_MILLIS: i64 = 2_000;
 
 #[tokio::test]
 async fn wake_instance_ready_response_maps_through_generated_client() {
@@ -274,6 +282,101 @@ async fn closed_subscribe_request_stream_is_surfaced() {
     ));
 }
 
+#[tokio::test]
+async fn http01_resolve_hit_sends_key_and_maps_challenge_record() {
+    let service = FakeOperatorControlPlane::default();
+    service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse {
+        challenge: Some(http01_challenge(
+            "app.example.com",
+            "token-a",
+            "token-a.key",
+        )),
+    }));
+    let mut resolver = test_http01_resolver(service.clone());
+
+    let response = resolver
+        .resolve_http01_challenge(
+            Http01ChallengeKey::new("App.Example.COM.", "token-a").expect("valid key"),
+        )
+        .await
+        .expect("HTTP-01 resolve succeeds")
+        .expect("challenge resolves");
+
+    assert_eq!(response.key().host().as_str(), "app.example.com");
+    assert_eq!(response.key().token(), "token-a");
+    assert_eq!(response.key_authorization(), "token-a.key");
+    assert_eq!(
+        service.resolve_http01_requests(),
+        vec![pb::ResolveHttp01ChallengeRequest {
+            key: Some(pb::Http01ChallengeKey {
+                host: "app.example.com".to_owned(),
+                token: "token-a".to_owned(),
+            })
+        }]
+    );
+}
+
+#[tokio::test]
+async fn http01_resolve_miss_maps_to_none() {
+    let service = FakeOperatorControlPlane::default();
+    service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse { challenge: None }));
+    let mut resolver = test_http01_resolver(service);
+
+    let response = resolver
+        .resolve_http01_challenge(
+            Http01ChallengeKey::new("missing.example.com", "token-a").expect("valid key"),
+        )
+        .await
+        .expect("HTTP-01 resolve succeeds");
+
+    assert!(response.is_none());
+}
+
+#[tokio::test]
+async fn http01_resolve_status_error_is_surfaced() {
+    let service = FakeOperatorControlPlane::default();
+    service.set_resolve_http01_response(Err(Status::unavailable("store unavailable")));
+    let mut resolver = test_http01_resolver(service);
+
+    let error = resolver
+        .resolve_http01_challenge(
+            Http01ChallengeKey::new("app.example.com", "token-a").expect("valid key"),
+        )
+        .await
+        .expect_err("status should surface");
+
+    assert!(matches!(
+        error,
+        GrpcOperatorHttp01ResolverError::Status(status)
+            if status.code() == tonic::Code::Unavailable
+    ));
+}
+
+#[tokio::test]
+async fn http01_resolve_malformed_challenge_is_protocol_error() {
+    let service = FakeOperatorControlPlane::default();
+    service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse {
+        challenge: Some(pb::Http01Challenge {
+            key: None,
+            key_authorization: "token-a.key".to_owned(),
+            expires_at_unix_millis: HTTP01_EXPIRES_AT_UNIX_MILLIS,
+        }),
+    }));
+    let mut resolver = test_http01_resolver(service);
+
+    let error = resolver
+        .resolve_http01_challenge(
+            Http01ChallengeKey::new("app.example.com", "token-a").expect("valid key"),
+        )
+        .await
+        .expect_err("malformed challenge should surface");
+
+    assert!(matches!(
+        error,
+        GrpcOperatorHttp01ResolverError::Protocol(_)
+    ));
+}
+
 #[derive(Clone)]
 struct InProcessService<S> {
     inner: S,
@@ -314,12 +417,23 @@ struct FakeProxyControlPlane {
     state: Arc<Mutex<FakeProxyControlPlaneState>>,
 }
 
+#[derive(Clone, Default)]
+struct FakeOperatorControlPlane {
+    state: Arc<Mutex<FakeOperatorControlPlaneState>>,
+}
+
 #[derive(Default)]
 struct FakeProxyControlPlaneState {
     wake_response: Option<Result<pb::ProxyWakeInstanceResponse, Status>>,
     wake_requests: Vec<pb::ProxyWakeInstanceRequest>,
     subscribe_actions: VecDeque<SubscribeAction>,
     subscribe_requests: Vec<pb::ProxySubscribeRequest>,
+}
+
+#[derive(Default)]
+struct FakeOperatorControlPlaneState {
+    resolve_http01_response: Option<Result<pb::ResolveHttp01ChallengeResponse, Status>>,
+    resolve_http01_requests: Vec<pb::ResolveHttp01ChallengeRequest>,
 }
 
 struct SubscribeAction {
@@ -441,11 +555,139 @@ impl FakeProxyControlPlane {
     }
 }
 
+#[tonic::async_trait]
+impl OperatorControlPlane for FakeOperatorControlPlane {
+    async fn create_workload_class_version(
+        &self,
+        _request: Request<pb::CreateWorkloadClassVersionRequest>,
+    ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn get_workload_class_version(
+        &self,
+        _request: Request<pb::GetWorkloadClassVersionRequest>,
+    ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn create_instance(
+        &self,
+        _request: Request<pb::CreateInstanceRequest>,
+    ) -> Result<Response<pb::Instance>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn get_instance(
+        &self,
+        _request: Request<pb::GetInstanceRequest>,
+    ) -> Result<Response<pb::Instance>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn delete_instance(
+        &self,
+        _request: Request<pb::DeleteInstanceRequest>,
+    ) -> Result<Response<pb::DeleteInstanceResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn create_route_binding(
+        &self,
+        _request: Request<pb::CreateRouteBindingRequest>,
+    ) -> Result<Response<pb::RouteBinding>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn get_route_binding(
+        &self,
+        _request: Request<pb::GetRouteBindingRequest>,
+    ) -> Result<Response<pb::RouteBinding>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn delete_route_binding(
+        &self,
+        _request: Request<pb::DeleteRouteBindingRequest>,
+    ) -> Result<Response<pb::DeleteRouteBindingResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn put_http01_challenge(
+        &self,
+        _request: Request<pb::PutHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::Http01Challenge>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn resolve_http01_challenge(
+        &self,
+        request: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        let response = {
+            let mut state = self.state.lock().expect("fake state");
+            state.resolve_http01_requests.push(request.into_inner());
+            state.resolve_http01_response.take().unwrap_or_else(|| {
+                Err(Status::failed_precondition(
+                    "test did not configure HTTP-01 resolve response",
+                ))
+            })
+        };
+
+        response.map(Response::new)
+    }
+
+    async fn delete_http01_challenge(
+        &self,
+        _request: Request<pb::DeleteHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::DeleteHttp01ChallengeResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn expire_http01_challenges(
+        &self,
+        _request: Request<pb::ExpireHttp01ChallengesRequest>,
+    ) -> Result<Response<pb::ExpireHttp01ChallengesResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+}
+
+impl FakeOperatorControlPlane {
+    fn set_resolve_http01_response(
+        &self,
+        response: Result<pb::ResolveHttp01ChallengeResponse, Status>,
+    ) {
+        self.state
+            .lock()
+            .expect("fake state")
+            .resolve_http01_response = Some(response);
+    }
+
+    fn resolve_http01_requests(&self) -> Vec<pb::ResolveHttp01ChallengeRequest> {
+        self.state
+            .lock()
+            .expect("fake state")
+            .resolve_http01_requests
+            .clone()
+    }
+}
+
 fn test_client(
     service: FakeProxyControlPlane,
 ) -> GrpcProxyControlPlaneClient<InProcessService<ProxyControlPlaneServer<FakeProxyControlPlane>>> {
     let server = ProxyControlPlaneServer::new(service);
     GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(InProcessService::new(server)))
+}
+
+fn test_http01_resolver(
+    service: FakeOperatorControlPlane,
+) -> GrpcOperatorHttp01Resolver<
+    InProcessService<OperatorControlPlaneServer<FakeOperatorControlPlane>>,
+> {
+    let server = OperatorControlPlaneServer::new(service);
+    GrpcOperatorHttp01Resolver::new(OperatorControlPlaneClient::new(InProcessService::new(
+        server,
+    )))
 }
 
 fn route_resolved_response(request_id: &str, subscription_id: &str) -> pb::ProxySubscribeResponse {
@@ -537,6 +779,17 @@ fn pb_route_entry() -> pb::ProxyRouteEntry {
         instance_generation: 7,
         backend_uri: Some("http://10.0.0.7:8080".to_owned()),
         backend_generation: Some(3),
+    }
+}
+
+fn http01_challenge(host: &str, token: &str, key_authorization: &str) -> pb::Http01Challenge {
+    pb::Http01Challenge {
+        key: Some(pb::Http01ChallengeKey {
+            host: host.to_owned(),
+            token: token.to_owned(),
+        }),
+        key_authorization: key_authorization.to_owned(),
+        expires_at_unix_millis: HTTP01_EXPIRES_AT_UNIX_MILLIS,
     }
 }
 

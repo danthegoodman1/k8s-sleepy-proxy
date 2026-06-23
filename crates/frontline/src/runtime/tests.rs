@@ -3,13 +3,14 @@ use std::{
     convert::Infallible,
     fmt,
     net::SocketAddr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use bytes::Bytes;
 use control_plane::{
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
-    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
+    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
+    RouteHost, RouteIdentity,
 };
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -20,9 +21,10 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 use super::FrontlineHttpRuntime;
 use crate::{
-    FrontlineRouteCoordinator, FrontlineRouteResolver, RouteRequestId, RouteSubscriptionClient,
-    RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
-    WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse, WakeTracker,
+    FrontlineRouteCoordinator, FrontlineRouteResolver, Http01ChallengeResolveFuture,
+    Http01ChallengeResolver, RouteRequestId, RouteSubscriptionClient, RouteSubscriptionFuture,
+    SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState, WakeClient, WakeClientFuture,
+    WakeInstanceRequest, WakeInstanceResponse, WakeTracker,
 };
 
 const READY_RESPONSE: &[u8] = b"ready-from-upstream";
@@ -53,6 +55,17 @@ impl fmt::Display for TestWakeClientError {
 }
 
 impl std::error::Error for TestWakeClientError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TestHttp01ResolverError;
+
+impl fmt::Display for TestHttp01ResolverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HTTP-01 resolver failed")
+    }
+}
+
+impl std::error::Error for TestHttp01ResolverError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RouteClientCall {
@@ -114,6 +127,36 @@ impl RouteSubscriptionClient for FakeRouteClient {
 struct FakeWakeClient {
     calls: Vec<WakeInstanceRequest>,
     responses: VecDeque<Result<WakeInstanceResponse, TestWakeClientError>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FakeHttp01Resolver {
+    calls: Vec<(String, String)>,
+    responses: VecDeque<Result<Option<Http01ChallengeRecord>, TestHttp01ResolverError>>,
+}
+
+impl FakeHttp01Resolver {
+    fn push_response(&mut self, response: Option<Http01ChallengeRecord>) {
+        self.responses.push_back(Ok(response));
+    }
+
+    fn push_error(&mut self, error: TestHttp01ResolverError) {
+        self.responses.push_back(Err(error));
+    }
+}
+
+impl Http01ChallengeResolver for FakeHttp01Resolver {
+    type Error = TestHttp01ResolverError;
+
+    fn resolve_http01_challenge(
+        &mut self,
+        key: Http01ChallengeKey,
+    ) -> Http01ChallengeResolveFuture<'_, Self::Error> {
+        self.calls
+            .push((key.host().as_str().to_owned(), key.token().to_owned()));
+        let response = self.responses.pop_front().expect("queued HTTP-01 response");
+        Box::pin(async move { response })
+    }
 }
 
 impl FakeWakeClient {
@@ -399,6 +442,146 @@ async fn forwarding_error_returns_bad_gateway() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
+#[tokio::test]
+async fn http01_challenge_hit_calls_resolver_before_route_resolution() {
+    let key = Http01ChallengeKey::new("app.example.com", "token-a").expect("HTTP-01 key");
+    let mut http01_resolver = FakeHttp01Resolver::default();
+    http01_resolver.push_response(Some(challenge_record(key, "token-a.key")));
+    let mut route_client = FakeRouteClient::default();
+    route_client.push_subscribe_response(miss_response(
+        generated_request_id(1),
+        http_identity("app.example.com", "/.well-known/acme-challenge/token-a"),
+    ));
+    let mut runtime = runtime_with_http01_resolver(
+        SubscriptionState::new(4),
+        route_client,
+        FakeWakeClient::default(),
+        http01_resolver,
+    );
+
+    let response = runtime
+        .handle_http(
+            Request::builder()
+                .uri("/.well-known/acme-challenge/token-a")
+                .header("host", "App.Example.COM:80")
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+            now(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        collect_body(response).await,
+        Bytes::from_static(b"token-a.key")
+    );
+    assert_eq!(
+        runtime.http01_resolver().calls,
+        vec![("app.example.com".to_owned(), "token-a".to_owned())]
+    );
+    assert!(runtime.coordinator().resolver().client().calls.is_empty());
+    assert!(runtime.coordinator().wake_client().calls.is_empty());
+}
+
+#[tokio::test]
+async fn http01_challenge_miss_returns_not_found_without_route_fallback() {
+    let mut http01_resolver = FakeHttp01Resolver::default();
+    http01_resolver.push_response(None);
+    let mut route_client = FakeRouteClient::default();
+    route_client.push_subscribe_response(resolved_response(
+        generated_request_id(1),
+        subscription_id("sub-app"),
+        http_identity(
+            "app.example.com",
+            "/.well-known/acme-challenge/missing-token",
+        ),
+        route_entry(InstanceState::Running, 7, None),
+    ));
+    let mut runtime = runtime_with_http01_resolver(
+        SubscriptionState::new(4),
+        route_client,
+        FakeWakeClient::default(),
+        http01_resolver,
+    );
+
+    let response = runtime
+        .handle_http(
+            Request::builder()
+                .uri("/.well-known/acme-challenge/missing-token")
+                .header("host", "app.example.com")
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+            now(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        runtime.http01_resolver().calls,
+        vec![("app.example.com".to_owned(), "missing-token".to_owned())]
+    );
+    assert!(runtime.coordinator().resolver().client().calls.is_empty());
+    assert!(runtime.coordinator().wake_client().calls.is_empty());
+}
+
+#[tokio::test]
+async fn http01_invalid_requests_and_resolver_errors_do_not_fall_through_to_routes() {
+    let invalid_host = runtime_with_http01_resolver(
+        SubscriptionState::new(4),
+        FakeRouteClient::default(),
+        FakeWakeClient::default(),
+        FakeHttp01Resolver::default(),
+    );
+    assert_status_for_path(
+        invalid_host,
+        "localhost",
+        "/.well-known/acme-challenge/token-a",
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let invalid_token = runtime_with_http01_resolver(
+        SubscriptionState::new(4),
+        FakeRouteClient::default(),
+        FakeWakeClient::default(),
+        FakeHttp01Resolver::default(),
+    );
+    assert_status_for_path(
+        invalid_token,
+        "app.example.com",
+        "/.well-known/acme-challenge/token-a/extra",
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let mut http01_resolver = FakeHttp01Resolver::default();
+    http01_resolver.push_error(TestHttp01ResolverError);
+    let mut runtime = runtime_with_http01_resolver(
+        SubscriptionState::new(4),
+        FakeRouteClient::default(),
+        FakeWakeClient::default(),
+        http01_resolver,
+    );
+    let response = runtime
+        .handle_http(
+            Request::builder()
+                .uri("/.well-known/acme-challenge/token-a")
+                .header("host", "app.example.com")
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+            now(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        runtime.http01_resolver().calls,
+        vec![("app.example.com".to_owned(), "token-a".to_owned())]
+    );
+    assert!(runtime.coordinator().resolver().client().calls.is_empty());
+    assert!(runtime.coordinator().wake_client().calls.is_empty());
+}
+
 async fn assert_status(
     mut runtime: FrontlineHttpRuntime<FakeRouteClient, FakeWakeClient>,
     host: &str,
@@ -416,6 +599,28 @@ async fn assert_status(
         .await;
 
     assert_eq!(response.status(), expected);
+}
+
+async fn assert_status_for_path(
+    mut runtime: FrontlineHttpRuntime<FakeRouteClient, FakeWakeClient, FakeHttp01Resolver>,
+    host: &str,
+    path: &str,
+    expected: StatusCode,
+) {
+    let response = runtime
+        .handle_http(
+            Request::builder()
+                .uri(path)
+                .header("host", host)
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+            now(),
+        )
+        .await;
+
+    assert_eq!(response.status(), expected);
+    assert!(runtime.coordinator().resolver().client().calls.is_empty());
+    assert!(runtime.coordinator().wake_client().calls.is_empty());
 }
 
 fn cached_runtime(
@@ -450,6 +655,23 @@ fn runtime_with_state(
             WakeTracker::new(),
             wake_client,
         ),
+        DrainTracker::new(Duration::from_secs(5)),
+    )
+}
+
+fn runtime_with_http01_resolver(
+    state: SubscriptionState,
+    route_client: FakeRouteClient,
+    wake_client: FakeWakeClient,
+    http01_resolver: FakeHttp01Resolver,
+) -> FrontlineHttpRuntime<FakeRouteClient, FakeWakeClient, FakeHttp01Resolver> {
+    FrontlineHttpRuntime::with_http01_resolver(
+        FrontlineRouteCoordinator::new(
+            FrontlineRouteResolver::from_parts(state, route_client),
+            WakeTracker::new(),
+            wake_client,
+        ),
+        http01_resolver,
         DrainTracker::new(Duration::from_secs(5)),
     )
 }
@@ -581,4 +803,10 @@ fn miss_response(
         request_identity: identity,
         negative_cache_policy: ttl(30),
     }
+}
+
+fn challenge_record(key: Http01ChallengeKey, key_authorization: &str) -> Http01ChallengeRecord {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    Http01ChallengeRecord::new(key, key_authorization, now + Duration::from_secs(60), now)
+        .expect("challenge record builds")
 }

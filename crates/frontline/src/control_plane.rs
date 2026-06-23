@@ -1,8 +1,13 @@
-use std::{error::Error, fmt, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use control_plane::{
-    api::pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId,
-    InstanceState, PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteHostKind, RouteIdentity,
+    api::pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
+    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
+    RouteHost, RouteHostKind, RouteIdentity,
 };
 
 use crate::{
@@ -58,6 +63,27 @@ pub fn wake_instance_request_to_proto(
         expected_generation: request.expected_generation.get(),
         backend_generation: None,
     }
+}
+
+pub fn http01_challenge_key_to_proto(key: Http01ChallengeKey) -> pb::Http01ChallengeKey {
+    pb::Http01ChallengeKey {
+        host: key.host().as_str().to_owned(),
+        token: key.token().to_owned(),
+    }
+}
+
+pub fn http01_challenge_record_from_proto(
+    challenge: pb::Http01Challenge,
+) -> Result<Http01ChallengeRecord, ProxyProtocolAdapterError> {
+    let key = http01_challenge_key_from_required_proto(challenge.key, "challenge.key")?;
+    let expires_at = system_time_from_unix_millis(challenge.expires_at_unix_millis)?;
+
+    Http01ChallengeRecord::new(key, challenge.key_authorization, expires_at, UNIX_EPOCH).map_err(
+        |error| ProxyProtocolAdapterError::InvalidField {
+            field: "challenge",
+            message: error.to_string(),
+        },
+    )
 }
 
 pub fn proxy_subscribe_response_from_proto(
@@ -262,6 +288,32 @@ fn route_host_from_required_proto(
     field: &'static str,
 ) -> Result<RouteHost, ProxyProtocolAdapterError> {
     route_host_from_proto(host.ok_or(ProxyProtocolAdapterError::MissingField { field })?)
+}
+
+fn http01_challenge_key_from_required_proto(
+    key: Option<pb::Http01ChallengeKey>,
+    field: &'static str,
+) -> Result<Http01ChallengeKey, ProxyProtocolAdapterError> {
+    http01_challenge_key_from_proto(key.ok_or(ProxyProtocolAdapterError::MissingField { field })?)
+}
+
+fn http01_challenge_key_from_proto(
+    key: pb::Http01ChallengeKey,
+) -> Result<Http01ChallengeKey, ProxyProtocolAdapterError> {
+    Http01ChallengeKey::new(key.host, key.token).map_err(|error| {
+        ProxyProtocolAdapterError::InvalidField {
+            field: "http01.key",
+            message: error.to_string(),
+        }
+    })
+}
+
+fn system_time_from_unix_millis(value: i64) -> Result<SystemTime, ProxyProtocolAdapterError> {
+    if value >= 0 {
+        Ok(UNIX_EPOCH + Duration::from_millis(value as u64))
+    } else {
+        Ok(UNIX_EPOCH - Duration::from_millis(value.unsigned_abs()))
+    }
 }
 
 fn route_host_from_proto(host: pb::RouteHost) -> Result<RouteHost, ProxyProtocolAdapterError> {

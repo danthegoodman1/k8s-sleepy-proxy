@@ -1,18 +1,22 @@
 use std::{collections::VecDeque, error::Error, fmt};
 
 use control_plane::{
-    api::pb::{self, proxy_control_plane_client::ProxyControlPlaneClient},
-    RouteIdentity,
+    api::pb::{
+        self, operator_control_plane_client::OperatorControlPlaneClient,
+        proxy_control_plane_client::ProxyControlPlaneClient,
+    },
+    Http01ChallengeKey, Http01ChallengeRecord, RouteIdentity,
 };
 use tokio::sync::mpsc;
 use tonic::codegen::{tokio_stream::wrappers::ReceiverStream, Body};
 
 use crate::{
+    http01_challenge_key_to_proto, http01_challenge_record_from_proto,
     proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
-    proxy_wake_response_from_proto, wake_instance_request_to_proto, ProxyProtocolAdapterError,
-    ProxySubscribeInput, RouteRequestId, RouteSubscriptionClient, RouteSubscriptionFuture,
-    SubscribeControlPlaneOutput, SubscriptionId, WakeClient, WakeClientFuture, WakeInstanceRequest,
-    WakeInstanceResponse,
+    proxy_wake_response_from_proto, wake_instance_request_to_proto, Http01ChallengeResolveFuture,
+    Http01ChallengeResolver, ProxyProtocolAdapterError, ProxySubscribeInput, RouteRequestId,
+    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
+    WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
 };
 
 const SUBSCRIBE_REQUEST_BUFFER: usize = 16;
@@ -21,6 +25,11 @@ const SUBSCRIBE_REQUEST_BUFFER: usize = 16;
 pub struct GrpcProxyControlPlaneClient<T> {
     client: ProxyControlPlaneClient<T>,
     subscription: Option<GrpcRouteSubscriptionSession>,
+}
+
+#[derive(Debug)]
+pub struct GrpcOperatorHttp01Resolver<T> {
+    client: OperatorControlPlaneClient<T>,
 }
 
 #[derive(Debug)]
@@ -37,6 +46,12 @@ pub enum GrpcProxyControlPlaneError {
     SubscribeResponseStreamClosed,
     Protocol(ProxyProtocolAdapterError),
     UnexpectedRouteResponse { request_id: RouteRequestId },
+}
+
+#[derive(Debug)]
+pub enum GrpcOperatorHttp01ResolverError {
+    Status(tonic::Status),
+    Protocol(ProxyProtocolAdapterError),
 }
 
 impl<T> GrpcProxyControlPlaneClient<T> {
@@ -56,6 +71,24 @@ impl<T> GrpcProxyControlPlaneClient<T> {
     }
 
     pub fn into_inner(self) -> ProxyControlPlaneClient<T> {
+        self.client
+    }
+}
+
+impl<T> GrpcOperatorHttp01Resolver<T> {
+    pub fn new(client: OperatorControlPlaneClient<T>) -> Self {
+        Self { client }
+    }
+
+    pub fn inner(&self) -> &OperatorControlPlaneClient<T> {
+        &self.client
+    }
+
+    pub fn inner_mut(&mut self) -> &mut OperatorControlPlaneClient<T> {
+        &mut self.client
+    }
+
+    pub fn into_inner(self) -> OperatorControlPlaneClient<T> {
         self.client
     }
 }
@@ -184,6 +217,34 @@ where
     }
 }
 
+impl<T> GrpcOperatorHttp01Resolver<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    async fn resolve_http01_challenge_via_transport(
+        &mut self,
+        key: Http01ChallengeKey,
+    ) -> Result<Option<Http01ChallengeRecord>, GrpcOperatorHttp01ResolverError> {
+        let response = self
+            .client
+            .resolve_http01_challenge(pb::ResolveHttp01ChallengeRequest {
+                key: Some(http01_challenge_key_to_proto(key)),
+            })
+            .await
+            .map_err(GrpcOperatorHttp01ResolverError::Status)?
+            .into_inner();
+
+        response
+            .challenge
+            .map(http01_challenge_record_from_proto)
+            .transpose()
+            .map_err(GrpcOperatorHttp01ResolverError::Protocol)
+    }
+}
+
 impl<T> RouteSubscriptionClient for GrpcProxyControlPlaneClient<T>
 where
     T: tonic::client::GrpcService<tonic::body::Body> + Send,
@@ -231,6 +292,24 @@ where
     }
 }
 
+impl<T> Http01ChallengeResolver for GrpcOperatorHttp01Resolver<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Send,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::Future: Send,
+    T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    type Error = GrpcOperatorHttp01ResolverError;
+
+    fn resolve_http01_challenge(
+        &mut self,
+        key: Http01ChallengeKey,
+    ) -> Http01ChallengeResolveFuture<'_, Self::Error> {
+        Box::pin(async move { self.resolve_http01_challenge_via_transport(key).await })
+    }
+}
+
 impl fmt::Display for GrpcProxyControlPlaneError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -259,6 +338,24 @@ impl Error for GrpcProxyControlPlaneError {
             Self::SubscribeRequestStreamClosed
             | Self::SubscribeResponseStreamClosed
             | Self::UnexpectedRouteResponse { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for GrpcOperatorHttp01ResolverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "operator HTTP-01 gRPC status: {status}"),
+            Self::Protocol(error) => write!(f, "operator HTTP-01 protocol error: {error}"),
+        }
+    }
+}
+
+impl Error for GrpcOperatorHttp01ResolverError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Status(status) => Some(status),
+            Self::Protocol(error) => Some(error),
         }
     }
 }

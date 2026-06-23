@@ -6,9 +6,10 @@ use proxy_core::{DrainError, Shutdown};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinSet};
 
 use crate::{
-    runtime::{resolve_http_route, route_outcome_or_forward_response},
-    FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator, RouteSubscriptionClient,
-    WakeClient,
+    is_http01_challenge_candidate_path,
+    runtime::{resolve_http01_response, resolve_http_route, route_outcome_or_forward_response},
+    FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator, Http01ChallengeResolver,
+    RouteSubscriptionClient, WakeClient,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,8 +25,9 @@ pub enum FrontlineHttpListenerError {
 }
 
 #[derive(Debug)]
-struct SharedFrontlineHttpRuntime<RouteClient, Wake> {
+struct SharedFrontlineHttpRuntime<RouteClient, Wake, Http01> {
     coordinator: std::sync::Arc<Mutex<FrontlineRouteCoordinator<RouteClient, Wake>>>,
+    http01_resolver: std::sync::Arc<Mutex<Http01>>,
     forwarder: FrontlineForwarder,
 }
 
@@ -39,9 +41,9 @@ impl FrontlineHttpListenerConfig {
     }
 }
 
-pub async fn serve_http<RouteClient, Wake>(
+pub async fn serve_http<RouteClient, Wake, Http01>(
     config: FrontlineHttpListenerConfig,
-    runtime: FrontlineHttpRuntime<RouteClient, Wake>,
+    runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>,
     shutdown: Shutdown,
 ) -> Result<(), FrontlineHttpListenerError>
 where
@@ -49,6 +51,8 @@ where
     RouteClient::Error: Send,
     Wake: WakeClient + Send + 'static,
     Wake::Error: Send,
+    Http01: Http01ChallengeResolver + Send + 'static,
+    Http01::Error: Send,
 {
     let listener = TcpListener::bind(config.listen_addr())
         .await
@@ -60,9 +64,9 @@ where
     serve_http_listener(listener, runtime, shutdown).await
 }
 
-pub async fn serve_http_listener<RouteClient, Wake>(
+pub async fn serve_http_listener<RouteClient, Wake, Http01>(
     listener: TcpListener,
-    runtime: FrontlineHttpRuntime<RouteClient, Wake>,
+    runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>,
     shutdown: Shutdown,
 ) -> Result<(), FrontlineHttpListenerError>
 where
@@ -70,10 +74,13 @@ where
     RouteClient::Error: Send,
     Wake: WakeClient + Send + 'static,
     Wake::Error: Send,
+    Http01: Http01ChallengeResolver + Send + 'static,
+    Http01::Error: Send,
 {
-    let (coordinator, forwarder, drain) = runtime.into_parts();
+    let (coordinator, http01_resolver, forwarder, drain) = runtime.into_parts();
     let shared = SharedFrontlineHttpRuntime {
         coordinator: std::sync::Arc::new(Mutex::new(coordinator)),
+        http01_resolver: std::sync::Arc::new(Mutex::new(http01_resolver)),
         forwarder,
     };
     let mut connections = JoinSet::new();
@@ -130,26 +137,41 @@ where
     drain_result.map_err(FrontlineHttpListenerError::Drain)
 }
 
-impl<RouteClient, Wake> Clone for SharedFrontlineHttpRuntime<RouteClient, Wake> {
+impl<RouteClient, Wake, Http01> Clone for SharedFrontlineHttpRuntime<RouteClient, Wake, Http01> {
     fn clone(&self) -> Self {
         Self {
             coordinator: self.coordinator.clone(),
+            http01_resolver: self.http01_resolver.clone(),
             forwarder: self.forwarder.clone(),
         }
     }
 }
 
-impl<RouteClient, Wake> SharedFrontlineHttpRuntime<RouteClient, Wake>
+impl<RouteClient, Wake, Http01> SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>
 where
     RouteClient: RouteSubscriptionClient + Send,
     RouteClient::Error: Send,
     Wake: WakeClient + Send,
     Wake::Error: Send,
+    Http01: Http01ChallengeResolver + Send,
+    Http01::Error: Send,
 {
     async fn handle(
         &self,
         request: http::Request<Incoming>,
     ) -> http::Response<crate::FrontlineRuntimeBody> {
+        if is_http01_challenge_candidate_path(request.uri().path()) {
+            let http01_response = {
+                let mut resolver = self.http01_resolver.lock().await;
+                resolve_http01_response(&mut *resolver, &request).await
+            };
+            match http01_response {
+                Ok(Some(response)) => return response,
+                Ok(None) => {}
+                Err(error) => return crate::runtime::http01_intercept_error_response(error),
+            }
+        }
+
         let outcome = {
             let mut coordinator = self.coordinator.lock().await;
             resolve_http_route(&mut coordinator, &request, Instant::now()).await

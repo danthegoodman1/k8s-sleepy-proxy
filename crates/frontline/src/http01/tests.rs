@@ -17,7 +17,8 @@ use http::{
 
 use super::{
     http01_challenge_key, http01_challenge_token, intercept_http01_challenge,
-    Http01InterceptDecision, Http01InterceptError, HTTP01_CONTENT_TYPE,
+    is_http01_challenge_candidate_path, Http01InterceptDecision, Http01InterceptError,
+    HTTP01_CONTENT_TYPE,
 };
 
 #[tokio::test]
@@ -68,8 +69,6 @@ async fn non_challenge_paths_pass_through_without_resolver_call() {
     for path in [
         "/foo/.well-known/acme-challenge/token",
         "/.well-known/acme-challenge",
-        "/.well-known/acme-challenge/",
-        "/.well-known/acme-challenge/a/b",
         "/.well-known/acme-challenges/token",
     ] {
         let called = Arc::new(AtomicBool::new(false));
@@ -128,6 +127,23 @@ async fn invalid_host_and_token_inputs_return_typed_errors() {
             InvalidHttp01Challenge::EmptyToken
         ))
     ));
+    let empty_token = request("app.example.com", "/.well-known/acme-challenge/");
+    let error =
+        intercept_http01_challenge(&empty_token, |_| async { Ok::<_, TestResolveError>(None) })
+            .await
+            .expect_err("empty token rejects");
+    assert!(matches!(
+        error,
+        Http01InterceptError::InvalidChallenge(InvalidHttp01Challenge::EmptyToken)
+    ));
+
+    let multi_segment_token = request("app.example.com", "/.well-known/acme-challenge/a/b");
+    let error = intercept_http01_challenge(&multi_segment_token, |_| async {
+        Ok::<_, TestResolveError>(None)
+    })
+    .await
+    .expect_err("multi-segment token rejects");
+    assert!(matches!(error, Http01InterceptError::InvalidTokenSegment));
     assert!(matches!(
         http01_challenge_key("app.example.com", "a/b"),
         Err(Http01InterceptError::InvalidTokenSegment)
@@ -201,6 +217,25 @@ fn challenge_path_token_matching_is_exact() {
         None
     );
     assert_eq!(http01_challenge_token("/prefix/acme-challenge/token"), None);
+}
+
+#[test]
+fn challenge_candidate_matching_includes_malformed_challenge_children_only() {
+    assert!(is_http01_challenge_candidate_path(
+        "/.well-known/acme-challenge/token"
+    ));
+    assert!(is_http01_challenge_candidate_path(
+        "/.well-known/acme-challenge/"
+    ));
+    assert!(is_http01_challenge_candidate_path(
+        "/.well-known/acme-challenge/a/b"
+    ));
+    assert!(!is_http01_challenge_candidate_path(
+        "/.well-known/acme-challenge"
+    ));
+    assert!(!is_http01_challenge_candidate_path(
+        "/foo/.well-known/acme-challenge/token"
+    ));
 }
 
 fn challenge_request(host: &str, token: &str) -> Request<()> {

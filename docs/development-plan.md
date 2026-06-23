@@ -261,7 +261,7 @@ Scope:
 | Complete | `Instance` pinned to a `WorkloadClass` version. | `create_instance` conformance covers pinned class version and value validation. |
 | Complete | `RouteBinding` for host, wildcard host, SNI, and optional path prefix. | `postgres/route_ops.rs` resolver tests and conformance cover host/SNI/path matching, uniqueness, and misses. |
 | Complete | `Materialization` for active cluster projections. | `postgres/materialization_ops.rs` and conformance cover record/load/complete materialization and backend generation checks. |
-| Complete | HTTP-01 challenge records keyed by `(host, token)`. | `postgres/http01_ops.rs` and conformance cover put, resolve, delete, expiry, and GC. |
+| Complete | HTTP-01 challenge records keyed by `(host, token)`. | `postgres/http01_ops.rs` and conformance cover put, resolve, wrong-key miss, repeated put, overwrite, delete, expiry, and GC. |
 | Complete | Instance state machine with generation checks. | `instance.rs` transition tests and Postgres conformance cover CAS generation failures, stale sidecar reports, and stale materialization updates. |
 | Complete | Structured manifest rendering from `WorkloadClass + Instance.values`. | `crates/control-plane/src/manifest/render.rs` and `manifest/tests.rs` cover templates, Deployment, StatefulSet, Service, PV, and PVC rendering. |
 
@@ -276,7 +276,7 @@ Sub-phases:
 | Complete | 2E: Instance APIs, value validation, generation fields, and idempotent create/update behavior. | Store-backed API and conformance cover create/get/delete, generation fields, idempotent replay/conflict, and rollback. |
 | Complete | 2F: RouteBinding model, resolver, and uniqueness constraints. | Resolver tests cover matching semantics; conformance covers route creation, duplicate rejection, and dependency lookup. |
 | Complete | 2G: Instance state machine with generation/CAS transitions. | `instance.rs` and conformance cover legal/illegal transitions and CAS behavior. |
-| Complete | 2H: HTTP-01 challenge store. | `http01_ops.rs` and conformance cover put, resolve, delete, expiry, and GC. |
+| Complete | 2H: HTTP-01 challenge store. | `http01_ops.rs` and conformance cover put, resolve, wrong-key miss, repeated put, overwrite, delete, expiry, and GC. |
 | Complete | 2I: Structured manifest renderer. | `manifest/tests.rs` covers Deployment, StatefulSet, Service, PV, PVC, sidecar config, and validation failures. |
 
 Done criteria:
@@ -292,7 +292,7 @@ Done criteria:
 | Complete | State-machine tests cover wake, running, draining, failed, retry, and delete. | `instance.rs` and Postgres conformance cover lifecycle edges and failed retry/deleting terminal behavior. |
 | Complete | State-machine tests cover concurrent wake, sleep while waking, delete while waking/draining, failed retry, stale sidecar reports, and stale materialization updates. | Postgres conformance includes concurrent CAS, invalid transitions, stale reports, and stale materialization rejection. |
 | Complete | Route resolver tests cover normalization, wildcard precedence/specificity, path-prefix, SNI uniqueness, and misses. | `postgres/route_ops.rs`, `crates/frontline/src/identity.rs`, and matcher tests cover these semantics. |
-| Incomplete | HTTP-01 store tests cover put, overwrite/idempotency, wrong host/token, expiry, delete, and GC. | Put/resolve/delete/expiry/GC are tested and upsert implements overwrite, but wrong host/token and explicit overwrite/idempotency tests are incomplete; follow-up: M9. |
+| Complete | HTTP-01 store tests cover put, overwrite/idempotency, wrong host/token, expiry, delete, and GC. | `postgres_store_conformance_against_real_database` covers put, resolve, wrong-host miss, wrong-token miss, repeated put, overwrite, delete, expiry, and GC. |
 | Complete | Manifest rendering tests cover Deployment, StatefulSet, Service, PV, and PVC. | `manifest/tests.rs` covers all listed object kinds and serialization. |
 | Complete | WorkloadClass version updates cannot mutate existing pinned instances. | Conformance proves v2 creation does not change v1 and instances remain pinned to the requested version. |
 
@@ -426,7 +426,7 @@ Scope:
 | Complete | `SubscribeRoute` fallback on local miss. | `resolver/tests.rs` covers positive/negative cache hits without calls and cache-miss subscribe behavior. |
 | Complete | `WakeInstance` flow when a route is Cold or missing a backend. | `route/tests.rs` and `runtime/tests.rs` cover cold wake, waiting, running-without-backend wake, stale response retry, and errors. |
 | Complete | Stale generation rejection. | `subscription.rs`, `cache/tests.rs`, and `route/tests.rs` reject stale instance/backend generations. |
-| Incomplete | HTTP-01 challenge lookup through `ResolveHTTP01Challenge`. | `http01.rs` helper and store/API methods are tested, but the frontline runtime does not wire HTTP-01 interception to the control-plane lookup; follow-up: M9 HTTP-01 runtime gate. |
+| Complete | HTTP-01 challenge lookup through `ResolveHTTP01Challenge`. | `http01.rs`, `runtime.rs`, `listener.rs`, and `control_plane_transport.rs` tests cover challenge interception before route resolution, hit/miss/error behavior, listener wiring, and generated operator-client lookup. |
 
 Sub-phases:
 
@@ -439,7 +439,7 @@ Sub-phases:
 | Complete | 3E: WakeInstance flow, Waking wait, and stale generation rejection. | `route/tests.rs` covers cold/running/waking/deleting states, wake failures, stale responses, and retry. |
 | Incomplete | 3F: HTTP/1.1, HTTP/2, h2c gRPC, and WebSocket forwarding. | Forwarding helper tests cover these paths, but the runtime listener is HTTP/1.1-only and the full protocol matrix is not wired end to end; follow-up: M9 protocol gates. |
 | Incomplete | 3G: HTTPS termination, SNI certificate selection, and TLS/SNI passthrough. | `tls.rs` helper tests cover termination/passthrough behavior, but `bin/frontline.rs` does not wire TLS termination or SNI passthrough listeners; follow-up: M9 runtime TLS/SNI wiring. |
-| Incomplete | 3H: HTTP-01 interception and `ResolveHTTP01Challenge` lookup. | `http01.rs` covers helper behavior, but runtime/control-plane lookup wiring is absent; follow-up: M9. |
+| Complete | 3H: HTTP-01 interception and `ResolveHTTP01Challenge` lookup. | Frontline runtime and listener tests cover challenge-first routing behavior; transport tests cover `GrpcOperatorHttp01Resolver` hit, miss, status error, and malformed response handling. |
 
 Done criteria:
 
@@ -451,11 +451,11 @@ Done criteria:
 | Complete | Subscription tests cover route subscription, miss without subscription ID, unsubscribe, duplicate unsubscribe, and invalidation after resolve. | `subscription.rs` and `resolver/tests.rs` cover these flows. |
 | Incomplete | Subscription tests cover duplicate in-flight SubscribeRoute, reassignment, invalidation during wake, and stream backpressure. | Reassignment is covered, but duplicate in-flight subscribe, invalidation-during-wake, and stream backpressure are not proven; follow-up: M9. |
 | Incomplete | Stream reconnect tests prove lazy resubscribe/rebuild without public cursors. | Resolver can rebuild through lazy subscribe, but no reconnect test proves it; follow-up: M9. |
-| Incomplete | Protocol tests cover HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS termination, SNI passthrough, and HTTP-01. | Helper/component tests cover pieces; runtime TLS/SNI and HTTP-01 wiring plus full E2E protocol coverage are missing; follow-up: M9. |
+| Incomplete | Protocol tests cover HTTP/1.1, HTTP/2, h2c gRPC, WebSockets, TLS termination, SNI passthrough, and HTTP-01. | Helper/component tests cover pieces and HTTP-01 runtime wiring is covered; runtime TLS/SNI and full E2E protocol coverage remain missing; follow-up: M9. |
 | Incomplete | Protocol tests include large/streaming HTTP, HTTP/2 multiplexing, gRPC trailers/status, WebSocket backpressure, TLS passthrough bytes, and TCP half-close. | h2c-shaped gRPC, passthrough bytes, and TCP half-close have partial coverage; full large/streaming/multiplex/backpressure matrix is missing; follow-up: M9. |
 | Incomplete | PostgreSQL/libpq 17+ SNI passthrough with `sslnegotiation=direct`. | No real PostgreSQL/libpq SNI passthrough test or kind gate found; follow-up: M9. |
 | Complete | TLS tests cover certificate selection, missing certificate, cert rotation, and passthrough for non-HTTP TLS traffic. | `crates/frontline/src/tls.rs` helper tests cover canonical certificate selection/rotation, missing SNI/cert rejection, and passthrough prefix preservation. |
-| Complete | HTTP-01 tests cover wrong host/token, expired/deleted challenge, content type, and precedence. | `http01.rs` and store tests cover challenge matching, invalid host/token, miss/expiry/delete behavior, content type, and challenge-path precedence. |
+| Complete | HTTP-01 tests cover wrong host/token, expired/deleted challenge, content type, and precedence. | `http01.rs`, `runtime.rs`, `control_plane_transport.rs`, and store tests cover challenge matching, invalid host/token, wrong-key miss, miss/expiry/delete behavior, content type, generated client lookup, and challenge-path precedence. |
 | Complete | Unknown Host/SNI negative caching protects fake control plane from repeat misses. | `cache/tests.rs` and `resolver/tests.rs` cover negative cache hits and expiry without repeat control-plane calls. |
 
 ## Milestone 4: Sidecar Idle Proxy
@@ -687,7 +687,7 @@ Scope:
 | Incomplete | Sidecar reports idle. | Sidecar and control-plane ReportIdle tests exist separately, but no full-platform E2E proves the deployed sidecar report path; follow-up: M9. |
 | Incomplete | Control plane drains and sleeps materialization. | `ReportIdle` transitions to Draining, but sleep finalization and Kubernetes cleanup are not wired; follow-up: M9. |
 | Incomplete | Custom host and wildcard host route to right instance. | Matcher/store component tests cover custom/wildcard routing; no full-platform E2E gate exists; follow-up: M9. |
-| Incomplete | HTTP-01 insert, resolve, serve, and delete flow works. | Store/API and frontend helper tests exist, but runtime interception and full flow are not wired; follow-up: M9. |
+| Incomplete | HTTP-01 insert, resolve, serve, and delete flow works. | Store/API/runtime/transport tests cover insert, resolve lookup, serve behavior, delete/expiry, and precedence; full-platform kind E2E remains missing; follow-up: M9 full-platform gate. |
 
 Sub-phases:
 
@@ -697,7 +697,7 @@ Sub-phases:
 | Incomplete | 6B: StatefulSet static PV/PVC lifecycle with data continuity. | Materializer-only kind lifecycle exists, but not full wake/sleep/re-wake through the platform; follow-up: M9. |
 | Incomplete | 6C: Custom host, wildcard host, SNI, and path-prefix routing. | Component coverage exists; full-platform E2E is missing; follow-up: M9. |
 | Incomplete | 6D: Full protocol matrix, including PostgreSQL/libpq SNI passthrough. | Helper/component tests cover pieces; runtime TLS/SNI, grpc-web browser, and PostgreSQL/libpq SNI E2E are missing; follow-up: M9. |
-| Incomplete | 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior. | Store/helper coverage exists; runtime/full-platform flow is missing; follow-up: M9. |
+| Incomplete | 6E: HTTP-01 insert, resolve, serve, delete, and expired-token behavior. | Store/helper/runtime/transport coverage exists; full-platform deployed flow is missing; follow-up: M9 full-platform gate. |
 | Incomplete | 6F: Failure-path matrix. | Component failure tests exist, but full-platform wake/PVC/route/stale/control-plane-restart failures are missing; follow-up: M9. |
 | Incomplete | 6G: Lifecycle race matrix. | Store/frontline components cover some races; full-platform lifecycle race E2E is missing; follow-up: M9. |
 

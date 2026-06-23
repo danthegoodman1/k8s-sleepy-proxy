@@ -26,18 +26,23 @@ pub use cache::{
 };
 pub use config::{FrontlineEnvConfig, FrontlineEnvConfigError};
 pub use control_plane::{
+    http01_challenge_key_to_proto, http01_challenge_record_from_proto,
     proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
     proxy_wake_response_from_proto, wake_instance_request_to_proto, ProxyProtocolAdapterError,
 };
-pub use control_plane_transport::{GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError};
+pub use control_plane_transport::{
+    GrpcOperatorHttp01Resolver, GrpcOperatorHttp01ResolverError, GrpcProxyControlPlaneClient,
+    GrpcProxyControlPlaneError,
+};
 pub use forward::{
     http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardError,
     FrontlineForwarder,
 };
 pub use http01::{
     http01_challenge_key, http01_challenge_token, intercept_http01_challenge,
+    is_http01_challenge_candidate_path, Http01ChallengeResolveFuture, Http01ChallengeResolver,
     Http01ChallengeResponse, Http01InterceptDecision, Http01InterceptError,
-    HTTP01_CHALLENGE_PREFIX, HTTP01_CONTENT_TYPE,
+    NoopHttp01ChallengeResolver, HTTP01_CHALLENGE_PREFIX, HTTP01_CONTENT_TYPE,
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use listener::{
