@@ -603,14 +603,16 @@ async fn proxy_wake_already_running_returns_ready_backend_without_apply() {
 }
 
 #[tokio::test]
-async fn proxy_wake_already_waking_returns_still_waking() {
+async fn proxy_wake_after_restart_resumes_waking_generation() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_instance(domain_instance(
         "instance-waking",
         DomainInstanceState::Waking,
         6,
     ));
-    let service = proxy_api(store, FakeKubernetesClient::default());
+    store.seed_workload_class(domain_workload_class());
+    let client = FakeKubernetesClient::default();
+    let service = proxy_api(store, client.clone());
 
     let response = service
         .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
@@ -622,12 +624,15 @@ async fn proxy_wake_already_waking_returns_still_waking() {
         .expect("already-waking wake succeeds")
         .into_inner();
 
-    let Some(proxy_wake_instance_response::Outcome::StillWaking(still_waking)) = response.outcome
-    else {
-        panic!("expected still-waking response");
-    };
-    assert_eq!(still_waking.instance_id, "instance-waking");
-    assert_eq!(still_waking.instance_generation, 6);
+    let ready = expect_ready(response);
+    assert_eq!(ready.instance_id, "instance-waking");
+    assert_eq!(ready.instance_generation, 7);
+    assert_eq!(
+        ready.backend_uri,
+        "http://svc-acme.apps.svc.cluster.local:80"
+    );
+    assert_eq!(ready.backend_generation, 6);
+    assert_eq!(client.applied_objects_len(), 2);
 }
 
 #[tokio::test]

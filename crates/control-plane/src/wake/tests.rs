@@ -367,7 +367,7 @@ async fn stale_running_expected_generation_does_not_load_materialization() {
 }
 
 #[tokio::test]
-async fn already_waking_does_not_duplicate_apply() {
+async fn restart_during_wake_resumes_waking_generation_without_new_cas() {
     let waking = instance("instance-a", InstanceState::Waking, 5);
     let store = FakeStore::new(waking.clone(), Some(workload_class()));
     let client = FakeKubernetesClient::default();
@@ -383,14 +383,29 @@ async fn already_waking_does_not_duplicate_apply() {
         ),
     )
     .await
-    .expect("already waking is stable");
+    .expect("persisted waking generation resumes after restart");
 
+    let WakeInstanceResult::Completed { result } = result else {
+        panic!("expected wake replay to complete");
+    };
+    assert_eq!(result.instance.state, InstanceState::Running);
+    assert_eq!(result.instance.generation, Generation::new(6));
     assert_eq!(
-        result,
-        WakeInstanceResult::AlreadyWaking { instance: waking }
+        result.materialization.instance_generation,
+        Generation::new(6)
     );
-    assert!(store.events().is_empty());
-    assert!(client.applied_objects().is_empty());
+    assert_eq!(
+        store.events(),
+        vec![StoreEvent::Complete {
+            expected_waking_generation: Generation::new(5),
+            backend_generation: BackendGeneration::new(5),
+            rendered_objects: vec![
+                object_ref("v1", "Service", "apps", "svc-acme"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            ],
+        }]
+    );
+    assert_eq!(client.applied_objects().len(), 2);
 }
 
 #[tokio::test]

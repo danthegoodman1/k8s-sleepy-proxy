@@ -307,6 +307,7 @@ async fn operator_delete_cleans_active_materialization_before_store_delete() {
 
     assert!(response.deleted);
     assert!(!store.instance_exists("instance-delete-active"));
+    assert!(store.materialization().is_none());
     assert_eq!(
         client.deleted(),
         vec![
@@ -414,6 +415,7 @@ async fn operator_delete_cleans_stale_generation_active_materialization_for_targ
 
     assert!(response.deleted);
     assert!(!store.instance_exists("instance-delete-stale-generation"));
+    assert!(store.materialization().is_none());
     assert_eq!(
         client.deleted(),
         vec![
@@ -476,7 +478,7 @@ async fn operator_delete_kubernetes_failure_preserves_store_state_for_retry() {
 }
 
 #[tokio::test]
-async fn operator_delete_retry_replays_cleanup_then_finalizes_store_delete() {
+async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
     let store = Arc::new(FakeInstanceStore::default());
     store.seed_instance(domain_instance(
         "instance-delete-retry",
@@ -519,6 +521,7 @@ async fn operator_delete_retry_replays_cleanup_then_finalizes_store_delete() {
 
     assert!(response.deleted);
     assert!(!store.instance_exists("instance-delete-retry"));
+    assert!(store.materialization().is_none());
     assert_eq!(
         retry_client.deleted(),
         vec![
@@ -2038,6 +2041,13 @@ impl FakeInstanceStore {
             .expect("fake store lock is available")
             .clone()
     }
+
+    fn materialization(&self) -> Option<MaterializationRecord> {
+        self.materialization
+            .lock()
+            .expect("fake store lock is available")
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2162,12 +2172,25 @@ impl ControlPlaneStore for FakeInstanceStore {
                 .lock()
                 .expect("fake store lock is available")
                 .push(request.clone());
-            Ok(self
+            let deleted = self
                 .instances
                 .lock()
                 .expect("fake store lock is available")
                 .remove(request.instance_id.as_str())
-                .is_some())
+                .is_some();
+            if deleted {
+                let mut materialization = self
+                    .materialization
+                    .lock()
+                    .expect("fake store lock is available");
+                if materialization.as_ref().is_some_and(|materialization| {
+                    materialization.instance_id == request.instance_id
+                }) {
+                    *materialization = None;
+                }
+            }
+
+            Ok(deleted)
         })
     }
 

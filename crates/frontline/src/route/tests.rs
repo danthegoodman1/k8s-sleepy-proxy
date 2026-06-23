@@ -413,7 +413,48 @@ async fn running_route_without_backend_triggers_wake() {
 }
 
 #[tokio::test]
-async fn waking_route_waits_without_wake_call() {
+async fn waking_route_without_local_pending_wake_resumes_via_control_plane() {
+    let now = now();
+    let request = http_request("app.example.com", "/");
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-1"),
+            http_rule("example.com", None),
+            route_entry(InstanceState::Waking, 6, None),
+        ),
+        now,
+    );
+    let mut wake_client = FakeWakeClient::default();
+    wake_client.push_response(ready_wake_response(7, 2));
+    let mut coordinator = coordinator_with_state(state, FakeRouteClient::default(), wake_client);
+
+    let outcome = coordinator
+        .route(request.clone(), now)
+        .await
+        .expect("waking route resumes wake");
+
+    assert!(matches!(outcome, FrontlineRouteOutcome::Ready(_)));
+    assert_eq!(coordinator.wake_client().calls, vec![wake_request(6)]);
+    assert_eq!(coordinator.wake_tracker().pending_len(), 0);
+
+    let cached = coordinator
+        .resolver()
+        .state()
+        .cache()
+        .positive_by_subscription(&subscription_id("sub-1"))
+        .expect("ready wake was cached");
+    assert_eq!(cached.entry.instance_state, InstanceState::Running);
+    assert_eq!(cached.entry.instance_generation, Generation::new(7));
+    assert_eq!(
+        cached.entry.backend_generation,
+        Some(BackendGeneration::new(2))
+    );
+}
+
+#[tokio::test]
+async fn waking_route_with_local_pending_wake_waits_without_second_wake_call() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
@@ -428,13 +469,14 @@ async fn waking_route_waits_without_wake_call() {
     );
     let mut coordinator =
         coordinator_with_state(state, FakeRouteClient::default(), FakeWakeClient::default());
+    coordinator.wake_tracker_mut().admit(wake_request(6));
 
     let outcome = coordinator.route(request, now).await.expect("waits");
 
     let FrontlineRouteOutcome::Waiting(wait) = outcome else {
         panic!("expected waiting outcome");
     };
-    assert_eq!(wait.reason, WakeWaitReason::AlreadyWaking);
+    assert_eq!(wait.reason, WakeWaitReason::DuplicatePendingWake);
     assert!(coordinator.wake_client().calls.is_empty());
 }
 
@@ -560,6 +602,87 @@ async fn stale_wake_response_is_rejected_clears_pending_and_does_not_update_cach
 
     assert!(matches!(retry, FrontlineRouteOutcome::Waking { .. }));
     assert_eq!(coordinator.wake_client().calls.len(), 2);
+}
+
+#[tokio::test]
+async fn stale_cold_wake_conflict_then_refreshed_waking_route_resumes_wake() {
+    let now = now();
+    let request = http_request("app.example.com", "/");
+    let matched_identity = http_rule("example.com", None);
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-1"),
+            matched_identity.clone(),
+            route_entry(InstanceState::Cold, 5, None),
+        ),
+        now,
+    );
+    let mut wake_client = FakeWakeClient::default();
+    wake_client.push_response(WakeInstanceResponse::GenerationConflict {
+        instance_id: instance_id("instance-a"),
+        expected_generation: Generation::new(5),
+        actual_generation: Generation::new(6),
+    });
+    wake_client.push_response(ready_wake_response(7, 2));
+    let mut coordinator = coordinator_with_state(state, FakeRouteClient::default(), wake_client);
+
+    let conflict = coordinator
+        .route(request.clone(), now)
+        .await
+        .expect("stale cold wake returns conflict");
+
+    let FrontlineRouteOutcome::GenerationConflict {
+        expected_generation,
+        actual_generation,
+        ..
+    } = conflict
+    else {
+        panic!("expected generation conflict");
+    };
+    assert_eq!(expected_generation, Generation::new(5));
+    assert_eq!(actual_generation, Generation::new(6));
+    assert_eq!(coordinator.wake_client().calls, vec![wake_request(5)]);
+    assert_eq!(coordinator.wake_tracker().pending_len(), 0);
+
+    coordinator
+        .resolver_mut()
+        .apply_control_plane_message(
+            SubscribeControlPlaneOutput::RouteUpdated {
+                subscription_id: subscription_id("sub-1"),
+                matched_identity,
+                entry: route_entry(InstanceState::Waking, 6, None),
+                cache_policy: ttl(30),
+            },
+            now,
+        )
+        .await
+        .expect("refreshed waking route applies");
+
+    let ready = coordinator
+        .route(request, now)
+        .await
+        .expect("refreshed waking route resumes wake");
+
+    assert!(matches!(ready, FrontlineRouteOutcome::Ready(_)));
+    assert_eq!(
+        coordinator.wake_client().calls,
+        vec![wake_request(5), wake_request(6)]
+    );
+    assert_eq!(coordinator.wake_tracker().pending_len(), 0);
+    let cached = coordinator
+        .resolver()
+        .state()
+        .cache()
+        .positive_by_subscription(&subscription_id("sub-1"))
+        .expect("ready route cached");
+    assert_eq!(cached.entry.instance_state, InstanceState::Running);
+    assert_eq!(cached.entry.instance_generation, Generation::new(7));
+    assert_eq!(
+        cached.entry.backend_generation,
+        Some(BackendGeneration::new(2))
+    );
 }
 
 #[tokio::test]

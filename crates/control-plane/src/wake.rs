@@ -135,7 +135,7 @@ where
         });
     }
 
-    match instance.state {
+    let waking = match instance.state {
         InstanceState::Running => {
             let target = request.target.clone();
             let materialization = store
@@ -156,9 +156,7 @@ where
                 materialization,
             });
         }
-        InstanceState::Waking => {
-            return Ok(WakeInstanceResult::AlreadyWaking { instance });
-        }
+        InstanceState::Waking => Some(instance),
         InstanceState::Deleting => {
             return Err(WakeInstanceError::Unavailable {
                 instance,
@@ -184,19 +182,25 @@ where
                     return Ok(WakeInstanceResult::AlreadyWaking { instance });
                 }
             }
-        }
-        InstanceState::Cold | InstanceState::Failed => {}
-    }
 
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            request.instance_id.clone(),
-            request.expected_generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await
-        .map_err(map_store_error)?;
+            None
+        }
+        InstanceState::Cold | InstanceState::Failed => None,
+    };
+
+    let waking = if let Some(waking) = waking {
+        waking
+    } else {
+        store
+            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+                request.instance_id.clone(),
+                request.expected_generation,
+                InstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            ))
+            .await
+            .map_err(map_store_error)?
+    };
 
     let workload_class = match store
         .load_workload_class_version(LoadWorkloadClassVersionRequest::new(

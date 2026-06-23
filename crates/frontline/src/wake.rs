@@ -32,6 +32,7 @@ pub struct ReadyBackend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeReason {
     Cold,
+    Waking,
     Failed,
     Draining,
     RunningMissingBackend,
@@ -181,11 +182,7 @@ pub fn route_wake_decision(entry: &RouteEntry) -> RouteWakeDecision {
         InstanceState::Cold => wake_decision(entry, WakeReason::Cold),
         InstanceState::Failed => wake_decision(entry, WakeReason::Failed),
         InstanceState::Draining => wake_decision(entry, WakeReason::Draining),
-        InstanceState::Waking => RouteWakeDecision::Wait(WakeWait {
-            instance_id: entry.instance_id.clone(),
-            generation: entry.instance_generation,
-            reason: WakeWaitReason::AlreadyWaking,
-        }),
+        InstanceState::Waking => wake_decision(entry, WakeReason::Waking),
         InstanceState::Deleting => RouteWakeDecision::Unavailable(WakeUnavailable {
             instance_id: entry.instance_id.clone(),
             generation: entry.instance_generation,

@@ -364,14 +364,6 @@ async fn cold_route_wakes_to_ready_forwards_and_updates_cache() {
 
 #[tokio::test]
 async fn unavailable_route_states_and_control_plane_errors_return_service_unavailable() {
-    let waiting = cached_runtime(InstanceState::Waking, "waiting.example.com");
-    assert_status(
-        waiting,
-        "waiting.example.com",
-        StatusCode::SERVICE_UNAVAILABLE,
-    )
-    .await;
-
     let unavailable = cached_runtime(InstanceState::Deleted, "deleted.example.com");
     assert_status(
         unavailable,
@@ -379,6 +371,45 @@ async fn unavailable_route_states_and_control_plane_errors_return_service_unavai
         StatusCode::SERVICE_UNAVAILABLE,
     )
     .await;
+
+    let mut waiting_state = SubscriptionState::new(4);
+    waiting_state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-waiting"),
+            http_identity("waiting.example.com", "/"),
+            route_entry(InstanceState::Waking, 6, None),
+        ),
+        now(),
+    );
+    let mut waiting_wake_client = FakeWakeClient::default();
+    waiting_wake_client.push_response(WakeInstanceResponse::WakeStarted {
+        instance_id: instance_id("instance-a"),
+        generation: Generation::new(6),
+    });
+    let mut waiting = runtime_with_state(
+        waiting_state,
+        FakeRouteClient::default(),
+        waiting_wake_client,
+    );
+    let response = waiting
+        .handle_http(
+            Request::builder()
+                .uri("/")
+                .header("host", "waiting.example.com")
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+            now(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        waiting.coordinator().wake_client().calls,
+        vec![WakeInstanceRequest {
+            instance_id: instance_id("instance-a"),
+            expected_generation: Generation::new(6),
+        }]
+    );
 
     let request_identity = http_identity("waking.example.com", "/");
     let mut route_client = FakeRouteClient::default();

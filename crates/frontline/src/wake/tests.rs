@@ -55,9 +55,10 @@ fn running_with_backend_is_ready() {
 }
 
 #[test]
-fn cold_failed_and_draining_routes_are_wakeable() {
+fn cold_waking_failed_and_draining_routes_are_wakeable() {
     for (state, reason) in [
         (InstanceState::Cold, WakeReason::Cold),
+        (InstanceState::Waking, WakeReason::Waking),
         (InstanceState::Failed, WakeReason::Failed),
         (InstanceState::Draining, WakeReason::Draining),
     ] {
@@ -69,18 +70,6 @@ fn cold_failed_and_draining_routes_are_wakeable() {
             }
         );
     }
-}
-
-#[test]
-fn waking_route_waits_instead_of_starting_another_wake() {
-    assert_eq!(
-        route_wake_decision(&route(InstanceState::Waking, 5, None)),
-        RouteWakeDecision::Wait(WakeWait {
-            instance_id: InstanceId::new("instance-a").expect("instance ID"),
-            generation: Generation::new(5),
-            reason: WakeWaitReason::AlreadyWaking,
-        })
-    );
 }
 
 #[test]

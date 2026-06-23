@@ -109,7 +109,7 @@ async fn report_idle_running_instance_transitions_to_draining() {
 }
 
 #[tokio::test]
-async fn report_idle_delete_failure_stays_draining_and_retry_resumes_cleanup() {
+async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
     let store = Arc::new(FakeSidecarStore::default());
     store.seed_instance(domain_instance(
         "instance-delete-retry",
@@ -148,10 +148,12 @@ async fn report_idle_delete_failure_stays_draining_and_retry_resumes_cleanup() {
         )]
     );
 
-    let response = service
+    let retry_client = FakeKubernetesClient::default();
+    let retry_service = sidecar_api(store.clone(), retry_client.clone());
+    let response = retry_service
         .report_idle(tonic::Request::new(request))
         .await
-        .expect("retry resumes cleanup")
+        .expect("recreated service resumes cleanup")
         .into_inner();
 
     let accepted = expect_accepted(response);
@@ -163,6 +165,15 @@ async fn report_idle_delete_failure_stays_draining_and_retry_resumes_cleanup() {
         .expect("materialization remains recorded");
     assert_eq!(materialization.state, MaterializationState::Deleted);
     assert!(materialization.rendered_objects.is_empty());
+    assert_eq!(
+        retry_client.deleted_objects(),
+        vec![object_ref(
+            "apps/v1",
+            "Deployment",
+            "apps",
+            "instance-delete-retry"
+        )]
+    );
 }
 
 #[tokio::test]
