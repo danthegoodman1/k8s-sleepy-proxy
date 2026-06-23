@@ -588,13 +588,15 @@ Scope:
   TLS/SNI runtime wiring, and subscribed route update/invalidation delivery.
 - Add WorkloadClass-owned sleep policy for idle timeout, idle report retry
   backoff, and drain grace.
-- Keep instance-level timeout customization optional and only available through
-  WorkloadClass-approved value schema fields and bounds.
+- Require every WorkloadClass to specify an idle timeout explicitly; there is no
+  platform default for the operator-facing sleep timeout.
+- Allow per-instance idle-timeout overrides only when the WorkloadClass declares
+  an override field and validation bounds.
 - Render the resolved policy into sidecar env as
   `SLEEPYPODS_IDLE_TIMEOUT_MS`, `SLEEPYPODS_IDLE_RETRY_BACKOFF_MS`, and
   `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS`.
-- Preserve sidecar runtime env defaults as a development fallback, not the
-  operator-facing source of truth.
+- Preserve sidecar runtime env parsing only as the execution mechanism for
+  rendered manifests, not as a source of platform defaults.
 
 Sub-phases:
 
@@ -602,7 +604,8 @@ Sub-phases:
   E2E, frontline TLS/SNI runtime wiring, and subscribed route
   updates/invalidations.
 - 9B: WorkloadClass sleep-policy model, validation, and API/proto mapping.
-- 9C: Optional validated instance-value overrides with bounds.
+- 9C: Validated per-instance idle-timeout overrides with WorkloadClass-declared
+  bounds.
 - 9D: Manifest rendering of resolved sidecar sleep-policy env.
 - 9E: Component and kind E2E coverage for policy rendering and idle behavior.
 
@@ -622,8 +625,11 @@ Done when:
 - Subscription tests prove route changes and backend changes are pushed as
   targeted updates or invalidations to actively subscribed proxies.
 - Operator APIs accept and return WorkloadClass sleep policy.
-- Invalid timeout values and out-of-bounds instance overrides are rejected before
-  manifest rendering.
+- WorkloadClass creation rejects missing or invalid idle timeout values.
+- Instance creation rejects idle-timeout overrides unless the WorkloadClass
+  explicitly allows them.
+- Out-of-bounds instance idle-timeout overrides are rejected before manifest
+  rendering.
 - Render tests prove the sidecar container receives the resolved timeout env
   values.
 - kind E2E proves two workload classes with different idle policies sleep at
@@ -681,6 +687,47 @@ Done when:
 - Contributor and agent-facing guidance calls out source-of-truth files,
   generated files, commands, test gates, and design constraints without
   duplicating full specs.
+
+## Stretch
+
+The original goal is complete when the plan reaches this line. Do not start
+stretch work unless explicitly asked.
+
+### Stretch Phase 1: SleepySockets
+
+Keep client WebSocket connections open at the frontline proxy while allowing the
+upstream sidecar/app connection and workload to sleep when no application
+messages have passed within the configured TTL.
+
+Scope:
+
+- Make SleepySockets opt-in per route or WorkloadClass; default WebSocket
+  behavior remains normal passthrough.
+- Terminate/intercept WebSockets at the frontline proxy, keep the client
+  connection open, and create or recreate upstream WebSockets to the sidecar/app
+  only when needed.
+- Change idle accounting for SleepySockets from connection-open activity to
+  application-message activity.
+- When the message TTL expires, close the upstream WebSocket so the sidecar can
+  observe idleness, report idle, and let the control plane sleep the workload.
+- When a later client message arrives, wake the instance, recreate the upstream
+  WebSocket to the sidecar/app, then forward the queued message.
+- Document the application contract: this only works for L7, client-driven or
+  resumable WebSocket protocols where losing backend-initiated messages while
+  asleep is acceptable.
+
+Done when:
+
+- Frontline tests prove client WebSockets stay open across upstream close,
+  workload sleep, wake, upstream reconnect, and message forwarding.
+- Sidecar idle tests prove open SleepySockets client sessions do not prevent
+  idle reporting when no application messages pass within the TTL.
+- E2E tests prove a client message after sleep wakes the workload and reaches
+  the app over a newly created upstream WebSocket.
+- Tests cover ordering, buffering limits, ping/pong behavior, close behavior,
+  backpressure, reconnect failure, and app-level resume/session token handling.
+- Operator docs clearly state that SleepySockets is not transparent generic
+  WebSocket sleep and requires an app protocol that tolerates upstream reconnect.
 
 ## Deferred
 
