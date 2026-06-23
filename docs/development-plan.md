@@ -487,6 +487,19 @@ Sub-phases:
 - 7F: kind wake/sleep soak tests and leaked-object detection.
 - 7G: Operator-facing runbook and metric name documentation.
 
+Milestone 7F starts with the existing materializer lifecycle kind test as a
+small soak target:
+
+- `./scripts/test-kind-materializer.sh` runs the single disposable-cluster
+  check.
+- `SLEEPYPODS_KIND_SOAK_ITERATIONS=3 ./scripts/soak-kind-materializer.sh`
+  reuses one kind cluster across repeated runs.
+
+The soak fails fast on the first failed iteration and waits for leaked
+`sleepypods.io/kind-test=true` namespaces and
+`sleepypods.io/instance-id=kind-materializer` PersistentVolumes to disappear
+after each successful iteration.
+
 Done when:
 
 - Automated tests cover restart during wake, sleep, and delete.
