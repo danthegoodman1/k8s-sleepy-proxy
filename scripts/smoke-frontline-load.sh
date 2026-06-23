@@ -72,6 +72,7 @@ require_route_path() {
 
 require_command awk
 require_command cargo
+require_command curl
 require_command docker
 
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS "${requests}"
@@ -188,6 +189,32 @@ extract_metric() {
   return 1
 }
 
+read_subscribe_route_calls() {
+  local url="$1"
+  local output
+  local count
+
+  if ! output="$(curl -fsS "${url}")"; then
+    echo "failed to read frontline load-smoke helper stats from ${url}" >&2
+    dump_logs
+    exit 1
+  fi
+
+  if ! count="$(extract_metric "${output}" subscribe_route_calls)"; then
+    echo "helper stats did not include subscribe_route_calls: ${output}" >&2
+    dump_logs
+    exit 1
+  fi
+
+  if [[ ! "${count}" =~ ^[0-9]+$ ]]; then
+    echo "helper subscribe_route_calls must be a non-negative integer, got ${count}" >&2
+    dump_logs
+    exit 1
+  fi
+
+  echo "${count}"
+}
+
 echo "Building local frontline load-smoke client"
 cargo build -p frontline --example frontline_load_smoke
 
@@ -225,6 +252,7 @@ direct_port="$(published_port "${helper_name}" "${backend_container_port}")"
 frontline_port="$(published_port "${helper_name}" "${frontline_container_port}")"
 direct_url="http://127.0.0.1:${direct_port}${route_path}"
 frontline_url="http://127.0.0.1:${frontline_port}${route_path}"
+stats_url="http://127.0.0.1:${direct_port}/__sleepypods_load_smoke_stats"
 
 wait_for_url direct "${direct_url}"
 
@@ -244,8 +272,19 @@ echo "Frontline route cache warmed for host ${route_host} path ${route_path}"
 echo "Running direct-backend smoke load"
 run_load direct "${direct_url}" "${direct_output_file}"
 
+subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
+echo "SubscribeRoute calls before measured frontline phase=${subscribe_route_calls_before}"
+
 echo "Running frontline smoke load"
 run_load frontline "${frontline_url}" "${frontline_output_file}"
+
+subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
+
+if [[ "${subscribe_route_calls_after}" != "${subscribe_route_calls_before}" ]]; then
+  echo "hot-cache frontline load made additional SubscribeRoute calls: before=${subscribe_route_calls_before} after=${subscribe_route_calls_after}" >&2
+  dump_logs
+  exit 1
+fi
 
 direct_result="$(cat "${direct_output_file}")"
 frontline_result="$(cat "${frontline_output_file}")"
@@ -280,3 +319,4 @@ if [[ "${ratio_status}" -ne 0 ]]; then
 fi
 
 echo "frontline/direct_rps_ratio=${ratio} min=${min_ratio}"
+echo "hot_cache_subscribe_route_calls=0 subscribe_route_calls_before=${subscribe_route_calls_before} subscribe_route_calls_after=${subscribe_route_calls_after}"

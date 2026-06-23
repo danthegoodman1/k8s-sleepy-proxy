@@ -139,13 +139,16 @@ the known Host header.
 Before measuring the frontline path, the script waits for one successful
 frontline request. That request validates lazy route resolution through
 `SubscribeRoute` and warms the route cache; the measured frontline phase then
-uses the cached ready route. The client sends the same request count directly to
-the backend and through frontline, reporting request count, failures, elapsed
-milliseconds, and rough RPS for both paths. The smoke fails on correctness
-errors, startup or process failures, missing tools or images, and a conservative
-frontline/direct RPS ratio below `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO`
-(default `0.10`). As with the sidecar smoke, this ratio only catches extreme
-obvious regressions; local Docker RPS is not a stable latency budget.
+uses the cached ready route. The helper exposes a small stats endpoint for the
+fake control plane, and the script fails if the measured hot-cache frontline
+phase increments `subscribe_route_calls`. The client sends the same request
+count directly to the backend and through frontline, reporting request count,
+failures, elapsed milliseconds, and rough RPS for both paths. The smoke fails on
+correctness errors, startup or process failures, missing tools or images,
+additional hot-cache `SubscribeRoute` calls, and a conservative frontline/direct
+RPS ratio below `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO` (default `0.10`). As
+with the sidecar smoke, this ratio only catches extreme obvious regressions;
+local Docker RPS is not a stable latency budget.
 
 Useful knobs:
 

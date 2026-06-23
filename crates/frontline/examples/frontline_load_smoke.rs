@@ -22,7 +22,7 @@ use control_plane::{
 };
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
 use http_body_util::Full;
-use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -39,6 +39,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 const BACKEND_BODY: &[u8] = b"frontline-load-smoke-ok\n";
 const DEFAULT_ROUTE_HOST: &str = "app.example.test";
 const DEFAULT_ROUTE_PATH: &str = "/smoke";
+const STATS_PATH: &str = "/__sleepypods_load_smoke_stats";
 const ROUTE_CACHE_TTL_MILLIS: u64 = 600_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SUBSCRIBE_RESPONSE_BUFFER: usize = 16;
@@ -112,6 +113,7 @@ fn socket_addr_from_env(
 async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
     let backend_listener = TcpListener::bind(config.backend_addr).await?;
     let backend_addr = backend_listener.local_addr()?;
+    let stats = SmokeStats::default();
     eprintln!("load-smoke backend listening on {backend_addr}");
     eprintln!(
         "load-smoke frontline control plane listening on {}",
@@ -122,12 +124,13 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
         config.route_host, config.route_path, config.backend_uri
     );
 
-    let backend = serve_backend(backend_listener);
+    let backend = serve_backend(backend_listener, stats.clone());
     let control_plane = Server::builder()
         .add_service(ProxyControlPlaneServer::new(FakeProxyControlPlane::new(
             config.route_host,
             config.route_path,
             config.backend_uri,
+            stats,
         )))
         .serve(config.control_plane_addr);
 
@@ -137,13 +140,17 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
     }
 }
 
-async fn serve_backend(listener: TcpListener) -> Result<(), BoxError> {
+async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), BoxError> {
     loop {
         let (stream, _) = listener.accept().await?;
+        let stats = stats.clone();
 
         tokio::spawn(async move {
-            let service =
-                service_fn(|request| async move { Ok::<_, Infallible>(backend_response(request)) });
+            let service = service_fn(move |request| {
+                let stats = stats.clone();
+
+                async move { Ok::<_, Infallible>(backend_response(request, &stats)) }
+            });
 
             if let Err(error) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -155,7 +162,11 @@ async fn serve_backend(listener: TcpListener) -> Result<(), BoxError> {
     }
 }
 
-fn backend_response(_request: HttpRequest<Incoming>) -> HttpResponse<Full<Bytes>> {
+fn backend_response<B>(request: HttpRequest<B>, stats: &SmokeStats) -> HttpResponse<Full<Bytes>> {
+    if request.uri().path() == STATS_PATH {
+        return stats_response(stats);
+    }
+
     HttpResponse::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain")
@@ -165,19 +176,56 @@ fn backend_response(_request: HttpRequest<Incoming>) -> HttpResponse<Full<Bytes>
         .expect("fixed load-smoke response builds")
 }
 
+fn stats_response(stats: &SmokeStats) -> HttpResponse<Full<Bytes>> {
+    let snapshot = stats.snapshot();
+    let body = format!("subscribe_route_calls={}\n", snapshot.subscribe_route_calls);
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain")
+        .header("content-length", body.len().to_string())
+        .header("cache-control", "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .expect("fixed load-smoke stats response builds")
+}
+
+#[derive(Clone, Debug, Default)]
+struct SmokeStats {
+    subscribe_route_calls: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SmokeStatsSnapshot {
+    subscribe_route_calls: u64,
+}
+
+impl SmokeStats {
+    fn record_subscribe_route(&self) {
+        self.subscribe_route_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SmokeStatsSnapshot {
+        SmokeStatsSnapshot {
+            subscribe_route_calls: self.subscribe_route_calls.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FakeProxyControlPlane {
     route_host: Arc<str>,
     route_path: Arc<str>,
     backend_uri: Arc<str>,
+    stats: SmokeStats,
 }
 
 impl FakeProxyControlPlane {
-    fn new(route_host: String, route_path: String, backend_uri: String) -> Self {
+    fn new(route_host: String, route_path: String, backend_uri: String, stats: SmokeStats) -> Self {
         Self {
             route_host: route_host.into(),
             route_path: route_path.into(),
             backend_uri: backend_uri.into(),
+            stats,
         }
     }
 
@@ -190,6 +238,7 @@ impl FakeProxyControlPlane {
             .ok_or_else(|| Status::invalid_argument("subscribe request input is required"))?
         {
             pb::proxy_subscribe_request::Input::SubscribeRoute(request) => {
+                self.stats.record_subscribe_route();
                 Ok(Some(self.subscribe_route_response(request)?))
             }
             pb::proxy_subscribe_request::Input::Unsubscribe(_) => Ok(None),
@@ -666,10 +715,12 @@ impl Error for ResponseValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        path_prefix_matches, validate_response, ClientConfig, FakeProxyControlPlane, HttpTarget,
-        BACKEND_BODY,
+        backend_response, path_prefix_matches, validate_response, ClientConfig,
+        FakeProxyControlPlane, HttpTarget, SmokeStats, BACKEND_BODY, STATS_PATH,
     };
     use control_plane::api::pb;
+    use http::Request as HttpRequest;
+    use http_body_util::BodyExt;
 
     #[test]
     fn parses_http_target_with_path_and_query() {
@@ -735,6 +786,7 @@ mod tests {
             "app.example.test".to_owned(),
             "/smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
+            SmokeStats::default(),
         );
 
         assert!(service.route_matches(&pb::RouteIdentity {
@@ -746,6 +798,64 @@ mod tests {
                 path_prefix: Some("/smoke".to_owned()),
             })),
         }));
+    }
+
+    #[test]
+    fn fake_control_plane_counts_subscribe_route_requests() {
+        let stats = SmokeStats::default();
+        let service = FakeProxyControlPlane::new(
+            "app.example.test".to_owned(),
+            "/smoke".to_owned(),
+            "http://127.0.0.1:18080".to_owned(),
+            stats.clone(),
+        );
+
+        let request = pb::ProxySubscribeRequest {
+            input: Some(pb::proxy_subscribe_request::Input::SubscribeRoute(
+                pb::ProxySubscribeRouteRequest {
+                    request_id: "request-1".to_owned(),
+                    identity: Some(pb::RouteIdentity {
+                        kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                            host: Some(pb::RouteHost {
+                                kind: pb::RouteHostKind::Exact as i32,
+                                host: "app.example.test".to_owned(),
+                            }),
+                            path_prefix: Some("/smoke".to_owned()),
+                        })),
+                    }),
+                },
+            )),
+        };
+
+        let response = service
+            .handle_subscribe_request(request)
+            .expect("subscribe route succeeds");
+
+        assert!(response.is_some());
+        assert_eq!(stats.snapshot().subscribe_route_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_stats_endpoint_reports_subscribe_route_count() {
+        let stats = SmokeStats::default();
+        stats.record_subscribe_route();
+        stats.record_subscribe_route();
+
+        let response = backend_response(
+            HttpRequest::builder()
+                .uri(STATS_PATH)
+                .body(())
+                .expect("stats request builds"),
+            &stats,
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stats body reads")
+            .to_bytes();
+
+        assert_eq!(body.as_ref(), b"subscribe_route_calls=2\n");
     }
 
     #[test]
