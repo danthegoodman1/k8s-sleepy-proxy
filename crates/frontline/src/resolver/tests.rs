@@ -7,8 +7,8 @@ use control_plane::{CachePolicy, PathPrefix, RouteHost, RouteIdentity};
 
 use super::{
     FrontlineRouteResolution, FrontlineRouteResolver, FrontlineRouteResolverError,
-    RouteResolverProtocolError, RouteSubscriptionClient, RouteSubscriptionFuture,
-    UnexpectedSubscribeResponseKind,
+    RouteResolverProtocolError, RouteSubscriptionClient, RouteSubscriptionEvent,
+    RouteSubscriptionFuture, UnexpectedSubscribeResponseKind,
 };
 use crate::{
     subscription::tests::{route_entry, route_entry_for_instance},
@@ -38,6 +38,7 @@ struct FakeRouteSubscriptionClient {
     calls: Vec<ClientCall>,
     subscribe_responses: VecDeque<Result<SubscribeControlPlaneOutput, TestClientError>>,
     unsubscribe_responses: VecDeque<Result<(), TestClientError>>,
+    events: VecDeque<Result<Vec<RouteSubscriptionEvent>, TestClientError>>,
 }
 
 impl FakeRouteSubscriptionClient {
@@ -59,6 +60,10 @@ impl FakeRouteSubscriptionClient {
 
     fn push_unsubscribe_response(&mut self, response: Result<(), TestClientError>) {
         self.unsubscribe_responses.push_back(response);
+    }
+
+    fn push_events(&mut self, events: Vec<RouteSubscriptionEvent>) {
+        self.events.push_back(Ok(events));
     }
 }
 
@@ -87,6 +92,13 @@ impl RouteSubscriptionClient for FakeRouteSubscriptionClient {
     ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
         self.calls.push(ClientCall::Unsubscribe { subscription_id });
         let response = self.unsubscribe_responses.pop_front().unwrap_or(Ok(()));
+        Box::pin(async move { response })
+    }
+
+    fn drain_subscription_events(
+        &mut self,
+    ) -> RouteSubscriptionFuture<'_, Vec<RouteSubscriptionEvent>, Self::Error> {
+        let response = self.events.pop_front().unwrap_or(Ok(Vec::new()));
         Box::pin(async move { response })
     }
 }
@@ -714,6 +726,53 @@ async fn apply_control_plane_message_unsubscribes_evicted_subscriptions() {
         resolver.client().calls,
         vec![ClientCall::Unsubscribe {
             subscription_id: subscription_id("sub-old")
+        }]
+    );
+}
+
+#[tokio::test]
+async fn stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebuilds() {
+    let now = now();
+    let request = http_request("app.example.com", "/");
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-old"),
+            http_rule("example.com", None),
+            "route-old",
+        ),
+        now,
+    );
+    let mut client = FakeRouteSubscriptionClient::with_subscribe_response(resolved_response(
+        generated_request_id(1),
+        subscription_id("sub-new"),
+        http_rule("example.com", None),
+        "route-new",
+    ));
+    client.push_events(vec![RouteSubscriptionEvent::StreamClosed]);
+    let mut resolver = FrontlineRouteResolver::from_parts(state, client);
+
+    let result = resolver
+        .resolve(request.clone(), now)
+        .await
+        .expect("stream close forces lazy rebuild");
+
+    let FrontlineRouteResolution::Resolved(entry) = result else {
+        panic!("expected rebuilt positive route");
+    };
+    assert_eq!(entry.subscription_id, subscription_id("sub-new"));
+    assert_eq!(entry.entry.route_binding_id.as_str(), "route-new");
+    assert!(resolver
+        .state()
+        .cache()
+        .positive_by_subscription(&subscription_id("sub-old"))
+        .is_none());
+    assert_eq!(
+        resolver.client().calls,
+        vec![ClientCall::Subscribe {
+            request_id: generated_request_id(1),
+            identity: request,
         }]
     );
 }

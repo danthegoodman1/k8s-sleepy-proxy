@@ -305,6 +305,13 @@ impl RouteCache {
         self.remove_positive(subscription_id).is_some()
     }
 
+    pub fn active_subscription_ids(&self) -> Vec<SubscriptionId> {
+        self.positives
+            .iter()
+            .map(|entry| entry.subscription_id.clone())
+            .collect()
+    }
+
     pub fn replace_subscription(
         &mut self,
         subscription_id: &SubscriptionId,

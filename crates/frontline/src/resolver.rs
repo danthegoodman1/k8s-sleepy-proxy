@@ -4,7 +4,7 @@ use control_plane::RouteIdentity;
 
 use crate::{
     matcher::rank_match, ApplyControlPlaneMessageOutcome, CacheInsertResult, CacheLookup,
-    CacheLookupHit, NegativeCacheEntry, PositiveCacheEntry, RouteRequestId,
+    CacheLookupHit, InvalidationReason, NegativeCacheEntry, PositiveCacheEntry, RouteRequestId,
     SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
 };
 
@@ -24,6 +24,18 @@ pub trait RouteSubscriptionClient {
         &mut self,
         subscription_id: SubscriptionId,
     ) -> RouteSubscriptionFuture<'_, (), Self::Error>;
+
+    fn drain_subscription_events(
+        &mut self,
+    ) -> RouteSubscriptionFuture<'_, Vec<RouteSubscriptionEvent>, Self::Error> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteSubscriptionEvent {
+    Update(SubscribeControlPlaneOutput),
+    StreamClosed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +136,8 @@ where
         identity: RouteIdentity,
         now: Instant,
     ) -> Result<FrontlineRouteResolution, FrontlineRouteResolverError<Client::Error>> {
+        self.drain_subscription_events(now).await?;
+
         let expired = self.state.cache_mut().expire(now);
         self.unsubscribe_all(expired).await?;
 
@@ -233,6 +247,32 @@ where
         let outcome = self.state.apply_control_plane_message(message, now);
         self.unsubscribe_outcome(&outcome).await?;
         Ok(outcome)
+    }
+
+    async fn drain_subscription_events(
+        &mut self,
+        now: Instant,
+    ) -> Result<(), FrontlineRouteResolverError<Client::Error>> {
+        let events = self
+            .client
+            .drain_subscription_events()
+            .await
+            .map_err(FrontlineRouteResolverError::Subscribe)?;
+
+        for event in events {
+            match event {
+                RouteSubscriptionEvent::Update(message) => {
+                    let outcome = self.state.apply_control_plane_message(message, now);
+                    self.unsubscribe_outcome(&outcome).await?;
+                }
+                RouteSubscriptionEvent::StreamClosed => {
+                    self.state
+                        .invalidate_active_subscriptions(InvalidationReason::StreamClosed, now);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn unsubscribe_outcome(

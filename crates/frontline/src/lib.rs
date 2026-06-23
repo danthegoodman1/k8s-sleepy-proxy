@@ -51,8 +51,8 @@ pub use listener::{
 pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};
 pub use resolver::{
     FrontlineRouteResolution, FrontlineRouteResolver, FrontlineRouteResolverError,
-    RouteResolverProtocolError, RouteSubscriptionClient, RouteSubscriptionFuture,
-    UnexpectedSubscribeResponseKind,
+    RouteResolverProtocolError, RouteSubscriptionClient, RouteSubscriptionEvent,
+    RouteSubscriptionFuture, UnexpectedSubscribeResponseKind,
 };
 pub use route::{
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome, WakeClient,

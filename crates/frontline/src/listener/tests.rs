@@ -24,13 +24,13 @@ use proxy_core::{DrainTracker, Shutdown};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::{oneshot, Mutex as TokioMutex},
     task::JoinHandle,
 };
 
 use super::serve_http_listener;
 use crate::{
-    FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteResolver,
+    FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteOutcome, FrontlineRouteResolver,
     Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteRequestId, RouteSubscriptionClient,
     RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
     WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse, WakeTracker,
@@ -71,12 +71,47 @@ struct FakeHttp01Resolver {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct BlockingRouteClient {
+    calls: Arc<Mutex<Vec<RouteClientCall>>>,
+    subscribe_responses: Arc<
+        Mutex<VecDeque<oneshot::Receiver<Result<SubscribeControlPlaneOutput, TestRouteError>>>>,
+    >,
+    subscribe_notifications: Arc<Mutex<VecDeque<oneshot::Sender<()>>>>,
+}
+
 impl FakeRouteClient {
     fn push_subscribe_response(&self, response: SubscribeControlPlaneOutput) {
         self.subscribe_responses
             .lock()
             .expect("responses lock")
             .push_back(Ok(response));
+    }
+
+    fn calls(&self) -> Vec<RouteClientCall> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+impl BlockingRouteClient {
+    fn push_subscribe_response_channel(
+        &self,
+    ) -> oneshot::Sender<Result<SubscribeControlPlaneOutput, TestRouteError>> {
+        let (tx, rx) = oneshot::channel();
+        self.subscribe_responses
+            .lock()
+            .expect("responses lock")
+            .push_back(rx);
+        tx
+    }
+
+    fn notify_next_subscribe(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.subscribe_notifications
+            .lock()
+            .expect("notifications lock")
+            .push_back(tx);
+        rx
     }
 
     fn calls(&self) -> Vec<RouteClientCall> {
@@ -106,6 +141,50 @@ impl RouteSubscriptionClient for FakeRouteClient {
             .pop_front()
             .expect("queued subscribe response");
         Box::pin(async move { response })
+    }
+
+    fn unsubscribe(
+        &mut self,
+        subscription_id: SubscriptionId,
+    ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push(RouteClientCall::Unsubscribe { subscription_id });
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl RouteSubscriptionClient for BlockingRouteClient {
+    type Error = TestRouteError;
+
+    fn subscribe_route(
+        &mut self,
+        request_id: RouteRequestId,
+        identity: RouteIdentity,
+    ) -> RouteSubscriptionFuture<'_, SubscribeControlPlaneOutput, Self::Error> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push(RouteClientCall::Subscribe {
+                request_id,
+                identity,
+            });
+        if let Some(notification) = self
+            .subscribe_notifications
+            .lock()
+            .expect("notifications lock")
+            .pop_front()
+        {
+            let _ = notification.send(());
+        }
+        let response = self
+            .subscribe_responses
+            .lock()
+            .expect("responses lock")
+            .pop_front()
+            .expect("queued subscribe response channel");
+        Box::pin(async move { response.await.expect("subscribe response sent") })
     }
 
     fn unsubscribe(
@@ -369,6 +448,84 @@ async fn listener_shutdown_drains_active_http_response() {
         .expect("listener task joins")
         .expect("listener exits");
     upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn listener_shared_coordinator_prevents_duplicate_in_flight_subscribe_route() {
+    let route_client = BlockingRouteClient::default();
+    let release_first_subscribe = route_client.push_subscribe_response_channel();
+    let first_subscribe_started = route_client.notify_next_subscribe();
+    let coordinator = Arc::new(TokioMutex::new(FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(4, route_client.clone()),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )));
+    let identity = http_identity("app.example.com", "/same");
+
+    let (first_locked_tx, first_locked_rx) = oneshot::channel();
+    let first_coordinator = Arc::clone(&coordinator);
+    let first_identity = identity.clone();
+    let first = tokio::spawn(async move {
+        let mut coordinator = first_coordinator.lock().await;
+        let _ = first_locked_tx.send(());
+        coordinator.route(first_identity, now()).await
+    });
+    first_locked_rx.await.expect("first route holds lock");
+    first_subscribe_started
+        .await
+        .expect("first subscribe starts");
+    assert!(
+        coordinator.try_lock().is_err(),
+        "coordinator lock remains held while first subscribe is in flight"
+    );
+
+    let second_coordinator = Arc::clone(&coordinator);
+    let second_identity = identity.clone();
+    let second = tokio::spawn(async move {
+        let mut coordinator = second_coordinator.lock().await;
+        coordinator.route(second_identity, now()).await
+    });
+    assert_eq!(
+        route_client.calls(),
+        vec![RouteClientCall::Subscribe {
+            request_id: generated_request_id(1),
+            identity: identity.clone(),
+        }]
+    );
+
+    release_first_subscribe
+        .send(Ok(resolved_response(
+            generated_request_id(1),
+            subscription_id("sub-shared"),
+            identity.clone(),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some(("http://127.0.0.1:1".to_owned(), 3)),
+            ),
+        )))
+        .expect("first subscribe response is received");
+
+    let first = tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("first route completes")
+        .expect("first route task joins")
+        .expect("first route succeeds");
+    let second = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("second route completes")
+        .expect("second route task joins")
+        .expect("second route succeeds");
+
+    assert!(matches!(first, FrontlineRouteOutcome::Ready(_)));
+    assert!(matches!(second, FrontlineRouteOutcome::Ready(_)));
+    assert_eq!(
+        route_client.calls(),
+        vec![RouteClientCall::Subscribe {
+            request_id: generated_request_id(1),
+            identity,
+        }]
+    );
 }
 
 async fn spawn_frontline_listener(

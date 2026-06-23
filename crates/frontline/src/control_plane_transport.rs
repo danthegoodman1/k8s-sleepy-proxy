@@ -15,11 +15,15 @@ use crate::{
     proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
     proxy_wake_response_from_proto, wake_instance_request_to_proto, Http01ChallengeResolveFuture,
     Http01ChallengeResolver, ProxyProtocolAdapterError, ProxySubscribeInput, RouteRequestId,
-    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
-    WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
+    RouteSubscriptionClient, RouteSubscriptionEvent, RouteSubscriptionFuture,
+    SubscribeControlPlaneOutput, SubscriptionId, WakeClient, WakeClientFuture, WakeInstanceRequest,
+    WakeInstanceResponse,
 };
 
 const SUBSCRIBE_REQUEST_BUFFER: usize = 16;
+// Matches the request-side buffer so pushed updates are backpressured by proxy
+// demand instead of accumulating unboundedly while the resolver is idle.
+const SUBSCRIBE_RESPONSE_BUFFER: usize = SUBSCRIBE_REQUEST_BUFFER;
 
 #[derive(Debug)]
 pub struct GrpcProxyControlPlaneClient<T> {
@@ -35,8 +39,16 @@ pub struct GrpcOperatorHttp01Resolver<T> {
 #[derive(Debug)]
 struct GrpcRouteSubscriptionSession {
     requests: mpsc::Sender<pb::ProxySubscribeRequest>,
-    responses: tonic::codec::Streaming<pb::ProxySubscribeResponse>,
+    responses: mpsc::Receiver<GrpcRouteSubscriptionEvent>,
     buffered_updates: VecDeque<SubscribeControlPlaneOutput>,
+}
+
+#[derive(Debug)]
+enum GrpcRouteSubscriptionEvent {
+    Message(SubscribeControlPlaneOutput),
+    ResponseStreamClosed,
+    Status(tonic::Status),
+    Protocol(ProxyProtocolAdapterError),
 }
 
 #[derive(Debug)]
@@ -103,27 +115,18 @@ where
     pub async fn next_update(
         &mut self,
     ) -> Result<SubscribeControlPlaneOutput, GrpcProxyControlPlaneError> {
-        let response = {
-            let session = self.ensure_subscription().await?;
-            if let Some(update) = session.buffered_updates.pop_front() {
-                return Ok(update);
-            }
-            session.responses.message().await
-        };
+        self.ensure_subscription().await?;
+        if let Some(update) = self
+            .subscription
+            .as_mut()
+            .expect("subscription exists after ensure")
+            .buffered_updates
+            .pop_front()
+        {
+            return Ok(update);
+        }
 
-        let response = match response {
-            Ok(Some(response)) => response,
-            Ok(None) => {
-                self.subscription = None;
-                return Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed);
-            }
-            Err(status) => {
-                self.subscription = None;
-                return Err(GrpcProxyControlPlaneError::Status(status));
-            }
-        };
-        let message = proxy_subscribe_response_from_proto(response)
-            .map_err(GrpcProxyControlPlaneError::Protocol)?;
+        let message = self.next_subscription_message().await?;
         if is_subscription_update(&message) {
             Ok(message)
         } else {
@@ -168,26 +171,7 @@ where
         }
 
         loop {
-            let response = {
-                let session = self
-                    .subscription
-                    .as_mut()
-                    .expect("subscription exists after successful request send");
-                session.responses.message().await
-            };
-            let response = match response {
-                Ok(Some(response)) => response,
-                Ok(None) => {
-                    self.subscription = None;
-                    return Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed);
-                }
-                Err(status) => {
-                    self.subscription = None;
-                    return Err(GrpcProxyControlPlaneError::Status(status));
-                }
-            };
-            let message = proxy_subscribe_response_from_proto(response)
-                .map_err(GrpcProxyControlPlaneError::Protocol)?;
+            let message = self.next_subscription_message().await?;
 
             match response_request_id(&message) {
                 Some(actual) if actual == &request_id => return Ok(message),
@@ -224,6 +208,81 @@ where
         Ok(())
     }
 
+    fn drain_subscription_events_via_transport(
+        &mut self,
+    ) -> Result<Vec<RouteSubscriptionEvent>, GrpcProxyControlPlaneError> {
+        let Some(session) = self.subscription.as_mut() else {
+            return Ok(Vec::new());
+        };
+
+        let mut events = Vec::new();
+        let mut drop_subscription = false;
+        let mut protocol_error = None;
+        while let Ok(event) = session.responses.try_recv() {
+            match event {
+                GrpcRouteSubscriptionEvent::Message(message) => {
+                    if is_subscription_update(&message) {
+                        events.push(RouteSubscriptionEvent::Update(message));
+                    } else {
+                        return Err(GrpcProxyControlPlaneError::UnexpectedRouteResponse {
+                            request_id: response_request_id(&message)
+                                .expect("route responses always carry a request ID")
+                                .clone(),
+                        });
+                    }
+                }
+                GrpcRouteSubscriptionEvent::ResponseStreamClosed
+                | GrpcRouteSubscriptionEvent::Status(_) => {
+                    events.push(RouteSubscriptionEvent::StreamClosed);
+                    drop_subscription = true;
+                    break;
+                }
+                GrpcRouteSubscriptionEvent::Protocol(error) => {
+                    protocol_error = Some(error);
+                    drop_subscription = true;
+                    break;
+                }
+            }
+        }
+
+        if drop_subscription {
+            self.subscription = None;
+        }
+        if let Some(error) = protocol_error {
+            return Err(GrpcProxyControlPlaneError::Protocol(error));
+        }
+
+        Ok(events)
+    }
+
+    async fn next_subscription_message(
+        &mut self,
+    ) -> Result<SubscribeControlPlaneOutput, GrpcProxyControlPlaneError> {
+        let event = {
+            let session = self
+                .subscription
+                .as_mut()
+                .expect("subscription exists while waiting for response");
+            session.responses.recv().await
+        };
+
+        match event {
+            Some(GrpcRouteSubscriptionEvent::Message(message)) => Ok(message),
+            Some(GrpcRouteSubscriptionEvent::ResponseStreamClosed) | None => {
+                self.subscription = None;
+                Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed)
+            }
+            Some(GrpcRouteSubscriptionEvent::Status(status)) => {
+                self.subscription = None;
+                Err(GrpcProxyControlPlaneError::Status(status))
+            }
+            Some(GrpcRouteSubscriptionEvent::Protocol(error)) => {
+                self.subscription = None;
+                Err(GrpcProxyControlPlaneError::Protocol(error))
+            }
+        }
+    }
+
     async fn ensure_subscription(
         &mut self,
     ) -> Result<&mut GrpcRouteSubscriptionSession, GrpcProxyControlPlaneError> {
@@ -235,10 +294,12 @@ where
                 .await
                 .map_err(GrpcProxyControlPlaneError::Status)?
                 .into_inner();
+            let (response_tx, response_rx) = mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
+            tokio::spawn(read_subscription_responses(responses, response_tx));
 
             self.subscription = Some(GrpcRouteSubscriptionSession {
                 requests,
-                responses,
+                responses: response_rx,
                 buffered_updates: VecDeque::new(),
             });
         }
@@ -304,6 +365,12 @@ where
         subscription_id: SubscriptionId,
     ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
         Box::pin(async move { self.unsubscribe_via_transport(subscription_id).await })
+    }
+
+    fn drain_subscription_events(
+        &mut self,
+    ) -> RouteSubscriptionFuture<'_, Vec<RouteSubscriptionEvent>, Self::Error> {
+        Box::pin(async move { self.drain_subscription_events_via_transport() })
     }
 }
 
@@ -407,6 +474,38 @@ fn response_request_id(message: &SubscribeControlPlaneOutput) -> Option<&RouteRe
         | SubscribeControlPlaneOutput::RouteMiss { request_id, .. } => Some(request_id),
         SubscribeControlPlaneOutput::RouteUpdated { .. }
         | SubscribeControlPlaneOutput::RouteInvalidated { .. } => None,
+    }
+}
+
+async fn read_subscription_responses(
+    mut responses: tonic::codec::Streaming<pb::ProxySubscribeResponse>,
+    events: mpsc::Sender<GrpcRouteSubscriptionEvent>,
+) {
+    loop {
+        match responses.message().await {
+            Ok(Some(response)) => {
+                let event = match proxy_subscribe_response_from_proto(response) {
+                    Ok(message) => GrpcRouteSubscriptionEvent::Message(message),
+                    Err(error) => GrpcRouteSubscriptionEvent::Protocol(error),
+                };
+                let terminal = matches!(event, GrpcRouteSubscriptionEvent::Protocol(_));
+                if events.send(event).await.is_err() || terminal {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = events
+                    .send(GrpcRouteSubscriptionEvent::ResponseStreamClosed)
+                    .await;
+                return;
+            }
+            Err(status) => {
+                let _ = events
+                    .send(GrpcRouteSubscriptionEvent::Status(status))
+                    .await;
+                return;
+            }
+        }
     }
 }
 

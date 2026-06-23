@@ -17,7 +17,7 @@ use control_plane::{
     BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey, InstanceId,
     InstanceState, PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tonic::{
     codegen::{http, tokio_stream::wrappers::ReceiverStream, Service},
     Request, Response, Status,
@@ -305,6 +305,32 @@ async fn subscribe_route_after_response_stream_close_opens_new_stream() {
 }
 
 #[tokio::test]
+async fn response_stream_close_after_route_response_is_observed_by_response_reader() {
+    let service = FakeProxyControlPlane::default();
+    service.push_subscribe_action(SubscribeAction::close_after(vec![Ok(
+        route_resolved_response("req-before-close", "sub-before-close"),
+    )]));
+    let mut client = test_client(service);
+
+    client
+        .subscribe_route(
+            route_request_id("req-before-close"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .expect("route response arrives before stream close");
+
+    let error = tokio::time::timeout(Duration::from_secs(1), client.next_update())
+        .await
+        .expect("response reader observes terminal stream close")
+        .expect_err("terminal stream close is surfaced");
+    assert!(matches!(
+        error,
+        GrpcProxyControlPlaneError::SubscribeResponseStreamClosed
+    ));
+}
+
+#[tokio::test]
 async fn pushed_updates_over_response_buffer_are_drained_without_public_cursor() {
     let service = FakeProxyControlPlane::default();
     let mut responses = (0..20)
@@ -505,6 +531,7 @@ where
 #[derive(Clone, Default)]
 struct FakeProxyControlPlane {
     state: Arc<Mutex<FakeProxyControlPlaneState>>,
+    subscribe_notify: Arc<Notify>,
 }
 
 #[derive(Clone, Default)]
@@ -574,6 +601,7 @@ impl ProxyControlPlane for FakeProxyControlPlane {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let mut requests = request.into_inner();
         let state = Arc::clone(&self.state);
+        let subscribe_notify = Arc::clone(&self.subscribe_notify);
         let (responses, response_stream) = mpsc::channel(16);
 
         tokio::spawn(async move {
@@ -594,6 +622,7 @@ impl ProxyControlPlane for FakeProxyControlPlane {
                         .pop_front()
                         .unwrap_or_else(|| SubscribeAction::respond(Vec::new()))
                 };
+                subscribe_notify.notify_waiters();
 
                 for response in action.responses {
                     if responses.send(response).await.is_err() {
@@ -628,7 +657,9 @@ impl FakeProxyControlPlane {
     }
 
     async fn wait_for_subscribe_requests(&self, count: usize) -> Vec<pb::ProxySubscribeRequest> {
-        for _ in 0..100 {
+        let timeout = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(timeout);
+        loop {
             let requests = self
                 .state
                 .lock()
@@ -638,10 +669,12 @@ impl FakeProxyControlPlane {
             if requests.len() >= count {
                 return requests;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
 
-        panic!("timed out waiting for {count} subscribe requests");
+            tokio::select! {
+                _ = self.subscribe_notify.notified() => {}
+                _ = &mut timeout => panic!("timed out waiting for {count} subscribe requests"),
+            }
+        }
     }
 }
 

@@ -224,6 +224,26 @@ impl SubscriptionState {
         }
     }
 
+    pub fn invalidate_active_subscriptions(
+        &mut self,
+        reason: InvalidationReason,
+        now: Instant,
+    ) -> Vec<ApplyControlPlaneMessageOutcome> {
+        self.cache
+            .active_subscription_ids()
+            .into_iter()
+            .map(|subscription_id| {
+                self.apply_control_plane_message(
+                    SubscribeControlPlaneOutput::RouteInvalidated {
+                        subscription_id,
+                        reason: reason.clone(),
+                    },
+                    now,
+                )
+            })
+            .collect()
+    }
+
     fn apply_update(
         &mut self,
         subscription_id: &SubscriptionId,
