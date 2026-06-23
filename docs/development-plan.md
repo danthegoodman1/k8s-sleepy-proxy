@@ -806,6 +806,7 @@ Scope:
 | Incomplete | Control-plane restart recovery from database state. | No restart reconciliation tests or runtime recovery loop found; follow-up: M9. |
 | Incomplete | Minimal production images for control plane, frontline, and sidecar. | Distroless non-root Dockerfiles and `scripts/smoke-images.sh` exist, but images are not used by full kind E2E/soak and full startup/connectivity gates are missing; follow-up: M9. |
 | Incomplete | Load tests for route lookup and hot proxy path. | `scripts/smoke-frontline-load.sh`, sidecar load smokes, and `docs/proxy-hot-path-budgets.md` exist, but route-lookup benchmark, protocol throughput matrix, and stable tail-latency gates are missing; follow-up: M9. |
+| Incomplete | Indexed frontline route matcher for hot-path lookup. | Positive route-cache lookup currently scans cached route entries and ranks matches; follow-up: M9 indexed matcher and route-key benchmark gates. |
 | Incomplete | Soak tests for repeated wake/sleep cycles. | `scripts/soak-kind-materializer.sh` is materializer-only, not full wake/sleep; follow-up: M9. |
 
 Sub-phases:
@@ -838,6 +839,7 @@ Done criteria:
 | Incomplete | Benchmark regressions warn above 10-15% and fail above 20-25%. | No regression budget enforcement found; follow-up: M9. |
 | Incomplete | Hot-cache route handling makes zero control-plane calls under load. | Component tests avoid calls on cache hits; no load gate asserts zero calls; follow-up: M9. |
 | Incomplete | Route lookup and hot proxy path meet target latency under load. | Route lookup benchmark is absent; follow-up: M9. |
+| Incomplete | Hot-cache route lookup avoids scanning every positive cached route. | Current positive route-cache lookup is a linear scan; follow-up: M9 indexed matcher and route-key benchmark gates. |
 | Incomplete | Retry/backoff tests cover transient database errors, Kubernetes conflicts, proxy disconnects, and materializer retries. | Sidecar retry is covered; database/Kubernetes/proxy/materializer retry gates are missing; follow-up: M9. |
 | Incomplete | Container tests prove images start, run non-root, include required files, access CA certs, and are used by kind E2E/soak. | `scripts/smoke-images.sh` checks non-root/no shell/files and expected startup failure without config; full startup/connectivity/kind-use is missing; follow-up: M9. |
 | Incomplete | Image-size budgets are defined and enforced. | No image-size budget gate found; follow-up: M9. |
@@ -894,8 +896,8 @@ Scope:
   `ReportIdle`, Kubernetes cleanup on delete, full-platform kind E2E, frontline
   TLS/SNI runtime wiring, and subscribed route update/invalidation delivery.
 - Close Milestone 8 audit gaps marked for M9: proxy/frontline/sidecar protocol
-  matrices, route-key lookup benchmarks, grpc-web parity/browser smoke,
-  HTTP-01 runtime wiring, PostgreSQL/libpq SNI E2E, materializer
+  matrices, indexed frontline route matching, route-key lookup benchmarks,
+  grpc-web parity/browser smoke, HTTP-01 runtime wiring, PostgreSQL/libpq SNI E2E, materializer
   readiness/failure gates, restart/reconnect/retry behavior, production-image
   gates, load budgets, and full wake/sleep soak.
 - Add runtime observability and structured-log gates for V1 lifecycle paths
@@ -922,11 +924,12 @@ Sub-phases:
   bounds.
 - 9D: Manifest rendering of resolved sidecar sleep-policy env.
 - 9E: Component and kind E2E coverage for policy rendering and idle behavior.
-- 9F: Protocol/API/runtime audit gaps: route-key lookup benchmarks, proxy-core
-  reset/backpressure tests, frontline HTTP/2/h2c/WebSocket/TLS/SNI/HTTP-01
-  runtime wiring, HTTP-01 store overwrite/idempotency and wrong host/token
-  tests, sidecar h2c/WebSocket idle coverage, sidecar restart during
-  idle/report behavior, grpc-web parity, and PostgreSQL/libpq SNI E2E.
+- 9F: Protocol/API/runtime audit gaps: indexed frontline route matcher,
+  route-key lookup benchmarks, proxy-core reset/backpressure tests, frontline
+  HTTP/2/h2c/WebSocket/TLS/SNI/HTTP-01 runtime wiring, HTTP-01 store
+  overwrite/idempotency and wrong host/token tests, sidecar h2c/WebSocket idle
+  coverage, sidecar restart during idle/report behavior, grpc-web parity, and
+  PostgreSQL/libpq SNI E2E.
 - 9G: Hardening audit gaps: materializer readiness/failure route publication,
   restart/reconnect/retry gates, runtime metrics/log assertions, production
   image startup/connectivity checks, load budgets, and full wake/sleep soak.
@@ -965,6 +968,11 @@ Done when:
 - Route-key lookup benchmarks and load gates cover hot-cache route lookup, hot
   proxy paths, cold wake latency, tail latency, and zero control-plane calls on
   hot-cache hits.
+- Indexed frontline route matching avoids scanning every positive cached route
+  on hot-cache hits while preserving exact-host over wildcard-host,
+  more-specific wildcard-host over broader wildcard-host, longest path-prefix
+  selection, SNI matching, negative-cache semantics, TTL expiry, invalidation,
+  and stale generation rejection.
 - grpc-web store-backed integration tests cover operator APIs, CORS/preflight,
   metadata/auth propagation, structured errors, and V8-compatible request
   encoding.
