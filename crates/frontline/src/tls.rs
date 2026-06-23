@@ -50,6 +50,12 @@ pub struct TlsPassthrough {
 }
 
 #[derive(Debug)]
+pub struct TlsPassthroughClientHello {
+    identity: RouteRequestIdentity,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub enum TlsCertificateError {
     InvalidSni(RequestIdentityError),
     InvalidCertificate(rustls::Error),
@@ -175,28 +181,63 @@ impl FrontlineTlsAdapter {
     where
         Client: AsyncRead + AsyncWrite + Unpin,
     {
-        let upstream = passthrough_backend_addr(ready)?;
-        let prefix = read_tls_client_hello_prefix(&mut client)
+        let client_hello = self.read_passthrough_client_hello(&mut client).await?;
+
+        self.passthrough_prefixed(ready, client, client_hello).await
+    }
+
+    pub async fn read_passthrough_client_hello<Client>(
+        &self,
+        client: &mut Client,
+    ) -> Result<TlsPassthroughClientHello, TlsPassthroughError>
+    where
+        Client: AsyncRead + Unpin,
+    {
+        let prefix = read_tls_client_hello_prefix(client)
             .await
             .map_err(TlsPassthroughError::ClientHello)?;
-        let sni = match prefix.outcome {
-            Ok(TlsClientHelloSni::Sni { hostname }) => hostname,
+        let sni = match &prefix.outcome {
+            Ok(TlsClientHelloSni::Sni { hostname }) => hostname.clone(),
             Ok(TlsClientHelloSni::NoSni) | Ok(TlsClientHelloSni::Incomplete { .. }) => {
                 return Err(TlsPassthroughError::MissingSni);
             }
-            Err(error) => return Err(TlsPassthroughError::NotTls(error)),
+            Err(error) => return Err(TlsPassthroughError::NotTls(error.clone())),
         };
         let identity = RouteRequestIdentity::sni(&sni).map_err(TlsPassthroughError::InvalidSni)?;
+
+        Ok(TlsPassthroughClientHello {
+            identity,
+            bytes: prefix.bytes,
+        })
+    }
+
+    pub async fn passthrough_prefixed<Client>(
+        &self,
+        ready: &ReadyBackend,
+        client: Client,
+        client_hello: TlsPassthroughClientHello,
+    ) -> Result<TlsPassthrough, TlsPassthroughError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        let upstream = passthrough_backend_addr(ready)?;
+        let identity = client_hello.identity;
 
         let upstream = TcpStream::connect(upstream)
             .await
             .map_err(TlsPassthroughError::Connect)?;
-        let client = PrefixedStream::new(prefix.bytes, client);
+        let client = PrefixedStream::new(client_hello.bytes, client);
         let stats = proxy_streams(client, upstream)
             .await
             .map_err(TlsPassthroughError::Proxy)?;
 
         Ok(TlsPassthrough { identity, stats })
+    }
+}
+
+impl TlsPassthroughClientHello {
+    pub fn identity(&self) -> &RouteRequestIdentity {
+        &self.identity
     }
 }
 

@@ -24,7 +24,10 @@ pub use cache::{
     CacheInsertResult, CacheLookup, CacheLookupHit, CacheLookupStatus, NegativeCacheEntry,
     PositiveCacheEntry, RouteCache,
 };
-pub use config::{FrontlineEnvConfig, FrontlineEnvConfigError};
+pub use config::{
+    FrontlineEnvConfig, FrontlineEnvConfigError, FrontlineTlsCertificateConfig,
+    FrontlineTlsCertificateLoadError,
+};
 pub use control_plane::{
     http01_challenge_key_to_proto, http01_challenge_record_from_proto,
     proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
@@ -46,7 +49,10 @@ pub use http01::{
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use listener::{
-    serve_http, serve_http_listener, FrontlineHttpListenerConfig, FrontlineHttpListenerError,
+    serve_frontline, serve_http, serve_http_listener, FrontlineHttpListenerConfig,
+    FrontlineHttpListenerError, FrontlineListenerError, FrontlineListenerKind,
+    FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
+    FrontlineTlsTerminationListenerConfig,
 };
 pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};
 pub use resolver::{
@@ -66,8 +72,8 @@ pub use subscription::{
 };
 pub use tls::{
     passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateError,
-    TlsCertificateStore, TlsPassthrough, TlsPassthroughBackendError, TlsPassthroughError,
-    TlsTerminationError,
+    TlsCertificateStore, TlsPassthrough, TlsPassthroughBackendError, TlsPassthroughClientHello,
+    TlsPassthroughError, TlsTerminationError,
 };
 pub use wake::{
     route_wake_decision, validate_route_update, validate_wake_response, ReadyBackend,

@@ -24,11 +24,19 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use proxy_core::{DrainTracker, Shutdown};
+use rcgen::generate_simple_self_signed;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{oneshot, Mutex as TokioMutex},
     task::{JoinHandle, JoinSet},
+};
+use tokio_rustls::{
+    rustls::{
+        pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+        ClientConfig, RootCertStore,
+    },
+    TlsConnector,
 };
 use tokio_tungstenite::{
     accept_hdr_async, connect_async,
@@ -40,15 +48,20 @@ use tokio_tungstenite::{
     },
 };
 
-use super::serve_http_listener;
+use super::{
+    serve_frontline, serve_http_listener, FrontlineHttpListenerConfig, FrontlineListenersConfig,
+    FrontlineTlsPassthroughListenerConfig, FrontlineTlsTerminationListenerConfig,
+};
 use crate::{
     FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteOutcome, FrontlineRouteResolver,
-    Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteRequestId, RouteSubscriptionClient,
-    RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
-    WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse, WakeTracker,
+    FrontlineTlsAdapter, Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteRequestId,
+    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
+    SubscriptionState, TlsCertificateStore, WakeClient, WakeClientFuture, WakeInstanceRequest,
+    WakeInstanceResponse, WakeTracker,
 };
 
 const READY_RESPONSE: &[u8] = b"ready-from-listener-upstream";
+const TLS_REQUEST_BODY: &[u8] = b"tls-listener-request";
 
 #[derive(Clone, Debug, Default)]
 struct FakeRouteClient {
@@ -300,6 +313,215 @@ async fn listener_forwards_http_request_through_ready_route() {
         .expect("listener task joins")
         .expect("listener exits");
     upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
+    let (upstream_addr, upstream_task) =
+        spawn_http_upstream(1, StatusCode::CREATED, READY_RESPONSE).await;
+    let route_client = FakeRouteClient::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-tls"),
+            http_identity("app.example.com", "/secure"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{upstream_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let http_addr = reserve_addr().await;
+    let tls_addr = reserve_addr().await;
+    let cert = test_cert("app.example.com");
+    let client_config = client_config_trusting(cert.cert.clone());
+    let store = TlsCertificateStore::new();
+    store
+        .upsert("app.example.com", vec![cert.cert], cert.key)
+        .expect("cert inserts");
+    let shutdown = Shutdown::new();
+    let runtime = runtime_with_state(
+        state,
+        route_client.clone(),
+        DrainTracker::new(Duration::from_secs(5)),
+    );
+    let config = FrontlineListenersConfig::new(FrontlineHttpListenerConfig::new(http_addr))
+        .with_tls_termination(Some(FrontlineTlsTerminationListenerConfig::new(tls_addr)));
+    let task = tokio::spawn(serve_frontline(
+        config,
+        runtime,
+        FrontlineTlsAdapter::new(store),
+        shutdown.clone(),
+    ));
+
+    let response = raw_https_request(
+        tls_addr,
+        "app.example.com",
+        "app.example.com",
+        "/secure?via=listener",
+        TLS_REQUEST_BODY,
+        client_config,
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 201 Created"), "{response}");
+    assert!(
+        response.ends_with("ready-from-listener-upstream"),
+        "{response}"
+    );
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("frontline task joins")
+        .expect("frontline exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn frontline_runtime_wires_tls_passthrough_listener_to_sni_route_and_preserves_prefix() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream binds");
+    let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+    let hello = client_hello(Some(sni_extension(b"Db.Example.COM.")));
+    let tail = b"database startup tail";
+    let mut expected = hello.clone();
+    expected.extend_from_slice(tail);
+    let upstream_response = Bytes::from_static(b"database response bytes");
+    let upstream_task = tokio::spawn({
+        let upstream_response = upstream_response.clone();
+        async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            let mut received = vec![0; expected.len()];
+            stream
+                .read_exact(&mut received)
+                .await
+                .expect("upstream reads preserved bytes");
+            assert_eq!(received, expected);
+            stream
+                .write_all(&upstream_response)
+                .await
+                .expect("upstream writes response");
+            stream.shutdown().await.expect("upstream shuts down");
+        }
+    });
+
+    let route_client = FakeRouteClient::default();
+    let request_identity = sni_identity("db.example.com");
+    route_client.push_subscribe_response(resolved_response(
+        generated_request_id(1),
+        subscription_id("sub-sni"),
+        request_identity.clone(),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("tcp://{upstream_addr}"), 3)),
+        ),
+    ));
+    let http_addr = reserve_addr().await;
+    let passthrough_addr = reserve_addr().await;
+    let shutdown = Shutdown::new();
+    let runtime = runtime_with_state(
+        SubscriptionState::new(4),
+        route_client.clone(),
+        DrainTracker::new(Duration::from_secs(5)),
+    );
+    let config = FrontlineListenersConfig::new(FrontlineHttpListenerConfig::new(http_addr))
+        .with_tls_passthrough(Some(FrontlineTlsPassthroughListenerConfig::new(
+            passthrough_addr,
+        )));
+    let task = tokio::spawn(serve_frontline(
+        config,
+        runtime,
+        FrontlineTlsAdapter::new(TlsCertificateStore::new()),
+        shutdown.clone(),
+    ));
+
+    let mut client = connect_tcp(passthrough_addr).await;
+    client.write_all(&hello).await.expect("client writes hello");
+    client.write_all(tail).await.expect("client writes tail");
+    client
+        .shutdown()
+        .await
+        .expect("client write half shuts down");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .await
+        .expect("client reads response");
+
+    assert_eq!(response, upstream_response);
+    assert_eq!(
+        route_client.calls(),
+        vec![RouteClientCall::Subscribe {
+            request_id: generated_request_id(1),
+            identity: request_identity,
+        }]
+    );
+
+    shutdown.shutdown();
+    task.await
+        .expect("frontline task joins")
+        .expect("frontline exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn tls_passthrough_listener_rejects_malformed_or_missing_sni_without_route_lookup() {
+    let route_client = FakeRouteClient::default();
+    let http_addr = reserve_addr().await;
+    let passthrough_addr = reserve_addr().await;
+    let shutdown = Shutdown::new();
+    let runtime = runtime_with_state(
+        SubscriptionState::new(4),
+        route_client.clone(),
+        DrainTracker::new(Duration::from_secs(5)),
+    );
+    let config = FrontlineListenersConfig::new(FrontlineHttpListenerConfig::new(http_addr))
+        .with_tls_passthrough(Some(FrontlineTlsPassthroughListenerConfig::new(
+            passthrough_addr,
+        )));
+    let task = tokio::spawn(serve_frontline(
+        config,
+        runtime,
+        FrontlineTlsAdapter::new(TlsCertificateStore::new()),
+        shutdown.clone(),
+    ));
+
+    let mut malformed = connect_tcp(passthrough_addr).await;
+    malformed
+        .write_all(b"GET / HTTP/1.1\r\n\r\n")
+        .await
+        .expect("malformed client writes");
+    malformed
+        .shutdown()
+        .await
+        .expect("malformed client shuts down");
+    let malformed_response = read_to_end_or_reset(&mut malformed).await;
+
+    let mut missing_sni = connect_tcp(passthrough_addr).await;
+    missing_sni
+        .write_all(&client_hello(None))
+        .await
+        .expect("missing-SNI client writes");
+    missing_sni
+        .shutdown()
+        .await
+        .expect("missing-SNI client shuts down");
+    let missing_sni_response = read_to_end_or_reset(&mut missing_sni).await;
+
+    assert!(malformed_response.is_empty());
+    assert!(missing_sni_response.is_empty());
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("frontline task joins")
+        .expect("frontline exits");
 }
 
 #[tokio::test]
@@ -849,6 +1071,67 @@ async fn listener_request(addr: SocketAddr, host: &str, path: &str) -> Response<
         .expect("listener request succeeds")
 }
 
+async fn raw_https_request(
+    addr: SocketAddr,
+    server_name: &'static str,
+    host: &str,
+    path: &str,
+    body: &[u8],
+    config: ClientConfig,
+) -> String {
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(server_name)
+        .expect("server name")
+        .to_owned();
+    let tcp = connect_tcp(addr).await;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls client connects");
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        std::str::from_utf8(body).expect("request body is utf8")
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("client writes request");
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response)
+        .await
+        .expect("client reads response");
+    String::from_utf8(response).expect("response is utf8")
+}
+
+async fn reserve_addr() -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("reserve listener binds");
+    listener.local_addr().expect("reserve listener addr")
+}
+
+async fn connect_tcp(addr: SocketAddr) -> TcpStream {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    panic!(
+        "client connects to {addr}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no connection attempt made".to_owned())
+    );
+}
+
 async fn raw_websocket_upgrade_status(addr: SocketAddr, host: Option<&str>) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("raw client connects");
     let host = host
@@ -1021,6 +1304,15 @@ async fn read_until(stream: &mut TcpStream, needle: &[u8]) {
     }
 }
 
+async fn read_to_end_or_reset(stream: &mut TcpStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match stream.read_to_end(&mut bytes).await {
+        Ok(_) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => bytes,
+        Err(error) => panic!("client reads close or reset: {error}"),
+    }
+}
+
 fn now() -> Instant {
     Instant::now()
 }
@@ -1058,6 +1350,35 @@ fn http_identity(host: &str, path: &str) -> RouteIdentity {
         host: RouteHost::exact(host).expect("host"),
         path: Some(PathPrefix::new(path).expect("path")),
     }
+}
+
+fn sni_identity(host: &str) -> RouteIdentity {
+    RouteIdentity::Sni {
+        host: RouteHost::exact(host).expect("host"),
+    }
+}
+
+fn test_cert(host: &str) -> TestCert {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec![host.to_owned()]).expect("cert generates");
+
+    TestCert {
+        cert: cert.der().clone(),
+        key: PrivateKeyDer::from(signing_key),
+    }
+}
+
+struct TestCert {
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+}
+
+fn client_config_trusting(cert: CertificateDer<'static>) -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).expect("root cert inserts");
+    ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 fn route_entry(
@@ -1102,4 +1423,81 @@ fn miss_response(
         request_identity: identity,
         negative_cache_policy: ttl(30),
     }
+}
+
+fn client_hello(extensions: Option<Vec<u8>>) -> Vec<u8> {
+    record(client_hello_handshake(extensions))
+}
+
+fn client_hello_handshake(extensions: Option<Vec<u8>>) -> Vec<u8> {
+    handshake(client_hello_body(extensions))
+}
+
+fn client_hello_body(extensions: Option<Vec<u8>>) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0x11; 32]);
+    body.push(0);
+    push_u16(&mut body, 2);
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(1);
+    body.push(0);
+
+    if let Some(extensions) = extensions {
+        push_u16(&mut body, extensions.len());
+        body.extend_from_slice(&extensions);
+    }
+
+    body
+}
+
+fn handshake(body: Vec<u8>) -> Vec<u8> {
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    push_u24(&mut handshake, body.len());
+    handshake.extend_from_slice(&body);
+    handshake
+}
+
+fn record(payload: Vec<u8>) -> Vec<u8> {
+    let mut record = Vec::new();
+    record.extend_from_slice(&[0x16, 0x03, 0x03]);
+    push_u16(&mut record, payload.len());
+    record.extend_from_slice(&payload);
+    record
+}
+
+fn sni_extension(hostname: &[u8]) -> Vec<u8> {
+    let mut name = Vec::new();
+    name.push(0);
+    push_u16(&mut name, hostname.len());
+    name.extend_from_slice(hostname);
+
+    let mut extension_data = Vec::new();
+    push_u16(&mut extension_data, name.len());
+    extension_data.extend_from_slice(&name);
+
+    extension(0, extension_data)
+}
+
+fn extension(extension_type: u16, data: Vec<u8>) -> Vec<u8> {
+    let mut extension = Vec::new();
+    push_u16(&mut extension, extension_type as usize);
+    push_u16(&mut extension, data.len());
+    extension.extend_from_slice(&data);
+    extension
+}
+
+fn push_u16(bytes: &mut Vec<u8>, value: usize) {
+    let value = u16::try_from(value).expect("test value fits in u16");
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn push_u24(bytes: &mut Vec<u8>, value: usize) {
+    assert!(value <= 0x00ff_ffff, "test value fits in u24");
+    bytes.extend_from_slice(&[
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    ]);
 }

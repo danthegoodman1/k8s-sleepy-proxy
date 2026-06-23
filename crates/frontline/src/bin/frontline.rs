@@ -5,8 +5,9 @@ use control_plane::api::pb::{
     proxy_control_plane_client::ProxyControlPlaneClient,
 };
 use frontline::{
-    serve_http, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
-    FrontlineRouteResolver, GrpcOperatorHttp01Resolver, GrpcProxyControlPlaneClient, WakeTracker,
+    serve_frontline, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
+    FrontlineRouteResolver, FrontlineTlsAdapter, GrpcOperatorHttp01Resolver,
+    GrpcProxyControlPlaneClient, TlsCertificateStore, WakeTracker,
 };
 use proxy_core::{observability::recorder::ObservabilityRecorder, DrainTracker, Shutdown};
 use tonic::transport::Endpoint;
@@ -23,6 +24,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let _ = ObservabilityRecorder::install_stderr_global();
     let observability = ObservabilityRecorder::global();
     let env = FrontlineEnvConfig::from_env()?;
+    let tls_certificates = env
+        .load_tls_certificate_store()?
+        .unwrap_or_else(TlsCertificateStore::new);
     let channel = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?
         .connect()
         .await?;
@@ -60,7 +64,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    serve_http(env.listener(), runtime, shutdown).await?;
+    serve_frontline(
+        env.listeners(),
+        runtime,
+        FrontlineTlsAdapter::new(tls_certificates),
+        shutdown,
+    )
+    .await?;
 
     Ok(())
 }
