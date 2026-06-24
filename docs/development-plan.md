@@ -933,6 +933,14 @@ Sub-phases:
 - 9G: Hardening audit gaps: materializer readiness/failure route publication,
   restart/reconnect/retry gates, runtime metrics/log assertions, production
   image startup/connectivity checks, load budgets, and full wake/sleep soak.
+- 9Y: Forwarded-header trust policy for frontline HTTP, TLS termination, and
+  WebSocket forwarding.
+
+Phase evidence:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 9Y: Frontline forwarded-header trust policy. | `proxy-core` helper tests cover stripping spoofed `Forwarded`/`X-Forwarded-*` headers and setting canonical `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`; `frontline/src/listener/tests.rs` covers HTTP, TLS termination with `https`, and WebSocket upstream handshakes; `sidecar/src/tests.rs` proves sidecar HTTP preserves existing forwarded headers. TLS/SNI passthrough remains byte-transparent and cannot mutate encrypted HTTP headers. Future extension: trusted-proxy CIDRs and append-to-chain behavior. |
 
 Done when:
 

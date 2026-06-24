@@ -19,8 +19,9 @@ use tokio::{
 use crate::{
     is_http01_challenge_candidate_path,
     runtime::{resolve_http01_response, resolve_http_route, route_outcome_or_forward_response},
-    FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteOutcome,
-    FrontlineTlsAdapter, Http01ChallengeResolver, RouteSubscriptionClient, WakeClient,
+    FrontlineForwardContext, FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator,
+    FrontlineRouteOutcome, FrontlineTlsAdapter, Http01ChallengeResolver, RouteSubscriptionClient,
+    WakeClient,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,7 +309,7 @@ where
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer_addr) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
                         exit_error = Some(FrontlineHttpListenerError::Accept(error));
@@ -317,9 +318,11 @@ where
                 };
                 let runtime = shared.clone();
                 let connection_shutdown = shutdown.clone();
+                let forwarding_context = FrontlineForwardContext::http(peer_addr.ip());
 
                 connections.spawn(async move {
-                    serve_http_connection(stream, runtime, connection_shutdown).await;
+                    serve_http_connection(stream, runtime, connection_shutdown, forwarding_context)
+                        .await;
                 });
             }
         }
@@ -370,7 +373,7 @@ where
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer_addr) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
                         exit_error = Some(FrontlineListenerError::Accept {
@@ -383,6 +386,7 @@ where
                 let runtime = shared.clone();
                 let tls_adapter = tls_adapter.clone();
                 let connection_shutdown = shutdown.clone();
+                let forwarding_context = FrontlineForwardContext::https(peer_addr.ip());
 
                 connections.spawn(async move {
                     let terminated = match tls_adapter.terminate(stream).await {
@@ -390,7 +394,13 @@ where
                         Err(_error) => return,
                     };
 
-                    serve_http_connection(terminated.stream, runtime, connection_shutdown).await;
+                    serve_http_connection(
+                        terminated.stream,
+                        runtime,
+                        connection_shutdown,
+                        forwarding_context,
+                    )
+                    .await;
                 });
             }
         }
@@ -467,6 +477,7 @@ async fn serve_http_connection<RouteClient, Wake, Http01, IO>(
     stream: IO,
     runtime: SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>,
     shutdown: Shutdown,
+    forwarding_context: FrontlineForwardContext,
 ) where
     RouteClient: RouteSubscriptionClient + Send + 'static,
     RouteClient::Error: Send,
@@ -478,7 +489,7 @@ async fn serve_http_connection<RouteClient, Wake, Http01, IO>(
 {
     let service = service_fn(move |request| {
         let runtime = runtime.clone();
-        async move { Ok::<_, Infallible>(runtime.handle(request).await) }
+        async move { Ok::<_, Infallible>(runtime.handle(request, forwarding_context).await) }
     });
     let builder = auto::Builder::new(TokioExecutor::new());
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
@@ -525,6 +536,7 @@ where
     async fn handle(
         &self,
         request: http::Request<Incoming>,
+        forwarding_context: FrontlineForwardContext,
     ) -> http::Response<crate::FrontlineRuntimeBody> {
         if is_http01_challenge_candidate_path(request.uri().path()) {
             let http01_response = {
@@ -539,7 +551,7 @@ where
         }
 
         if is_websocket_upgrade_candidate(&request) {
-            return self.handle_websocket(request).await;
+            return self.handle_websocket(request, forwarding_context).await;
         }
 
         let outcome = {
@@ -549,7 +561,13 @@ where
 
         match outcome {
             Ok(outcome) => {
-                route_outcome_or_forward_response(&self.forwarder, outcome, request).await
+                route_outcome_or_forward_response(
+                    &self.forwarder,
+                    outcome,
+                    request,
+                    Some(forwarding_context),
+                )
+                .await
             }
             Err(error) => crate::runtime::route_resolution_error_response(error),
         }
@@ -582,6 +600,8 @@ where
             Err(_error) => return,
         };
 
+        // TLS passthrough forwards encrypted bytes after ClientHello routing; HTTP
+        // headers are opaque here and cannot be mutated.
         let _ = tls_adapter
             .passthrough_prefixed(&ready, stream, client_hello)
             .await;
@@ -590,6 +610,7 @@ where
     async fn handle_websocket(
         &self,
         mut request: http::Request<Incoming>,
+        forwarding_context: FrontlineForwardContext,
     ) -> http::Response<crate::FrontlineRuntimeBody> {
         let switching_protocols = match websocket_upgrade_response(&request, empty_body()) {
             Ok(response) => response,
@@ -608,6 +629,7 @@ where
                     .path_and_query()
                     .map(|value| value.as_str().to_owned())
                     .unwrap_or_else(|| "/".to_owned());
+                let upstream_headers = forwarding_context.headers_for_request(&mut request);
                 let upgraded = hyper::upgrade::on(&mut request);
                 let forwarder = self.forwarder.clone();
 
@@ -618,7 +640,12 @@ where
                         return;
                     };
                     let _ = forwarder
-                        .forward_accepted_websocket(&ready, TokioIo::new(upgraded), &path_and_query)
+                        .forward_accepted_websocket_with_headers(
+                            &ready,
+                            TokioIo::new(upgraded),
+                            &path_and_query,
+                            &upstream_headers,
+                        )
                         .await;
                 });
 

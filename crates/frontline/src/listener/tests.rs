@@ -316,6 +316,54 @@ async fn listener_forwards_http_request_through_ready_route() {
 }
 
 #[tokio::test]
+async fn listener_applies_forwarded_header_trust_policy_to_http_upstream() {
+    let (upstream_addr, upstream_task) =
+        spawn_forwarded_header_asserting_http_upstream("http").await;
+    let route_client = FakeRouteClient::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-forwarded-http"),
+            http_identity("app.example.com", "/forwarded"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{upstream_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let client = Client::builder(TokioExecutor::new()).build_http();
+
+    let response = client
+        .request(
+            Request::builder()
+                .uri(format!("http://{addr}/forwarded"))
+                .header("host", "app.example.com")
+                .header("forwarded", "for=198.51.100.10;proto=https")
+                .header("x-forwarded-for", "198.51.100.11")
+                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-host", "spoof.example.com")
+                .header("x-forwarded-prefix", "/spoofed")
+                .body(Full::new(Bytes::new()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("listener request succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("listener task joins")
+        .expect("listener exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
 async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::CREATED, READY_RESPONSE).await;
@@ -372,6 +420,75 @@ async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
         response.ends_with("ready-from-listener-upstream"),
         "{response}"
     );
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("frontline task joins")
+        .expect("frontline exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
+async fn tls_termination_applies_forwarded_header_trust_policy_to_http_upstream() {
+    let (upstream_addr, upstream_task) =
+        spawn_forwarded_header_asserting_http_upstream("https").await;
+    let route_client = FakeRouteClient::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-forwarded-tls"),
+            http_identity("app.example.com", "/secure-forwarded"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{upstream_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let http_addr = reserve_addr().await;
+    let tls_addr = reserve_addr().await;
+    let cert = test_cert("app.example.com");
+    let client_config = client_config_trusting(cert.cert.clone());
+    let store = TlsCertificateStore::new();
+    store
+        .upsert("app.example.com", vec![cert.cert], cert.key)
+        .expect("cert inserts");
+    let shutdown = Shutdown::new();
+    let runtime = runtime_with_state(
+        state,
+        route_client.clone(),
+        DrainTracker::new(Duration::from_secs(5)),
+    );
+    let config = FrontlineListenersConfig::new(FrontlineHttpListenerConfig::new(http_addr))
+        .with_tls_termination(Some(FrontlineTlsTerminationListenerConfig::new(tls_addr)));
+    let task = tokio::spawn(serve_frontline(
+        config,
+        runtime,
+        FrontlineTlsAdapter::new(store),
+        shutdown.clone(),
+    ));
+
+    let response = raw_https_request_with_headers(
+        tls_addr,
+        "app.example.com",
+        "app.example.com",
+        "/secure-forwarded",
+        TLS_REQUEST_BODY,
+        client_config,
+        &[
+            ("Forwarded", "for=198.51.100.10;proto=http"),
+            ("X-Forwarded-For", "198.51.100.11"),
+            ("X-Forwarded-Proto", "http"),
+            ("X-Forwarded-Host", "spoof.example.com"),
+            ("X-Forwarded-Prefix", "/spoofed"),
+        ],
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(route_client.calls().is_empty());
 
     shutdown.shutdown();
@@ -634,6 +751,7 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
                         .as_str(),
                     "/socket?room=blue"
                 );
+                assert_frontline_forwarded_headers(request.headers(), "http", "ws.example.com");
                 path_seen_tx
                     .take()
                     .expect("path signal unused")
@@ -684,6 +802,30 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
     request
         .headers_mut()
         .insert("host", "ws.example.com".parse().expect("host header"));
+    request.headers_mut().insert(
+        "forwarded",
+        "for=198.51.100.10;proto=https"
+            .parse()
+            .expect("forwarded header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-for",
+        "198.51.100.11".parse().expect("x-forwarded-for header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-proto",
+        "https".parse().expect("x-forwarded-proto header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-host",
+        "spoof.example.com"
+            .parse()
+            .expect("x-forwarded-host header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-prefix",
+        "/spoofed".parse().expect("x-forwarded-prefix header"),
+    );
 
     let (mut client, response) = connect_async(request)
         .await
@@ -1079,6 +1221,18 @@ async fn raw_https_request(
     body: &[u8],
     config: ClientConfig,
 ) -> String {
+    raw_https_request_with_headers(addr, server_name, host, path, body, config, &[]).await
+}
+
+async fn raw_https_request_with_headers(
+    addr: SocketAddr,
+    server_name: &'static str,
+    host: &str,
+    path: &str,
+    body: &[u8],
+    config: ClientConfig,
+    extra_headers: &[(&str, &str)],
+) -> String {
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(server_name)
         .expect("server name")
@@ -1089,11 +1243,18 @@ async fn raw_https_request(
         .await
         .expect("tls client connects");
 
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+    let mut request = format!("POST {path} HTTP/1.1\r\nHost: {host}\r\n");
+    for (name, value) in extra_headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str(&format!(
+        "Connection: close\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         std::str::from_utf8(body).expect("request body is utf8")
-    );
+    ));
     tls.write_all(request.as_bytes())
         .await
         .expect("client writes request");
@@ -1191,6 +1352,71 @@ async fn spawn_http_upstream(
     });
 
     (addr, task)
+}
+
+async fn spawn_forwarded_header_asserting_http_upstream(
+    expected_proto: &'static str,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream binds");
+    let addr = listener.local_addr().expect("upstream addr");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("upstream accepts");
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |mut request: Request<Incoming>| async move {
+                    assert_frontline_forwarded_headers(
+                        request.headers(),
+                        expected_proto,
+                        "app.example.com",
+                    );
+                    let _ = request
+                        .body_mut()
+                        .collect()
+                        .await
+                        .expect("request body reads");
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from_static(READY_RESPONSE)))
+                            .expect("response builds"),
+                    )
+                }),
+            )
+            .await
+            .expect("upstream serves");
+    });
+
+    (addr, task)
+}
+
+fn assert_frontline_forwarded_headers(
+    headers: &HeaderMap,
+    expected_proto: &str,
+    expected_host: &str,
+) {
+    assert!(headers.get("forwarded").is_none());
+    assert_eq!(
+        headers
+            .get("x-forwarded-for")
+            .expect("canonical x-forwarded-for"),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        headers
+            .get("x-forwarded-proto")
+            .expect("canonical x-forwarded-proto"),
+        expected_proto
+    );
+    assert_eq!(
+        headers
+            .get("x-forwarded-host")
+            .expect("canonical x-forwarded-host"),
+        expected_host
+    );
+    assert!(headers.get("x-forwarded-prefix").is_none());
 }
 
 async fn spawn_h2c_grpc_upstream() -> (SocketAddr, JoinHandle<()>) {

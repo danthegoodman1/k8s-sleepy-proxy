@@ -11,8 +11,10 @@ use tokio::{
     time::timeout,
 };
 use tokio_tungstenite::{
-    accept_async, connect_async,
+    accept_async, accept_hdr_async, connect_async,
     tungstenite::{
+        client::IntoClientRequest,
+        handshake::server::{Request as WsRequest, Response as WsResponse},
         protocol::{CloseFrame, Role},
         Bytes as WsBytes, Error as TungsteniteError, Message,
     },
@@ -167,6 +169,145 @@ async fn websocket_proxy_preserves_bidirectional_messages_client_close_and_lifec
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
     assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test]
+async fn websocket_proxy_preserves_forwarded_headers_in_upstream_handshake() {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream listener has address");
+    let upstream_url = format!("ws://{upstream_addr}");
+
+    let (headers_seen_tx, headers_seen_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream_listener
+            .accept()
+            .await
+            .expect("upstream accepts proxy connection");
+        let mut headers_seen_tx = Some(headers_seen_tx);
+        let mut websocket =
+            accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("forwarded")
+                        .expect("forwarded header"),
+                    "for=203.0.113.10;proto=https"
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-forwarded-for")
+                        .expect("x-forwarded-for header"),
+                    "203.0.113.11"
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-forwarded-proto")
+                        .expect("x-forwarded-proto header"),
+                    "https"
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-forwarded-host")
+                        .expect("x-forwarded-host header"),
+                    "edge.example.com"
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-forwarded-prefix")
+                        .expect("x-forwarded-prefix header"),
+                    "/edge"
+                );
+                headers_seen_tx
+                    .take()
+                    .expect("headers signal unused")
+                    .send(())
+                    .expect("test waits for headers");
+                Ok(response)
+            })
+            .await
+            .expect("upstream accepts websocket");
+
+        let close = websocket
+            .next()
+            .await
+            .expect("upstream receives close")
+            .expect("close frame valid");
+        assert!(matches!(close, Message::Close(Some(_))));
+        websocket.flush().await.expect("upstream flushes close");
+    });
+
+    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("proxy listener binds");
+    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
+    let proxy = WebSocketProxy::new(DrainTracker::new(Duration::from_secs(5)));
+
+    let proxy_task = tokio::spawn(async move {
+        let (stream, _) = proxy_listener
+            .accept()
+            .await
+            .expect("proxy accepts client connection");
+
+        proxy.accept_and_proxy(stream, &upstream_url).await
+    });
+
+    let mut request = format!("ws://{proxy_addr}")
+        .into_client_request()
+        .expect("client request builds");
+    request.headers_mut().insert(
+        "forwarded",
+        "for=203.0.113.10;proto=https"
+            .parse()
+            .expect("forwarded header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-for",
+        "203.0.113.11".parse().expect("x-forwarded-for header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-proto",
+        "https".parse().expect("x-forwarded-proto header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-host",
+        "edge.example.com".parse().expect("x-forwarded-host header"),
+    );
+    request.headers_mut().insert(
+        "x-forwarded-prefix",
+        "/edge".parse().expect("x-forwarded-prefix header"),
+    );
+    let (mut client, _) = connect_async(request)
+        .await
+        .expect("client connects to proxy websocket");
+
+    headers_seen_rx.await.expect("upstream saw headers");
+    client
+        .send(Message::Close(Some(CloseFrame {
+            code: 1000.into(),
+            reason: "done".into(),
+        })))
+        .await
+        .expect("client sends close");
+    let close_response = client
+        .next()
+        .await
+        .expect("client receives close response")
+        .expect("close response is valid");
+    assert!(matches!(close_response, Message::Close(Some(frame)) if frame.reason == "done"));
+
+    proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect("proxy completed successfully");
+    upstream_task.await.expect("upstream task completed");
 }
 
 #[tokio::test]

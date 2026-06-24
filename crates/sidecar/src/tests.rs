@@ -112,6 +112,41 @@ async fn http_forwarding_preserves_request_response_and_releases_active_count() 
                             .expect("normal header is preserved"),
                         "yes"
                     );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("forwarded")
+                            .expect("forwarded header is preserved"),
+                        "for=203.0.113.10;proto=https"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-forwarded-for")
+                            .expect("x-forwarded-for is preserved"),
+                        "203.0.113.11"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-forwarded-proto")
+                            .expect("x-forwarded-proto is preserved"),
+                        "https"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-forwarded-host")
+                            .expect("x-forwarded-host is preserved"),
+                        "edge.example.com"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("x-forwarded-prefix")
+                            .expect("x-forwarded-prefix is preserved"),
+                        "/edge"
+                    );
                     assert!(request.headers().get("connection").is_none());
                     assert!(request.headers().get("x-remove").is_none());
 
@@ -141,6 +176,11 @@ async fn http_forwarding_preserves_request_response_and_releases_active_count() 
         .method("PATCH")
         .uri("/v1/workload?preserve=true")
         .header("x-preserve", "yes")
+        .header("forwarded", "for=203.0.113.10;proto=https")
+        .header("x-forwarded-for", "203.0.113.11")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "edge.example.com")
+        .header("x-forwarded-prefix", "/edge")
         .header("connection", "x-remove")
         .header("x-remove", "drop")
         .body(Full::new(Bytes::from_static(HTTP_REQUEST_BODY)))

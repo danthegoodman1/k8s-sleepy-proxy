@@ -38,8 +38,8 @@ pub use control_plane_transport::{
     GrpcProxyControlPlaneError,
 };
 pub use forward::{
-    http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardError,
-    FrontlineForwarder,
+    http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardContext,
+    FrontlineForwardError, FrontlineForwarder,
 };
 pub use http01::{
     http01_challenge_key, http01_challenge_token, intercept_http01_challenge,

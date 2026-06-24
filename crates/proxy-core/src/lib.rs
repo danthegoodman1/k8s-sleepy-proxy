@@ -15,7 +15,8 @@ pub use accounting::{ActiveConnection, ActiveConnectionCounter};
 pub use admission::{AdmissionError, AdmissionLimiter, AdmissionPermit};
 pub use drain::{DrainError, DrainPermit, DrainTracker};
 pub use http::{
-    prepare_reverse_proxy_request, strip_hop_by_hop_headers, upstream_request_uri, HttpProxy,
+    apply_forwarded_header_policy, forwarded_headers, prepare_reverse_proxy_request,
+    strip_forwarded_headers, strip_hop_by_hop_headers, upstream_request_uri, HttpProxy,
     HttpProxyError, ReverseProxyRequestError, TrackedBody,
 };
 pub use shutdown::Shutdown;

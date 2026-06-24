@@ -14,7 +14,7 @@ use proxy_core::observability::{
 use proxy_core::DrainTracker;
 
 use crate::{
-    intercept_http01_challenge, FrontlineForwardError, FrontlineForwarder,
+    intercept_http01_challenge, FrontlineForwardContext, FrontlineForwardError, FrontlineForwarder,
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
     Http01ChallengeResolver, Http01InterceptDecision, Http01InterceptError,
     NoopHttp01ChallengeResolver, ReadyBackend, RequestIdentityError, RouteRequestIdentity,
@@ -129,6 +129,20 @@ where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<BoxError>,
     {
+        self.handle_http_with_forwarding_context(request, now, None)
+            .await
+    }
+
+    pub async fn handle_http_with_forwarding_context<B>(
+        &mut self,
+        request: Request<B>,
+        now: Instant,
+        forwarding_context: Option<FrontlineForwardContext>,
+    ) -> Response<FrontlineRuntimeBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<BoxError>,
+    {
         match resolve_http01_response(&mut self.http01_resolver, &request).await {
             Ok(Some(response)) => {
                 record_http01_response(&self.observability, response.status());
@@ -146,7 +160,8 @@ where
             Err(error) => return route_resolution_error_response(error),
         };
 
-        route_outcome_or_forward_response(&self.forwarder, outcome, request).await
+        route_outcome_or_forward_response(&self.forwarder, outcome, request, forwarding_context)
+            .await
     }
 }
 
@@ -230,6 +245,7 @@ pub(crate) async fn route_outcome_or_forward_response<B>(
     forwarder: &FrontlineForwarder,
     outcome: FrontlineRouteOutcome,
     request: Request<B>,
+    forwarding_context: Option<FrontlineForwardContext>,
 ) -> Response<FrontlineRuntimeBody>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -237,7 +253,7 @@ where
 {
     match outcome {
         FrontlineRouteOutcome::Ready(ready) => {
-            forward_ready_response(forwarder, ready, request).await
+            forward_ready_response(forwarder, ready, request, forwarding_context).await
         }
         outcome => route_outcome_response(outcome),
     }
@@ -272,12 +288,22 @@ async fn forward_ready_response<B>(
     forwarder: &FrontlineForwarder,
     ready: ReadyBackend,
     request: Request<B>,
+    forwarding_context: Option<FrontlineForwardContext>,
 ) -> Response<FrontlineRuntimeBody>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<BoxError>,
 {
-    match forwarder.forward_http(&ready, request).await {
+    let forwarded = match forwarding_context {
+        Some(context) => {
+            forwarder
+                .forward_http_with_context(&ready, request, context)
+                .await
+        }
+        None => forwarder.forward_http(&ready, request).await,
+    };
+
+    match forwarded {
         Ok(response) => response.map(box_runtime_body),
         Err(error) => forward_error_response(error),
     }

@@ -1,15 +1,15 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, net::IpAddr};
 
 use bytes::Bytes;
 use http::{
     uri::{InvalidUri, InvalidUriParts, PathAndQuery},
-    Request, Response, Uri,
+    HeaderMap, Request, Response, Uri,
 };
 use http_body::Body;
 use hyper::body::Incoming;
 use proxy_core::{
-    DrainTracker, HttpProxy, HttpProxyError, TrackedBody, WebSocketProxy, WebSocketProxyError,
-    WebSocketProxyStats,
+    apply_forwarded_header_policy, forwarded_headers, DrainTracker, HttpProxy, HttpProxyError,
+    TrackedBody, WebSocketProxy, WebSocketProxyError, WebSocketProxyStats,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -21,6 +21,18 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub struct FrontlineForwarder {
     http: HttpProxy,
     websocket: WebSocketProxy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontlineForwardContext {
+    peer_ip: IpAddr,
+    proto: ForwardedProto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardedProto {
+    Http,
+    Https,
 }
 
 #[derive(Debug)]
@@ -65,6 +77,20 @@ impl FrontlineForwarder {
             .map_err(FrontlineForwardError::Http)
     }
 
+    pub async fn forward_http_with_context<B>(
+        &self,
+        ready: &ReadyBackend,
+        mut request: Request<B>,
+        context: FrontlineForwardContext,
+    ) -> Result<Response<TrackedBody<Incoming>>, FrontlineForwardError>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<BoxError>,
+    {
+        context.apply_to_request(&mut request);
+        self.forward_http(ready, request).await
+    }
+
     pub async fn forward_websocket<Client>(
         &self,
         ready: &ReadyBackend,
@@ -95,6 +121,57 @@ impl FrontlineForwarder {
             .proxy_accepted_upgrade(client, &upstream_url)
             .await
             .map_err(FrontlineForwardError::WebSocket)
+    }
+
+    pub async fn forward_accepted_websocket_with_headers<Client>(
+        &self,
+        ready: &ReadyBackend,
+        client: Client,
+        upstream_path_and_query: &str,
+        upstream_headers: &HeaderMap,
+    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
+        self.websocket
+            .proxy_accepted_upgrade_with_upstream_headers(client, &upstream_url, upstream_headers)
+            .await
+            .map_err(FrontlineForwardError::WebSocket)
+    }
+}
+
+impl FrontlineForwardContext {
+    pub fn http(peer_ip: IpAddr) -> Self {
+        Self {
+            peer_ip,
+            proto: ForwardedProto::Http,
+        }
+    }
+
+    pub fn https(peer_ip: IpAddr) -> Self {
+        Self {
+            peer_ip,
+            proto: ForwardedProto::Https,
+        }
+    }
+
+    pub fn apply_to_request<B>(&self, request: &mut Request<B>) {
+        apply_forwarded_header_policy(request, self.peer_ip, self.proto.as_str());
+    }
+
+    pub fn headers_for_request<B>(&self, request: &mut Request<B>) -> HeaderMap {
+        self.apply_to_request(request);
+        forwarded_headers(request.headers())
+    }
+}
+
+impl ForwardedProto {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
     }
 }
 

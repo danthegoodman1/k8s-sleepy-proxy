@@ -1,13 +1,16 @@
 use std::{
     error::Error,
     fmt,
+    net::IpAddr,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use http::{
-    header::CONNECTION, uri::InvalidUriParts, HeaderMap, HeaderName, Request, Response, Uri,
+    header::{CONNECTION, HOST},
+    uri::InvalidUriParts,
+    HeaderMap, HeaderName, HeaderValue, Request, Response, Uri,
 };
 use http_body::{Body, Frame, SizeHint};
 use hyper::body::Incoming;
@@ -85,6 +88,48 @@ pub fn prepare_reverse_proxy_request<B>(
     Ok(request)
 }
 
+pub fn apply_forwarded_header_policy<B>(request: &mut Request<B>, peer_ip: IpAddr, proto: &str) {
+    let original_host = request.headers().get(HOST).cloned();
+    strip_forwarded_headers(request.headers_mut());
+
+    request.headers_mut().insert(
+        HeaderName::from_static("x-forwarded-for"),
+        HeaderValue::from_str(&peer_ip.to_string()).expect("IP address is a valid header value"),
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_str(proto).expect("forwarded proto is a valid header value"),
+    );
+
+    if let Some(original_host) = original_host {
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("x-forwarded-host"), original_host);
+    }
+}
+
+pub fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if is_forwarded_header_name(name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
+}
+
+pub fn strip_forwarded_headers(headers: &mut HeaderMap) {
+    let forwarded_names: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| is_forwarded_header_name(name))
+        .cloned()
+        .collect();
+
+    for name in forwarded_names {
+        headers.remove(name);
+    }
+}
+
 pub fn upstream_request_uri(
     upstream_origin: &Uri,
     original_uri: &Uri,
@@ -143,6 +188,15 @@ fn connection_header_tokens(headers: &HeaderMap) -> Vec<HeaderName> {
             HeaderName::from_bytes(token.as_bytes()).ok()
         })
         .collect()
+}
+
+fn is_forwarded_header_name(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name.eq_ignore_ascii_case("forwarded")
+        || name
+            .get(..12)
+            .map(|prefix| prefix.eq_ignore_ascii_case("x-forwarded-"))
+            .unwrap_or(false)
 }
 
 pin_project! {
@@ -256,11 +310,13 @@ impl Error for ReverseProxyRequestError {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::IpAddr, str::FromStr};
+
     use http::{Method, Request};
 
     use super::{
-        prepare_reverse_proxy_request, strip_hop_by_hop_headers, upstream_request_uri,
-        ReverseProxyRequestError,
+        apply_forwarded_header_policy, prepare_reverse_proxy_request, strip_hop_by_hop_headers,
+        upstream_request_uri, ReverseProxyRequestError,
     };
 
     #[test]
@@ -343,5 +399,57 @@ mod tests {
         assert!(request.headers().get("x-drop-two").is_none());
         assert!(request.headers().get("transfer-encoding").is_none());
         assert_eq!(request.headers().get("x-keep").expect("kept"), "yes");
+    }
+
+    #[test]
+    fn forwarded_header_policy_replaces_spoofable_edge_headers() {
+        let mut request = Request::builder()
+            .uri("/")
+            .header("host", "app.example.test")
+            .header("forwarded", "for=198.51.100.1;proto=https")
+            .header("x-forwarded-for", "198.51.100.2")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "spoof.example.test")
+            .header("x-forwarded-prefix", "/spoofed")
+            .header("x-real-ip", "198.51.100.3")
+            .body(())
+            .expect("request builds");
+
+        apply_forwarded_header_policy(
+            &mut request,
+            IpAddr::from_str("203.0.113.10").expect("peer IP parses"),
+            "http",
+        );
+
+        assert!(request.headers().get("forwarded").is_none());
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .expect("canonical x-forwarded-for"),
+            "203.0.113.10"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-proto")
+                .expect("canonical x-forwarded-proto"),
+            "http"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-host")
+                .expect("canonical x-forwarded-host"),
+            "app.example.test"
+        );
+        assert!(request.headers().get("x-forwarded-prefix").is_none());
+        assert_eq!(
+            request
+                .headers()
+                .get("x-real-ip")
+                .expect("normal header kept"),
+            "198.51.100.3"
+        );
     }
 }

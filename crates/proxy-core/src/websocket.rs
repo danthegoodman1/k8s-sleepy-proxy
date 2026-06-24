@@ -1,16 +1,26 @@
 use std::{error::Error, fmt};
 
 use futures_util::{SinkExt, StreamExt};
-use http::{Request, Response};
+use http::{HeaderMap, Request as HttpRequest, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
-    accept_async, connect_async,
-    tungstenite::{handshake::server::create_response_with_body, protocol::Role},
+    accept_hdr_async, connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        handshake::{
+            client::Request as WsClientRequest,
+            server::{create_response_with_body, Request as WsServerRequest},
+        },
+        protocol::Role,
+    },
     tungstenite::{Error as TungsteniteError, Message},
     WebSocketStream,
 };
 
-use crate::drain::{DrainError, DrainTracker};
+use crate::{
+    drain::{DrainError, DrainTracker},
+    http::forwarded_headers,
+};
 
 #[derive(Clone, Debug)]
 pub struct WebSocketProxy {
@@ -51,10 +61,16 @@ impl WebSocketProxy {
         Client: AsyncRead + AsyncWrite + Unpin,
     {
         let _permit = self.drain.try_acquire()?;
-        let client = accept_async(client)
-            .await
-            .map_err(WebSocketProxyError::ClientHandshake)?;
-        let (upstream, _) = connect_async(upstream_url)
+        let mut upstream_headers = HeaderMap::new();
+        let client = accept_hdr_async(client, |request: &WsServerRequest, response| {
+            upstream_headers = forwarded_headers(request.headers());
+            Ok(response)
+        })
+        .await
+        .map_err(WebSocketProxyError::ClientHandshake)?;
+        let upstream_request = upstream_websocket_request(upstream_url, &upstream_headers)
+            .map_err(WebSocketProxyError::UpstreamConnect)?;
+        let (upstream, _) = connect_async(upstream_request)
             .await
             .map_err(WebSocketProxyError::UpstreamConnect)?;
 
@@ -81,13 +97,46 @@ impl WebSocketProxy {
             .await
             .map_err(WebSocketProxyError::Proxy)
     }
+
+    pub async fn proxy_accepted_upgrade_with_upstream_headers<Client>(
+        &self,
+        client: Client,
+        upstream_url: &str,
+        upstream_headers: &HeaderMap,
+    ) -> Result<WebSocketProxyStats, WebSocketProxyError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        let _permit = self.drain.try_acquire()?;
+        let client = WebSocketStream::from_raw_socket(client, Role::Server, None).await;
+        let upstream_request = upstream_websocket_request(upstream_url, upstream_headers)
+            .map_err(WebSocketProxyError::UpstreamConnect)?;
+        let (upstream, _) = connect_async(upstream_request)
+            .await
+            .map_err(WebSocketProxyError::UpstreamConnect)?;
+
+        proxy_websocket_streams(client, upstream)
+            .await
+            .map_err(WebSocketProxyError::Proxy)
+    }
 }
 
 pub fn websocket_upgrade_response<B, R>(
-    request: &Request<B>,
+    request: &HttpRequest<B>,
     body: R,
 ) -> Result<Response<R>, WebSocketProxyError> {
     create_response_with_body(request, || body).map_err(WebSocketProxyError::ClientHandshake)
+}
+
+fn upstream_websocket_request(
+    upstream_url: &str,
+    upstream_headers: &HeaderMap,
+) -> Result<WsClientRequest, TungsteniteError> {
+    let mut request = upstream_url.into_client_request()?;
+    for (name, value) in upstream_headers.iter() {
+        request.headers_mut().append(name.clone(), value.clone());
+    }
+    Ok(request)
 }
 
 pub async fn proxy_websocket_streams<Client, Upstream>(
