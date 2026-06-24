@@ -20,9 +20,10 @@ use control_plane::{
     },
     RouteHost,
 };
+use futures_util::{SinkExt, StreamExt};
 use http::{
-    header::CONTENT_TYPE, HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse,
-    StatusCode, Version,
+    header::{CONTENT_TYPE, HOST},
+    HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode, Version,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, client::conn::http2 as client_http2, service::service_fn};
@@ -30,11 +31,17 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
+use proxy_core::websocket_upgrade_response;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinSet,
     time::timeout,
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, protocol::Role, Bytes as WsBytes, Message},
+    WebSocketStream,
 };
 use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream, transport::Server, Request, Response, Status,
@@ -45,8 +52,13 @@ type BackendBody = BoxBody<Bytes, BoxError>;
 
 const BACKEND_BODY: &[u8] = b"frontline-load-smoke-ok\n";
 const GRPC_BODY: &[u8] = b"\0\0\0\0\x05hello";
+const WEBSOCKET_CLIENT_TEXT: &str = "frontline websocket text";
+const WEBSOCKET_BACKEND_TEXT: &str = "backend websocket text";
+const WEBSOCKET_CLIENT_BINARY: &[u8] = b"frontline websocket bytes";
+const WEBSOCKET_BACKEND_BINARY: &[u8] = b"backend websocket bytes";
 const DEFAULT_ROUTE_HOST: &str = "app.example.test";
 const DEFAULT_ROUTE_PATH: &str = "/smoke";
+const DEFAULT_COLD_ROUTE_PATH: &str = "/cold-smoke";
 const STATS_PATH: &str = "/__sleepypods_load_smoke_stats";
 const ROUTE_CACHE_TTL_MILLIS: u64 = 600_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,6 +92,7 @@ struct ServerConfig {
     backend_uri: String,
     route_host: String,
     route_path: String,
+    cold_route_path: String,
 }
 
 impl ServerConfig {
@@ -94,9 +107,12 @@ impl ServerConfig {
             .unwrap_or_else(|_| DEFAULT_ROUTE_HOST.to_owned());
         let route_path = env::var("SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH")
             .unwrap_or_else(|_| DEFAULT_ROUTE_PATH.to_owned());
+        let cold_route_path = env::var("SLEEPYPODS_LOAD_SMOKE_COLD_ROUTE_PATH")
+            .unwrap_or_else(|_| DEFAULT_COLD_ROUTE_PATH.to_owned());
 
         let route_host = canonical_route_host("SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST", &route_host)?;
         validate_route_path("SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH", &route_path)?;
+        validate_route_path("SLEEPYPODS_LOAD_SMOKE_COLD_ROUTE_PATH", &cold_route_path)?;
 
         Ok(Self {
             backend_addr,
@@ -104,6 +120,7 @@ impl ServerConfig {
             backend_uri,
             route_host,
             route_path,
+            cold_route_path,
         })
     }
 }
@@ -128,8 +145,8 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
         config.control_plane_addr
     );
     eprintln!(
-        "load-smoke route host={} path={} backend={}",
-        config.route_host, config.route_path, config.backend_uri
+        "load-smoke route host={} path={} cold_path={} backend={}",
+        config.route_host, config.route_path, config.cold_route_path, config.backend_uri
     );
 
     let backend = serve_backend(backend_listener, stats.clone());
@@ -137,6 +154,7 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
         .add_service(ProxyControlPlaneServer::new(FakeProxyControlPlane::new(
             config.route_host,
             config.route_path,
+            config.cold_route_path,
             config.backend_uri,
             stats,
         )))
@@ -161,7 +179,7 @@ async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), B
             });
 
             if let Err(error) = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), service)
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
                 .await
             {
                 eprintln!("load-smoke backend connection failed: {error}");
@@ -175,12 +193,18 @@ async fn backend_response<B>(
     stats: &SmokeStats,
 ) -> HttpResponse<BackendBody>
 where
-    B: http_body::Body<Data = Bytes>,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: fmt::Display,
 {
+    if is_websocket_upgrade_candidate(&request) {
+        return websocket_backend_response(request, stats);
+    }
+
     if request.uri().path() == STATS_PATH {
         return stats_response(stats);
     }
+
+    stats.record_backend_http_request();
 
     if request.headers().get(CONTENT_TYPE).is_some_and(|value| {
         value
@@ -246,9 +270,109 @@ fn bad_request_response(message: String) -> HttpResponse<BackendBody> {
         .expect("fixed load-smoke bad request response builds")
 }
 
+fn websocket_backend_response<B>(
+    mut request: HttpRequest<B>,
+    stats: &SmokeStats,
+) -> HttpResponse<BackendBody>
+where
+    B: Send + 'static,
+{
+    let response = match websocket_upgrade_response(&request, boxed_body(Bytes::new())) {
+        Ok(response) => response,
+        Err(_error) => return bad_request_response("invalid WebSocket upgrade".to_owned()),
+    };
+    let upgraded = hyper::upgrade::on(&mut request);
+    let stats = stats.clone();
+
+    tokio::spawn(async move {
+        let Ok(upgraded) = upgraded.await else {
+            return;
+        };
+        stats.record_backend_websocket_session();
+        if let Err(error) = serve_backend_websocket(
+            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await,
+        )
+        .await
+        {
+            eprintln!("load-smoke backend websocket failed: {error}");
+        }
+    });
+
+    response
+}
+
+async fn serve_backend_websocket<S>(mut websocket: WebSocketStream<S>) -> Result<(), BoxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let text = timeout(REQUEST_TIMEOUT, websocket.next())
+        .await
+        .map_err(|_| timeout_error("websocket read text"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing text frame"))??;
+    if text != Message::Text(WEBSOCKET_CLIENT_TEXT.into()) {
+        return Err(Box::new(
+            ResponseValidationError::UnexpectedWebSocketMessage(format!("{text:?}")),
+        ));
+    }
+
+    timeout(
+        REQUEST_TIMEOUT,
+        websocket.send(Message::Text(WEBSOCKET_BACKEND_TEXT.into())),
+    )
+    .await
+    .map_err(|_| timeout_error("websocket write text"))??;
+
+    let binary = timeout(REQUEST_TIMEOUT, websocket.next())
+        .await
+        .map_err(|_| timeout_error("websocket read binary"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing binary frame"))??;
+    if binary != Message::Binary(WsBytes::from_static(WEBSOCKET_CLIENT_BINARY)) {
+        return Err(Box::new(
+            ResponseValidationError::UnexpectedWebSocketMessage(format!("{binary:?}")),
+        ));
+    }
+
+    timeout(
+        REQUEST_TIMEOUT,
+        websocket.send(Message::Binary(WsBytes::from_static(
+            WEBSOCKET_BACKEND_BINARY,
+        ))),
+    )
+    .await
+    .map_err(|_| timeout_error("websocket write binary"))??;
+    timeout(REQUEST_TIMEOUT, websocket.close(None))
+        .await
+        .map_err(|_| timeout_error("websocket close"))??;
+
+    Ok(())
+}
+
+fn is_websocket_upgrade_candidate<B>(request: &HttpRequest<B>) -> bool {
+    request
+        .headers()
+        .get("connection")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        && request
+            .headers()
+            .get("upgrade")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+}
+
 fn stats_response(stats: &SmokeStats) -> HttpResponse<BackendBody> {
     let snapshot = stats.snapshot();
-    let body = format!("subscribe_route_calls={}\n", snapshot.subscribe_route_calls);
+    let body = format!(
+        "subscribe_route_calls={} wake_instance_calls={} backend_http_requests={} backend_websocket_sessions={}\n",
+        snapshot.subscribe_route_calls,
+        snapshot.wake_instance_calls,
+        snapshot.backend_http_requests,
+        snapshot.backend_websocket_sessions
+    );
 
     HttpResponse::builder()
         .status(StatusCode::OK)
@@ -266,11 +390,17 @@ fn boxed_body(bytes: Bytes) -> BackendBody {
 #[derive(Clone, Debug, Default)]
 struct SmokeStats {
     subscribe_route_calls: Arc<AtomicU64>,
+    wake_instance_calls: Arc<AtomicU64>,
+    backend_http_requests: Arc<AtomicU64>,
+    backend_websocket_sessions: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SmokeStatsSnapshot {
     subscribe_route_calls: u64,
+    wake_instance_calls: u64,
+    backend_http_requests: u64,
+    backend_websocket_sessions: u64,
 }
 
 impl SmokeStats {
@@ -278,9 +408,25 @@ impl SmokeStats {
         self.subscribe_route_calls.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_wake_instance(&self) {
+        self.wake_instance_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_backend_http_request(&self) {
+        self.backend_http_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_backend_websocket_session(&self) {
+        self.backend_websocket_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> SmokeStatsSnapshot {
         SmokeStatsSnapshot {
             subscribe_route_calls: self.subscribe_route_calls.load(Ordering::Relaxed),
+            wake_instance_calls: self.wake_instance_calls.load(Ordering::Relaxed),
+            backend_http_requests: self.backend_http_requests.load(Ordering::Relaxed),
+            backend_websocket_sessions: self.backend_websocket_sessions.load(Ordering::Relaxed),
         }
     }
 }
@@ -289,15 +435,23 @@ impl SmokeStats {
 struct FakeProxyControlPlane {
     route_host: Arc<str>,
     route_path: Arc<str>,
+    cold_route_path: Arc<str>,
     backend_uri: Arc<str>,
     stats: SmokeStats,
 }
 
 impl FakeProxyControlPlane {
-    fn new(route_host: String, route_path: String, backend_uri: String, stats: SmokeStats) -> Self {
+    fn new(
+        route_host: String,
+        route_path: String,
+        cold_route_path: String,
+        backend_uri: String,
+        stats: SmokeStats,
+    ) -> Self {
         Self {
             route_host: route_host.into(),
             route_path: route_path.into(),
+            cold_route_path: cold_route_path.into(),
             backend_uri: backend_uri.into(),
             stats,
         }
@@ -328,7 +482,13 @@ impl FakeProxyControlPlane {
             .identity
             .ok_or_else(|| Status::invalid_argument("identity is required"))?;
 
-        if self.route_matches(&request_identity) {
+        if self.cold_route_matches(&request_identity) {
+            Ok(self.resolved_response(
+                request_id,
+                self.cold_matched_identity(),
+                self.cold_route_entry(),
+            ))
+        } else if self.route_matches(&request_identity) {
             Ok(pb::ProxySubscribeResponse {
                 output: Some(pb::proxy_subscribe_response::Output::RouteResolved(
                     pb::ProxyRouteResolvedResponse {
@@ -356,6 +516,14 @@ impl FakeProxyControlPlane {
     }
 
     fn route_matches(&self, identity: &pb::RouteIdentity) -> bool {
+        self.http_identity_matches(identity, self.route_path.as_ref())
+    }
+
+    fn cold_route_matches(&self, identity: &pb::RouteIdentity) -> bool {
+        self.http_identity_matches(identity, self.cold_route_path.as_ref())
+    }
+
+    fn http_identity_matches(&self, identity: &pb::RouteIdentity, route_path: &str) -> bool {
         let Some(pb::route_identity::Kind::Http(identity)) = identity.kind.as_ref() else {
             return false;
         };
@@ -365,21 +533,47 @@ impl FakeProxyControlPlane {
 
         host.kind == pb::RouteHostKind::Exact as i32
             && host.host == self.route_host.as_ref()
-            && path_prefix_matches(
-                identity.path_prefix.as_deref().unwrap_or("/"),
-                self.route_path.as_ref(),
-            )
+            && path_prefix_matches(identity.path_prefix.as_deref().unwrap_or("/"), route_path)
     }
 
     fn matched_identity(&self) -> pb::RouteIdentity {
+        self.http_matched_identity(self.route_path.as_ref())
+    }
+
+    fn cold_matched_identity(&self) -> pb::RouteIdentity {
+        self.http_matched_identity(self.cold_route_path.as_ref())
+    }
+
+    fn http_matched_identity(&self, route_path: &str) -> pb::RouteIdentity {
         pb::RouteIdentity {
             kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
                 host: Some(pb::RouteHost {
                     kind: pb::RouteHostKind::Exact as i32,
                     host: self.route_host.to_string(),
                 }),
-                path_prefix: Some(self.route_path.to_string()),
+                path_prefix: Some(route_path.to_owned()),
             })),
+        }
+    }
+
+    fn resolved_response(
+        &self,
+        request_id: String,
+        matched_identity: pb::RouteIdentity,
+        route: pb::ProxyRouteEntry,
+    ) -> pb::ProxySubscribeResponse {
+        pb::ProxySubscribeResponse {
+            output: Some(pb::proxy_subscribe_response::Output::RouteResolved(
+                pb::ProxyRouteResolvedResponse {
+                    subscription_id: format!("frontline-load-smoke:{request_id}"),
+                    request_id,
+                    matched_identity: Some(matched_identity),
+                    route: Some(route),
+                    cache_policy: Some(pb::ProxyCachePolicy {
+                        ttl_millis: ROUTE_CACHE_TTL_MILLIS,
+                    }),
+                },
+            )),
         }
     }
 
@@ -393,6 +587,17 @@ impl FakeProxyControlPlane {
             backend_generation: Some(1),
         }
     }
+
+    fn cold_route_entry(&self) -> pb::ProxyRouteEntry {
+        pb::ProxyRouteEntry {
+            route_binding_id: "frontline-load-smoke-cold-route".to_owned(),
+            instance_id: "frontline-load-smoke-cold-instance".to_owned(),
+            instance_state: pb::InstanceState::Cold as i32,
+            instance_generation: 1,
+            backend_uri: None,
+            backend_generation: None,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -404,6 +609,7 @@ impl ProxyControlPlane for FakeProxyControlPlane {
         request: Request<pb::ProxyWakeInstanceRequest>,
     ) -> Result<Response<pb::ProxyWakeInstanceResponse>, Status> {
         let request = request.into_inner();
+        self.stats.record_wake_instance();
 
         Ok(Response::new(pb::ProxyWakeInstanceResponse {
             outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
@@ -540,6 +746,7 @@ impl ClientConfig {
 enum ClientProtocol {
     Http1,
     H2cGrpc,
+    WebSocket,
 }
 
 impl ClientProtocol {
@@ -547,8 +754,9 @@ impl ClientProtocol {
         match value {
             "http1" => Ok(Self::Http1),
             "h2c-grpc" => Ok(Self::H2cGrpc),
+            "websocket" => Ok(Self::WebSocket),
             _ => Err(InvalidArgs(format!(
-                "--protocol must be http1 or h2c-grpc, got {value:?}"
+                "--protocol must be http1, h2c-grpc, or websocket, got {value:?}"
             ))),
         }
     }
@@ -630,6 +838,9 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     ClientProtocol::H2cGrpc => {
                         send_h2c_grpc_request(&target, &host_header, request_id).await
                     }
+                    ClientProtocol::WebSocket => {
+                        send_websocket_request(&target, &host_header, request_id).await
+                    }
                 };
 
                 if let Err(error) = result {
@@ -689,6 +900,73 @@ async fn send_smoke_request(
         .map_err(|_| timeout_error("read response"))??;
 
     validate_response(&response)?;
+    Ok(())
+}
+
+async fn send_websocket_request(
+    target: &HttpTarget,
+    host_header: &str,
+    request_id: u64,
+) -> Result<(), BoxError> {
+    let mut request = format!(
+        "ws://{}{}",
+        target.authority(),
+        target.request_path(request_id)
+    )
+    .into_client_request()?;
+    request.headers_mut().insert(
+        HOST,
+        HeaderValue::from_str(host_header)
+            .map_err(|error| InvalidArgs(format!("--host must be a valid header: {error}")))?,
+    );
+
+    let (mut websocket, response) = timeout(REQUEST_TIMEOUT, connect_async(request))
+        .await
+        .map_err(|_| timeout_error("websocket connect"))??;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(Box::new(ResponseValidationError::UnexpectedStatus(
+            format!("websocket {}", response.status()),
+        )));
+    }
+
+    timeout(
+        REQUEST_TIMEOUT,
+        websocket.send(Message::Text(WEBSOCKET_CLIENT_TEXT.into())),
+    )
+    .await
+    .map_err(|_| timeout_error("websocket write text"))??;
+    let text = timeout(REQUEST_TIMEOUT, websocket.next())
+        .await
+        .map_err(|_| timeout_error("websocket read text"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing text frame"))??;
+    if text != Message::Text(WEBSOCKET_BACKEND_TEXT.into()) {
+        return Err(Box::new(
+            ResponseValidationError::UnexpectedWebSocketMessage(format!("{text:?}")),
+        ));
+    }
+
+    timeout(
+        REQUEST_TIMEOUT,
+        websocket.send(Message::Binary(WsBytes::from_static(
+            WEBSOCKET_CLIENT_BINARY,
+        ))),
+    )
+    .await
+    .map_err(|_| timeout_error("websocket write binary"))??;
+    let binary = timeout(REQUEST_TIMEOUT, websocket.next())
+        .await
+        .map_err(|_| timeout_error("websocket read binary"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing binary frame"))??;
+    if binary != Message::Binary(WsBytes::from_static(WEBSOCKET_BACKEND_BINARY)) {
+        return Err(Box::new(
+            ResponseValidationError::UnexpectedWebSocketMessage(format!("{binary:?}")),
+        ));
+    }
+
+    timeout(REQUEST_TIMEOUT, websocket.close(None))
+        .await
+        .map_err(|_| timeout_error("websocket close"))??;
+
     Ok(())
 }
 
@@ -902,6 +1180,7 @@ enum ResponseValidationError {
     UnexpectedStatus(String),
     UnexpectedHeader { name: &'static str, value: String },
     UnexpectedBody { len: usize },
+    UnexpectedWebSocketMessage(String),
     BodyRead(String),
 }
 
@@ -922,6 +1201,9 @@ impl fmt::Display for ResponseValidationError {
             }
             Self::UnexpectedBody { len } => {
                 write!(f, "unexpected HTTP response body length {len}")
+            }
+            Self::UnexpectedWebSocketMessage(message) => {
+                write!(f, "unexpected WebSocket message {message}")
             }
             Self::BodyRead(error) => write!(f, "failed to read HTTP response body: {error}"),
         }
@@ -1012,6 +1294,25 @@ mod tests {
     }
 
     #[test]
+    fn client_config_parses_websocket_protocol() {
+        let config = ClientConfig::from_args(
+            [
+                "--url",
+                "http://127.0.0.1:18080/",
+                "--host",
+                "app.example.test",
+                "--protocol",
+                "websocket",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("WebSocket client config parses");
+
+        assert_eq!(config.protocol, ClientProtocol::WebSocket);
+    }
+
+    #[test]
     fn path_prefix_matching_uses_route_boundaries() {
         assert!(path_prefix_matches("/smoke", "/smoke"));
         assert!(path_prefix_matches("/smoke/request", "/smoke"));
@@ -1023,6 +1324,7 @@ mod tests {
         let service = FakeProxyControlPlane::new(
             "app.example.test".to_owned(),
             "/smoke".to_owned(),
+            "/cold-smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
             SmokeStats::default(),
         );
@@ -1044,6 +1346,7 @@ mod tests {
         let service = FakeProxyControlPlane::new(
             "app.example.test".to_owned(),
             "/smoke".to_owned(),
+            "/cold-smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
             stats.clone(),
         );
@@ -1073,6 +1376,40 @@ mod tests {
         assert_eq!(stats.snapshot().subscribe_route_calls, 1);
     }
 
+    #[test]
+    fn fake_control_plane_returns_cold_route_for_cold_path() {
+        let service = FakeProxyControlPlane::new(
+            "app.example.test".to_owned(),
+            "/smoke".to_owned(),
+            "/cold-smoke".to_owned(),
+            "http://127.0.0.1:18080".to_owned(),
+            SmokeStats::default(),
+        );
+
+        let response = service
+            .subscribe_route_response(pb::ProxySubscribeRouteRequest {
+                request_id: "cold-request".to_owned(),
+                identity: Some(pb::RouteIdentity {
+                    kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                        host: Some(pb::RouteHost {
+                            kind: pb::RouteHostKind::Exact as i32,
+                            host: "app.example.test".to_owned(),
+                        }),
+                        path_prefix: Some("/cold-smoke".to_owned()),
+                    })),
+                }),
+            })
+            .expect("cold route resolves");
+
+        let Some(pb::proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output
+        else {
+            panic!("expected resolved route");
+        };
+        let route = resolved.route.expect("route is present");
+        assert_eq!(route.instance_state, pb::InstanceState::Cold as i32);
+        assert!(route.backend_uri.is_none());
+    }
+
     #[tokio::test]
     async fn backend_stats_endpoint_reports_subscribe_route_count() {
         let stats = SmokeStats::default();
@@ -1094,7 +1431,10 @@ mod tests {
             .expect("stats body reads")
             .to_bytes();
 
-        assert_eq!(body.as_ref(), b"subscribe_route_calls=2\n");
+        assert_eq!(
+            body.as_ref(),
+            b"subscribe_route_calls=2 wake_instance_calls=0 backend_http_requests=0 backend_websocket_sessions=0\n"
+        );
     }
 
     #[tokio::test]

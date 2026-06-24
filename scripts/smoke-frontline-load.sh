@@ -12,8 +12,12 @@ min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO:-0.10}"
 grpc_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS:-${requests}}"
 grpc_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY:-${concurrency}}"
 grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-${min_ratio}}"
+websocket_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS:-${requests}}"
+websocket_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY:-${concurrency}}"
+websocket_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO:-${min_ratio}}"
 route_host="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST:-app.example.test}"
 route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH:-/smoke}"
+cold_route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH:-/cold-smoke}"
 backend_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT:-18080}"
 frontline_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_PORT:-18081}"
 control_plane_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT:-19090}"
@@ -82,13 +86,17 @@ require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS "${requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY "${concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS "${grpc_requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY "${grpc_concurrency}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS "${websocket_requests}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY "${websocket_concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT "${backend_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_PORT "${frontline_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO "${grpc_min_ratio}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO "${websocket_min_ratio}"
 require_header_value SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST "${route_host}"
 require_route_path SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH "${route_path}"
+require_route_path SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH "${cold_route_path}"
 
 client_bin="${repo_root}/target/debug/examples/frontline_load_smoke"
 run_id="sleepypods-frontline-load-smoke-$(date +%s)-$$"
@@ -98,9 +106,12 @@ direct_output_file="$(mktemp)"
 frontline_output_file="$(mktemp)"
 grpc_direct_output_file="$(mktemp)"
 grpc_frontline_output_file="$(mktemp)"
+websocket_direct_output_file="$(mktemp)"
+websocket_frontline_output_file="$(mktemp)"
+cold_frontline_output_file="$(mktemp)"
 
 cleanup() {
-  rm -f "${direct_output_file}" "${frontline_output_file}" "${grpc_direct_output_file}" "${grpc_frontline_output_file}"
+  rm -f "${direct_output_file}" "${frontline_output_file}" "${grpc_direct_output_file}" "${grpc_frontline_output_file}" "${websocket_direct_output_file}" "${websocket_frontline_output_file}" "${cold_frontline_output_file}"
   docker rm -f "${frontline_name}" "${helper_name}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -240,8 +251,9 @@ extract_metric() {
   return 1
 }
 
-read_subscribe_route_calls() {
+read_helper_metric() {
   local url="$1"
+  local key="$2"
   local output
   local count
 
@@ -251,19 +263,31 @@ read_subscribe_route_calls() {
     exit 1
   fi
 
-  if ! count="$(extract_metric "${output}" subscribe_route_calls)"; then
-    echo "helper stats did not include subscribe_route_calls: ${output}" >&2
+  if ! count="$(extract_metric "${output}" "${key}")"; then
+    echo "helper stats did not include ${key}: ${output}" >&2
     dump_logs
     exit 1
   fi
 
   if [[ ! "${count}" =~ ^[0-9]+$ ]]; then
-    echo "helper subscribe_route_calls must be a non-negative integer, got ${count}" >&2
+    echo "helper ${key} must be a non-negative integer, got ${count}" >&2
     dump_logs
     exit 1
   fi
 
   echo "${count}"
+}
+
+read_subscribe_route_calls() {
+  read_helper_metric "$1" subscribe_route_calls
+}
+
+read_wake_instance_calls() {
+  read_helper_metric "$1" wake_instance_calls
+}
+
+read_backend_http_requests() {
+  read_helper_metric "$1" backend_http_requests
 }
 
 echo "Building local frontline load-smoke client"
@@ -297,12 +321,14 @@ docker run -d \
   --env "SLEEPYPODS_LOAD_SMOKE_BACKEND_URI=http://127.0.0.1:${backend_container_port}" \
   --env "SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST=${route_host}" \
   --env "SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH=${route_path}" \
+  --env "SLEEPYPODS_LOAD_SMOKE_COLD_ROUTE_PATH=${cold_route_path}" \
   "${helper_image}" >/dev/null
 
 direct_port="$(published_port "${helper_name}" "${backend_container_port}")"
 frontline_port="$(published_port "${helper_name}" "${frontline_container_port}")"
 direct_url="http://127.0.0.1:${direct_port}${route_path}"
 frontline_url="http://127.0.0.1:${frontline_port}${route_path}"
+cold_frontline_url="http://127.0.0.1:${frontline_port}${cold_route_path}"
 stats_url="http://127.0.0.1:${direct_port}/__sleepypods_load_smoke_stats"
 
 wait_for_url direct "${direct_url}" http1
@@ -372,3 +398,61 @@ grpc_frontline_rps="$(extract_metric "${grpc_frontline_result}" rps)"
 assert_ratio_at_least "h2c_grpc" "${grpc_direct_rps}" "${grpc_frontline_rps}" "${grpc_min_ratio}"
 
 echo "hot_cache_h2c_grpc_subscribe_route_calls=0 subscribe_route_calls_before=${grpc_subscribe_route_calls_before} subscribe_route_calls_after=${grpc_subscribe_route_calls_after}"
+
+echo "Warming WebSocket hot-cache route"
+wait_for_url frontline "${frontline_url}" websocket
+
+echo "Running direct-backend WebSocket smoke load"
+run_load direct-websocket "${direct_url}" "${websocket_direct_output_file}" "${websocket_requests}" "${websocket_concurrency}" websocket
+
+websocket_subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
+echo "SubscribeRoute calls before measured WebSocket frontline phase=${websocket_subscribe_route_calls_before}"
+
+echo "Running frontline WebSocket smoke load"
+run_load frontline-websocket "${frontline_url}" "${websocket_frontline_output_file}" "${websocket_requests}" "${websocket_concurrency}" websocket
+
+websocket_subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
+
+if [[ "${websocket_subscribe_route_calls_after}" != "${websocket_subscribe_route_calls_before}" ]]; then
+  echo "hot-cache WebSocket frontline load made additional SubscribeRoute calls: before=${websocket_subscribe_route_calls_before} after=${websocket_subscribe_route_calls_after}" >&2
+  dump_logs
+  exit 1
+fi
+
+websocket_direct_result="$(cat "${websocket_direct_output_file}")"
+websocket_frontline_result="$(cat "${websocket_frontline_output_file}")"
+websocket_direct_rps="$(extract_metric "${websocket_direct_result}" rps)"
+websocket_frontline_rps="$(extract_metric "${websocket_frontline_result}" rps)"
+assert_ratio_at_least "websocket" "${websocket_direct_rps}" "${websocket_frontline_rps}" "${websocket_min_ratio}"
+
+echo "hot_cache_websocket_subscribe_route_calls=0 subscribe_route_calls_before=${websocket_subscribe_route_calls_before} subscribe_route_calls_after=${websocket_subscribe_route_calls_after}"
+
+cold_subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
+cold_wake_instance_calls_before="$(read_wake_instance_calls "${stats_url}")"
+cold_backend_http_requests_before="$(read_backend_http_requests "${stats_url}")"
+echo "Running cold-wake frontline smoke for host ${route_host} path ${cold_route_path}"
+run_load frontline-cold-wake "${cold_frontline_url}" "${cold_frontline_output_file}" 1 1 http1
+
+cold_subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
+cold_wake_instance_calls_after="$(read_wake_instance_calls "${stats_url}")"
+cold_backend_http_requests_after="$(read_backend_http_requests "${stats_url}")"
+
+if [[ "${cold_subscribe_route_calls_after}" -ne $((cold_subscribe_route_calls_before + 1)) ]]; then
+  echo "cold-wake smoke did not make exactly one SubscribeRoute call: before=${cold_subscribe_route_calls_before} after=${cold_subscribe_route_calls_after}" >&2
+  dump_logs
+  exit 1
+fi
+
+if [[ "${cold_wake_instance_calls_after}" -ne $((cold_wake_instance_calls_before + 1)) ]]; then
+  echo "cold-wake smoke did not make exactly one WakeInstance call: before=${cold_wake_instance_calls_before} after=${cold_wake_instance_calls_after}" >&2
+  dump_logs
+  exit 1
+fi
+
+if [[ "${cold_backend_http_requests_after}" -ne $((cold_backend_http_requests_before + 1)) ]]; then
+  echo "cold-wake smoke did not reach backend exactly once: before=${cold_backend_http_requests_before} after=${cold_backend_http_requests_after}" >&2
+  dump_logs
+  exit 1
+fi
+
+echo "cold_wake_subscribe_route_calls=1 cold_wake_wake_instance_calls=1 cold_wake_backend_http_requests=1"
