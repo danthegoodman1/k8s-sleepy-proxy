@@ -38,6 +38,52 @@ same-host HTTP path-prefix lookup, and SNI lookup. These paths should stay
 indexed by route identity components rather than scanning every cached positive
 route on each hot-cache hit.
 
+## Criterion Benchmark Regression Gate
+
+Criterion stores benchmark baselines and comparison results under
+`target/criterion`. After running the proxy primitive and frontline route lookup
+benchmarks, check the recorded Criterion estimates with:
+
+```sh
+./scripts/check-criterion-regressions.py
+```
+
+The checker reads each benchmark's `change/estimates.json` mean point estimate,
+which Criterion reports as relative change from `base` to `new`. Positive change
+means slower/higher time. If Criterion change data is not present, the checker
+falls back to comparing `new/estimates.json` and `base/estimates.json` mean point
+estimates. Missing or malformed estimates fail by default so required gates do
+not silently pass without a usable baseline.
+
+Default thresholds warn above a 15% regression and fail above a 25% regression:
+
+```sh
+./scripts/check-criterion-regressions.py \
+  --warn-percent 15 \
+  --fail-percent 25
+```
+
+The same knobs are available as environment variables for local scripts or CI:
+
+```sh
+SLEEPYPODS_CRITERION_ROOT=target/criterion \
+SLEEPYPODS_BENCH_REGRESSION_WARN_PERCENT=15 \
+SLEEPYPODS_BENCH_REGRESSION_FAIL_PERCENT=25 \
+./scripts/check-criterion-regressions.py
+```
+
+For local adoption before a branch has Criterion baselines, pass
+`--allow-missing` or set `SLEEPYPODS_BENCH_REGRESSION_ALLOW_MISSING=1`. Required
+release or CI gates should omit that knob. The output is one stable line per
+benchmark with `benchmark`, `status`, `reason`, `change_percent`, thresholds,
+and comparison `source` fields.
+
+To create or refresh a baseline before checking a change, run the relevant
+benchmarks once on the target machine, keep the generated `target/criterion`
+artifacts locally, then run the benchmark again after the change so Criterion
+can populate `change/estimates.json`. Do not check benchmark result artifacts
+into the repository.
+
 ## Production Image Sidecar HTTP Load Smoke
 
 Milestone 7E starts with a small production-image smoke for the sidecar HTTP/1.1
