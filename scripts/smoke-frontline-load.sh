@@ -2,19 +2,38 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${repo_root}/scripts/lib/load-budget.sh"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-dev}"
 frontline_image="${SLEEPYPODS_FRONTLINE_IMAGE:-${image_prefix}/frontline:${image_tag}}"
 helper_image="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HELPER_IMAGE:-${image_prefix}/frontline-load-smoke-helper:${image_tag}}"
 requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS:-200}"
 concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY:-8}"
-min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO:-0.10}"
+strict_budgets="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS:-0}"
+if [[ "${strict_budgets}" == "1" ]]; then
+  min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO:-0.80}"
+  default_max_added_p99_ms="25"
+else
+  min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO:-0.10}"
+  default_max_added_p99_ms="1000"
+fi
+max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 grpc_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS:-${requests}}"
 grpc_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY:-${concurrency}}"
-grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-${min_ratio}}"
+if [[ "${strict_budgets}" == "1" ]]; then
+  grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-0.75}"
+else
+  grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-${min_ratio}}"
+fi
+grpc_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 websocket_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS:-${requests}}"
 websocket_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY:-${concurrency}}"
-websocket_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO:-${min_ratio}}"
+if [[ "${strict_budgets}" == "1" ]]; then
+  websocket_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO:-0.80}"
+else
+  websocket_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO:-${min_ratio}}"
+fi
+websocket_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 route_host="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST:-app.example.test}"
 route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH:-/smoke}"
 cold_route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH:-/cold-smoke}"
@@ -94,6 +113,13 @@ require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT "${c
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO "${grpc_min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO "${websocket_min_ratio}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS "${max_added_p99_ms}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS "${grpc_max_added_p99_ms}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS "${websocket_max_added_p99_ms}"
+if [[ "${strict_budgets}" != "0" && "${strict_budgets}" != "1" ]]; then
+  echo "SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS must be 0 or 1, got ${strict_budgets}" >&2
+  exit 1
+fi
 require_header_value SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST "${route_host}"
 require_route_path SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH "${route_path}"
 require_route_path SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH "${cold_route_path}"
@@ -201,54 +227,30 @@ assert_ratio_at_least() {
   local direct="$2"
   local proxied="$3"
   local min="$4"
-  local ratio
-  local ratio_status
 
-  set +e
-  ratio="$(awk -v direct="${direct}" -v proxied="${proxied}" -v min="${min}" 'BEGIN {
-    if (direct <= 0) {
-      print "nan"
-      exit 2
-    }
-    ratio = proxied / direct
-    printf "%.3f", ratio
-    if (ratio < min) {
-      exit 1
-    }
-  }')"
-  ratio_status=$?
-  set -e
-
-  if [[ "${ratio_status}" -eq 2 ]]; then
-    echo "direct ${label} RPS was not positive; cannot compare frontline smoke load" >&2
+  if ! load_budget_assert_ratio_at_least "frontline_direct_${label}_rps" "${direct}" "${proxied}" "${min}"; then
     dump_logs
     exit 1
   fi
+}
 
-  if [[ "${ratio_status}" -ne 0 ]]; then
-    echo "frontline/direct ${label} RPS ratio ${ratio} is below conservative smoke threshold ${min}" >&2
+assert_added_p99_at_most() {
+  local label="$1"
+  local direct="$2"
+  local proxied="$3"
+  local max="$4"
+
+  if ! load_budget_assert_added_p99_at_most "frontline_direct_${label}" "${direct}" "${proxied}" "${max}"; then
     dump_logs
     exit 1
   fi
-
-  echo "frontline/direct_${label}_rps_ratio=${ratio} min=${min}"
 }
 
 extract_metric() {
   local line="$1"
   local key="$2"
-  local field
 
-  for field in ${line}; do
-    case "${field}" in
-      "${key}"=*)
-        echo "${field#*=}"
-        return 0
-        ;;
-    esac
-  done
-
-  return 1
+  load_budget_extract_metric "${line}" "${key}"
 }
 
 read_helper_metric() {
@@ -367,7 +369,10 @@ direct_result="$(cat "${direct_output_file}")"
 frontline_result="$(cat "${frontline_output_file}")"
 direct_rps="$(extract_metric "${direct_result}" rps)"
 frontline_rps="$(extract_metric "${frontline_result}" rps)"
+direct_p99_ms="$(extract_metric "${direct_result}" p99_ms)"
+frontline_p99_ms="$(extract_metric "${frontline_result}" p99_ms)"
 assert_ratio_at_least "http1" "${direct_rps}" "${frontline_rps}" "${min_ratio}"
+assert_added_p99_at_most "http1" "${direct_p99_ms}" "${frontline_p99_ms}" "${max_added_p99_ms}"
 
 echo "hot_cache_http1_subscribe_route_calls=0 subscribe_route_calls_before=${subscribe_route_calls_before} subscribe_route_calls_after=${subscribe_route_calls_after}"
 
@@ -395,7 +400,10 @@ grpc_direct_result="$(cat "${grpc_direct_output_file}")"
 grpc_frontline_result="$(cat "${grpc_frontline_output_file}")"
 grpc_direct_rps="$(extract_metric "${grpc_direct_result}" rps)"
 grpc_frontline_rps="$(extract_metric "${grpc_frontline_result}" rps)"
+grpc_direct_p99_ms="$(extract_metric "${grpc_direct_result}" p99_ms)"
+grpc_frontline_p99_ms="$(extract_metric "${grpc_frontline_result}" p99_ms)"
 assert_ratio_at_least "h2c_grpc" "${grpc_direct_rps}" "${grpc_frontline_rps}" "${grpc_min_ratio}"
+assert_added_p99_at_most "h2c_grpc" "${grpc_direct_p99_ms}" "${grpc_frontline_p99_ms}" "${grpc_max_added_p99_ms}"
 
 echo "hot_cache_h2c_grpc_subscribe_route_calls=0 subscribe_route_calls_before=${grpc_subscribe_route_calls_before} subscribe_route_calls_after=${grpc_subscribe_route_calls_after}"
 
@@ -423,7 +431,10 @@ websocket_direct_result="$(cat "${websocket_direct_output_file}")"
 websocket_frontline_result="$(cat "${websocket_frontline_output_file}")"
 websocket_direct_rps="$(extract_metric "${websocket_direct_result}" rps)"
 websocket_frontline_rps="$(extract_metric "${websocket_frontline_result}" rps)"
+websocket_direct_p99_ms="$(extract_metric "${websocket_direct_result}" p99_ms)"
+websocket_frontline_p99_ms="$(extract_metric "${websocket_frontline_result}" p99_ms)"
 assert_ratio_at_least "websocket" "${websocket_direct_rps}" "${websocket_frontline_rps}" "${websocket_min_ratio}"
+assert_added_p99_at_most "websocket" "${websocket_direct_p99_ms}" "${websocket_frontline_p99_ms}" "${websocket_max_added_p99_ms}"
 
 echo "hot_cache_websocket_subscribe_route_calls=0 subscribe_route_calls_before=${websocket_subscribe_route_calls_before} subscribe_route_calls_after=${websocket_subscribe_route_calls_after}"
 

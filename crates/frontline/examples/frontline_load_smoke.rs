@@ -7,7 +7,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -813,15 +813,18 @@ fn validate_route_path(name: &'static str, value: &str) -> Result<(), InvalidArg
 async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     let next_request = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(AtomicU64::new(0));
+    let latencies = LatencyRecorder::new(config.requests);
     let mut tasks = JoinSet::new();
     let start = Instant::now();
 
     for _ in 0..config.concurrency {
         let next_request = Arc::clone(&next_request);
         let failures = Arc::clone(&failures);
+        let latencies = latencies.clone();
         let target = config.target.clone();
         let host_header = config.host_header.clone();
         let requests = config.requests;
+        let protocol = config.protocol;
 
         tasks.spawn(async move {
             loop {
@@ -831,7 +834,8 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     break;
                 }
 
-                let result = match config.protocol {
+                let request_start = Instant::now();
+                let result = match protocol {
                     ClientProtocol::Http1 => {
                         send_smoke_request(&target, &host_header, request_id).await
                     }
@@ -843,11 +847,14 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     }
                 };
 
-                if let Err(error) = result {
-                    failures.fetch_add(1, Ordering::Relaxed);
+                match result {
+                    Ok(()) => latencies.record(request_start.elapsed()),
+                    Err(error) => {
+                        failures.fetch_add(1, Ordering::Relaxed);
 
-                    if request_id < 5 {
-                        eprintln!("request {request_id} failed: {error}");
+                        if request_id < 5 {
+                            eprintln!("request {request_id} failed: {error}");
+                        }
                     }
                 }
             }
@@ -863,10 +870,19 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let failures = failures.load(Ordering::Relaxed);
     let rps = config.requests as f64 / elapsed_secs;
+    let latency = latencies.snapshot();
 
     println!(
-        "{} requests={} failures={} elapsed_ms={} rps={:.1}",
-        config.label, config.requests, failures, elapsed_ms, rps
+        "{} requests={} failures={} elapsed_ms={} rps={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+        config.label,
+        config.requests,
+        failures,
+        elapsed_ms,
+        rps,
+        latency.p50_ms,
+        latency.p95_ms,
+        latency.p99_ms,
+        latency.max_ms
     );
 
     if failures > 0 {
@@ -874,6 +890,78 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct LatencyRecorder {
+    durations: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl LatencyRecorder {
+    fn new(capacity: u64) -> Self {
+        let capacity = usize::try_from(capacity.min(100_000)).unwrap_or(100_000);
+        Self {
+            durations: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
+        }
+    }
+
+    fn record(&self, duration: Duration) {
+        self.durations
+            .lock()
+            .expect("latency recorder mutex is not poisoned")
+            .push(duration);
+    }
+
+    fn snapshot(&self) -> LatencyStats {
+        let durations = self
+            .durations
+            .lock()
+            .expect("latency recorder mutex is not poisoned");
+        LatencyStats::from_durations(&durations)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LatencyStats {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+impl LatencyStats {
+    fn from_durations(durations: &[Duration]) -> Self {
+        if durations.is_empty() {
+            return Self::default();
+        }
+
+        let mut values = durations.to_vec();
+        values.sort_unstable();
+
+        Self {
+            p50_ms: duration_ms(percentile(&values, 50)),
+            p95_ms: duration_ms(percentile(&values, 95)),
+            p99_ms: duration_ms(percentile(&values, 99)),
+            max_ms: duration_ms(*values.last().expect("non-empty latency values")),
+        }
+    }
+}
+
+fn percentile(sorted: &[Duration], percentile: u64) -> Duration {
+    debug_assert!(!sorted.is_empty());
+    debug_assert!(percentile <= 100);
+
+    let rank = ((sorted.len() as u64 * percentile).div_ceil(100)).max(1);
+    sorted[(rank - 1) as usize]
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    let ms = duration.as_secs_f64() * 1000.0;
+    if ms > 0.0 && ms < 0.001 {
+        0.001
+    } else {
+        ms
+    }
 }
 
 async fn send_smoke_request(
@@ -1216,7 +1304,8 @@ impl Error for ResponseValidationError {}
 mod tests {
     use super::{
         backend_response, path_prefix_matches, validate_response, ClientConfig, ClientProtocol,
-        FakeProxyControlPlane, HttpTarget, SmokeStats, BACKEND_BODY, GRPC_BODY, STATS_PATH,
+        FakeProxyControlPlane, HttpTarget, LatencyStats, SmokeStats, BACKEND_BODY, GRPC_BODY,
+        STATS_PATH,
     };
     use bytes::Bytes;
     use control_plane::api::pb;
@@ -1310,6 +1399,23 @@ mod tests {
         .expect("WebSocket client config parses");
 
         assert_eq!(config.protocol, ClientProtocol::WebSocket);
+    }
+
+    #[test]
+    fn latency_stats_use_nearest_rank_percentiles() {
+        let durations = (1..=100)
+            .map(std::time::Duration::from_millis)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            LatencyStats::from_durations(&durations),
+            LatencyStats {
+                p50_ms: 50.0,
+                p95_ms: 95.0,
+                p99_ms: 99.0,
+                max_ms: 100.0,
+            }
+        );
     }
 
     #[test]

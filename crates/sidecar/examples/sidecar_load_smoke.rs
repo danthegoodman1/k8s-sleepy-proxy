@@ -8,7 +8,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -369,12 +369,14 @@ fn parse_positive_usize(name: &'static str, value: &str) -> Result<usize, Invali
 async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     let next_request = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(AtomicU64::new(0));
+    let latencies = LatencyRecorder::new(config.requests);
     let mut tasks = JoinSet::new();
     let start = Instant::now();
 
     for _ in 0..config.concurrency {
         let next_request = Arc::clone(&next_request);
         let failures = Arc::clone(&failures);
+        let latencies = latencies.clone();
         let target = config.target.clone();
         let requests = config.requests;
 
@@ -386,11 +388,15 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     break;
                 }
 
-                if let Err(error) = send_smoke_request(&target, request_id).await {
-                    failures.fetch_add(1, Ordering::Relaxed);
+                let request_start = Instant::now();
+                match send_smoke_request(&target, request_id).await {
+                    Ok(()) => latencies.record(request_start.elapsed()),
+                    Err(error) => {
+                        failures.fetch_add(1, Ordering::Relaxed);
 
-                    if request_id < 5 {
-                        eprintln!("request {request_id} failed: {error}");
+                        if request_id < 5 {
+                            eprintln!("request {request_id} failed: {error}");
+                        }
                     }
                 }
             }
@@ -406,10 +412,19 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let failures = failures.load(Ordering::Relaxed);
     let rps = config.requests as f64 / elapsed_secs;
+    let latency = latencies.snapshot();
 
     println!(
-        "{} requests={} failures={} elapsed_ms={} rps={:.1}",
-        config.label, config.requests, failures, elapsed_ms, rps
+        "{} requests={} failures={} elapsed_ms={} rps={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+        config.label,
+        config.requests,
+        failures,
+        elapsed_ms,
+        rps,
+        latency.p50_ms,
+        latency.p95_ms,
+        latency.p99_ms,
+        latency.max_ms
     );
 
     if failures > 0 {
@@ -423,6 +438,7 @@ async fn run_tcp_client(config: TcpClientConfig) -> Result<(), BoxError> {
     let next_stream = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(AtomicU64::new(0));
     let completed_bytes = Arc::new(AtomicU64::new(0));
+    let latencies = LatencyRecorder::new(config.streams);
     let mut tasks = JoinSet::new();
     let start = Instant::now();
     let expected_bytes = config
@@ -434,6 +450,7 @@ async fn run_tcp_client(config: TcpClientConfig) -> Result<(), BoxError> {
         let next_stream = Arc::clone(&next_stream);
         let failures = Arc::clone(&failures);
         let completed_bytes = Arc::clone(&completed_bytes);
+        let latencies = latencies.clone();
         let target = config.target;
         let streams = config.streams;
         let bytes_per_stream = config.bytes_per_stream;
@@ -447,8 +464,10 @@ async fn run_tcp_client(config: TcpClientConfig) -> Result<(), BoxError> {
                     break;
                 }
 
+                let stream_start = Instant::now();
                 match send_tcp_echo_stream(target, stream_id, bytes_per_stream, chunk_size).await {
                     Ok(bytes) => {
+                        latencies.record(stream_start.elapsed());
                         completed_bytes.fetch_add(bytes, Ordering::Relaxed);
                     }
                     Err(error) => {
@@ -473,16 +492,21 @@ async fn run_tcp_client(config: TcpClientConfig) -> Result<(), BoxError> {
     let failures = failures.load(Ordering::Relaxed);
     let completed_bytes = completed_bytes.load(Ordering::Relaxed);
     let throughput_mib_s = completed_bytes as f64 / 1024.0 / 1024.0 / elapsed_secs;
+    let latency = latencies.snapshot();
 
     println!(
-        "{} streams={} bytes={} expected_bytes={} failures={} elapsed_ms={} throughput_mib_s={:.2}",
+        "{} streams={} bytes={} expected_bytes={} failures={} elapsed_ms={} throughput_mib_s={:.2} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
         config.label,
         config.streams,
         completed_bytes,
         expected_bytes,
         failures,
         elapsed_ms,
-        throughput_mib_s
+        throughput_mib_s,
+        latency.p50_ms,
+        latency.p95_ms,
+        latency.p99_ms,
+        latency.max_ms
     );
 
     if failures > 0 {
@@ -497,6 +521,78 @@ async fn run_tcp_client(config: TcpClientConfig) -> Result<(), BoxError> {
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct LatencyRecorder {
+    durations: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl LatencyRecorder {
+    fn new(capacity: u64) -> Self {
+        let capacity = usize::try_from(capacity.min(100_000)).unwrap_or(100_000);
+        Self {
+            durations: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
+        }
+    }
+
+    fn record(&self, duration: Duration) {
+        self.durations
+            .lock()
+            .expect("latency recorder mutex is not poisoned")
+            .push(duration);
+    }
+
+    fn snapshot(&self) -> LatencyStats {
+        let durations = self
+            .durations
+            .lock()
+            .expect("latency recorder mutex is not poisoned");
+        LatencyStats::from_durations(&durations)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LatencyStats {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+impl LatencyStats {
+    fn from_durations(durations: &[Duration]) -> Self {
+        if durations.is_empty() {
+            return Self::default();
+        }
+
+        let mut values = durations.to_vec();
+        values.sort_unstable();
+
+        Self {
+            p50_ms: duration_ms(percentile(&values, 50)),
+            p95_ms: duration_ms(percentile(&values, 95)),
+            p99_ms: duration_ms(percentile(&values, 99)),
+            max_ms: duration_ms(*values.last().expect("non-empty latency values")),
+        }
+    }
+}
+
+fn percentile(sorted: &[Duration], percentile: u64) -> Duration {
+    debug_assert!(!sorted.is_empty());
+    debug_assert!(percentile <= 100);
+
+    let rank = ((sorted.len() as u64 * percentile).div_ceil(100)).max(1);
+    sorted[(rank - 1) as usize]
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    let ms = duration.as_secs_f64() * 1000.0;
+    if ms > 0.0 && ms < 0.001 {
+        0.001
+    } else {
+        ms
+    }
 }
 
 async fn send_smoke_request(target: &HttpTarget, request_id: u64) -> Result<(), BoxError> {
@@ -841,7 +937,7 @@ impl Error for TcpEchoValidationError {}
 mod tests {
     use super::{
         fill_tcp_payload, validate_response, validate_tcp_payload, ClientConfig, HttpTarget,
-        TcpClientConfig, TcpEchoValidationError, BACKEND_BODY,
+        LatencyStats, TcpClientConfig, TcpEchoValidationError, BACKEND_BODY,
     };
 
     #[test]
@@ -874,6 +970,23 @@ mod tests {
         .expect_err("zero request count is rejected");
 
         assert_eq!(error.0, "--requests must be greater than zero");
+    }
+
+    #[test]
+    fn latency_stats_use_nearest_rank_percentiles() {
+        let durations = (1..=100)
+            .map(std::time::Duration::from_millis)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            LatencyStats::from_durations(&durations),
+            LatencyStats {
+                p50_ms: 50.0,
+                p95_ms: 95.0,
+                p99_ms: 99.0,
+                max_ms: 100.0,
+            }
+        );
     }
 
     #[test]

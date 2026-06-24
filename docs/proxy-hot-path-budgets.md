@@ -56,12 +56,19 @@ the direct-backend baseline.
 
 The smoke client sends the same request count to the backend directly and
 through the sidecar. It reports request count, failures, elapsed milliseconds,
-and rough RPS for each path, then fails on request correctness errors, process
-startup failures, missing tools or images, and a very conservative
-sidecar/direct RPS ratio below `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO`
-(default `0.10`). The ratio guard is only intended to catch extreme obvious
-regressions; local Docker wall-clock numbers are not treated as stable latency
-budgets.
+rough RPS, and successful request latency percentiles as stable `key=value`
+fields: `p50_ms`, `p95_ms`, `p99_ms`, and `max_ms`. The script fails on request
+correctness errors, process startup failures, missing tools or images, malformed
+or missing load metrics, non-positive direct baselines, a sidecar/direct RPS
+ratio below `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO`, or p99 added latency
+above `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MAX_ADDED_P99_MS`.
+
+By default, this remains a conservative developer smoke:
+`SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO=0.10` and
+`SLEEPYPODS_SIDECAR_LOAD_SMOKE_MAX_ADDED_P99_MS=1000`. Release-style runs can
+set `SLEEPYPODS_SIDECAR_LOAD_SMOKE_STRICT_BUDGETS=1`, which changes the default
+gate values to a direct-baseline RPS ratio of `0.80` and max p99 added latency
+of `25` ms. The explicit env vars still override those strict defaults.
 
 Useful knobs:
 
@@ -73,7 +80,9 @@ SLEEPYPODS_SIDECAR_LOAD_SMOKE_CONCURRENCY=16 \
 
 This HTTP smoke only covers the sidecar HTTP/1.1 hot path. It does not cover
 frontline routing, Kubernetes, the real control plane, HTTP/2, h2c, gRPC, TCP,
-WebSockets, streaming throughput, or tail latency.
+WebSockets, streaming throughput, cold-wake behavior, or protocol paths beyond
+HTTP/1.1. Its p99 gate is a same-run direct-baseline sidecar HTTP check, not a
+general end-to-end latency SLO.
 
 ## Production Image Sidecar TCP Load Smoke
 
@@ -96,11 +105,20 @@ The TCP smoke client opens a fixed number of streams, writes a known byte count
 per stream, and validates the exact echoed bytes while reads and writes run
 concurrently. It fails on byte mismatches, early close, timeouts, startup or
 process failures, and missing tools or images. It reports stream count, echoed
-bytes, expected bytes, failures, elapsed milliseconds, and rough MiB/s for the
-direct and sidecar paths. A conservative
-`SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO` guard defaults to `0.05` and is
-only meant to catch extreme obvious regressions; local Docker throughput is not
-a stable latency or throughput budget.
+bytes, expected bytes, failures, elapsed milliseconds, rough MiB/s, and
+successful stream latency percentiles as stable `key=value` fields: `p50_ms`,
+`p95_ms`, `p99_ms`, and `max_ms`. The script fails on malformed or missing
+metrics, non-positive direct baselines, a sidecar/direct throughput ratio below
+`SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO`, or stream p99 added latency above
+`SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS`.
+
+By default, this remains a conservative developer smoke:
+`SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO=0.05` and
+`SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS=10000`. Release-style runs
+can set `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_STRICT_BUDGETS=1`, which changes the
+default gate values to a direct-baseline throughput ratio of `0.85` and max
+stream p99 added latency of `500` ms. The explicit env vars still override
+those strict defaults.
 
 Useful knobs:
 
@@ -114,8 +132,10 @@ SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CHUNK_SIZE=32768 \
 
 This smoke only covers plain TCP byte forwarding through the sidecar production
 image. It does not cover Kubernetes, the real control plane, frontline routing,
-TLS/SNI, HTTP/2, h2c, gRPC, WebSockets, protocol-specific streaming behavior,
-tail latency, or stable large-stream throughput budgets.
+TLS/SNI, HTTP/2, h2c, gRPC, WebSockets, or protocol-specific streaming
+behavior. Its throughput and p99 stream gates are
+same-run direct-baseline TCP checks, not cross-machine absolute throughput or
+latency SLOs.
 
 ## Production Image Frontline HTTP, h2c gRPC-Shaped, WebSocket, and Cold-Wake Load Smoke
 
@@ -168,14 +188,22 @@ fails unless that phase increments each expected counter exactly once.
 
 The client sends the same request count directly to the backend and through
 frontline for each protocol phase, reporting request count, failures, elapsed
-milliseconds, and rough RPS. The smoke fails on correctness errors, startup or
-process failures, missing tools or images, additional hot-cache `SubscribeRoute`
-calls, and conservative frontline/direct RPS ratios below
-`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO` and
-`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO`, and
-`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO` (all default `0.10`). As
-with the sidecar smoke, these ratios only catch extreme obvious regressions;
-local Docker RPS is not a stable latency budget.
+milliseconds, rough RPS, and successful request/session latency percentiles as
+stable `key=value` fields: `p50_ms`, `p95_ms`, `p99_ms`, and `max_ms`. The smoke
+fails on correctness errors, startup or process failures, missing tools or
+images, malformed or missing load metrics, non-positive direct baselines,
+additional hot-cache `SubscribeRoute` calls, frontend/direct RPS ratios below
+their configured thresholds, and p99 added latency above configured thresholds.
+
+By default, this remains a conservative developer smoke:
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO=0.10`,
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO=0.10`,
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.10`, and each
+`*_MAX_ADDED_P99_MS` defaulting to `1000`. Release-style runs can set
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS=1`, which changes the default
+HTTP/1.1 ratio to `0.80`, h2c gRPC-shaped ratio to `0.75`, WebSocket session
+ratio to `0.80`, and each max p99 added-latency threshold to `25` ms. The
+explicit env vars still override those strict defaults.
 
 Useful knobs:
 
@@ -196,8 +224,36 @@ This smoke only covers frontline HTTP/1.1, prior-knowledge h2c gRPC-shaped, and
 WebSocket cached ready-route forwarding plus one fake-control-plane cold wake
 through the production frontline image. It does not cover Kubernetes, the real
 control plane, TLS/SNI, negotiated HTTP/2 over TLS, real generated gRPC clients,
-TCP, WebSocket streaming throughput, cold wake latency budgets, route-cache
-invalidation behavior, tail latency, or enforced regression budgets.
+TCP, WebSocket byte-streaming throughput, cold wake latency budgets, or
+route-cache invalidation behavior.
+
+## Production-Image Load Budget Gates
+
+The production-image load smokes compare proxied paths to direct-backend
+baselines measured in the same run and environment. Ordinary local runs keep
+loose thresholds so they catch extreme regressions without depending on stable
+developer Docker timing. Release runs should opt into strict defaults:
+
+```sh
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS=1 ./scripts/smoke-frontline-load.sh
+SLEEPYPODS_SIDECAR_LOAD_SMOKE_STRICT_BUDGETS=1 ./scripts/smoke-sidecar-load.sh
+SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_STRICT_BUDGETS=1 ./scripts/smoke-sidecar-tcp-load.sh
+```
+
+Strict defaults:
+
+| Script/path | Ratio metric | Strict default | p99 added metric | Strict default |
+| --- | --- | --- | --- | --- |
+| `smoke-frontline-load.sh` HTTP/1.1 | frontline RPS / direct RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO=0.80` | frontend `p99_ms` - direct `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS=25` |
+| `smoke-frontline-load.sh` h2c gRPC-shaped | frontline RPS / direct RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO=0.75` | frontend `p99_ms` - direct `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS=25` |
+| `smoke-frontline-load.sh` WebSocket | frontline sessions/s / direct sessions/s | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.80` | frontend session `p99_ms` - direct session `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS=25` |
+| `smoke-sidecar-load.sh` HTTP/1.1 | sidecar RPS / direct RPS | `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO=0.80` | sidecar `p99_ms` - direct `p99_ms` | `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MAX_ADDED_P99_MS=25` |
+| `smoke-sidecar-tcp-load.sh` TCP large streams | sidecar MiB/s / direct MiB/s | `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO=0.85` | sidecar stream `p99_ms` - direct stream `p99_ms` | `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS=500` |
+
+Smoke defaults use the same env vars but remain intentionally loose: frontline
+and sidecar HTTP/WebSocket/h2c ratios default to `0.10`, sidecar TCP throughput
+ratio defaults to `0.05`, HTTP/WebSocket/h2c p99 added latency defaults to
+`1000` ms, and TCP stream p99 added latency defaults to `10000` ms.
 
 ## Budget Principles
 

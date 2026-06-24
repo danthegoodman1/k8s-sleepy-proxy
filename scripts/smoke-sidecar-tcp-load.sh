@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${repo_root}/scripts/lib/load-budget.sh"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-dev}"
 sidecar_image="${SLEEPYPODS_SIDECAR_IMAGE:-${image_prefix}/sidecar:${image_tag}}"
@@ -10,7 +11,15 @@ streams="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_STREAMS:-4}"
 concurrency="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CONCURRENCY:-2}"
 bytes_per_stream="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_BYTES_PER_STREAM:-4194304}"
 chunk_size="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CHUNK_SIZE:-16384}"
-min_ratio="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO:-0.05}"
+strict_budgets="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_STRICT_BUDGETS:-0}"
+if [[ "${strict_budgets}" == "1" ]]; then
+  min_ratio="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO:-0.85}"
+  default_max_added_p99_ms="500"
+else
+  min_ratio="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO:-0.05}"
+  default_max_added_p99_ms="10000"
+fi
+max_added_p99_ms="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 http_backend_container_port="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_HTTP_BACKEND_PORT:-18080}"
 tcp_backend_container_port="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_BACKEND_PORT:-18082}"
 sidecar_container_port="${SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_SIDECAR_PORT:-18083}"
@@ -69,6 +78,11 @@ require_positive_integer SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_BACKEND_PORT "${tcp_b
 require_positive_integer SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_SIDECAR_PORT "${sidecar_container_port}"
 require_positive_integer SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
 require_decimal SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
+require_decimal SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS "${max_added_p99_ms}"
+if [[ "${strict_budgets}" != "0" && "${strict_budgets}" != "1" ]]; then
+  echo "SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_STRICT_BUDGETS must be 0 or 1, got ${strict_budgets}" >&2
+  exit 1
+fi
 require_distinct_ports SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_HTTP_BACKEND_PORT "${http_backend_container_port}" SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_BACKEND_PORT "${tcp_backend_container_port}"
 require_distinct_ports SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_HTTP_BACKEND_PORT "${http_backend_container_port}" SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_SIDECAR_PORT "${sidecar_container_port}"
 require_distinct_ports SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_HTTP_BACKEND_PORT "${http_backend_container_port}" SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
@@ -168,18 +182,8 @@ run_load() {
 extract_metric() {
   local line="$1"
   local key="$2"
-  local field
 
-  for field in ${line}; do
-    case "${field}" in
-      "${key}"=*)
-        echo "${field#*=}"
-        return 0
-        ;;
-    esac
-  done
-
-  return 1
+  load_budget_extract_metric "${line}" "${key}"
 }
 
 echo "Building local TCP load-smoke client"
@@ -247,32 +251,15 @@ direct_result="$(cat "${direct_output_file}")"
 sidecar_result="$(cat "${sidecar_output_file}")"
 direct_throughput="$(extract_metric "${direct_result}" throughput_mib_s)"
 sidecar_throughput="$(extract_metric "${sidecar_result}" throughput_mib_s)"
+direct_p99_ms="$(extract_metric "${direct_result}" p99_ms)"
+sidecar_p99_ms="$(extract_metric "${sidecar_result}" p99_ms)"
 
-set +e
-ratio="$(awk -v direct="${direct_throughput}" -v sidecar="${sidecar_throughput}" -v min="${min_ratio}" 'BEGIN {
-  if (direct <= 0) {
-    print "nan"
-    exit 2
-  }
-  ratio = sidecar / direct
-  printf "%.3f", ratio
-  if (ratio < min) {
-    exit 1
-  }
-}')"
-ratio_status=$?
-set -e
-
-if [[ "${ratio_status}" -eq 2 ]]; then
-  echo "direct TCP throughput was not positive; cannot compare sidecar smoke load" >&2
+if ! load_budget_assert_ratio_at_least "sidecar_direct_tcp_throughput" "${direct_throughput}" "${sidecar_throughput}" "${min_ratio}"; then
   dump_logs
   exit 1
 fi
 
-if [[ "${ratio_status}" -ne 0 ]]; then
-  echo "sidecar/direct TCP throughput ratio ${ratio} is below conservative smoke threshold ${min_ratio}" >&2
+if ! load_budget_assert_added_p99_at_most "sidecar_direct_tcp_stream" "${direct_p99_ms}" "${sidecar_p99_ms}" "${max_added_p99_ms}"; then
   dump_logs
   exit 1
 fi
-
-echo "sidecar/direct_tcp_throughput_ratio=${ratio} min=${min_ratio}"

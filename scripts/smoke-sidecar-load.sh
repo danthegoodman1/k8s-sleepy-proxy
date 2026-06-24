@@ -2,13 +2,22 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${repo_root}/scripts/lib/load-budget.sh"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-dev}"
 sidecar_image="${SLEEPYPODS_SIDECAR_IMAGE:-${image_prefix}/sidecar:${image_tag}}"
 helper_image="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_HELPER_IMAGE:-${image_prefix}/sidecar-load-smoke-helper:${image_tag}}"
 requests="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_REQUESTS:-200}"
 concurrency="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_CONCURRENCY:-8}"
-min_ratio="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO:-0.10}"
+strict_budgets="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_STRICT_BUDGETS:-0}"
+if [[ "${strict_budgets}" == "1" ]]; then
+  min_ratio="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO:-0.80}"
+  default_max_added_p99_ms="25"
+else
+  min_ratio="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO:-0.10}"
+  default_max_added_p99_ms="1000"
+fi
+max_added_p99_ms="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 backend_container_port="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_BACKEND_PORT:-18080}"
 sidecar_container_port="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_SIDECAR_PORT:-18081}"
 control_plane_container_port="${SLEEPYPODS_SIDECAR_LOAD_SMOKE_CONTROL_PLANE_PORT:-19090}"
@@ -51,6 +60,11 @@ require_positive_integer SLEEPYPODS_SIDECAR_LOAD_SMOKE_BACKEND_PORT "${backend_c
 require_positive_integer SLEEPYPODS_SIDECAR_LOAD_SMOKE_SIDECAR_PORT "${sidecar_container_port}"
 require_positive_integer SLEEPYPODS_SIDECAR_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
 require_decimal SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
+require_decimal SLEEPYPODS_SIDECAR_LOAD_SMOKE_MAX_ADDED_P99_MS "${max_added_p99_ms}"
+if [[ "${strict_budgets}" != "0" && "${strict_budgets}" != "1" ]]; then
+  echo "SLEEPYPODS_SIDECAR_LOAD_SMOKE_STRICT_BUDGETS must be 0 or 1, got ${strict_budgets}" >&2
+  exit 1
+fi
 
 client_bin="${repo_root}/target/debug/examples/sidecar_load_smoke"
 run_id="sleepypods-sidecar-load-smoke-$(date +%s)-$$"
@@ -142,18 +156,8 @@ run_load() {
 extract_metric() {
   local line="$1"
   local key="$2"
-  local field
 
-  for field in ${line}; do
-    case "${field}" in
-      "${key}"=*)
-        echo "${field#*=}"
-        return 0
-        ;;
-    esac
-  done
-
-  return 1
+  load_budget_extract_metric "${line}" "${key}"
 }
 
 echo "Building local load-smoke client"
@@ -219,32 +223,15 @@ direct_result="$(cat "${direct_output_file}")"
 sidecar_result="$(cat "${sidecar_output_file}")"
 direct_rps="$(extract_metric "${direct_result}" rps)"
 sidecar_rps="$(extract_metric "${sidecar_result}" rps)"
+direct_p99_ms="$(extract_metric "${direct_result}" p99_ms)"
+sidecar_p99_ms="$(extract_metric "${sidecar_result}" p99_ms)"
 
-set +e
-ratio="$(awk -v direct="${direct_rps}" -v sidecar="${sidecar_rps}" -v min="${min_ratio}" 'BEGIN {
-  if (direct <= 0) {
-    print "nan"
-    exit 2
-  }
-  ratio = sidecar / direct
-  printf "%.3f", ratio
-  if (ratio < min) {
-    exit 1
-  }
-}')"
-ratio_status=$?
-set -e
-
-if [[ "${ratio_status}" -eq 2 ]]; then
-  echo "direct RPS was not positive; cannot compare sidecar smoke load" >&2
+if ! load_budget_assert_ratio_at_least "sidecar_direct_http1_rps" "${direct_rps}" "${sidecar_rps}" "${min_ratio}"; then
   dump_logs
   exit 1
 fi
 
-if [[ "${ratio_status}" -ne 0 ]]; then
-  echo "sidecar/direct RPS ratio ${ratio} is below conservative smoke threshold ${min_ratio}" >&2
+if ! load_budget_assert_added_p99_at_most "sidecar_direct_http1" "${direct_p99_ms}" "${sidecar_p99_ms}" "${max_added_p99_ms}"; then
   dump_logs
   exit 1
 fi
-
-echo "sidecar/direct_rps_ratio=${ratio} min=${min_ratio}"
