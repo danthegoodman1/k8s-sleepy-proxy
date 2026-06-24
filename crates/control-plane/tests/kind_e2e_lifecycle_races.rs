@@ -27,9 +27,10 @@ use control_plane::api::pb::{
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
     core::v1::{PersistentVolume, PersistentVolumeClaim, Pod, Service},
+    rbac::v1::Role,
 };
 use kube::{
-    api::{DeleteParams, ListParams},
+    api::{DeleteParams, ListParams, PostParams},
     Api, Client, Error as KubeError,
 };
 use tokio::time::{sleep, timeout, Instant};
@@ -43,6 +44,7 @@ type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const NORMAL_CLASS_ID: &str = "lifecycle-normal";
 const SLEEP_WHILE_WAKING_CLASS_ID: &str = "lifecycle-sleep-waking";
 const DELETE_WHILE_WAKING_CLASS_ID: &str = "lifecycle-delete-waking";
+const DELETE_WHILE_DRAINING_CLASS_ID: &str = "lifecycle-delete-draining";
 const FAILED_RETRY_CLASS_ID: &str = "lifecycle-failed-retry";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
@@ -105,6 +107,21 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
     .await?;
     create_workload_class(
         &mut operator,
+        DELETE_WHILE_DRAINING_CLASS_ID,
+        &config.app_image,
+        &config.sidecar_image,
+        WorkloadKind::StatefulSet,
+        "lifecycle-delete-draining-app",
+        stateful_volumes(
+            "lifecycle-delete-draining-pv",
+            "lifecycle-delete-draining-pvc",
+            "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-draining",
+        ),
+        "delete-draining",
+    )
+    .await?;
+    create_workload_class(
+        &mut operator,
         FAILED_RETRY_CLASS_ID,
         &config.failed_retry_image,
         &config.sidecar_image,
@@ -123,6 +140,10 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
 
     eprintln!("==> lifecycle race E2E: delete while waking");
     delete_while_waking_cleans_pending_objects(&mut operator, kube.clone(), &config).await?;
+
+    eprintln!("==> lifecycle race E2E: delete while draining");
+    delete_while_draining_cleans_deleting_materialization(&mut operator, kube.clone(), &config)
+        .await?;
 
     eprintln!("==> lifecycle race E2E: failed wake retry");
     failed_wake_retry_rejects_stale_generation(&mut operator, kube.clone(), &config).await?;
@@ -433,6 +454,116 @@ async fn delete_while_waking_cleans_pending_objects(
         config,
         "delete-waking.lifecycle.sleepypods.test",
         "delete-waking",
+        5,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn delete_while_draining_cleans_deleting_materialization(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    kube: Client,
+    config: &E2eConfig,
+) -> TestResult<()> {
+    create_instance_and_route(
+        operator,
+        DELETE_WHILE_DRAINING_CLASS_ID,
+        "lifecycle-delete-draining",
+        "lifecycle-delete-draining-route",
+        "delete-draining.lifecycle.sleepypods.test",
+        "delete-draining",
+        "delete-draining",
+    )
+    .await?;
+    wait_for_instance_response(
+        config,
+        "delete-draining wake",
+        "delete-draining.lifecycle.sleepypods.test",
+        "/",
+        "delete-draining",
+        180,
+    )
+    .await?;
+    let running = wait_for_instance_state(
+        operator,
+        "lifecycle-delete-draining",
+        PbInstanceState::Running,
+        30,
+    )
+    .await?;
+    wait_for_stateful_objects_present(
+        kube.clone(),
+        &config.namespace,
+        "lifecycle-delete-draining",
+        "lifecycle-delete-draining-pvc",
+        "lifecycle-delete-draining-pv",
+        60,
+    )
+    .await?;
+
+    set_control_plane_statefulset_delete_permission(kube.clone(), &config.namespace, false).await?;
+    sleep(Duration::from_secs(2)).await;
+    let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+    let idle_result = sidecar
+        .report_idle(SidecarReportIdleRequest {
+            instance_id: "lifecycle-delete-draining".to_owned(),
+            expected_generation: running.generation,
+            active_count: 0,
+        })
+        .await;
+    set_control_plane_statefulset_delete_permission(kube.clone(), &config.namespace, true).await?;
+
+    let idle_error =
+        idle_result.expect_err("sleep cleanup should fail while StatefulSet delete is forbidden");
+    if idle_error.code() != tonic::Code::Unavailable
+        || !idle_error.message().contains("sleep cleanup failed")
+    {
+        return Err(format!(
+            "expected forbidden sleep cleanup to return Unavailable cleanup failure, got {:?}: {}",
+            idle_error.code(),
+            idle_error.message()
+        )
+        .into());
+    }
+    let draining = wait_for_instance_state(
+        operator,
+        "lifecycle-delete-draining",
+        PbInstanceState::Draining,
+        30,
+    )
+    .await?;
+    if draining.generation <= running.generation {
+        return Err(format!(
+            "delete-draining generation {} did not advance beyond running generation {}",
+            draining.generation, running.generation
+        )
+        .into());
+    }
+
+    let deleted = operator
+        .delete_instance(DeleteInstanceRequest {
+            instance_id: "lifecycle-delete-draining".to_owned(),
+        })
+        .await?
+        .into_inner();
+    if !deleted.deleted {
+        return Err("delete while draining did not report deletion".into());
+    }
+    assert_instance_not_found(operator, "lifecycle-delete-draining").await?;
+    wait_for_stateful_objects_absent(
+        kube,
+        &config.namespace,
+        "lifecycle-delete-draining",
+        "lifecycle-delete-draining-pvc",
+        "lifecycle-delete-draining-pv",
+        60,
+    )
+    .await?;
+    assert_no_backend_response(
+        config,
+        "delete-draining.lifecycle.sleepypods.test",
+        "delete-draining",
         5,
     )
     .await?;
@@ -1172,6 +1303,43 @@ async fn delete_workload_pods(
             let _ = pods.delete(&name, &DeleteParams::default()).await;
         }
     }
+    Ok(())
+}
+
+async fn set_control_plane_statefulset_delete_permission(
+    kube: Client,
+    namespace: &str,
+    allow: bool,
+) -> TestResult<()> {
+    let roles: Api<Role> = Api::namespaced(kube, namespace);
+    let mut role = roles.get("sleepypods-control-plane").await?;
+    let rules = role
+        .rules
+        .as_mut()
+        .ok_or("sleepypods-control-plane Role has no rules")?;
+    let rule = rules
+        .iter_mut()
+        .find(|rule| {
+            rule.api_groups
+                .as_ref()
+                .is_some_and(|groups| groups.iter().any(|group| group == "apps"))
+                && rule.resources.as_ref().is_some_and(|resources| {
+                    resources.iter().any(|resource| resource == "statefulsets")
+                })
+        })
+        .ok_or("sleepypods-control-plane Role has no StatefulSet rule")?;
+
+    if allow {
+        if !rule.verbs.iter().any(|verb| verb == "delete") {
+            rule.verbs.push("delete".to_owned());
+        }
+    } else {
+        rule.verbs.retain(|verb| verb != "delete");
+    }
+
+    roles
+        .replace("sleepypods-control-plane", &PostParams::default(), &role)
+        .await?;
     Ok(())
 }
 

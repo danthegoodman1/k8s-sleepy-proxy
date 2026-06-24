@@ -48,7 +48,7 @@ cleanup() {
   elif [[ "${keep_namespace}" != "1" ]]; then
     KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
     KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-      -l "sleepypods.io/workload-class-id in (lifecycle-delete-waking)" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      -l "sleepypods.io/workload-class-id in (lifecycle-delete-waking,lifecycle-delete-draining)" --ignore-not-found --wait=true >/dev/null 2>&1 || true
     KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
       "sleepypods-control-plane-${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   fi
@@ -104,7 +104,7 @@ done
 echo "==> Recreating namespace ${namespace}"
 KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-  -l "sleepypods.io/workload-class-id in (lifecycle-delete-waking)" --ignore-not-found --wait=true
+  -l "sleepypods.io/workload-class-id in (lifecycle-delete-waking,lifecycle-delete-draining)" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
   "sleepypods-control-plane-${namespace}" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl create namespace "${namespace}"

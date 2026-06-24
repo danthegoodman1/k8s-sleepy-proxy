@@ -120,7 +120,14 @@ where
             .iter()
             .filter(|object| object.apply_order == ApplyOrder::PersistentVolume)
         {
-            applied_refs.push(self.apply_object(&object.object).await?);
+            match self.apply_object(&object.object).await {
+                Ok(object_ref) => applied_refs.push(object_ref),
+                Err(error) => {
+                    self.delete_rendered_objects_best_effort(&applied_refs)
+                        .await;
+                    return Err(error);
+                }
+            }
         }
 
         let mut pvc_refs = Vec::new();
@@ -128,13 +135,24 @@ where
             .iter()
             .filter(|object| object.apply_order == ApplyOrder::PersistentVolumeClaim)
         {
-            let object_ref = self.apply_object(&object.object).await?;
+            let object_ref = match self.apply_object(&object.object).await {
+                Ok(object_ref) => object_ref,
+                Err(error) => {
+                    self.delete_rendered_objects_best_effort(&applied_refs)
+                        .await;
+                    return Err(error);
+                }
+            };
             pvc_refs.push(object_ref.clone());
             applied_refs.push(object_ref);
         }
 
         for pvc in pvc_refs {
-            self.wait_for_pvc_bound(&pvc).await?;
+            if let Err(error) = self.wait_for_pvc_bound(&pvc).await {
+                self.delete_rendered_objects_best_effort(&applied_refs)
+                    .await;
+                return Err(error);
+            }
         }
 
         for apply_order in [ApplyOrder::Service, ApplyOrder::Workload] {
@@ -142,7 +160,14 @@ where
                 .iter()
                 .filter(|object| object.apply_order == apply_order)
             {
-                applied_refs.push(self.apply_object(&object.object).await?);
+                match self.apply_object(&object.object).await {
+                    Ok(object_ref) => applied_refs.push(object_ref),
+                    Err(error) => {
+                        self.delete_rendered_objects_best_effort(&applied_refs)
+                            .await;
+                        return Err(error);
+                    }
+                }
             }
         }
 
@@ -176,6 +201,12 @@ where
         }
 
         Ok(())
+    }
+
+    async fn delete_rendered_objects_best_effort(&self, objects: &[RenderedObjectRef]) {
+        for object in objects.iter().rev() {
+            let _ = self.client.delete_object(object).await;
+        }
     }
 
     async fn apply_object(
@@ -912,8 +943,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_failure_after_partial_stateful_apply_deletes_known_refs() {
+        let client = FakeKubernetesClient::default();
+        let service_ref = object_ref("v1", "Service", "data", "db-acme");
+        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme");
+        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme");
+        client.fail_apply(service_ref.clone());
+        let materializer = KubernetesMaterializer::new(client.clone());
+
+        let error = materializer
+            .apply_manifest(&stateful_manifest())
+            .await
+            .expect_err("service apply failure stops stateful materialization");
+
+        assert_eq!(
+            error,
+            MaterializerError::Apply {
+                object: service_ref.clone(),
+                source: KubernetesClientError::new("apply failed"),
+            }
+        );
+        assert_eq!(
+            client.operations(),
+            vec![
+                FakeOperation::Apply(pv_ref.clone()),
+                FakeOperation::Apply(pvc_ref.clone()),
+                FakeOperation::WaitPvcBound {
+                    namespace: "data".to_owned(),
+                    name: "pvc-acme".to_owned(),
+                },
+                FakeOperation::Apply(service_ref),
+                FakeOperation::Delete(pvc_ref),
+                FakeOperation::Delete(pv_ref),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn pvc_bound_wait_failure_prevents_service_and_workload_apply() {
         let client = FakeKubernetesClient::default();
+        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme");
+        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme");
         client.fail_pvc_wait("data", "pvc-acme");
         let materializer = KubernetesMaterializer::new(client.clone());
 
@@ -933,17 +1003,14 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
-                FakeOperation::Apply(object_ref(
-                    "v1",
-                    "PersistentVolumeClaim",
-                    "data",
-                    "pvc-acme"
-                )),
+                FakeOperation::Apply(pv_ref.clone()),
+                FakeOperation::Apply(pvc_ref.clone()),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
                     name: "pvc-acme".to_owned(),
                 },
+                FakeOperation::Delete(pvc_ref),
+                FakeOperation::Delete(pv_ref),
             ]
         );
     }
@@ -951,6 +1018,8 @@ mod tests {
     #[tokio::test]
     async fn pvc_bound_wait_failure_prevents_readiness_wait() {
         let client = FakeKubernetesClient::default();
+        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme");
+        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme");
         client.fail_pvc_wait("data", "pvc-acme");
         let materializer = KubernetesMaterializer::new(client.clone());
 
@@ -970,17 +1039,14 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
-                FakeOperation::Apply(object_ref(
-                    "v1",
-                    "PersistentVolumeClaim",
-                    "data",
-                    "pvc-acme"
-                )),
+                FakeOperation::Apply(pv_ref.clone()),
+                FakeOperation::Apply(pvc_ref.clone()),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
                     name: "pvc-acme".to_owned(),
                 },
+                FakeOperation::Delete(pvc_ref),
+                FakeOperation::Delete(pv_ref),
             ]
         );
     }
