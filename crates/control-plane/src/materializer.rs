@@ -107,11 +107,18 @@ where
         })
     }
 
+    pub fn rendered_object_refs(
+        &self,
+        manifest: &RenderedManifest,
+    ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
+        rendered_object_refs(manifest)
+    }
+
     pub async fn apply_manifest(
         &self,
         manifest: &RenderedManifest,
     ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
-        validate_manifest_generations(manifest)?;
+        let rendered_objects = rendered_object_refs(manifest)?;
 
         let objects = ordered_objects(manifest);
         let mut applied_refs = Vec::with_capacity(objects.len());
@@ -171,7 +178,7 @@ where
             }
         }
 
-        Ok(applied_refs)
+        Ok(rendered_objects)
     }
 
     pub async fn wait_for_readiness(
@@ -341,6 +348,17 @@ pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
         namespace: namespace.unwrap_or_default(),
         name: object.name().to_owned(),
     }
+}
+
+pub fn rendered_object_refs(
+    manifest: &RenderedManifest,
+) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
+    validate_manifest_generations(manifest)?;
+
+    Ok(ordered_objects(manifest)
+        .into_iter()
+        .map(|object| rendered_object_ref(&object.object))
+        .collect())
 }
 
 fn ordered_objects(manifest: &RenderedManifest) -> Vec<&RenderedManifestObject> {
@@ -1148,6 +1166,31 @@ mod tests {
                 object_ref("v1", "Service", "data", "db-acme"),
                 object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
             ]
+        );
+    }
+
+    #[test]
+    fn rendered_object_refs_are_available_without_applying_or_waiting() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let manifest = stateful_manifest();
+
+        let refs = materializer
+            .rendered_object_refs(&manifest)
+            .expect("refs derive");
+
+        assert_eq!(
+            refs,
+            vec![
+                object_ref("v1", "PersistentVolume", "", "pv-acme"),
+                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
+                object_ref("v1", "Service", "data", "db-acme"),
+                object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+            ]
+        );
+        assert!(
+            client.operations().is_empty(),
+            "deriving rendered refs must not touch Kubernetes"
         );
     }
 

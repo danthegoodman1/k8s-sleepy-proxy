@@ -20,15 +20,13 @@ use crate::{
         CompleteWakeRequest, CompleteWakeResult, FinalizeSleepRequest,
         LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
         MaterializationState, MaterializationTarget, RecordMaterializationRequest,
+        RenderedObjectRef,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     sleep_policy::SleepPolicyError,
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
-
-#[cfg(test)]
-use crate::materialization::RenderedObjectRef;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WakeInstanceRequest {
@@ -135,6 +133,12 @@ where
             actual: instance.generation,
         });
     }
+
+    let should_consider_active_backend_generation = request.backend_generation.is_none()
+        && matches!(
+            instance.state,
+            InstanceState::Waking | InstanceState::Failed
+        );
 
     let waking = match instance.state {
         InstanceState::Running => {
@@ -266,7 +270,7 @@ where
         }
     };
 
-    let rendered_objects = match materializer.apply_manifest(&manifest).await {
+    let rendered_objects = match materializer.rendered_object_refs(&manifest) {
         Ok(rendered_objects) => rendered_objects,
         Err(error) => {
             return Err(fail_waking(
@@ -281,9 +285,31 @@ where
         }
     };
 
-    let backend_generation = request
-        .backend_generation
-        .unwrap_or_else(|| BackendGeneration::new(waking.generation.get()));
+    let backend_generation = match request.backend_generation {
+        Some(backend_generation) => backend_generation,
+        None => {
+            let default = BackendGeneration::new(waking.generation.get());
+            if should_consider_active_backend_generation {
+                match store
+                    .load_active_materialization(LoadActiveMaterializationRequest::new(
+                        request.instance_id.clone(),
+                        request.target.clone(),
+                    ))
+                    .await
+                {
+                    Ok(Some(materialization)) => {
+                        std::cmp::max(default, materialization.backend_generation)
+                    }
+                    Ok(None) => default,
+                    Err(error) => {
+                        return Err(fail_waking_with_store_error(store, &waking, error).await);
+                    }
+                }
+            } else {
+                default
+            }
+        }
+    };
     let mut pending = RecordMaterializationRequest::new(
         request.instance_id.clone(),
         waking.generation,
@@ -293,16 +319,25 @@ where
     );
     pending.rendered_objects = rendered_objects.clone();
     if let Err(error) = store.record_materialization(pending).await {
-        let _ = materializer
-            .delete_rendered_objects(&rendered_objects)
-            .await;
         return Err(fail_waking_with_store_error(store, &waking, error).await);
+    }
+
+    if let Err(error) = materializer.apply_manifest(&manifest).await {
+        return Err(fail_waking(
+            store,
+            &waking,
+            WakeInstanceError::Materializer {
+                instance: waking.clone(),
+                source: error,
+            },
+        )
+        .await);
     }
 
     let backend = match materializer.wait_for_readiness(&rendered_objects).await {
         Ok(backend) => backend,
         Err(error) => {
-            return Err(fail_waking(
+            let original = fail_waking(
                 store,
                 &waking,
                 WakeInstanceError::Materializer {
@@ -310,10 +345,19 @@ where
                     source: error,
                 },
             )
-            .await);
+            .await;
+            cleanup_rendered_objects_if_instance_missing_or_terminal(
+                store,
+                materializer,
+                &waking.id,
+                &rendered_objects,
+            )
+            .await;
+            return Err(original);
         }
     };
 
+    let complete_instance_id = request.instance_id.clone();
     let mut complete = CompleteWakeRequest::new(
         request.instance_id,
         waking.generation,
@@ -321,13 +365,47 @@ where
         backend,
         backend_generation,
     );
-    complete.rendered_objects = rendered_objects;
+    complete.rendered_objects = rendered_objects.clone();
 
-    store
-        .complete_wake(complete)
+    match store.complete_wake(complete).await {
+        Ok(result) => Ok(WakeInstanceResult::Completed { result }),
+        Err(error) => {
+            cleanup_rendered_objects_if_instance_missing_or_terminal(
+                store,
+                materializer,
+                &complete_instance_id,
+                &rendered_objects,
+            )
+            .await;
+            Err(map_store_error(error))
+        }
+    }
+}
+
+async fn cleanup_rendered_objects_if_instance_missing_or_terminal<S, C>(
+    store: &S,
+    materializer: &KubernetesMaterializer<C>,
+    instance_id: &InstanceId,
+    rendered_objects: &[RenderedObjectRef],
+) where
+    S: ControlPlaneStore + ?Sized,
+    C: KubernetesMaterializerClient,
+{
+    let should_cleanup = match store
+        .get_instance(GetInstanceRequest::new(instance_id.clone()))
         .await
-        .map(|result| WakeInstanceResult::Completed { result })
-        .map_err(map_store_error)
+    {
+        Ok(None) => true,
+        Ok(Some(instance)) => matches!(
+            instance.state,
+            InstanceState::Deleting | InstanceState::Deleted
+        ),
+        Err(_) => false,
+    };
+
+    if should_cleanup {
+        let _ = materializer.delete_rendered_objects(rendered_objects).await;
+    }
 }
 
 async fn resume_deleting_sleep<S, C>(

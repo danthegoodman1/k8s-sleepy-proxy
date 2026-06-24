@@ -20,8 +20,9 @@ use crate::{
     },
     manifest::{
         ContainerPortTemplate, ContainerTemplate, EnvVarTemplate, KubernetesObject,
-        ManifestTemplate, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-        WorkloadKind, WorkloadTemplate,
+        ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+        PersistentVolumeSourceTemplate, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+        TemplateText, VolumeTemplate, WorkloadKind, WorkloadTemplate,
     },
     materialization::{
         BackendEndpoint, BeginSleepRequest, BeginSleepResult, FinalizeSleepRequest,
@@ -61,6 +62,7 @@ struct FakeStoreState {
     events: Vec<StoreEvent>,
     complete_conflict: bool,
     delete_before_record_materialization: bool,
+    delete_after_record_materialization: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,15 +101,19 @@ enum StoreEvent {
 #[derive(Clone, Debug, Default)]
 struct FakeKubernetesClient {
     inner: Arc<Mutex<FakeKubernetesState>>,
+    observed_store: Option<FakeStore>,
 }
 
 #[derive(Clone, Debug)]
 struct FakeKubernetesState {
     applied_objects: Vec<KubernetesObject>,
     deleted_objects: Vec<RenderedObjectRef>,
+    pvc_bound_calls: Vec<(String, String)>,
     readiness_calls: Vec<Vec<RenderedObjectRef>>,
     backend: BackendEndpoint,
+    fail_pvc_wait: Option<(String, String)>,
     fail_readiness: bool,
+    first_apply_store_events: Option<Vec<StoreEvent>>,
 }
 
 impl Default for FakeKubernetesState {
@@ -115,9 +121,12 @@ impl Default for FakeKubernetesState {
         Self {
             applied_objects: Vec::new(),
             deleted_objects: Vec::new(),
+            pvc_bound_calls: Vec::new(),
             readiness_calls: Vec::new(),
             backend: backend("http://svc-acme.apps.svc.cluster.local:80"),
+            fail_pvc_wait: None,
             fail_readiness: false,
+            first_apply_store_events: None,
         }
     }
 }
@@ -126,7 +135,7 @@ impl Default for FakeKubernetesState {
 async fn successful_wake_cas_renders_applies_and_completes_with_waking_generation() {
     let instance = instance("instance-a", InstanceState::Cold, 1);
     let store = FakeStore::new(instance, Some(workload_class()));
-    let client = FakeKubernetesClient::default();
+    let client = FakeKubernetesClient::observing_store(store.clone());
     let materializer = KubernetesMaterializer::new(client.clone());
 
     let result = wake_instance(
@@ -187,6 +196,25 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
             object_ref("v1", "Service", "apps", "svc-acme"),
             object_ref("apps/v1", "Deployment", "apps", "app-acme"),
         ]]
+    );
+    assert_eq!(
+        client.first_apply_store_events(),
+        Some(vec![
+            StoreEvent::Cas {
+                expected: Generation::new(1),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(2),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+        ])
     );
 
     let applied = client.applied_objects();
@@ -419,6 +447,10 @@ async fn restart_during_wake_resumes_waking_generation_without_new_cas() {
     assert_eq!(
         store.events(),
         vec![
+            StoreEvent::LoadActiveMaterialization {
+                instance_id: instance_id("instance-a"),
+                target: target("cluster-a", "apps"),
+            },
             StoreEvent::RecordMaterialization {
                 instance_generation: Generation::new(5),
                 state: MaterializationState::Pending,
@@ -474,6 +506,12 @@ async fn failed_and_draining_instances_can_start_wake() {
             next_state: InstanceState::Waking,
             reason: StateTransitionReason::WakeRequested,
         });
+        if state == InstanceState::Failed {
+            expected_events.push(StoreEvent::LoadActiveMaterialization {
+                instance_id: instance_id("instance-a"),
+                target: target("cluster-a", "apps"),
+            });
+        }
         expected_events.push(StoreEvent::RecordMaterialization {
             instance_generation: Generation::new(13),
             state: MaterializationState::Pending,
@@ -616,6 +654,205 @@ async fn materializer_failure_marks_waking_generation_failed() {
 }
 
 #[tokio::test]
+async fn retry_after_failed_high_backend_generation_does_not_rewind_pending_materialization() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 1),
+        Some(workload_class()),
+    );
+    let first_client = FakeKubernetesClient::default();
+    first_client.fail_readiness();
+    let first_materializer = KubernetesMaterializer::new(first_client.clone());
+
+    let first_error = wake_instance(
+        &store,
+        &first_materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        )
+        .with_backend_generation(BackendGeneration::new(100)),
+    )
+    .await
+    .expect_err("first wake fails after recording high backend generation");
+
+    assert!(matches!(
+        first_error,
+        WakeInstanceError::Materializer { .. }
+    ));
+    assert_eq!(store.instance().state, InstanceState::Failed);
+    assert_eq!(store.instance().generation, Generation::new(3));
+    assert_eq!(
+        store.materialization().map(|record| (
+            record.state,
+            record.backend_generation,
+            record.backend
+        )),
+        Some((
+            MaterializationState::Pending,
+            BackendGeneration::new(100),
+            None
+        ))
+    );
+
+    let retry_client = FakeKubernetesClient::default();
+    let retry_materializer = KubernetesMaterializer::new(retry_client.clone());
+    let retry_result = wake_instance(
+        &store,
+        &retry_materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(3),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect("retry reuses active backend generation instead of rewinding");
+
+    let WakeInstanceResult::Completed { result } = retry_result else {
+        panic!("retry should complete");
+    };
+    assert_eq!(result.instance.state, InstanceState::Running);
+    assert_eq!(result.instance.generation, Generation::new(5));
+    assert_eq!(
+        result.materialization.backend_generation,
+        BackendGeneration::new(100)
+    );
+    assert_eq!(
+        result
+            .materialization
+            .backend
+            .as_ref()
+            .map(BackendEndpoint::uri),
+        Some("http://svc-acme.apps.svc.cluster.local:80")
+    );
+    assert_eq!(retry_client.applied_objects().len(), 2);
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(1),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(100),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+            StoreEvent::Cas {
+                expected: Generation::new(2),
+                next_state: InstanceState::Failed,
+                reason: StateTransitionReason::FailureReported(
+                    "materialization failed: failed waiting for readiness across 2 rendered Kubernetes objects: not ready"
+                        .to_owned()
+                ),
+            },
+            StoreEvent::Cas {
+                expected: Generation::new(3),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::LoadActiveMaterialization {
+                instance_id: instance_id("instance-a"),
+                target: target("cluster-a", "apps"),
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(4),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(100),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+            StoreEvent::Complete {
+                expected_waking_generation: Generation::new(4),
+                backend_generation: BackendGeneration::new(100),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 6),
+        Some(stateful_workload_class()),
+    );
+    let client = FakeKubernetesClient::observing_store(store.clone());
+    client.fail_pvc_wait("apps", "pvc-acme");
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(6),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("pvc wait failure fails wake");
+
+    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert_eq!(store.instance().state, InstanceState::Failed);
+    assert_eq!(store.instance().generation, Generation::new(8));
+    let rendered_objects = vec![
+        object_ref("v1", "PersistentVolume", "", "pv-acme"),
+        object_ref("v1", "PersistentVolumeClaim", "apps", "pvc-acme"),
+        object_ref("v1", "Service", "apps", "svc-acme"),
+        object_ref("apps/v1", "StatefulSet", "apps", "app-acme"),
+    ];
+    assert_eq!(
+        store.materialization().map(|record| {
+            (
+                record.state,
+                record.backend,
+                record.instance_generation,
+                record.rendered_objects,
+            )
+        }),
+        Some((
+            MaterializationState::Pending,
+            None,
+            Generation::new(7),
+            rendered_objects.clone()
+        ))
+    );
+    assert_eq!(
+        client.first_apply_store_events(),
+        Some(vec![
+            StoreEvent::Cas {
+                expected: Generation::new(6),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(7),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(7),
+                rendered_objects: rendered_objects.clone(),
+            },
+        ])
+    );
+    assert_eq!(
+        client.pvc_bound_calls(),
+        vec![("apps".to_owned(), "pvc-acme".to_owned())]
+    );
+    assert!(client.readiness_calls().is_empty());
+}
+
+#[tokio::test]
 async fn materializer_failure_records_wake_and_failure_observability_fields() {
     let store = FakeStore::new(
         instance("instance-a", InstanceState::Cold, 6),
@@ -673,7 +910,7 @@ async fn materializer_failure_records_wake_and_failure_observability_fields() {
 }
 
 #[tokio::test]
-async fn record_materialization_failure_after_apply_deletes_rendered_objects() {
+async fn record_materialization_failure_prevents_kubernetes_apply() {
     let store = FakeStore::new(
         instance("instance-a", InstanceState::Cold, 8),
         Some(workload_class()),
@@ -692,7 +929,55 @@ async fn record_materialization_failure_after_apply_deletes_rendered_objects() {
         ),
     )
     .await
-    .expect_err("recording pending materialization should fail after apply");
+    .expect_err("recording pending materialization should fail before apply");
+
+    assert!(matches!(error, WakeInstanceError::NotFound));
+    let rendered_objects = vec![
+        object_ref("v1", "Service", "apps", "svc-acme"),
+        object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+    ];
+    assert!(client.applied_objects().is_empty());
+    assert!(client.deleted_objects().is_empty());
+    assert!(client.readiness_calls().is_empty());
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(8),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(9),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(9),
+                rendered_objects,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delete_after_pending_before_apply_cleans_objects_applied_by_wake() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 8),
+        Some(workload_class()),
+    );
+    store.delete_after_record_materialization();
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(8),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("complete fails after delete wins the post-pending race");
 
     assert!(matches!(error, WakeInstanceError::NotFound));
     let rendered_objects = vec![
@@ -702,9 +987,80 @@ async fn record_materialization_failure_after_apply_deletes_rendered_objects() {
     assert_eq!(client.applied_objects().len(), 2);
     assert_eq!(
         client.deleted_objects(),
-        vec![rendered_objects[1].clone(), rendered_objects[0].clone()]
+        vec![rendered_objects[0].clone(), rendered_objects[1].clone()]
     );
-    assert!(client.readiness_calls().is_empty());
+    assert_eq!(
+        store.materialization().map(|record| {
+            (
+                record.state,
+                record.backend,
+                record.instance_generation,
+                record.rendered_objects,
+            )
+        }),
+        Some((
+            MaterializationState::Pending,
+            None,
+            Generation::new(9),
+            rendered_objects.clone()
+        ))
+    );
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(8),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(9),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(9),
+                rendered_objects: rendered_objects.clone(),
+            },
+            StoreEvent::Complete {
+                expected_waking_generation: Generation::new(9),
+                backend_generation: BackendGeneration::new(9),
+                rendered_objects,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delete_after_pending_before_readiness_failure_cleans_objects_applied_by_wake() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 8),
+        Some(workload_class()),
+    );
+    store.delete_after_record_materialization();
+    let client = FakeKubernetesClient::default();
+    client.fail_readiness();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(8),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("readiness fails after delete wins the post-pending race");
+
+    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    let rendered_objects = vec![
+        object_ref("v1", "Service", "apps", "svc-acme"),
+        object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+    ];
+    assert_eq!(client.applied_objects().len(), 2);
+    assert_eq!(
+        client.deleted_objects(),
+        vec![rendered_objects[0].clone(), rendered_objects[1].clone()]
+    );
     assert_eq!(
         store.events(),
         vec![
@@ -777,6 +1133,7 @@ async fn complete_generation_conflict_after_apply_is_returned_without_retry() {
     assert_eq!(store.instance().state, InstanceState::Waking);
     assert_eq!(store.instance().generation, Generation::new(10));
     assert_eq!(client.applied_objects().len(), 2);
+    assert!(client.deleted_objects().is_empty());
 }
 
 #[tokio::test]
@@ -893,6 +1250,7 @@ impl FakeStore {
                 events: Vec::new(),
                 complete_conflict: false,
                 delete_before_record_materialization: false,
+                delete_after_record_materialization: false,
             })),
         }
     }
@@ -914,6 +1272,14 @@ impl FakeStore {
             .expect("fake instance")
     }
 
+    fn materialization(&self) -> Option<MaterializationRecord> {
+        self.inner
+            .lock()
+            .expect("fake store lock not poisoned")
+            .materialization
+            .clone()
+    }
+
     fn set_complete_conflict(&self) {
         self.inner
             .lock()
@@ -926,6 +1292,13 @@ impl FakeStore {
             .lock()
             .expect("fake store lock not poisoned")
             .delete_before_record_materialization = true;
+    }
+
+    fn delete_after_record_materialization(&self) {
+        self.inner
+            .lock()
+            .expect("fake store lock not poisoned")
+            .delete_after_record_materialization = true;
     }
 
     fn set_materialization(&self, materialization: MaterializationRecord) {
@@ -1060,6 +1433,15 @@ impl ControlPlaneStore for FakeStore {
                     resource: "instance",
                 });
             }
+            if inner.materialization.as_ref().is_some_and(|existing| {
+                existing.instance_id == request.instance_id
+                    && existing.target == request.target
+                    && existing.backend_generation > request.backend_generation
+            }) {
+                return Err(StoreError::invalid_argument(
+                    "materialization backend generation rewind rejected",
+                ));
+            }
             let record = MaterializationRecord {
                 id: MaterializationId::new(format!(
                     "{}:{}:{}",
@@ -1077,6 +1459,9 @@ impl ControlPlaneStore for FakeStore {
                 rendered_objects: request.rendered_objects,
             };
             inner.materialization = Some(record.clone());
+            if inner.delete_after_record_materialization {
+                inner.instance = None;
+            }
             Ok(record)
         })
     }
@@ -1263,6 +1648,13 @@ impl ControlPlaneStore for FakeStore {
 }
 
 impl FakeKubernetesClient {
+    fn observing_store(store: FakeStore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(FakeKubernetesState::default())),
+            observed_store: Some(store),
+        }
+    }
+
     fn applied_objects(&self) -> Vec<KubernetesObject> {
         self.inner
             .lock()
@@ -1279,12 +1671,35 @@ impl FakeKubernetesClient {
             .clone()
     }
 
+    fn pvc_bound_calls(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .pvc_bound_calls
+            .clone()
+    }
+
     fn readiness_calls(&self) -> Vec<Vec<RenderedObjectRef>> {
         self.inner
             .lock()
             .expect("fake kubernetes lock not poisoned")
             .readiness_calls
             .clone()
+    }
+
+    fn first_apply_store_events(&self) -> Option<Vec<StoreEvent>> {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .first_apply_store_events
+            .clone()
+    }
+
+    fn fail_pvc_wait(&self, namespace: &str, name: &str) {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .fail_pvc_wait = Some((namespace.to_owned(), name.to_owned()));
     }
 
     fn fail_readiness(&self) {
@@ -1301,11 +1716,23 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         object: &'a KubernetesObject,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            self.inner
+            let first_apply_store_events = self.observed_store.as_ref().and_then(|store| {
+                let should_capture = self
+                    .inner
+                    .lock()
+                    .expect("fake kubernetes lock not poisoned")
+                    .first_apply_store_events
+                    .is_none();
+                should_capture.then(|| store.events())
+            });
+            let mut inner = self
+                .inner
                 .lock()
-                .expect("fake kubernetes lock not poisoned")
-                .applied_objects
-                .push(object.clone());
+                .expect("fake kubernetes lock not poisoned");
+            if inner.first_apply_store_events.is_none() {
+                inner.first_apply_store_events = first_apply_store_events;
+            }
+            inner.applied_objects.push(object.clone());
             Ok(())
         })
     }
@@ -1326,10 +1753,28 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
 
     fn wait_for_pvc_bound<'a>(
         &'a self,
-        _namespace: &'a str,
-        _name: &'a str,
+        namespace: &'a str,
+        name: &'a str,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("fake kubernetes lock not poisoned");
+            inner
+                .pvc_bound_calls
+                .push((namespace.to_owned(), name.to_owned()));
+            if inner
+                .fail_pvc_wait
+                .as_ref()
+                .is_some_and(|(fail_namespace, fail_name)| {
+                    fail_namespace == namespace && fail_name == name
+                })
+            {
+                return Err(KubernetesClientError::new("pvc did not bind"));
+            }
+            Ok(())
+        })
     }
 
     fn wait_for_readiness<'a>(
@@ -1380,6 +1825,17 @@ fn workload_class() -> WorkloadClassVersion {
     }
 }
 
+fn stateful_workload_class() -> WorkloadClassVersion {
+    WorkloadClassVersion {
+        reference: workload_ref(),
+        template_generation: Generation::new(3),
+        template: stateful_template(),
+        default_values: InstanceValues::new(),
+        value_schema: WorkloadValueSchema::new(true),
+        sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy"),
+    }
+}
+
 fn deployment_template() -> ManifestTemplate {
     ManifestTemplate {
         workload: WorkloadTemplate {
@@ -1414,6 +1870,56 @@ fn deployment_template() -> ManifestTemplate {
             mode: None,
         },
         volumes: Vec::new(),
+    }
+}
+
+fn stateful_template() -> ManifestTemplate {
+    ManifestTemplate {
+        workload: WorkloadTemplate {
+            kind: WorkloadKind::StatefulSet,
+            name: TemplateText::literal("app-acme"),
+            replicas: Some(1),
+            app_container: ContainerTemplate {
+                name: "app".to_owned(),
+                image: TemplateText::literal("example/app:1"),
+                ports: vec![ContainerPortTemplate {
+                    name: Some("http".to_owned()),
+                    container_port: 8080,
+                }],
+                env: vec![EnvVarTemplate {
+                    name: "TENANT".to_owned(),
+                    value: TemplateText::literal("acme"),
+                }],
+            },
+        },
+        service: Some(ServiceTemplate {
+            name: TemplateText::literal("svc-acme"),
+            ports: vec![ServicePortTemplate {
+                name: Some("http".to_owned()),
+                port: 80,
+                target_port: 8080,
+            }],
+        }),
+        sidecar: SidecarTemplate {
+            name: "sleepypods-sidecar".to_owned(),
+            image: TemplateText::literal("sleepypods/sidecar:test"),
+            listen_port: 15000,
+            mode: None,
+        },
+        volumes: vec![VolumeTemplate {
+            name: "data".to_owned(),
+            mount_path: TemplateText::literal("/data"),
+            pv_name: TemplateText::literal("pv-acme"),
+            pvc_name: TemplateText::literal("pvc-acme"),
+            access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+            capacity: TemplateText::literal("1Gi"),
+            reclaim_policy: PersistentVolumeReclaimPolicy::Retain,
+            storage_class_name: Some(TemplateText::literal("manual")),
+            source: PersistentVolumeSourceTemplate::HostPath {
+                path: TemplateText::literal("/tmp/sleepypods-test"),
+                type_: None,
+            },
+        }],
     }
 }
 
