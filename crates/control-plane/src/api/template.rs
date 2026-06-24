@@ -88,6 +88,7 @@ fn sidecar_template_from_proto(
         image: required_template_field(template.image, "template.sidecar.image")
             .and_then(template_text_from_proto)?,
         listen_port: u16_from_proto("template.sidecar.listen_port", template.listen_port)?,
+        mode: template.mode,
     })
 }
 
@@ -348,6 +349,7 @@ fn sidecar_template_to_proto(template: domain_manifest::SidecarTemplate) -> pb::
         name: template.name,
         image: Some(template_text_to_proto(template.image)),
         listen_port: u32::from(template.listen_port),
+        mode: template.mode,
     }
 }
 

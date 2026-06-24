@@ -1463,6 +1463,7 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
                 name: "sleepypods-sidecar".to_owned(),
                 image: control_plane::TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
+                mode: None,
             },
             volumes: Vec::new(),
         },

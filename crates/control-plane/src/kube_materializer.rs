@@ -21,6 +21,7 @@ use crate::{
 
 const DEFAULT_FIELD_MANAGER: &str = "sleepypods-control-plane";
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
+const BACKEND_SCHEME_ANNOTATION: &str = "sleepypods.io/backend-scheme";
 
 #[derive(Clone)]
 pub struct KubeMaterializerClient {
@@ -271,11 +272,7 @@ fn backend_endpoint_for_service(
     service: &Service,
     config: &KubeMaterializerClientConfig,
 ) -> KubernetesClientResult<BackendEndpoint> {
-    if !is_valid_uri_scheme(&config.backend_scheme) {
-        return Err(KubernetesClientError::new(
-            "Kubernetes materializer backend scheme is invalid",
-        ));
-    }
+    let backend_scheme = backend_scheme_for_service(service, config)?;
 
     let name = service
         .metadata
@@ -290,9 +287,38 @@ fn backend_endpoint_for_service(
 
     BackendEndpoint::new(format!(
         "{}://{name}.{namespace}.svc.cluster.local:{port}",
-        config.backend_scheme
+        backend_scheme
     ))
     .map_err(|error| KubernetesClientError::new(error.to_string()))
+}
+
+fn backend_scheme_for_service<'a>(
+    service: &'a Service,
+    config: &'a KubeMaterializerClientConfig,
+) -> KubernetesClientResult<&'a str> {
+    if let Some(annotation) = service
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(BACKEND_SCHEME_ANNOTATION))
+        .map(String::as_str)
+    {
+        if !is_valid_uri_scheme(annotation) {
+            return Err(KubernetesClientError::new(format!(
+                "Service backend scheme annotation {BACKEND_SCHEME_ANNOTATION} is invalid"
+            )));
+        }
+
+        return Ok(annotation);
+    }
+
+    if !is_valid_uri_scheme(&config.backend_scheme) {
+        return Err(KubernetesClientError::new(
+            "Kubernetes materializer backend scheme is invalid",
+        ));
+    }
+
+    Ok(&config.backend_scheme)
 }
 
 fn endpoint_slice_has_ready_endpoint(slice: &EndpointSlice) -> bool {
@@ -392,7 +418,7 @@ fn is_transient_kube_error(error: &KubeError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
 
     use k8s_openapi::{
         api::{
@@ -491,6 +517,24 @@ mod tests {
             backend_endpoint_for_service(&service, &config).expect("service backend endpoint");
 
         assert_eq!(backend.uri(), "tcp://postgres.data.svc.cluster.local:5432");
+    }
+
+    #[test]
+    fn service_annotation_overrides_default_backend_scheme() {
+        let mut service = service("passthrough", "apps", [9443]);
+        service.metadata.annotations = Some(BTreeMap::from([(
+            "sleepypods.io/backend-scheme".to_owned(),
+            "tcp".to_owned(),
+        )]));
+        let config = KubeMaterializerClientConfig::default();
+
+        let backend =
+            backend_endpoint_for_service(&service, &config).expect("service backend endpoint");
+
+        assert_eq!(
+            backend.uri(),
+            "tcp://passthrough.apps.svc.cluster.local:9443"
+        );
     }
 
     #[test]

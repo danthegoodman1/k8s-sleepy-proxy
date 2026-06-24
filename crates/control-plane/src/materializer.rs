@@ -1474,6 +1474,7 @@ mod tests {
             name: "sleepypods-sidecar".to_owned(),
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
+            mode: None,
         }
     }
 

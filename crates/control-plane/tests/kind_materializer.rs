@@ -161,6 +161,7 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
             name: "sleepypods-sidecar".to_owned(),
             image: TemplateText::literal("nginx:1.27-alpine"),
             listen_port: 80,
+            mode: None,
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal(WORKLOAD_NAME),

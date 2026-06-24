@@ -64,6 +64,7 @@ pub struct SidecarTemplate {
     pub name: String,
     pub image: TemplateText,
     pub listen_port: u16,
+    pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

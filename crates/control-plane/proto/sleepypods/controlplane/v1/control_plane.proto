@@ -281,6 +281,7 @@ message SidecarTemplate {
   string name = 1;
   TemplateText image = 2;
   uint32 listen_port = 3;
+  optional string mode = 4;
 }
 
 message ServiceTemplate {

@@ -1776,6 +1776,7 @@ fn stateful_manifest_template_proto() -> ManifestTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text("sleepypods/sidecar:test")),
             listen_port: 15000,
+            mode: None,
         }),
         service: Some(ServiceTemplate {
             name: Some(composed_text("db-", "tenant")),

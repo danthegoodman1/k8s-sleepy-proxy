@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.13-alpine
+
+RUN mkdir -p /app/tls
+COPY scripts/kind-tls-app.py /app/kind-tls-app.py
+COPY scripts/kind-e2e-tls-cert.pem /app/tls/cert.pem
+COPY scripts/kind-e2e-tls-key.pem /app/tls/key.pem
+
+EXPOSE 8080
+CMD ["python", "/app/kind-tls-app.py"]

@@ -202,6 +202,39 @@ fn renders_deployment_and_service_without_volumes() {
 }
 
 #[test]
+fn renders_optional_sidecar_mode_env() {
+    let mut template = deployment_template();
+    template.sidecar.mode = Some("tcp".to_owned());
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("deployment renders");
+    let service = match &rendered.objects[0].object {
+        KubernetesObject::Service(service) => service,
+        other => panic!("expected Service, got {}", other.kind()),
+    };
+    let deployment = match &rendered.objects[1].object {
+        KubernetesObject::Deployment(deployment) => deployment,
+        other => panic!("expected Deployment, got {}", other.kind()),
+    };
+
+    assert_eq!(
+        service.metadata.annotations["sleepypods.io/backend-scheme"],
+        "tcp"
+    );
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_SIDECAR_MODE",
+        "tcp",
+    );
+}
+
+#[test]
 fn serializes_deployment_and_service_as_kubernetes_json() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &deployment_template(),
@@ -696,6 +729,29 @@ fn rejects_zero_sidecar_listen_port() {
 }
 
 #[test]
+fn rejects_invalid_sidecar_mode() {
+    let mut template = deployment_template();
+    template.sidecar.mode = Some("smtp".to_owned());
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("invalid sidecar mode is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "sidecar.mode",
+            message: "sidecar mode must be either http or tcp".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn rejects_service_without_ports_for_sidecar_routing() {
     let mut template = deployment_template();
     template.service.as_mut().expect("service").ports = Vec::new();
@@ -1063,6 +1119,7 @@ fn sidecar_template() -> SidecarTemplate {
         name: "sleepypods-sidecar".to_owned(),
         image: TemplateText::literal("sleepypods/sidecar:test"),
         listen_port: 15000,
+        mode: None,
     }
 }
 

@@ -1854,6 +1854,7 @@ fn workload_manifest_template() -> ManifestTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
+            mode: None,
         },
         service: Some(ServiceTemplate {
             name: composed_text("svc-", "tenant"),

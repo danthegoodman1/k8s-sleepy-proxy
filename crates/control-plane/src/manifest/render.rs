@@ -28,6 +28,8 @@ const ENV_CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
 const ENV_IDLE_TIMEOUT_MS: &str = "SLEEPYPODS_IDLE_TIMEOUT_MS";
 const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
 const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
+const ENV_SIDECAR_MODE: &str = "SLEEPYPODS_SIDECAR_MODE";
+const ANNOTATION_BACKEND_SCHEME: &str = "sleepypods.io/backend-scheme";
 
 pub fn render_manifests(
     request: RenderManifestRequest<'_>,
@@ -105,6 +107,11 @@ pub fn render_manifests(
     }
 
     if let Some(service) = &request.template.service {
+        let mut service_annotations = annotations.clone();
+        if sidecar.mode.as_deref() == Some("tcp") {
+            service_annotations.insert(ANNOTATION_BACKEND_SCHEME.to_owned(), "tcp".to_owned());
+        }
+
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::Service,
             object: KubernetesObject::Service(Service {
@@ -112,7 +119,7 @@ pub fn render_manifests(
                     name: service_name.clone().expect("service name was rendered"),
                     namespace: Some(request.namespace.to_owned()),
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: service_annotations,
                 },
                 spec: ServiceSpec {
                     selector: selector_labels.clone(),
@@ -229,10 +236,11 @@ struct RenderedVolume {
     source: PersistentVolumeSource,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SidecarRenderConfig {
     listen_port: u16,
     app_port: u16,
+    mode: Option<String>,
 }
 
 fn render_sidecar_config(
@@ -275,10 +283,19 @@ fn render_sidecar_config(
     }
     render_non_empty("sidecar.image", &template.sidecar.image, instance)?;
     validate_dns_label("sidecar.name", &template.sidecar.name)?;
+    if let Some(mode) = &template.sidecar.mode {
+        if !matches!(mode.as_str(), "http" | "tcp") {
+            return Err(ManifestRenderError::InvalidField {
+                field: "sidecar.mode",
+                message: "sidecar mode must be either http or tcp".to_owned(),
+            });
+        }
+    }
 
     Ok(SidecarRenderConfig {
         listen_port: template.sidecar.listen_port,
         app_port,
+        mode: template.sidecar.mode.clone(),
     })
 }
 
@@ -435,14 +452,7 @@ fn render_sidecar_container(
     namespace: &str,
     sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
 ) -> Result<Container, ManifestRenderError> {
-    Ok(Container {
-        name: template.name.clone(),
-        image: render_non_empty("sidecar.image", &template.image, instance)?,
-        ports: vec![ContainerPort {
-            name: Some(SIDECAR_PORT_NAME.to_owned()),
-            container_port: config.listen_port,
-        }],
-        env: vec![
+    let mut env = vec![
             EnvVar {
                 name: ENV_LISTEN_PORT.to_owned(),
                 value: config.listen_port.to_string(),
@@ -481,7 +491,22 @@ fn render_sidecar_container(
                 name: ENV_DRAIN_GRACE_TIMEOUT_MS.to_owned(),
                 value: sleep_policy.drain_grace_timeout_ms.to_string(),
             },
-        ],
+        ];
+    if let Some(mode) = &config.mode {
+        env.push(EnvVar {
+            name: ENV_SIDECAR_MODE.to_owned(),
+            value: mode.clone(),
+        });
+    }
+
+    Ok(Container {
+        name: template.name.clone(),
+        image: render_non_empty("sidecar.image", &template.image, instance)?,
+        ports: vec![ContainerPort {
+            name: Some(SIDECAR_PORT_NAME.to_owned()),
+            container_port: config.listen_port,
+        }],
+        env,
         volume_mounts: Vec::new(),
     })
 }
