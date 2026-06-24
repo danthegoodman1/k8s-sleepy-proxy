@@ -24,7 +24,7 @@ use super::{
         self, generation_to_i64, instance_from_row, instance_state_to_db,
         manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
         sleep_policy_to_json, value_schema_to_json, values_to_json,
-        workload_class_version_from_row,
+        workload_class_version_from_row, workload_exclusivity_keys_to_json,
     },
 };
 
@@ -102,6 +102,7 @@ pub(crate) async fn create_workload_class_version(
     let default_values = values_to_json(&desired.default_values)?;
     let value_schema = value_schema_to_json(&desired.value_schema);
     let sleep_policy = sleep_policy_to_json(&desired.sleep_policy)?;
+    let exclusivity_keys = workload_exclusivity_keys_to_json(&desired.exclusivity_keys)?;
     let inserted = client
         .execute(
             "
@@ -112,9 +113,10 @@ pub(crate) async fn create_workload_class_version(
                 manifest_template,
                 default_values,
                 value_schema,
-                sleep_policy
+                sleep_policy,
+                exclusivity_keys
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
             &[
@@ -125,6 +127,7 @@ pub(crate) async fn create_workload_class_version(
                 &default_values,
                 &value_schema,
                 &sleep_policy,
+                &exclusivity_keys,
             ],
         )
         .await
@@ -297,7 +300,8 @@ async fn load_workload_class_version_from_client(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, manifest_template, default_values, value_schema, sleep_policy
+            SELECT class_id, version, template_generation, manifest_template, default_values,
+                value_schema, sleep_policy, exclusivity_keys
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",

@@ -285,6 +285,21 @@ where
         }
     };
 
+    let exclusivity_keys = match workload_class.render_exclusivity_keys(&waking.values) {
+        Ok(exclusivity_keys) => exclusivity_keys,
+        Err(error) => {
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Render {
+                    instance: waking.clone(),
+                    source: error,
+                },
+            )
+            .await);
+        }
+    };
+
     let backend_generation = match request.backend_generation {
         Some(backend_generation) => backend_generation,
         None => {
@@ -318,11 +333,22 @@ where
         backend_generation,
     );
     pending.rendered_objects = rendered_objects.clone();
+    pending.exclusivity_keys = exclusivity_keys.clone();
     if let Err(error) = store.record_materialization(pending).await {
         return Err(fail_waking_with_store_error(store, &waking, error).await);
     }
 
     if let Err(error) = materializer.apply_manifest(&manifest).await {
+        let no_objects_applied = materializer_error_has_no_applied_objects(&error);
+        if no_objects_applied {
+            release_pending_materialization_after_no_apply_failure(
+                store,
+                &waking,
+                &request.target,
+                backend_generation,
+            )
+            .await;
+        }
         return Err(fail_waking(
             store,
             &waking,
@@ -366,6 +392,7 @@ where
         backend_generation,
     );
     complete.rendered_objects = rendered_objects.clone();
+    complete.exclusivity_keys = exclusivity_keys;
 
     match store.complete_wake(complete).await {
         Ok(result) => Ok(WakeInstanceResult::Completed { result }),
@@ -406,6 +433,34 @@ async fn cleanup_rendered_objects_if_instance_missing_or_terminal<S, C>(
     if should_cleanup {
         let _ = materializer.delete_rendered_objects(rendered_objects).await;
     }
+}
+
+fn materializer_error_has_no_applied_objects(error: &MaterializerError) -> bool {
+    matches!(
+        error.applied_objects_before_failure(),
+        Some(applied_objects) if applied_objects.is_empty()
+    )
+}
+
+async fn release_pending_materialization_after_no_apply_failure<S>(
+    store: &S,
+    waking: &InstanceRecord,
+    target: &MaterializationTarget,
+    backend_generation: BackendGeneration,
+) where
+    S: ControlPlaneStore + ?Sized,
+{
+    let mut request = RecordMaterializationRequest::new(
+        waking.id.clone(),
+        waking.generation,
+        target.clone(),
+        MaterializationState::Deleted,
+        backend_generation,
+    );
+    request.rendered_objects = Vec::new();
+    request.exclusivity_keys = Vec::new();
+
+    let _ = store.record_materialization(request).await;
 }
 
 async fn resume_deleting_sleep<S, C>(
@@ -459,8 +514,20 @@ fn record_wake_observation(
     ));
 
     let mut fields = request_fields.to_vec();
-    if let Err(error) = result {
-        fields.push(LogField::error_reason(wake_error_reason(error)));
+    match result {
+        Ok(WakeInstanceResult::Completed { result }) => {
+            append_acquired_exclusivity_fields(&mut fields, &result.materialization);
+        }
+        Ok(WakeInstanceResult::AlreadyRunning {
+            materialization, ..
+        }) => {
+            append_acquired_exclusivity_fields(&mut fields, materialization);
+        }
+        Ok(WakeInstanceResult::AlreadyWaking { .. }) => {}
+        Err(error) => {
+            fields.push(LogField::error_reason(wake_error_reason(error)));
+            append_exclusivity_conflict_fields(&mut fields, error);
+        }
     }
     observability.record_log(LifecycleLogEvent::new(EVENT_WAKE, fields));
 
@@ -491,10 +558,46 @@ fn wake_error_reason(error: &WakeInstanceError) -> &'static str {
         WakeInstanceError::Unavailable { .. } => "unavailable",
         WakeInstanceError::ReadyMaterializationNotFound { .. } => "ready_materialization_not_found",
         WakeInstanceError::WorkloadClassNotFound { .. } => "workload_class_not_found",
+        WakeInstanceError::Store(StoreError::ExclusivityConflict { .. }) => "exclusivity_conflict",
         WakeInstanceError::Store(_) => "store",
         WakeInstanceError::Render { .. } => "render",
         WakeInstanceError::SleepPolicy { .. } => "sleep_policy",
         WakeInstanceError::Materializer { .. } => "materializer",
+    }
+}
+
+fn append_acquired_exclusivity_fields(
+    fields: &mut Vec<LogField>,
+    materialization: &MaterializationRecord,
+) {
+    if materialization.exclusivity_keys.is_empty() {
+        return;
+    }
+
+    let key_names = materialization
+        .exclusivity_keys
+        .iter()
+        .map(|key| key.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    fields.push(LogField::exclusivity_action("acquire"));
+    fields.push(LogField::exclusivity_key_name(key_names));
+}
+
+fn append_exclusivity_conflict_fields(fields: &mut Vec<LogField>, error: &WakeInstanceError) {
+    let WakeInstanceError::Store(StoreError::ExclusivityConflict {
+        key_name,
+        owner_instance_id,
+        ..
+    }) = error
+    else {
+        return;
+    };
+
+    fields.push(LogField::exclusivity_action("conflict"));
+    fields.push(LogField::exclusivity_key_name(key_name));
+    if let Some(owner_instance_id) = owner_instance_id {
+        fields.push(LogField::exclusivity_owner_instance_id(owner_instance_id));
     }
 }
 

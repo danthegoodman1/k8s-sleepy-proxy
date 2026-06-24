@@ -201,6 +201,7 @@ async fn create_operator_resources(
                 drain_grace_timeout_ms: 500,
                 idle_timeout_override: None,
             }),
+            exclusivity_keys: vec![],
         })
         .await?;
 

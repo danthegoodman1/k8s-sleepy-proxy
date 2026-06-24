@@ -631,6 +631,7 @@ async fn create_workload_class(
             template_generation: 1,
             template: Some(manifest_template(app_image, sidecar_image)),
             sleep_policy: Some(sleep_policy),
+            exclusivity_keys: vec![],
         })
         .await?;
 

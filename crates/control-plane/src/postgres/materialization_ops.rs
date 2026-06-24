@@ -18,14 +18,15 @@ use super::{
     mapping::{
         backend_generation_to_i64, generation_to_i64, instance_from_row, instance_state_to_db,
         materialization_from_row, materialization_id, materialization_state_to_db,
-        rendered_objects_to_json,
+        rendered_exclusivity_keys_to_json, rendered_objects_to_json,
     },
 };
 
 pub(crate) async fn record_materialization(
     store: &PostgresStore,
-    request: RecordMaterializationRequest,
+    mut request: RecordMaterializationRequest,
 ) -> StoreResult<MaterializationRecord> {
+    normalize_exclusivity_keys(&mut request.exclusivity_keys);
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     ensure_instance_generation(&transaction, &request).await?;
@@ -48,7 +49,8 @@ pub(crate) async fn load_ready_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects
+                namespace, state, backend_uri, backend_generation, rendered_objects,
+                exclusivity_keys
             FROM materializations
             WHERE instance_id = $1
                 AND instance_generation = $2
@@ -75,8 +77,9 @@ pub(crate) async fn load_active_materialization(
 
 pub(crate) async fn complete_wake(
     store: &PostgresStore,
-    request: CompleteWakeRequest,
+    mut request: CompleteWakeRequest,
 ) -> StoreResult<CompleteWakeResult> {
+    normalize_exclusivity_keys(&mut request.exclusivity_keys);
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let instance_id = request.instance_id.as_str();
@@ -142,6 +145,7 @@ pub(crate) async fn complete_wake(
     );
     materialization_request.backend = Some(request.backend);
     materialization_request.rendered_objects = request.rendered_objects;
+    materialization_request.exclusivity_keys = request.exclusivity_keys;
     let materialization = upsert_materialization(&transaction, &materialization_request).await?;
 
     transaction.commit().await.map_err(map_postgres_error)?;
@@ -150,6 +154,15 @@ pub(crate) async fn complete_wake(
         instance,
         materialization,
     })
+}
+
+fn normalize_exclusivity_keys(keys: &mut Vec<crate::workload::RenderedExclusivityKey>) {
+    keys.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    keys.dedup();
 }
 
 pub(crate) async fn begin_sleep(
@@ -293,6 +306,7 @@ pub(crate) async fn finalize_sleep(
         MaterializationState::Deleted,
         Some(cold_generation),
         Some(&[]),
+        Some(&[]),
     )
     .await?;
 
@@ -308,6 +322,7 @@ async fn upsert_materialization(
     client: &impl GenericClient,
     request: &RecordMaterializationRequest,
 ) -> StoreResult<MaterializationRecord> {
+    acquire_exclusivity_keys(client, request).await?;
     ensure_no_rendered_object_ref_collision(client, request).await?;
 
     let id = materialization_id(&request.instance_id, &request.target)?;
@@ -319,6 +334,7 @@ async fn upsert_materialization(
     let backend_uri = request.backend.as_ref().map(|backend| backend.uri());
     let backend_generation = backend_generation_to_i64(request.backend_generation)?;
     let rendered_objects = rendered_objects_to_json(&request.rendered_objects);
+    let exclusivity_keys = rendered_exclusivity_keys_to_json(&request.exclusivity_keys);
     let materialization_id = id.as_str();
 
     let row = client
@@ -333,9 +349,10 @@ async fn upsert_materialization(
                 state,
                 backend_uri,
                 backend_generation,
-                rendered_objects
+                rendered_objects,
+                exclusivity_keys
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (instance_id, cluster_id, namespace)
             DO UPDATE SET
                 materialization_id = EXCLUDED.materialization_id,
@@ -344,10 +361,12 @@ async fn upsert_materialization(
                 backend_uri = EXCLUDED.backend_uri,
                 backend_generation = EXCLUDED.backend_generation,
                 rendered_objects = EXCLUDED.rendered_objects,
+                exclusivity_keys = EXCLUDED.exclusivity_keys,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materializations.backend_generation <= EXCLUDED.backend_generation
             RETURNING materialization_id, instance_id, instance_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects
+                namespace, state, backend_uri, backend_generation, rendered_objects,
+                exclusivity_keys
             ",
             &[
                 &materialization_id,
@@ -359,6 +378,7 @@ async fn upsert_materialization(
                 &backend_uri,
                 &backend_generation,
                 &rendered_objects,
+                &exclusivity_keys,
             ],
         )
         .await
@@ -376,6 +396,133 @@ async fn upsert_materialization(
     };
 
     materialization_from_row(&row)
+}
+
+async fn acquire_exclusivity_keys(
+    client: &impl GenericClient,
+    request: &RecordMaterializationRequest,
+) -> StoreResult<()> {
+    if request.exclusivity_keys.is_empty() || request.state == MaterializationState::Deleted {
+        return Ok(());
+    }
+
+    for key in &request.exclusivity_keys {
+        let lock_key = exclusivity_advisory_lock_id(request, key);
+        let row = client
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1) AS acquired",
+                &[&lock_key],
+            )
+            .await
+            .map_err(map_postgres_error)?;
+        let acquired: bool = row.get("acquired");
+        if !acquired {
+            return Err(exclusivity_key_conflict_error(
+                request.target.cluster_id(),
+                request.target.namespace(),
+                &key.name,
+                None,
+                None,
+            ));
+        }
+    }
+
+    ensure_no_exclusivity_key_conflict(client, request).await
+}
+
+fn exclusivity_advisory_lock_id(
+    request: &RecordMaterializationRequest,
+    key: &crate::workload::RenderedExclusivityKey,
+) -> i64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    fn feed_part(hash: &mut u64, part: &str) {
+        feed(hash, &(part.len() as u64).to_be_bytes());
+        feed(hash, part.as_bytes());
+    }
+
+    let mut hash = FNV_OFFSET_BASIS;
+    feed_part(&mut hash, request.target.cluster_id());
+    feed_part(&mut hash, request.target.namespace());
+    feed_part(&mut hash, &key.name);
+    feed_part(&mut hash, &key.value);
+
+    i64::from_ne_bytes(hash.to_ne_bytes())
+}
+
+async fn ensure_no_exclusivity_key_conflict(
+    client: &impl GenericClient,
+    request: &RecordMaterializationRequest,
+) -> StoreResult<()> {
+    let cluster_id = request.target.cluster_id();
+    let namespace = request.target.namespace();
+    let instance_id = request.instance_id.as_str();
+    let incoming = rendered_exclusivity_keys_to_json(&request.exclusivity_keys);
+    let collision = client
+        .query_opt(
+            "
+            SELECT
+                materializations.instance_id AS owner_instance_id,
+                materializations.instance_generation AS owner_instance_generation,
+                existing.key ->> 'name' AS key_name
+            FROM materializations
+            CROSS JOIN LATERAL jsonb_array_elements(materializations.exclusivity_keys)
+                AS existing(key)
+            CROSS JOIN LATERAL jsonb_array_elements($4::jsonb)
+                AS incoming(key)
+            WHERE materializations.cluster_id = $1
+                AND materializations.namespace = $2
+                AND materializations.instance_id <> $3
+                AND materializations.state <> 'deleted'
+                AND existing.key ->> 'name' = incoming.key ->> 'name'
+                AND existing.key ->> 'value' = incoming.key ->> 'value'
+            LIMIT 1
+            ",
+            &[&cluster_id, &namespace, &instance_id, &incoming],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(row) = collision else {
+        return Ok(());
+    };
+
+    let owner_instance_id: String = row.get("owner_instance_id");
+    let owner_instance_generation: i64 = row.get("owner_instance_generation");
+    let key_name: String = row.get("key_name");
+    Err(exclusivity_key_conflict_error(
+        cluster_id,
+        namespace,
+        &key_name,
+        Some(owner_instance_id),
+        u64::try_from(owner_instance_generation)
+            .ok()
+            .map(crate::ids::Generation::new),
+    ))
+}
+
+fn exclusivity_key_conflict_error(
+    cluster_id: &str,
+    namespace: &str,
+    key_name: &str,
+    owner_instance_id: Option<String>,
+    owner_generation: Option<crate::ids::Generation>,
+) -> StoreError {
+    StoreError::ExclusivityConflict {
+        cluster_id: cluster_id.to_owned(),
+        namespace: namespace.to_owned(),
+        key_name: key_name.to_owned(),
+        owner_instance_id,
+        owner_generation,
+    }
 }
 
 async fn ensure_no_rendered_object_ref_collision(
@@ -447,7 +594,8 @@ async fn load_active_materialization_from_client(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects
+                namespace, state, backend_uri, backend_generation, rendered_objects,
+                exclusivity_keys
             FROM materializations
             WHERE instance_id = $1
                 AND cluster_id = $2
@@ -469,12 +617,14 @@ async fn mark_active_materialization_state(
     state: MaterializationState,
     instance_generation: Option<Generation>,
     rendered_objects: Option<&[crate::materialization::RenderedObjectRef]>,
+    exclusivity_keys: Option<&[crate::workload::RenderedExclusivityKey]>,
 ) -> StoreResult<Option<MaterializationRecord>> {
     let instance_id = instance_id.as_str();
     let cluster_id = target.cluster_id();
     let namespace = target.namespace();
     let state = materialization_state_to_db(state);
     let rendered_objects = rendered_objects.map(rendered_objects_to_json);
+    let exclusivity_keys = exclusivity_keys.map(rendered_exclusivity_keys_to_json);
 
     let row = if let Some(instance_generation) = instance_generation {
         let instance_generation = generation_to_i64(instance_generation)?;
@@ -486,13 +636,15 @@ async fn mark_active_materialization_state(
                     instance_generation = $5,
                     backend_uri = NULL,
                     rendered_objects = COALESCE($6, rendered_objects),
+                    exclusivity_keys = COALESCE($7, exclusivity_keys),
                     updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
                 WHERE instance_id = $1
                     AND cluster_id = $2
                     AND namespace = $3
                     AND state <> 'deleted'
                 RETURNING materialization_id, instance_id, instance_generation, cluster_id,
-                    namespace, state, backend_uri, backend_generation, rendered_objects
+                    namespace, state, backend_uri, backend_generation, rendered_objects,
+                    exclusivity_keys
                 ",
                 &[
                     &instance_id,
@@ -501,6 +653,7 @@ async fn mark_active_materialization_state(
                     &state,
                     &instance_generation,
                     &rendered_objects,
+                    &exclusivity_keys,
                 ],
             )
             .await
@@ -518,7 +671,8 @@ async fn mark_active_materialization_state(
                     AND namespace = $3
                     AND state <> 'deleted'
                 RETURNING materialization_id, instance_id, instance_generation, cluster_id,
-                    namespace, state, backend_uri, backend_generation, rendered_objects
+                    namespace, state, backend_uri, backend_generation, rendered_objects,
+                    exclusivity_keys
                 ",
                 &[&instance_id, &cluster_id, &namespace, &state],
             )
@@ -553,7 +707,8 @@ async fn mark_active_materialization_deleting_for_sleep(
                 AND instance_generation = $4
                 AND state <> 'deleted'
             RETURNING materialization_id, instance_id, instance_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects
+                namespace, state, backend_uri, backend_generation, rendered_objects,
+                exclusivity_keys
             ",
             &[
                 &instance_id_value,

@@ -894,6 +894,7 @@ async fn create_workload_class(
                 volumes,
             }),
             sleep_policy: Some(sleep_policy()),
+            exclusivity_keys: vec![],
         })
         .await?;
     Ok(())

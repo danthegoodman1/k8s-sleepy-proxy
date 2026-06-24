@@ -52,6 +52,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
             template_generation: 1,
             template: Some(manifest_template()),
             sleep_policy: Some(sleep_policy()),
+            exclusivity_keys: vec![],
         },
     )?;
     assert_eq!(

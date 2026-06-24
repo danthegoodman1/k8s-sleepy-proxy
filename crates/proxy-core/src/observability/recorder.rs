@@ -25,6 +25,9 @@ pub const FIELD_NAMESPACE: &str = "namespace";
 pub const FIELD_ERROR_REASON: &str = "error.reason";
 pub const FIELD_ACTIVE_COUNT: &str = "active.count";
 pub const FIELD_DURATION_MS: &str = "duration.ms";
+pub const FIELD_EXCLUSIVITY_ACTION: &str = "exclusivity.action";
+pub const FIELD_EXCLUSIVITY_KEY_NAME: &str = "exclusivity.key.name";
+pub const FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID: &str = "exclusivity.owner.instance.id";
 
 pub const LIFECYCLE_FIELDS: &[&str] = &[
     FIELD_INSTANCE_ID,
@@ -37,6 +40,9 @@ pub const LIFECYCLE_FIELDS: &[&str] = &[
     FIELD_ERROR_REASON,
     FIELD_ACTIVE_COUNT,
     FIELD_DURATION_MS,
+    FIELD_EXCLUSIVITY_ACTION,
+    FIELD_EXCLUSIVITY_KEY_NAME,
+    FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID,
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -182,6 +188,18 @@ impl LogField {
 
     pub fn duration_ms(value: impl ToString) -> Self {
         Self::new(FIELD_DURATION_MS, value)
+    }
+
+    pub fn exclusivity_action(value: impl ToString) -> Self {
+        Self::new(FIELD_EXCLUSIVITY_ACTION, value)
+    }
+
+    pub fn exclusivity_key_name(value: impl ToString) -> Self {
+        Self::new(FIELD_EXCLUSIVITY_KEY_NAME, value)
+    }
+
+    pub fn exclusivity_owner_instance_id(value: impl ToString) -> Self {
+        Self::new(FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID, value)
     }
 }
 

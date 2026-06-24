@@ -971,6 +971,7 @@ fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationR
         backend: Some(BackendEndpoint::new("http://example").expect("backend is valid")),
         backend_generation: control_plane::BackendGeneration::new(generation),
         rendered_objects: vec![object_ref("apps/v1", "Deployment", "apps", instance_id)],
+        exclusivity_keys: vec![],
     }
 }
 

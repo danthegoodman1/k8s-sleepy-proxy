@@ -13,9 +13,12 @@ postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19151}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19180}"
 kubeconfig="$(mktemp)"
+control_plane_pf_log="$(mktemp)"
+frontline_pf_log="$(mktemp)"
 created_cluster=0
 control_plane_pf=""
 frontline_pf=""
+port_forward_loop_pid=""
 
 require_command() {
   local name="$1"
@@ -24,6 +27,39 @@ require_command() {
     echo "${name} is required for the stateful kind E2E" >&2
     exit 127
   fi
+}
+
+start_port_forward_loop() {
+  local service="$1"
+  local local_port="$2"
+  local remote_port="$3"
+  local log_file="$4"
+
+  (
+    child=""
+    stop_loop() {
+      if [[ -n "${child}" ]]; then
+        kill "${child}" >/dev/null 2>&1 || true
+        wait "${child}" 2>/dev/null || true
+      fi
+      exit 0
+    }
+    trap stop_loop TERM INT
+
+    while true; do
+      KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
+        "svc/${service}" "${local_port}:${remote_port}" >>"${log_file}" 2>&1 &
+      child=$!
+      wait "${child}" 2>/dev/null || true
+      child=""
+
+      sleep 1 &
+      child=$!
+      wait "${child}" 2>/dev/null || true
+      child=""
+    done
+  ) >/dev/null 2>&1 &
+  port_forward_loop_pid="$!"
 }
 
 cleanup() {
@@ -42,13 +78,15 @@ cleanup() {
     KUBECONFIG="${kubeconfig}" kind delete cluster --name "${cluster_name}" || true
   elif [[ "${keep_namespace}" != "1" ]]; then
     KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-    KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-      -l "sleepypods.io/instance-id=e2e-stateful" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    for instance_id in e2e-stateful m12ownera m12blockb m12otherc; do
+      KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
+        -l "sleepypods.io/instance-id=${instance_id}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    done
     KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
       "sleepypods-control-plane-${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   fi
 
-  rm -f "${kubeconfig}"
+  rm -f "${kubeconfig}" "${control_plane_pf_log}" "${frontline_pf_log}"
   exit "${status}"
 }
 trap cleanup EXIT
@@ -96,8 +134,10 @@ done
 
 echo "==> Recreating namespace ${namespace}"
 KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true
-KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-  -l "sleepypods.io/instance-id=e2e-stateful" --ignore-not-found --wait=true
+for instance_id in e2e-stateful m12ownera m12blockb m12otherc; do
+  KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
+    -l "sleepypods.io/instance-id=${instance_id}" --ignore-not-found --wait=true
+done
 KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
   "sleepypods-control-plane-${namespace}" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl create namespace "${namespace}"
@@ -351,15 +391,19 @@ YAML
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/sleepypods-control-plane --timeout=180s
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/sleepypods-frontline --timeout=180s
 
-echo "==> Starting local port-forwards"
-KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
-  svc/sleepypods-control-plane "${operator_port}:50051" >/tmp/sleepypods-control-plane-stateful-port-forward.log 2>&1 &
-control_plane_pf=$!
-KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
-  svc/sleepypods-frontline "${frontline_port}:8080" >/tmp/sleepypods-frontline-stateful-port-forward.log 2>&1 &
-frontline_pf=$!
+echo "==> Starting local port-forward loops"
+start_port_forward_loop sleepypods-control-plane "${operator_port}" 50051 "${control_plane_pf_log}"
+control_plane_pf="${port_forward_loop_pid}"
+start_port_forward_loop sleepypods-frontline "${frontline_port}" 8080 "${frontline_pf_log}"
+frontline_pf="${port_forward_loop_pid}"
 
 echo "==> Running stateful kind E2E driver"
+cargo_args=(test -p control-plane --test kind_e2e_stateful)
+if [[ -n "${SLEEPYPODS_KIND_E2E_TEST_FILTER:-}" ]]; then
+  cargo_args+=("${SLEEPYPODS_KIND_E2E_TEST_FILTER}")
+fi
+cargo_args+=(-- --ignored --nocapture)
+
 KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_KIND_E2E_STATEFUL=1 \
   SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
@@ -367,6 +411,6 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
-  cargo test -p control-plane --test kind_e2e_stateful -- --ignored --nocapture
+  cargo "${cargo_args[@]}"
 
 echo "stateful full-platform kind E2E completed"

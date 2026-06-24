@@ -14,7 +14,11 @@ pub(crate) fn map_postgres_error(error: tokio_postgres::Error) -> StoreError {
             SqlState::CHECK_VIOLATION => {
                 StoreError::invalid_argument(format!("Postgres check constraint failed: {error}"))
             }
-            _ => StoreError::internal(format!("Postgres query failed: {error}")),
+            _ => StoreError::internal(format!(
+                "Postgres query failed: code={} message={}",
+                db_error.code().code(),
+                db_error.message()
+            )),
         };
     }
 

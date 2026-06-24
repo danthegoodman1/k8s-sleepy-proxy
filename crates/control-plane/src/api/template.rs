@@ -182,7 +182,7 @@ fn volume_source_template_from_proto(
     }
 }
 
-fn template_text_from_proto(
+pub(super) fn template_text_from_proto(
     text: pb::TemplateText,
 ) -> Result<domain_manifest::TemplateText, Status> {
     if text.parts.is_empty() {
@@ -425,7 +425,7 @@ fn volume_source_template_to_proto(
     pb::PersistentVolumeSourceTemplate { kind: Some(kind) }
 }
 
-fn template_text_to_proto(text: domain_manifest::TemplateText) -> pb::TemplateText {
+pub(super) fn template_text_to_proto(text: domain_manifest::TemplateText) -> pb::TemplateText {
     pb::TemplateText {
         parts: text
             .parts()

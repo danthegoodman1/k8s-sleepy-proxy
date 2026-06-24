@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use crate::{
     ids::{Generation, WorkloadClassId},
     instance::InstanceValues,
-    manifest::ManifestTemplate,
+    manifest::{ManifestRenderError, ManifestTemplate, TemplateText, TemplateTextPart},
     sleep_policy::{SleepPolicyError, WorkloadSleepPolicy},
 };
 
@@ -31,6 +31,7 @@ pub struct WorkloadClassVersion {
     pub default_values: InstanceValues,
     pub value_schema: WorkloadValueSchema,
     pub sleep_policy: WorkloadSleepPolicy,
+    pub exclusivity_keys: Vec<WorkloadExclusivityKeyTemplate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,10 +46,35 @@ pub struct WorkloadValueFieldRule {
     pub default: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkloadExclusivityKeyTemplate {
+    pub name: String,
+    pub value: TemplateText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedExclusivityKey {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueSchemaError {
     MissingRequiredField { field: String },
     UnknownField { field: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkloadClassValidationError {
+    SleepPolicy(SleepPolicyError),
+    ExclusivityKey(WorkloadExclusivityKeyError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkloadExclusivityKeyError {
+    index: usize,
+    field: &'static str,
+    message: &'static str,
 }
 
 impl WorkloadClassVersionRef {
@@ -72,8 +98,50 @@ impl LoadWorkloadClassVersionRequest {
 }
 
 impl WorkloadClassVersion {
-    pub fn validate(&self) -> Result<(), SleepPolicyError> {
-        self.sleep_policy.validate()
+    pub fn validate(&self) -> Result<(), WorkloadClassValidationError> {
+        self.sleep_policy
+            .validate()
+            .map_err(WorkloadClassValidationError::SleepPolicy)?;
+
+        for (index, key) in self.exclusivity_keys.iter().enumerate() {
+            key.validate(index)
+                .map_err(WorkloadClassValidationError::ExclusivityKey)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn render_exclusivity_keys(
+        &self,
+        values: &InstanceValues,
+    ) -> Result<Vec<RenderedExclusivityKey>, ManifestRenderError> {
+        let mut rendered = self
+            .exclusivity_keys
+            .iter()
+            .map(|key| {
+                let value = key.value.render(values)?;
+                if value.trim().is_empty() {
+                    return Err(ManifestRenderError::InvalidField {
+                        field: "exclusivity_keys.value",
+                        message: "rendered value must not be empty".to_owned(),
+                    });
+                }
+
+                Ok(RenderedExclusivityKey {
+                    name: key.name.clone(),
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rendered.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.value.cmp(&right.value))
+        });
+        rendered.dedup();
+
+        Ok(rendered)
     }
 }
 
@@ -152,6 +220,70 @@ impl WorkloadValueFieldRule {
     }
 }
 
+impl WorkloadExclusivityKeyTemplate {
+    pub fn new(name: impl Into<String>, value: TemplateText) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
+
+    fn validate(&self, index: usize) -> Result<(), WorkloadExclusivityKeyError> {
+        if !is_exclusivity_key_name(&self.name) {
+            return Err(WorkloadExclusivityKeyError {
+                index,
+                field: "name",
+                message: "must use only ASCII letters, digits, '.', '_', or '-', start and end with a letter or digit, and be at most 128 characters",
+            });
+        }
+
+        if self.value.parts().is_empty() {
+            return Err(WorkloadExclusivityKeyError {
+                index,
+                field: "value",
+                message: "template parts must not be empty",
+            });
+        }
+
+        if self.value.parts().iter().any(|part| {
+            matches!(part, TemplateTextPart::InstanceValue(field) if field.trim().is_empty())
+        }) {
+            return Err(WorkloadExclusivityKeyError {
+                index,
+                field: "value",
+                message: "instance value field names must not be empty",
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl RenderedExclusivityKey {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+fn is_exclusivity_key_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
 impl fmt::Display for ValueSchemaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -165,10 +297,53 @@ impl fmt::Display for ValueSchemaError {
 
 impl Error for ValueSchemaError {}
 
+impl WorkloadExclusivityKeyError {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+}
+
+impl fmt::Display for WorkloadClassValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SleepPolicy(error) => write!(f, "{error}"),
+            Self::ExclusivityKey(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for WorkloadClassValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SleepPolicy(error) => Some(error),
+            Self::ExclusivityKey(error) => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for WorkloadExclusivityKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "workload exclusivity key {} {} {}",
+            self.index, self.field, self.message
+        )
+    }
+}
+
+impl Error for WorkloadExclusivityKeyError {}
+
 #[cfg(test)]
 mod tests {
-    use super::{ValueSchemaError, WorkloadValueFieldRule, WorkloadValueSchema};
-    use crate::instance::InstanceValues;
+    use super::{
+        RenderedExclusivityKey, ValueSchemaError, WorkloadExclusivityKeyTemplate,
+        WorkloadValueFieldRule, WorkloadValueSchema,
+    };
+    use crate::{instance::InstanceValues, manifest::TemplateText};
 
     #[test]
     fn value_schema_applies_defaults() {
@@ -253,6 +428,69 @@ mod tests {
         let keys = validated.keys().cloned().collect::<Vec<_>>();
 
         assert_eq!(keys, vec!["alpha", "middle", "tenant", "zeta"]);
+    }
+
+    #[test]
+    fn exclusivity_key_validation_rejects_unsafe_names() {
+        let key = WorkloadExclusivityKeyTemplate::new("disk/name", TemplateText::literal("disk-1"));
+
+        let error = key.validate(2).expect_err("unsafe name is rejected");
+
+        assert_eq!(error.index(), 2);
+        assert_eq!(error.field(), "name");
+    }
+
+    #[test]
+    fn exclusivity_key_rendering_sorts_and_deduplicates() {
+        let class = super::WorkloadClassVersion {
+            reference: super::WorkloadClassVersionRef::new(
+                crate::ids::WorkloadClassId::new("class-a").expect("valid class id"),
+                crate::ids::Generation::new(1),
+            ),
+            template_generation: crate::ids::Generation::new(1),
+            template: crate::manifest::ManifestTemplate {
+                workload: crate::manifest::WorkloadTemplate {
+                    kind: crate::manifest::WorkloadKind::Deployment,
+                    name: TemplateText::literal("app"),
+                    replicas: Some(1),
+                    app_container: crate::manifest::ContainerTemplate {
+                        name: "app".to_owned(),
+                        image: TemplateText::literal("example/app:1"),
+                        ports: vec![],
+                        env: vec![],
+                    },
+                },
+                sidecar: crate::manifest::SidecarTemplate {
+                    name: "sleepypods-sidecar".to_owned(),
+                    image: TemplateText::literal("example/sidecar:1"),
+                    listen_port: 8080,
+                    mode: None,
+                },
+                service: None,
+                volumes: vec![],
+            },
+            default_values: InstanceValues::new(),
+            value_schema: WorkloadValueSchema::new(true),
+            sleep_policy: crate::sleep_policy::WorkloadSleepPolicy::new(60_000, 1_000, 30_000)
+                .expect("valid sleep policy"),
+            exclusivity_keys: vec![
+                WorkloadExclusivityKeyTemplate::new("license", TemplateText::instance_value("l")),
+                WorkloadExclusivityKeyTemplate::new("disk", TemplateText::instance_value("d")),
+                WorkloadExclusivityKeyTemplate::new("disk", TemplateText::instance_value("d")),
+            ],
+        };
+
+        let rendered = class
+            .render_exclusivity_keys(&values([("d", "disk-a"), ("l", "license-a")]))
+            .expect("keys render");
+
+        assert_eq!(
+            rendered,
+            vec![
+                RenderedExclusivityKey::new("disk", "disk-a"),
+                RenderedExclusivityKey::new("license", "license-a"),
+            ]
+        );
     }
 
     fn values<const N: usize>(pairs: [(&str, &str); N]) -> InstanceValues {

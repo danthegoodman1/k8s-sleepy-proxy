@@ -710,6 +710,24 @@ fn store_error_to_status(error: StoreError) -> Status {
         StoreError::GenerationConflict { expected, actual } => Status::failed_precondition(
             format!("generation conflict: expected generation {expected}, found {actual}"),
         ),
+        StoreError::ExclusivityConflict {
+            cluster_id,
+            namespace,
+            key_name,
+            owner_instance_id,
+            owner_generation,
+        } => {
+            let mut message = format!(
+                "exclusivity key {key_name:?} is already held for target {cluster_id}/{namespace}"
+            );
+            if let Some(owner_instance_id) = owner_instance_id {
+                message.push_str(&format!(" by instance {owner_instance_id}"));
+            }
+            if let Some(owner_generation) = owner_generation {
+                message.push_str(&format!(" generation {owner_generation}"));
+            }
+            Status::failed_precondition(message)
+        }
         StoreError::IdempotencyConflict => {
             Status::already_exists("idempotency key was already used for a different request")
         }

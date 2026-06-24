@@ -370,6 +370,7 @@ async fn create_workload_class(
                 drain_grace_timeout_ms: 500,
                 idle_timeout_override: None,
             }),
+            exclusivity_keys: vec![],
         })
         .await?;
     Ok(())

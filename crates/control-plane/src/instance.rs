@@ -620,6 +620,7 @@ mod tests {
             default_values: BTreeMap::new(),
             value_schema,
             sleep_policy,
+            exclusivity_keys: vec![],
         }
     }
 

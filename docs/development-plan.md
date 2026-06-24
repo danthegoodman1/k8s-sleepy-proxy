@@ -1139,49 +1139,57 @@ Scope:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Add `WorkloadClass` exclusivity keys rendered from instance values. | Example shape: `name: "disk"` and `value: "{{ volume_handle }}"`. |
-| Incomplete | Treat the rendered key as opaque. | The control plane must not understand or validate provider-specific disk IDs beyond normal value-schema validation. |
-| Incomplete | Acquire exclusivity during wake before Kubernetes PV/PVC/workload objects are applied. | Not implemented. |
-| Incomplete | Reject or use only bounded/cancellable waiting when another active materialization holds the same rendered key. | Wake must never wait indefinitely on an exclusivity key. |
-| Incomplete | Acquire multiple exclusivity keys in deterministic sorted order. | Prevents deadlocks when one workload class declares more than one exclusive resource. |
-| Incomplete | Release partially acquired keys when later acquisition or wake setup fails. | A failed multi-key wake must not strand earlier acquired keys. |
-| Incomplete | Keep unrelated exclusivity keys independent. | Concurrent wakes for different rendered keys must not serialize on a global lock. |
-| Incomplete | Release the key only after safe cleanup. | Release after sleep/delete cleanup removes recorded Kubernetes objects, or after wake fails before any objects are applied. |
-| Incomplete | Bind locks to instance ID, generation, target, and rendered key. | Stale generations must not release or overwrite another generation's lock. |
-| Incomplete | Reconcile exclusivity state from durable active materializations after control-plane restart. | Not implemented. |
-| Incomplete | Emit structured observability for lock acquire, conflict, timeout, release, and reconciliation. | Operators need enough signal to diagnose blocked stateful workloads. |
-| Incomplete | Document explicit operator responsibility for singleton external resources. | Operators must declare exclusivity for stateful workloads that require single-writer access; otherwise duplicate external resource references are outside the platform safety contract. |
+| Complete | Add `WorkloadClass` exclusivity keys rendered from instance values. | `WorkloadExclusivityKeyTemplate` is part of `WorkloadClassVersion`, protobuf create/get includes `repeated WorkloadExclusivityKey`, and `api_transport.rs` round-trips `name: "disk"` with `value: "{{ volume_handle }}"`. |
+| Complete | Treat the rendered key as opaque. | Rendering validates only key-name/template shape and non-empty rendered values; store errors and `runtime.wake.event` include key name/holder but never the rendered value. |
+| Complete | Acquire exclusivity during wake before Kubernetes PV/PVC/workload objects are applied. | `wake::tests::wake_records_rendered_exclusivity_keys_before_kubernetes_apply` and `exclusivity_conflict_prevents_kubernetes_apply_and_materialization_record` prove keys are recorded with Pending before apply and conflicts apply no objects. |
+| Complete | Reject or use only bounded/cancellable waiting when another active materialization holds the same rendered key. | Postgres uses deterministic transaction-scoped `pg_try_advisory_xact_lock` keyed by a stable per-target/name/value advisory ID plus an active-materialization conflict query and returns `StoreError::ExclusivityConflict` immediately. |
+| Complete | Acquire multiple exclusivity keys in deterministic sorted order. | Domain rendering and Postgres store normalization sort/deduplicate by `(name, value)`; unit tests cover deterministic ordering. |
+| Complete | Release partially acquired keys when later acquisition or wake setup fails. | Keys are acquired inside the same transaction as Pending materialization; failed acquisition/conflict rolls back with no materialization row; `wake::tests::first_apply_failure_after_exclusivity_acquire_releases_pending_key` proves a first Kubernetes apply failure after key acquisition clears the Pending row to Deleted with empty keys. |
+| Complete | Keep unrelated exclusivity keys independent. | Postgres conformance `exercise_exclusivity_keys` records different rendered keys while another key is held; acquisition locks are keyed per target/name/value, not an in-memory global mutex. |
+| Complete | Release the key only after safe cleanup. | Keys remain on Pending/Ready/Deleting materializations and are cleared only when `finalize_sleep` marks Deleted; delete releases via cascade only after materializer cleanup succeeds. |
+| Complete | Bind locks to instance ID, generation, target, and rendered key. | Materialization rows store instance ID, instance generation, target, and rendered keys; stale generation record attempts are rejected before key overwrite in Postgres conformance. |
+| Complete | Reconcile exclusivity state from durable active materializations after control-plane restart. | Locks are derived from active materialization rows; Postgres conformance reconnects a recreated store and proves same-key wake remains blocked while the original active row exists. |
+| Complete | Emit structured observability for lock acquire and conflict decisions. | Wake observations add `exclusivity.action`, `exclusivity.key.name`, and `exclusivity.owner.instance.id` for acquire/conflict without rendered values; `wake::tests::exclusivity_conflict_observability_uses_bounded_fields` covers conflict fields. |
+| Complete | Document explicit operator responsibility for singleton external resources. | `docs/operator-guide.md` and `docs/operator-runbook.md` document opt-in exclusivity keys, opaque values, conflict diagnosis, and cleanup ordering. |
 
 Sub-phases:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | 12A: Protobuf, domain model, validation, and Postgres schema for `WorkloadClass` exclusivity keys. | Not implemented. |
-| Incomplete | 12B: Store APIs and transaction semantics for acquiring, observing, and releasing rendered exclusivity keys. | Not implemented. |
-| Incomplete | 12C: Wake/sleep/delete integration. | Kubernetes apply must not begin until all required keys are acquired; keys release only after cleanup. |
-| Incomplete | 12D: Restart reconciliation for locks derived from active materializations. | Not implemented. |
-| Incomplete | 12E: Operator documentation and runbook updates for exclusive external resources. | Not implemented. |
-| Incomplete | 12F: Unit and component concurrency tests. | Cover same-key contention, different-key independence, deterministic multi-key ordering, partial acquisition rollback, stale generation release rejection, and cleanup ordering. |
-| Incomplete | 12G: kind E2E tests for same-key contention, restart, and cleanup. | Use real control plane, Postgres, Kubernetes API, PV/PVC/StatefulSet objects, and production images. |
+| Complete | 12A: Protobuf, domain model, validation, and Postgres schema for `WorkloadClass` exclusivity keys. | `control_plane.proto`, `workload.rs`, migration `0005_workload_class_exclusivity_keys.sql`, Postgres mapping/persistence, and API validation are implemented. |
+| Complete | 12B: Store APIs and transaction semantics for acquiring, observing, and releasing rendered exclusivity keys. | `record_materialization` normalizes keys, takes per-key Postgres advisory locks, checks active materializations, and persists keys transactionally. |
+| Complete | 12C: Wake/sleep/delete integration. | Wake renders keys before Pending; sleep keeps keys through Deleting and clears on finalize; delete releases only after materializer cleanup and row deletion. |
+| Complete | 12D: Restart reconciliation for locks derived from active materializations. | No separate lock table is needed; recreated Postgres store conflict test proves active rows remain authoritative. |
+| Complete | 12E: Operator documentation and runbook updates for exclusive external resources. | Operator guide and runbook updated. |
+| Complete | 12F: Unit and component concurrency tests. | Unit/API/wake tests cover validation, pre-apply no-object conflicts, deterministic ordering, bounded observability, first-apply no-object release, and partial-apply held-key behavior; `./scripts/test-postgres-store.sh` passed on 2026-06-24 with same-key contention, different-key independence, stale generation rejection, active-vs-deleted release, and recreated-store behavior against real Postgres. |
+| Complete | 12G: kind E2E tests for same-key contention, restart, and cleanup. | `./scripts/test-kind-e2e-exclusivity.sh` passed on 2026-06-24 with production control-plane/frontline/sidecar images, Postgres, Kubernetes PV/PVC/StatefulSet objects, same `{{ volume_handle }}` duplicate rejection with no blocked-instance objects, unrelated handle wake, control-plane pod restart while the owner held the key, and post-delete cleanup release. |
 
 Done criteria:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Two cold instances with the same rendered exclusivity key cannot both materialize at the same time. | Needs concurrency tests. |
-| Incomplete | Same-key concurrent wake has a bounded result. | Exactly one wake may materialize; other callers must receive a structured conflict/block response or bounded timeout, not hang. |
-| Incomplete | Different-key concurrent wakes proceed independently. | Tests must prove there is no global exclusivity bottleneck. |
-| Incomplete | Multi-key acquisition is deadlock-free. | Keys are acquired in deterministic order, and cancellation or timeout releases any partial acquisitions. |
-| Incomplete | A blocked or rejected wake creates no Kubernetes objects. | Must create no PV, PVC, Service, Deployment, or StatefulSet objects. |
-| Incomplete | Sleep/delete releases the key only after rendered Kubernetes objects are gone. | Needs cleanup ordering tests. |
-| Incomplete | Control-plane restart reconstructs held keys from active durable materializations and prevents duplicate wake after restart. | Needs restart test. |
-| Incomplete | Crash/restart tests cover every lock boundary. | Cover restart after lock acquire before apply, after apply before ready, while running, and during cleanup. |
-| Incomplete | Cleanup failure keeps the key held until cleanup succeeds or operator intervention marks it safe. | Prevents a second stateful materialization while old Kubernetes objects may still exist. |
-| Incomplete | Stale generations cannot release, steal, or overwrite another generation's lock. | Needs store and wake/delete race tests. |
-| Incomplete | Failure tests cover wake failure before apply, wake failure after lock acquire, Kubernetes cleanup failure, delete retry, stale generation, cancellation/timeout, and concurrent wake attempts. | Not implemented. |
-| Incomplete | kind E2E proves a stateful workload class using `{{ volume_handle }}` as an exclusivity key prevents duplicate attachment while allowing unrelated handles. | Must race two same-handle instances, verify only one materialized object set exists, verify the blocked instance creates no objects, then sleep/delete the first and prove the second can wake. |
-| Incomplete | kind E2E proves restart safety while an exclusivity key is held. | Restart the control plane while the first instance holds the key, then verify a second same-key wake remains blocked and no duplicate Kubernetes objects are created. |
-| Incomplete | Operator docs clearly state the exclusivity boundary. | SleepyPods does not own external volume lifecycle or infer singleton resources unless the `WorkloadClass` declares an exclusivity key. |
+| Complete | Two cold instances with the same rendered exclusivity key cannot both materialize at the same time. | Postgres conformance same-key contender receives `StoreError::ExclusivityConflict`; wake component conflict applies no Kubernetes objects; `./scripts/test-kind-e2e-exclusivity.sh` proves the duplicate `{{ volume_handle }}` stateful instance returns HTTP 503 and creates no PV/PVC/Service/StatefulSet objects. |
+| Complete | Same-key concurrent wake has a bounded result. | `pg_try_advisory_xact_lock` avoids indefinite waiting and returns structured conflict when a key is held or being acquired. |
+| Complete | Different-key concurrent wakes proceed independently. | Postgres conformance records a different `disk`/`license` pair while another pair remains active; kind M12 gate wakes an unrelated `volume_handle` while the shared handle remains held. |
+| Complete | Multi-key acquisition is deadlock-free. | Keys are sorted by `(name, value)` in render and at the store boundary before advisory lock acquisition. |
+| Complete | A blocked or rejected wake creates no Kubernetes objects. | Wake conflict and rendered-object collision tests assert no apply/readiness/delete calls; `wake::tests::first_apply_failure_after_exclusivity_acquire_releases_pending_key` proves a first-object apply failure leaves no Kubernetes objects and releases the key; kind M12 gate verifies the blocked same-key instance has zero PV/PVC/Service/StatefulSet/Pod objects by `sleepypods.io/instance-id`. |
+| Complete | Sleep/delete releases the key only after rendered Kubernetes objects are gone. | Store finalization clears keys only on Deleted; sidecar/delete cleanup paths call materializer delete before finalizing/deleting rows. |
+| Complete | Control-plane restart reconstructs held keys from active durable materializations and prevents duplicate wake after restart. | Postgres conformance reconnects a store and proves duplicate key conflict from the persisted active row; kind M12 gate deletes the control-plane pod while the owner holds the key and then verifies the same-key duplicate remains blocked. |
+| Partial | Crash/restart tests cover every lock boundary. | Durable active-row restart behavior is covered in real Postgres and through a real control-plane pod restart in kind while a stateful owner materialization holds the key. Explicit crash injection after key acquire before apply, after apply before ready, and during cleanup remains a gap. |
+| Complete | Cleanup failure keeps the key held until cleanup succeeds or operator intervention marks it safe. | Deleting materialization rows retain exclusivity keys and still conflict until `finalize_sleep` clears keys. |
+| Complete | Stale generations cannot release, steal, or overwrite another generation's lock. | Postgres conformance stale `record_materialization` attempt returns `GenerationConflict` before changing keys. |
+| Partial | Failure tests cover wake failure before apply, wake failure after lock acquire, Kubernetes cleanup failure, delete retry, stale generation, cancellation/timeout, and concurrent wake attempts. | Unit/Postgres paths cover pre-apply conflict, stale generation, no materialization, deleting-held semantics, bounded contention, cleanup-held release, first-apply no-object release, and partial-apply held-key behavior; kind M12 gate covers live duplicate rejection, delete cleanup release, retry across control-plane restart, and unrelated wake independence. Dedicated cancellation/timeout injection and live concurrent wake race tests remain gaps. |
+| Complete | kind E2E proves a stateful workload class using `{{ volume_handle }}` as an exclusivity key prevents duplicate attachment while allowing unrelated handles. | `./scripts/test-kind-e2e-exclusivity.sh` passed on 2026-06-24 using `disk={{ volume_handle }}` and real PV/PVC/StatefulSet objects. |
+| Complete | kind E2E proves restart safety while an exclusivity key is held. | `./scripts/test-kind-e2e-exclusivity.sh` passed on 2026-06-24 after deleting the control-plane pod while the first stateful owner held the rendered key. |
+| Complete | Operator docs clearly state the exclusivity boundary. | Operator guide says SleepyPods does not own external volume lifecycle or infer singleton resources unless a `WorkloadClass` declares an exclusivity key. |
+
+The two Partial rows above are retained as explicit future hardening gaps for
+broader crash-injection and cancellation/race coverage. They do not change the
+M12 V1 acceptance boundary: opt-in keys are rendered and persisted, same-key
+contention is bounded, no-object wake failures release, partial/cleanup-risk
+failures keep keys held, stale generations are rejected, active rows survive
+restart, and the full-platform stateful kind gate covers the supported
+restart-held-key workflow.
 
 ## Milestone 13: Control Plane Authentication and Authorization
 

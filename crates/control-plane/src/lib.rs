@@ -79,6 +79,8 @@ pub use store::{
     ControlPlaneStore, RetryingControlPlaneStore, StoreError, StoreFuture, StoreResult,
 };
 pub use workload::{
-    CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, ValueSchemaError,
-    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+    CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, RenderedExclusivityKey,
+    ValueSchemaError, WorkloadClassValidationError, WorkloadClassVersion, WorkloadClassVersionRef,
+    WorkloadExclusivityKeyError, WorkloadExclusivityKeyTemplate, WorkloadValueFieldRule,
+    WorkloadValueSchema,
 };

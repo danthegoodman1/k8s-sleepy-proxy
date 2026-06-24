@@ -143,6 +143,18 @@ Rendered object name collision:
 4. Retry after changing the naming template or deleting/finalizing the
    conflicting active materialization.
 
+Workload exclusivity key conflict:
+
+1. Search `runtime.wake.event` for `error.reason=exclusivity_conflict`.
+2. Use `exclusivity.key.name`, `exclusivity.owner.instance.id`, `cluster.id`,
+   and `namespace` to identify the held key without relying on provider-specific
+   disk or license parsing. Rendered key values are intentionally not logged.
+3. Inspect the owner instance and active materialization. Pending, Ready, and
+   Deleting materializations keep keys held; Deleted materializations do not.
+4. If cleanup is stuck, resolve Kubernetes deletion errors first. Do not wake a
+   second same-key instance until the first materialization has safely finalized
+   or an operator has deliberately changed the workload values/key declaration.
+
 Hot routes are missing or unexpectedly cold:
 
 1. Check route-cache miss rate and

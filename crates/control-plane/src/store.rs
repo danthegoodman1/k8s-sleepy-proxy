@@ -156,6 +156,13 @@ pub enum StoreError {
         expected: crate::ids::Generation,
         actual: crate::ids::Generation,
     },
+    ExclusivityConflict {
+        cluster_id: String,
+        namespace: String,
+        key_name: String,
+        owner_instance_id: Option<String>,
+        owner_generation: Option<crate::ids::Generation>,
+    },
     IdempotencyConflict,
     Unavailable {
         message: String,
@@ -434,6 +441,25 @@ impl fmt::Display for StoreError {
                     f,
                     "generation conflict: expected generation {expected}, found {actual}"
                 )
+            }
+            Self::ExclusivityConflict {
+                cluster_id,
+                namespace,
+                key_name,
+                owner_instance_id,
+                owner_generation,
+            } => {
+                write!(
+                    f,
+                    "exclusivity key {key_name:?} is already held for target {cluster_id}/{namespace}"
+                )?;
+                if let Some(owner_instance_id) = owner_instance_id {
+                    write!(f, " by instance {owner_instance_id}")?;
+                }
+                if let Some(owner_generation) = owner_generation {
+                    write!(f, " generation {owner_generation}")?;
+                }
+                Ok(())
             }
             Self::IdempotencyConflict => {
                 f.write_str("idempotency key was already used for a different request")

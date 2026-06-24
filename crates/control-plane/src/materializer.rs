@@ -72,6 +72,7 @@ pub enum MaterializerError {
     },
     Apply {
         object: RenderedObjectRef,
+        applied_objects: Vec<RenderedObjectRef>,
         source: KubernetesClientError,
     },
     Delete {
@@ -81,6 +82,7 @@ pub enum MaterializerError {
     PvcBoundWait {
         namespace: String,
         name: String,
+        applied_objects: Vec<RenderedObjectRef>,
         source: KubernetesClientError,
     },
     ReadinessWait {
@@ -139,7 +141,7 @@ where
                 Err(error) => {
                     self.delete_rendered_objects_best_effort(&applied_refs)
                         .await;
-                    return Err(error);
+                    return Err(error.with_applied_objects(&applied_refs));
                 }
             }
         }
@@ -154,7 +156,7 @@ where
                 Err(error) => {
                     self.delete_rendered_objects_best_effort(&applied_refs)
                         .await;
-                    return Err(error);
+                    return Err(error.with_applied_objects(&applied_refs));
                 }
             };
             pvc_refs.push(object_ref.clone());
@@ -165,7 +167,7 @@ where
             if let Err(error) = self.wait_for_pvc_bound(&pvc).await {
                 self.delete_rendered_objects_best_effort(&applied_refs)
                     .await;
-                return Err(error);
+                return Err(error.with_applied_objects(&applied_refs));
             }
         }
 
@@ -179,7 +181,7 @@ where
                     Err(error) => {
                         self.delete_rendered_objects_best_effort(&applied_refs)
                             .await;
-                        return Err(error);
+                        return Err(error.with_applied_objects(&applied_refs));
                     }
                 }
             }
@@ -233,6 +235,7 @@ where
             .await
             .map_err(|source| MaterializerError::Apply {
                 object: object_ref.clone(),
+                applied_objects: Vec::new(),
                 source,
             })?;
         Ok(object_ref)
@@ -245,8 +248,48 @@ where
             .map_err(|source| MaterializerError::PvcBoundWait {
                 namespace: pvc.namespace.clone(),
                 name: pvc.name.clone(),
+                applied_objects: Vec::new(),
                 source,
             })
+    }
+}
+
+impl MaterializerError {
+    pub fn applied_objects_before_failure(&self) -> Option<&[RenderedObjectRef]> {
+        match self {
+            Self::Apply {
+                applied_objects, ..
+            }
+            | Self::PvcBoundWait {
+                applied_objects, ..
+            } => Some(applied_objects),
+            Self::ReadinessWait {
+                rendered_objects, ..
+            } => Some(rendered_objects),
+            Self::InvalidManifest { .. } | Self::Delete { .. } => None,
+        }
+    }
+
+    fn with_applied_objects(self, applied_objects: &[RenderedObjectRef]) -> Self {
+        match self {
+            Self::Apply { object, source, .. } => Self::Apply {
+                object,
+                applied_objects: applied_objects.to_vec(),
+                source,
+            },
+            Self::PvcBoundWait {
+                namespace,
+                name,
+                source,
+                ..
+            } => Self::PvcBoundWait {
+                namespace,
+                name,
+                applied_objects: applied_objects.to_vec(),
+                source,
+            },
+            other => other,
+        }
     }
 }
 
@@ -496,7 +539,7 @@ impl fmt::Display for MaterializerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidManifest { message } => write!(f, "invalid rendered manifest: {message}"),
-            Self::Apply { object, source } => {
+            Self::Apply { object, source, .. } => {
                 write!(
                     f,
                     "failed to apply {} {}/{}: {}",
@@ -514,6 +557,7 @@ impl fmt::Display for MaterializerError {
                 namespace,
                 name,
                 source,
+                ..
             } => write!(
                 f,
                 "failed waiting for PersistentVolumeClaim {namespace}/{name} to become Bound: {source}"
@@ -892,6 +936,7 @@ mod tests {
             error,
             MaterializerError::Apply {
                 object: service_ref.clone(),
+                applied_objects: Vec::new(),
                 source: KubernetesClientError::new("invalid object"),
             }
         );
@@ -1067,6 +1112,7 @@ mod tests {
             error,
             MaterializerError::Apply {
                 object: service_ref.clone(),
+                applied_objects: Vec::new(),
                 source: KubernetesClientError::new("apply failed"),
             }
         );
@@ -1091,6 +1137,7 @@ mod tests {
             error,
             MaterializerError::Apply {
                 object: service_ref.clone(),
+                applied_objects: vec![pv_ref.clone(), pvc_ref.clone()],
                 source: KubernetesClientError::new("apply failed"),
             }
         );
@@ -1128,6 +1175,7 @@ mod tests {
             MaterializerError::PvcBoundWait {
                 namespace: "data".to_owned(),
                 name: "pvc-acme-postgres".to_owned(),
+                applied_objects: vec![pv_ref.clone(), pvc_ref.clone()],
                 source: KubernetesClientError::new("pvc did not bind"),
             }
         );
@@ -1164,6 +1212,7 @@ mod tests {
             MaterializerError::PvcBoundWait {
                 namespace: "data".to_owned(),
                 name: "pvc-acme-postgres".to_owned(),
+                applied_objects: vec![pv_ref.clone(), pvc_ref.clone()],
                 source: KubernetesClientError::new("pvc did not bind"),
             }
         );

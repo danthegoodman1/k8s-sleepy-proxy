@@ -4,6 +4,7 @@ use crate::ids::{
     BackendGeneration, EmptyStringError, Generation, InstanceId, MaterializationId, NonEmptyString,
 };
 use crate::instance::InstanceRecord;
+use crate::workload::RenderedExclusivityKey;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationRecord {
@@ -15,6 +16,7 @@ pub struct MaterializationRecord {
     pub backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
+    pub exclusivity_keys: Vec<RenderedExclusivityKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +28,7 @@ pub struct RecordMaterializationRequest {
     pub backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
+    pub exclusivity_keys: Vec<RenderedExclusivityKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +39,7 @@ pub struct CompleteWakeRequest {
     pub backend: BackendEndpoint,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
+    pub exclusivity_keys: Vec<RenderedExclusivityKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +136,7 @@ impl RecordMaterializationRequest {
             backend: None,
             backend_generation,
             rendered_objects: Vec::new(),
+            exclusivity_keys: Vec::new(),
         }
     }
 }
@@ -151,6 +156,7 @@ impl CompleteWakeRequest {
             backend,
             backend_generation,
             rendered_objects: Vec::new(),
+            exclusivity_keys: Vec::new(),
         }
     }
 }

@@ -20,8 +20,8 @@ use control_plane::{
     RenderedObjectRef, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
     RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
     StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
-    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind,
+    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -64,7 +64,7 @@ async fn postgres_store_conformance_against_real_database() -> TestResult {
     let store_url = connection_url_with_search_path(&base_url, &schema);
     let config = PostgresStoreConfig::new(store_url)?;
     let store = PostgresStore::connect(&config).await?;
-    let result = run_conformance(&store).await;
+    let result = run_conformance(&store, &config).await;
 
     drop(store);
     let cleanup = admin
@@ -77,7 +77,10 @@ async fn postgres_store_conformance_against_real_database() -> TestResult {
     result.map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
 }
 
-async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
+async fn run_conformance(
+    store: &PostgresStore,
+    config: &PostgresStoreConfig,
+) -> Result<(), StoreError> {
     store.run_migrations().await?;
     store.run_migrations().await?;
 
@@ -280,12 +283,22 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
         template_generation: Some(loaded.template_generation),
     })
     .map_err(|error| StoreError::internal(error.to_string()))?;
+    let rendered_names = rendered
+        .objects
+        .iter()
+        .map(|object| (object.object.kind(), object.object.name().to_owned()))
+        .collect::<Vec<_>>();
     assert!(
-        rendered
-            .objects
+        rendered_names
             .iter()
-            .any(|object| object.object.name() == "app-instance-a"),
-        "loaded workload class template should render durable instance manifests"
+            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-instance"),
+        "loaded workload class template should render durable instance Deployment, got {rendered_names:?}"
+    );
+    assert!(
+        rendered_names
+            .iter()
+            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-instance"),
+        "loaded workload class template should render durable instance Service, got {rendered_names:?}"
     );
 
     let replayed = store.create_instance(create.clone()).await?;
@@ -361,6 +374,8 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     exercise_instance_lifecycle(store, class.reference.clone()).await?;
     exercise_complete_wake(store, class.reference.clone()).await?;
     exercise_rendered_object_ref_collision_rejection(store, class.reference.clone()).await?;
+    exercise_exclusivity_keys(store, config).await?;
+    exercise_no_object_apply_failure_release(store).await?;
 
     let delete_target = store
         .create_instance(create_instance_request(
@@ -993,6 +1008,26 @@ async fn create_lifecycle_instance(
         .await
 }
 
+async fn create_exclusive_instance(
+    store: &PostgresStore,
+    workload_class: &WorkloadClassVersionRef,
+    idempotency_key: &str,
+    instance_id: &str,
+    volume_handle: &str,
+    license_handle: &str,
+) -> Result<control_plane::CreateInstanceResult, StoreError> {
+    store
+        .create_instance(
+            create_instance_request(idempotency_key, instance_id, workload_class.clone(), vec![])
+                .with_values(BTreeMap::from([
+                    ("tenant".to_owned(), instance_id.to_owned()),
+                    ("volume_handle".to_owned(), volume_handle.to_owned()),
+                    ("license_handle".to_owned(), license_handle.to_owned()),
+                ])),
+        )
+        .await
+}
+
 async fn exercise_rendered_object_ref_collision_rejection(
     store: &PostgresStore,
     workload_class: WorkloadClassVersionRef,
@@ -1128,6 +1163,437 @@ async fn exercise_rendered_object_ref_collision_rejection(
         "v1 PersistentVolume /shared-pv",
         "instance-collision-pv-owner",
     );
+
+    Ok(())
+}
+
+async fn exercise_exclusivity_keys(
+    store: &PostgresStore,
+    config: &PostgresStoreConfig,
+) -> Result<(), StoreError> {
+    let workload_class = exclusive_workload_class();
+    store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(
+            workload_class.clone(),
+        ))
+        .await?;
+    let loaded = store
+        .load_workload_class_version(control_plane::LoadWorkloadClassVersionRequest::new(
+            workload_class.reference.clone(),
+        ))
+        .await?
+        .expect("exclusive workload class loads");
+    assert_eq!(loaded.exclusivity_keys, workload_class.exclusivity_keys);
+
+    let target = MaterializationTarget::new("cluster-exclusive", "apps").expect("valid target");
+    let owner = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "idem-exclusive-owner",
+        "instance-exclusive-owner",
+        "disk-a",
+        "license-owner",
+    )
+    .await?;
+    let owner_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            owner.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut owner_materialization = RecordMaterializationRequest::new(
+        owner.instance.id.clone(),
+        owner_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    owner_materialization.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&owner_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    let expected_owner_keys = vec![
+        control_plane::RenderedExclusivityKey::new("disk", "disk-a"),
+        control_plane::RenderedExclusivityKey::new("license", "license-owner"),
+    ];
+    assert_eq!(owner_materialization.exclusivity_keys, expected_owner_keys);
+    let owner_record = store.record_materialization(owner_materialization).await?;
+    assert_eq!(owner_record.exclusivity_keys, expected_owner_keys);
+
+    let stale_record = RecordMaterializationRequest::new(
+        owner.instance.id.clone(),
+        Generation::new(0),
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(2),
+    );
+    let stale_error = store
+        .record_materialization(stale_record)
+        .await
+        .expect_err("stale instance generation cannot update held keys");
+    assert!(matches!(
+        stale_error,
+        StoreError::GenerationConflict {
+            expected,
+            actual
+        } if expected == Generation::new(0) && actual == owner_waking.generation
+    ));
+
+    let contender = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "idem-exclusive-contender",
+        "instance-exclusive-contender",
+        "disk-a",
+        "license-contender",
+    )
+    .await?;
+    let contender_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            contender.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut contender_materialization = RecordMaterializationRequest::new(
+        contender.instance.id.clone(),
+        contender_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    contender_materialization.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&contender_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    let conflict = store
+        .record_materialization(contender_materialization.clone())
+        .await
+        .expect_err("same rendered key is rejected while active materialization holds it");
+    assert_exclusivity_conflict(conflict, "disk", Some("instance-exclusive-owner"));
+    assert!(store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            contender.instance.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .is_none());
+
+    let restarted_store = PostgresStore::connect(config).await?;
+    let restart_contender = create_exclusive_instance(
+        &restarted_store,
+        &workload_class.reference,
+        "idem-exclusive-restart-contender",
+        "instance-exclusive-restart-contender",
+        "disk-a",
+        "license-restart",
+    )
+    .await?;
+    let restart_waking = restarted_store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            restart_contender.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut restart_materialization = RecordMaterializationRequest::new(
+        restart_contender.instance.id,
+        restart_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    restart_materialization.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&restart_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    let restart_conflict = restarted_store
+        .record_materialization(restart_materialization)
+        .await
+        .expect_err("recreated store still sees active held key");
+    assert_exclusivity_conflict(restart_conflict, "disk", Some("instance-exclusive-owner"));
+
+    let different = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "idem-exclusive-different",
+        "instance-exclusive-different",
+        "disk-b",
+        "license-different",
+    )
+    .await?;
+    let different_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            different.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut different_materialization = RecordMaterializationRequest::new(
+        different.instance.id,
+        different_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    different_materialization.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&different_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    let different_record = store
+        .record_materialization(different_materialization)
+        .await?;
+    assert_eq!(
+        different_record.exclusivity_keys,
+        vec![
+            control_plane::RenderedExclusivityKey::new("disk", "disk-b"),
+            control_plane::RenderedExclusivityKey::new("license", "license-different"),
+        ]
+    );
+
+    let mut complete = CompleteWakeRequest::new(
+        owner.instance.id.clone(),
+        owner_waking.generation,
+        target.clone(),
+        BackendEndpoint::new("http://10.0.0.50:8080").expect("valid backend"),
+        BackendGeneration::new(2),
+    );
+    complete.exclusivity_keys = expected_owner_keys.clone();
+    let completed = store.complete_wake(complete).await?;
+    assert_eq!(
+        completed.materialization.exclusivity_keys,
+        expected_owner_keys
+    );
+
+    let begin = store
+        .begin_sleep(BeginSleepRequest::new(
+            owner.instance.id.clone(),
+            completed.instance.generation,
+            target.clone(),
+        ))
+        .await?;
+    assert_eq!(begin.instance.state, InstanceState::Draining);
+    assert_eq!(
+        begin
+            .materialization
+            .as_ref()
+            .expect("materialization is marked deleting")
+            .exclusivity_keys,
+        expected_owner_keys
+    );
+    let deleting_conflict = store
+        .record_materialization(contender_materialization.clone())
+        .await
+        .expect_err("deleting materialization keeps the key held until finalize");
+    assert_exclusivity_conflict(deleting_conflict, "disk", Some("instance-exclusive-owner"));
+
+    let finalized = store
+        .finalize_sleep(FinalizeSleepRequest::new(
+            owner.instance.id,
+            begin.instance.generation,
+            target.clone(),
+        ))
+        .await?;
+    assert_eq!(finalized.instance.state, InstanceState::Cold);
+    assert_eq!(
+        finalized
+            .materialization
+            .as_ref()
+            .expect("deleted materialization returned")
+            .exclusivity_keys,
+        Vec::<control_plane::RenderedExclusivityKey>::new()
+    );
+    assert!(store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            owner_record.instance_id,
+            target.clone(),
+        ))
+        .await?
+        .is_none());
+
+    let acquired_after_release = store
+        .record_materialization(contender_materialization)
+        .await?;
+    assert_eq!(acquired_after_release.instance_id, contender.instance.id);
+
+    Ok(())
+}
+
+async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Result<(), StoreError> {
+    let workload_class = exclusive_workload_class_with_id("class-exclusive-no-apply-release");
+    store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(
+            workload_class.clone(),
+        ))
+        .await?;
+
+    let target =
+        MaterializationTarget::new("cluster-exclusive-release", "apps").expect("valid target");
+    let owner = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "idem-exclusive-release-owner",
+        "instance-exclusive-release-owner",
+        "disk-release",
+        "license-release",
+    )
+    .await?;
+    let owner_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            owner.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let expected_owner_keys = vec![
+        control_plane::RenderedExclusivityKey::new("disk", "disk-release"),
+        control_plane::RenderedExclusivityKey::new("license", "license-release"),
+    ];
+    let mut pending = RecordMaterializationRequest::new(
+        owner.instance.id.clone(),
+        owner_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    pending.rendered_objects = vec![object_ref("v1", "PersistentVolume", "", "pv-release")];
+    pending.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&owner_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    assert_eq!(pending.exclusivity_keys, expected_owner_keys);
+    store.record_materialization(pending).await?;
+
+    let mut release = RecordMaterializationRequest::new(
+        owner.instance.id.clone(),
+        owner_waking.generation,
+        target.clone(),
+        MaterializationState::Deleted,
+        BackendGeneration::new(1),
+    );
+    release.rendered_objects = Vec::new();
+    release.exclusivity_keys = Vec::new();
+    let released = store.record_materialization(release).await?;
+    assert_eq!(released.state, MaterializationState::Deleted);
+    assert!(released.rendered_objects.is_empty());
+    assert!(released.exclusivity_keys.is_empty());
+    assert!(store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            owner.instance.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .is_none());
+
+    let failed = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            owner.instance.id,
+            owner_waking.generation,
+            InstanceState::Failed,
+            StateTransitionReason::FailureReported(
+                "materialization failed before apply".to_owned(),
+            ),
+        ))
+        .await?;
+    assert_eq!(failed.generation, owner_waking.generation.next());
+
+    let contender = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "idem-exclusive-release-contender",
+        "instance-exclusive-release-contender",
+        "disk-release",
+        "license-contender",
+    )
+    .await?;
+    let contender_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            contender.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut contender_materialization = RecordMaterializationRequest::new(
+        contender.instance.id.clone(),
+        contender_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    contender_materialization.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&contender_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    let acquired = store
+        .record_materialization(contender_materialization)
+        .await?;
+    assert_eq!(acquired.instance_id, contender.instance.id);
+
+    let stale_owner = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "idem-exclusive-stale-release-owner",
+        "instance-exclusive-stale-release-owner",
+        "disk-stale-release",
+        "license-stale-release",
+    )
+    .await?;
+    let stale_owner_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            stale_owner.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut stale_pending = RecordMaterializationRequest::new(
+        stale_owner.instance.id.clone(),
+        stale_owner_waking.generation,
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    stale_pending.exclusivity_keys = workload_class
+        .render_exclusivity_keys(&stale_owner_waking.values)
+        .map_err(|error| StoreError::internal(error.to_string()))?;
+    store.record_materialization(stale_pending).await?;
+    let stale_failed = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            stale_owner.instance.id.clone(),
+            stale_owner_waking.generation,
+            InstanceState::Failed,
+            StateTransitionReason::FailureReported(
+                "materialization failed before apply".to_owned(),
+            ),
+        ))
+        .await?;
+    let stale_release = RecordMaterializationRequest::new(
+        stale_owner.instance.id.clone(),
+        stale_owner_waking.generation,
+        target.clone(),
+        MaterializationState::Deleted,
+        BackendGeneration::new(1),
+    );
+    let stale_release_error = store
+        .record_materialization(stale_release)
+        .await
+        .expect_err("stale generation cannot release pending held keys");
+    assert!(matches!(
+        stale_release_error,
+        StoreError::GenerationConflict {
+            expected,
+            actual
+        } if expected == stale_owner_waking.generation && actual == stale_failed.generation
+    ));
+    let accepted_release = RecordMaterializationRequest::new(
+        stale_owner.instance.id,
+        stale_failed.generation,
+        target,
+        MaterializationState::Deleted,
+        BackendGeneration::new(1),
+    );
+    store.record_materialization(accepted_release).await?;
 
     Ok(())
 }
@@ -1821,8 +2287,14 @@ async fn exercise_route_bindings(
     .await?;
     assert_resolves_to(
         store,
-        http_identity("app.routes.example.com", Some("/apiary")),
+        http_identity("app.routes.example.com", Some("/api")),
         &exact_api.id,
+    )
+    .await?;
+    assert_resolves_to(
+        store,
+        http_identity("app.routes.example.com", Some("/apiary")),
+        &exact_root.id,
     )
     .await?;
     assert_resolves_to(
@@ -1950,7 +2422,28 @@ fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
                 WorkloadValueFieldRule::optional_with_default(image),
             ),
         sleep_policy: default_sleep_policy(),
+        exclusivity_keys: vec![],
     }
+}
+
+fn exclusive_workload_class() -> WorkloadClassVersion {
+    exclusive_workload_class_with_id("class-exclusive")
+}
+
+fn exclusive_workload_class_with_id(class_id: &str) -> WorkloadClassVersion {
+    let mut workload_class = workload_class(class_id, 1);
+    workload_class.value_schema = workload_class
+        .value_schema
+        .with_field("volume_handle", WorkloadValueFieldRule::required())
+        .with_field("license_handle", WorkloadValueFieldRule::required());
+    workload_class.exclusivity_keys = vec![
+        WorkloadExclusivityKeyTemplate::new(
+            "license",
+            TemplateText::instance_value("license_handle"),
+        ),
+        WorkloadExclusivityKeyTemplate::new("disk", TemplateText::instance_value("volume_handle")),
+    ];
+    workload_class
 }
 
 fn workload_class_with_idle_override(class_id: &str, version: u64) -> WorkloadClassVersion {
@@ -2107,6 +2600,24 @@ fn assert_collision_error(error: StoreError, object: &str, owner_instance_id: &s
             );
         }
         other => panic!("expected rendered object collision invalid argument, got {other}"),
+    }
+}
+
+fn assert_exclusivity_conflict(
+    error: StoreError,
+    expected_key_name: &str,
+    expected_owner: Option<&str>,
+) {
+    match error {
+        StoreError::ExclusivityConflict {
+            key_name,
+            owner_instance_id,
+            ..
+        } => {
+            assert_eq!(key_name, expected_key_name);
+            assert_eq!(owner_instance_id.as_deref(), expected_owner);
+        }
+        other => panic!("expected exclusivity conflict, got {other}"),
     }
 }
 

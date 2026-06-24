@@ -23,8 +23,8 @@ use control_plane::api::{
         ResolveHttp01ChallengeRequest, ResolveHttp01ChallengeResponse, RouteBinding, RouteHost,
         RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
         SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersion,
-        WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-        WorkloadValueFieldRule, WorkloadValueSchema,
+        WorkloadClassVersionRef, WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy,
+        WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
     },
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
@@ -119,6 +119,7 @@ fn materialization(
             object_ref("v1", "Service", "apps", &format!("{instance_id}-svc")),
             object_ref("apps/v1", "Deployment", "apps", instance_id),
         ],
+        exclusivity_keys: vec![],
     }
 }
 
@@ -165,6 +166,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
         template_generation: 1,
         template: Some(stateful_manifest_template_proto()),
         sleep_policy: Some(sleep_policy_proto()),
+        exclusivity_keys: vec![],
     };
 
     assert_eq!(request.values["tenant"], "acme");
@@ -580,6 +582,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
             template_generation: 9,
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         }))
         .await
         .expect("create workload class succeeds")
@@ -610,6 +613,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
             template_generation: 1,
             template: None,
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         }))
         .await
         .expect_err("template is required");
@@ -626,6 +630,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
             template_generation: 1,
             template: Some(template.clone()),
             sleep_policy: None,
+            exclusivity_keys: vec![],
         }))
         .await
         .expect_err("sleep policy is required");
@@ -649,6 +654,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
                 drain_grace_timeout_ms: 30_000,
                 idle_timeout_override: None,
             }),
+            exclusivity_keys: vec![],
         }))
         .await
         .expect_err("invalid sleep policy is rejected");
@@ -769,6 +775,7 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
             template_generation: 1,
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         }))
         .await
         .expect("create workload class with hostPath template succeeds")
@@ -800,6 +807,160 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
 }
 
 #[tokio::test]
+async fn store_backed_workload_class_api_round_trips_exclusivity_keys() {
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let key = WorkloadExclusivityKey {
+        name: "disk".to_owned(),
+        value: Some(TemplateText {
+            parts: vec![TemplateTextPart {
+                kind: Some(template_text_part::Kind::InstanceValue(
+                    "volume_handle".to_owned(),
+                )),
+            }],
+        }),
+    };
+
+    let created = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-exclusive-class".to_owned(),
+            class_id: "exclusive-class".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: [(
+                    "volume_handle".to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )]
+                .into(),
+                allow_extra: false,
+            }),
+            template_generation: 1,
+            template: Some(stateful_manifest_template_proto()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![key.clone()],
+        }))
+        .await
+        .expect("create workload class with exclusivity key succeeds")
+        .into_inner();
+
+    assert_eq!(created.exclusivity_keys, vec![key.clone()]);
+
+    let loaded = service
+        .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "exclusive-class".to_owned(),
+                version: 1,
+            }),
+        }))
+        .await
+        .expect("get workload class with exclusivity key succeeds")
+        .into_inner();
+
+    assert_eq!(loaded, created);
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_rejects_invalid_exclusivity_keys() {
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let valid_value = TemplateText {
+        parts: vec![TemplateTextPart {
+            kind: Some(template_text_part::Kind::InstanceValue(
+                "volume_handle".to_owned(),
+            )),
+        }],
+    };
+
+    let invalid_name = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-invalid-exclusive-name".to_owned(),
+            class_id: "invalid-exclusive-name".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(stateful_manifest_template_proto()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![WorkloadExclusivityKey {
+                name: "disk/name".to_owned(),
+                value: Some(valid_value.clone()),
+            }],
+        }))
+        .await
+        .expect_err("unsafe key name is rejected");
+    assert_eq!(invalid_name.code(), Code::InvalidArgument);
+    assert!(invalid_name.message().contains("exclusivity key"));
+
+    let missing_value = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-missing-exclusive-value".to_owned(),
+            class_id: "missing-exclusive-value".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(stateful_manifest_template_proto()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![WorkloadExclusivityKey {
+                name: "disk".to_owned(),
+                value: None,
+            }],
+        }))
+        .await
+        .expect_err("missing key value template is rejected");
+    assert_eq!(missing_value.code(), Code::InvalidArgument);
+    assert!(missing_value.message().contains("exclusivity_keys.value"));
+
+    let empty_parts = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-empty-exclusive-value".to_owned(),
+            class_id: "empty-exclusive-value".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(stateful_manifest_template_proto()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![WorkloadExclusivityKey {
+                name: "disk".to_owned(),
+                value: Some(TemplateText { parts: vec![] }),
+            }],
+        }))
+        .await
+        .expect_err("empty key value template is rejected");
+    assert_eq!(empty_parts.code(), Code::InvalidArgument);
+    assert!(empty_parts.message().contains("template text parts"));
+
+    let blank_instance_value = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-blank-exclusive-value-field".to_owned(),
+            class_id: "blank-exclusive-value-field".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(stateful_manifest_template_proto()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![WorkloadExclusivityKey {
+                name: "disk".to_owned(),
+                value: Some(TemplateText {
+                    parts: vec![TemplateTextPart {
+                        kind: Some(template_text_part::Kind::InstanceValue(" ".to_owned())),
+                    }],
+                }),
+            }],
+        }))
+        .await
+        .expect_err("blank key value field is rejected");
+    assert_eq!(blank_instance_value.code(), Code::InvalidArgument);
+    assert!(blank_instance_value
+        .message()
+        .contains("instance value field names"));
+}
+
+#[tokio::test]
 async fn store_backed_workload_class_api_rejects_empty_template_static_strings() {
     let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
     let mut template = stateful_manifest_template_proto();
@@ -823,6 +984,7 @@ async fn store_backed_workload_class_api_rejects_empty_template_static_strings()
             template_generation: 1,
             template: Some(template),
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         }))
         .await
         .expect_err("empty static template names are rejected");
@@ -851,6 +1013,7 @@ async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
             template_generation: 1,
             template: Some(template),
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         }))
         .await
         .expect_err("empty template text parts are rejected");
@@ -1009,6 +1172,7 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
             template_generation: 5,
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         },
     )
     .await;
@@ -1177,6 +1341,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
             template_generation: 6,
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
         },
     )
     .await;

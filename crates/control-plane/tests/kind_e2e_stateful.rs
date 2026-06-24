@@ -15,8 +15,9 @@ use control_plane::api::pb::{
     Instance, InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
     PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute, RouteHost,
     RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueSchema,
+    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef,
+    WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueSchema,
 };
 use k8s_openapi::{
     api::{
@@ -25,9 +26,15 @@ use k8s_openapi::{
     },
     apimachinery::pkg::util::intstr::IntOrString,
 };
-use kube::{api::ListParams, Api, Client, Error as KubeError};
+use kube::{
+    api::{DeleteParams, ListParams},
+    Api, Client, Error as KubeError,
+};
 use tokio::time::{sleep, Instant};
-use tonic::transport::{Channel, Endpoint};
+use tonic::{
+    transport::{Channel, Endpoint},
+    Code,
+};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -45,6 +52,22 @@ const MOUNT_PATH: &str = "/data";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
 const STATEFUL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(180);
+const CONTROL_PLANE_LABEL: &str = "app.kubernetes.io/name=sleepypods-control-plane";
+const EXCLUSIVE_CLASS_ID: &str = "stateful-exclusive";
+const EXCLUSIVE_OWNER_INSTANCE_ID: &str = "m12ownera";
+const EXCLUSIVE_BLOCKED_INSTANCE_ID: &str = "m12blockb";
+const EXCLUSIVE_OTHER_INSTANCE_ID: &str = "m12otherc";
+const EXCLUSIVE_OWNER_ROUTE_ID: &str = "m12-owner-route";
+const EXCLUSIVE_BLOCKED_ROUTE_ID: &str = "m12-blocked-route";
+const EXCLUSIVE_OTHER_ROUTE_ID: &str = "m12-other-route";
+const EXCLUSIVE_OWNER_HOST: &str = "m12-owner.sleepypods.test";
+const EXCLUSIVE_BLOCKED_HOST: &str = "m12-blocked.sleepypods.test";
+const EXCLUSIVE_OTHER_HOST: &str = "m12-other.sleepypods.test";
+const EXCLUSIVE_OWNER_TENANT: &str = "m12-owner";
+const EXCLUSIVE_BLOCKED_TENANT: &str = "m12-blocked";
+const EXCLUSIVE_OTHER_TENANT: &str = "m12-other";
+const EXCLUSIVE_SHARED_HANDLE: &str = "opaque-shared-handle";
+const EXCLUSIVE_OTHER_HANDLE: &str = "opaque-other-handle";
 
 #[tokio::test]
 #[ignore = "requires scripts/test-kind-e2e-stateful.sh or an equivalent kind deployment"]
@@ -172,6 +195,218 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires scripts/test-kind-e2e-exclusivity.sh or an equivalent kind deployment"]
+async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()> {
+    if env::var("SLEEPYPODS_KIND_E2E_EXCLUSIVITY").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping exclusivity kind E2E because SLEEPYPODS_KIND_E2E_EXCLUSIVITY=1 is not set"
+        );
+        return Ok(());
+    }
+
+    control_plane::install_rustls_crypto_provider();
+
+    let config = E2eConfig::from_env()?;
+    let kube = Client::try_default().await?;
+    let mut operator = connect_operator(&config.operator_endpoint).await?;
+    let marker = unique_marker()?;
+
+    assert_single_node_cluster(kube.clone()).await?;
+    create_exclusivity_resources(&mut operator, &config).await?;
+    let owner_created = wait_for_named_instance_state(
+        &mut operator,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+        PbInstanceState::Cold,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let blocked_created = wait_for_named_instance_state(
+        &mut operator,
+        EXCLUSIVE_BLOCKED_INSTANCE_ID,
+        PbInstanceState::Cold,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    eprintln!("exclusivity E2E: waking owner with shared key");
+    let owner_path = format!("/write/{marker}-owner");
+    let owner_response = wait_for_frontline_response_for_host(
+        &config,
+        EXCLUSIVE_OWNER_HOST,
+        "owner wake",
+        &owner_path,
+        "wrote:",
+        Duration::from_secs(180),
+    )
+    .await?;
+    assert_response(&owner_response, "owner wake", "wrote:")?;
+    let owner_running = wait_for_named_instance_state(
+        &mut operator,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+        PbInstanceState::Running,
+        Duration::from_secs(30),
+    )
+    .await?;
+    if owner_running.generation <= owner_created.generation {
+        return Err(format!(
+            "expected owner wake to advance generation beyond {}, got {}",
+            owner_created.generation, owner_running.generation
+        )
+        .into());
+    }
+    assert_materialized_objects_for_instance(
+        kube.clone(),
+        &config.namespace,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+    )
+    .await?;
+
+    eprintln!("exclusivity E2E: restarting control-plane while owner holds key");
+    restart_control_plane_pod(kube.clone(), &config.namespace, &config.operator_endpoint).await?;
+
+    eprintln!("exclusivity E2E: same key is rejected without applying objects");
+    let blocked_path = format!("/write/{marker}-blocked");
+    let started = Instant::now();
+    let blocked_response = wait_for_frontline_status_for_host(
+        &config,
+        EXCLUSIVE_BLOCKED_HOST,
+        &blocked_path,
+        503,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if started.elapsed() > Duration::from_secs(65) {
+        return Err(format!(
+            "same-key contention was not bounded; elapsed {:?}",
+            started.elapsed()
+        )
+        .into());
+    }
+    if blocked_response.body.contains("wrote:") {
+        return Err("same-key contention unexpectedly reached the blocked backend".into());
+    }
+    let blocked_failed = wait_for_named_instance_state_with_reconnect(
+        &config.operator_endpoint,
+        EXCLUSIVE_BLOCKED_INSTANCE_ID,
+        PbInstanceState::Failed,
+        Duration::from_secs(30),
+    )
+    .await?;
+    if blocked_failed.generation <= blocked_created.generation {
+        return Err(format!(
+            "expected blocked wake to advance generation beyond {}, got {}",
+            blocked_created.generation, blocked_failed.generation
+        )
+        .into());
+    }
+    assert_no_materialized_objects_for_instance(
+        kube.clone(),
+        &config.namespace,
+        EXCLUSIVE_BLOCKED_INSTANCE_ID,
+    )
+    .await?;
+
+    eprintln!("exclusivity E2E: unrelated key can wake independently");
+    let other_path = format!("/write/{marker}-other");
+    let other_response = wait_for_frontline_response_for_host(
+        &config,
+        EXCLUSIVE_OTHER_HOST,
+        "unrelated key wake",
+        &other_path,
+        "wrote:",
+        Duration::from_secs(180),
+    )
+    .await?;
+    assert_response(&other_response, "unrelated key wake", "wrote:")?;
+    wait_for_named_instance_state_with_reconnect(
+        &config.operator_endpoint,
+        EXCLUSIVE_OTHER_INSTANCE_ID,
+        PbInstanceState::Running,
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert_materialized_objects_for_instance(
+        kube.clone(),
+        &config.namespace,
+        EXCLUSIVE_OTHER_INSTANCE_ID,
+    )
+    .await?;
+
+    eprintln!("exclusivity E2E: delete owner releases shared key after cleanup");
+    let deleted = delete_instance_with_reconnect(
+        &config.operator_endpoint,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if !deleted.deleted {
+        return Err("expected owner DeleteInstance to delete the running instance".into());
+    }
+    wait_for_materialized_objects_deleted_for_instance(
+        kube.clone(),
+        &config.namespace,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+        STATEFUL_CLEANUP_TIMEOUT,
+    )
+    .await?;
+
+    let recovered_response = wait_for_frontline_response_for_host(
+        &config,
+        EXCLUSIVE_BLOCKED_HOST,
+        "shared key wake after owner cleanup",
+        &blocked_path,
+        "wrote:",
+        Duration::from_secs(180),
+    )
+    .await?;
+    assert_response(
+        &recovered_response,
+        "shared key wake after owner cleanup",
+        "wrote:",
+    )?;
+    let blocked_running = wait_for_named_instance_state_with_reconnect(
+        &config.operator_endpoint,
+        EXCLUSIVE_BLOCKED_INSTANCE_ID,
+        PbInstanceState::Running,
+        Duration::from_secs(30),
+    )
+    .await?;
+    if blocked_running.generation <= blocked_failed.generation {
+        return Err(format!(
+            "expected released-key wake to advance generation beyond {}, got {}",
+            blocked_failed.generation, blocked_running.generation
+        )
+        .into());
+    }
+    assert_materialized_objects_for_instance(
+        kube.clone(),
+        &config.namespace,
+        EXCLUSIVE_BLOCKED_INSTANCE_ID,
+    )
+    .await?;
+
+    for instance_id in [EXCLUSIVE_BLOCKED_INSTANCE_ID, EXCLUSIVE_OTHER_INSTANCE_ID] {
+        let deleted = delete_instance_with_reconnect(
+            &config.operator_endpoint,
+            instance_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if deleted.deleted {
+            wait_for_materialized_objects_deleted_for_instance(
+                kube.clone(),
+                &config.namespace,
+                instance_id,
+                STATEFUL_CLEANUP_TIMEOUT,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct E2eConfig {
     namespace: String,
@@ -218,7 +453,29 @@ async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClie
             .connect()
             .await;
         match channel {
-            Ok(channel) => return Ok(OperatorControlPlaneClient::new(channel)),
+            Ok(channel) => {
+                let mut client = OperatorControlPlaneClient::new(channel);
+                match probe_operator(&mut client).await {
+                    Ok(()) => {
+                        sleep(Duration::from_millis(500)).await;
+                        match probe_operator(&mut client).await {
+                            Ok(()) => return Ok(client),
+                            Err(error) if Instant::now() < deadline => {
+                                eprintln!(
+                                    "waiting for stable operator gRPC endpoint {endpoint}: {error}"
+                                );
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        eprintln!("waiting for stable operator gRPC endpoint {endpoint}: {error}");
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             Err(error) if Instant::now() < deadline => {
                 eprintln!("waiting for operator gRPC endpoint {endpoint}: {error}");
                 sleep(Duration::from_secs(1)).await;
@@ -226,6 +483,69 @@ async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClie
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+async fn probe_operator(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+) -> Result<(), tonic::Status> {
+    match operator
+        .get_instance(GetInstanceRequest {
+            instance_id: "kind-e2e-probe-missing".to_owned(),
+        })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(status)
+            if matches!(
+                status.code(),
+                Code::NotFound | Code::InvalidArgument | Code::FailedPrecondition
+            ) =>
+        {
+            Ok(())
+        }
+        Err(status) => Err(status),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeleteInstanceOutcome {
+    deleted: bool,
+}
+
+async fn delete_instance_with_reconnect(
+    endpoint: &str,
+    instance_id: &str,
+    timeout: Duration,
+) -> TestResult<DeleteInstanceOutcome> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut operator = connect_operator(endpoint).await?;
+        match operator
+            .delete_instance(DeleteInstanceRequest {
+                instance_id: instance_id.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => {
+                return Ok(DeleteInstanceOutcome {
+                    deleted: response.into_inner().deleted,
+                });
+            }
+            Err(status)
+                if retryable_operator_transport_status(&status) && Instant::now() < deadline =>
+            {
+                eprintln!(
+                    "retrying DeleteInstance for {instance_id} after transient operator transport error: {status}"
+                );
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(status) => return Err(status.into()),
+        }
+    }
+}
+
+fn retryable_operator_transport_status(status: &tonic::Status) -> bool {
+    status.code() == Code::Unknown && status.message().contains("transport error")
 }
 
 async fn create_operator_resources(
@@ -250,6 +570,7 @@ async fn create_operator_resources(
                 drain_grace_timeout_ms: 500,
                 idle_timeout_override: None,
             }),
+            exclusivity_keys: vec![],
         })
         .await?;
 
@@ -286,8 +607,125 @@ async fn create_operator_resources(
     Ok(())
 }
 
+async fn create_exclusivity_resources(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    config: &E2eConfig,
+) -> TestResult<()> {
+    operator
+        .create_workload_class_version(CreateWorkloadClassVersionRequest {
+            idempotency_key: "kind-e2e-exclusivity-create-class".to_owned(),
+            class_id: EXCLUSIVE_CLASS_ID.to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: Default::default(),
+                allow_extra: true,
+            }),
+            template_generation: 1,
+            template: Some(manifest_template(config)),
+            sleep_policy: Some(WorkloadSleepPolicy {
+                idle_timeout_ms: 900_000,
+                idle_retry_backoff_ms: 500,
+                drain_grace_timeout_ms: 500,
+                idle_timeout_override: None,
+            }),
+            exclusivity_keys: vec![WorkloadExclusivityKey {
+                name: "disk".to_owned(),
+                value: Some(instance_value_text("volume_handle")),
+            }],
+        })
+        .await?;
+
+    create_exclusive_instance_and_route(
+        operator,
+        "owner",
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+        EXCLUSIVE_OWNER_ROUTE_ID,
+        EXCLUSIVE_OWNER_HOST,
+        EXCLUSIVE_OWNER_TENANT,
+        EXCLUSIVE_SHARED_HANDLE,
+    )
+    .await?;
+    create_exclusive_instance_and_route(
+        operator,
+        "blocked",
+        EXCLUSIVE_BLOCKED_INSTANCE_ID,
+        EXCLUSIVE_BLOCKED_ROUTE_ID,
+        EXCLUSIVE_BLOCKED_HOST,
+        EXCLUSIVE_BLOCKED_TENANT,
+        EXCLUSIVE_SHARED_HANDLE,
+    )
+    .await?;
+    create_exclusive_instance_and_route(
+        operator,
+        "other",
+        EXCLUSIVE_OTHER_INSTANCE_ID,
+        EXCLUSIVE_OTHER_ROUTE_ID,
+        EXCLUSIVE_OTHER_HOST,
+        EXCLUSIVE_OTHER_TENANT,
+        EXCLUSIVE_OTHER_HANDLE,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn create_exclusive_instance_and_route(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    suffix: &str,
+    instance_id: &str,
+    route_id: &str,
+    route_host: &str,
+    tenant: &str,
+    volume_handle: &str,
+) -> TestResult<()> {
+    operator
+        .create_instance(CreateInstanceRequest {
+            idempotency_key: format!("kind-e2e-exclusivity-create-{suffix}"),
+            instance_id: instance_id.to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: EXCLUSIVE_CLASS_ID.to_owned(),
+                version: 1,
+            }),
+            values: HashMap::from([
+                ("tenant".to_owned(), tenant.to_owned()),
+                ("volume_handle".to_owned(), volume_handle.to_owned()),
+            ]),
+        })
+        .await?;
+
+    operator
+        .create_route_binding(CreateRouteBindingRequest {
+            idempotency_key: format!("kind-e2e-exclusivity-route-{suffix}"),
+            route_binding_id: route_id.to_owned(),
+            instance_id: instance_id.to_owned(),
+            identity: Some(RouteIdentity {
+                kind: Some(route_identity::Kind::Http(HttpRouteIdentity {
+                    host: Some(RouteHost {
+                        kind: RouteHostKind::Exact as i32,
+                        host: route_host.to_owned(),
+                    }),
+                    path_prefix: None,
+                })),
+            }),
+            protocol: ProtocolRoute::Http as i32,
+        })
+        .await?;
+
+    Ok(())
+}
+
 async fn wait_for_instance_state(
     operator: &mut OperatorControlPlaneClient<Channel>,
+    expected: PbInstanceState,
+    timeout: Duration,
+) -> TestResult<Instance> {
+    wait_for_named_instance_state(operator, INSTANCE_ID, expected, timeout).await
+}
+
+async fn wait_for_named_instance_state(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    instance_id: &str,
     expected: PbInstanceState,
     timeout: Duration,
 ) -> TestResult<Instance> {
@@ -295,7 +733,7 @@ async fn wait_for_instance_state(
     loop {
         let instance = operator
             .get_instance(GetInstanceRequest {
-                instance_id: INSTANCE_ID.to_owned(),
+                instance_id: instance_id.to_owned(),
             })
             .await?
             .into_inner();
@@ -307,10 +745,54 @@ async fn wait_for_instance_state(
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for instance {INSTANCE_ID} to reach {expected:?}; last state was {actual:?} generation {}",
+                "timed out waiting for instance {instance_id} to reach {expected:?}; last state was {actual:?} generation {}",
                 instance.generation
             )
             .into());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_for_named_instance_state_with_reconnect(
+    endpoint: &str,
+    instance_id: &str,
+    expected: PbInstanceState,
+    timeout: Duration,
+) -> TestResult<Instance> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut operator = connect_operator(endpoint).await?;
+        match operator
+            .get_instance(GetInstanceRequest {
+                instance_id: instance_id.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => {
+                let instance = response.into_inner();
+                let actual = PbInstanceState::try_from(instance.state)
+                    .unwrap_or(PbInstanceState::Unspecified);
+                if actual == expected {
+                    return Ok(instance);
+                }
+
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out waiting for instance {instance_id} to reach {expected:?}; last state was {actual:?} generation {}",
+                        instance.generation
+                    )
+                    .into());
+                }
+            }
+            Err(status)
+                if retryable_operator_transport_status(&status) && Instant::now() < deadline =>
+            {
+                eprintln!(
+                    "retrying GetInstance for {instance_id} after transient operator transport error: {status}"
+                );
+            }
+            Err(status) => return Err(status.into()),
         }
         sleep(Duration::from_secs(1)).await;
     }
@@ -323,9 +805,21 @@ async fn wait_for_frontline_response(
     expected_body: &str,
     timeout: Duration,
 ) -> TestResult<HttpResponse> {
+    wait_for_frontline_response_for_host(config, ROUTE_HOST, context, path, expected_body, timeout)
+        .await
+}
+
+async fn wait_for_frontline_response_for_host(
+    config: &E2eConfig,
+    host: &str,
+    context: &str,
+    path: &str,
+    expected_body: &str,
+    timeout: Duration,
+) -> TestResult<HttpResponse> {
     let deadline = Instant::now() + timeout;
     loop {
-        let last_error = match http_get(config.frontline_addr, ROUTE_HOST, path).await {
+        let last_error = match http_get(config.frontline_addr, host, path).await {
             Ok(response) if response.status == 200 && response.body.contains(expected_body) => {
                 return Ok(response);
             }
@@ -338,8 +832,36 @@ async fn wait_for_frontline_response(
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for successful frontline response for {context} path {path}: {}",
+                "timed out waiting for successful frontline response for {context} host {host} path {path}: {}",
                 last_error
+            )
+            .into());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_for_frontline_status_for_host(
+    config: &E2eConfig,
+    host: &str,
+    path: &str,
+    expected_status: u16,
+    timeout: Duration,
+) -> TestResult<HttpResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match http_get(config.frontline_addr, host, path).await {
+            Ok(response) if response.status == expected_status => return Ok(response),
+            Ok(response) => format!(
+                "frontline returned HTTP {} with body {:?}",
+                response.status, response.body
+            ),
+            Err(error) => error.to_string(),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for frontline HTTP {expected_status} for host {host} path {path}: {last_error}"
             )
             .into());
         }
@@ -415,6 +937,86 @@ async fn assert_materialized_stateful_objects(kube: Client, config: &E2eConfig) 
     assert_stateful_set_shape(&stateful_set, config)?;
     assert_service_targets_sidecar(&service)?;
     assert_stateful_pod_mounts_pvc(&pods).await?;
+
+    Ok(())
+}
+
+async fn assert_materialized_objects_for_instance(
+    kube: Client,
+    namespace: &str,
+    instance_id: &str,
+) -> TestResult<()> {
+    let pvs: Api<PersistentVolume> = Api::all(kube.clone());
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube.clone(), namespace);
+    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(kube.clone(), namespace);
+    let pods: Api<Pod> = Api::namespaced(kube, namespace);
+    let labels = instance_label_selector(instance_id);
+    let deadline = Instant::now() + Duration::from_secs(120);
+
+    loop {
+        let pv_count = pvs
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len();
+        let pvc_count = pvcs
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len();
+        let stateful_set_count = stateful_sets
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len();
+        let service_count = services
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len();
+        let pod_ready = pods
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .iter()
+            .any(pod_ready);
+        if pv_count == 1
+            && pvc_count == 1
+            && stateful_set_count == 1
+            && service_count == 1
+            && pod_ready
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for materialized objects for instance {instance_id}; got PV={pv_count} PVC={pvc_count} StatefulSet={stateful_set_count} Service={service_count} pod_ready={pod_ready}"
+            )
+            .into());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn assert_no_materialized_objects_for_instance(
+    kube: Client,
+    namespace: &str,
+    instance_id: &str,
+) -> TestResult<()> {
+    let counts = materialized_object_counts(kube, namespace, instance_id).await?;
+    if counts.total() != 0 {
+        return Err(format!(
+            "expected no materialized objects for instance {instance_id}; got PV={} PVC={} StatefulSet={} Service={} Pod={}",
+            counts.persistent_volumes,
+            counts.persistent_volume_claims,
+            counts.stateful_sets,
+            counts.services,
+            counts.pods
+        )
+        .into());
+    }
 
     Ok(())
 }
@@ -690,6 +1292,152 @@ async fn wait_for_materialized_objects_deleted(
     }
 }
 
+async fn wait_for_materialized_objects_deleted_for_instance(
+    kube: Client,
+    namespace: &str,
+    instance_id: &str,
+    timeout: Duration,
+) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let counts = materialized_object_counts(kube.clone(), namespace, instance_id).await?;
+        if counts.total() == 0 {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for materialized objects for instance {instance_id} to be deleted; got PV={} PVC={} StatefulSet={} Service={} Pod={}",
+                counts.persistent_volumes,
+                counts.persistent_volume_claims,
+                counts.stateful_sets,
+                counts.services,
+                counts.pods
+            )
+            .into());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[derive(Debug)]
+struct MaterializedObjectCounts {
+    persistent_volumes: usize,
+    persistent_volume_claims: usize,
+    stateful_sets: usize,
+    services: usize,
+    pods: usize,
+}
+
+impl MaterializedObjectCounts {
+    fn total(&self) -> usize {
+        self.persistent_volumes
+            + self.persistent_volume_claims
+            + self.stateful_sets
+            + self.services
+            + self.pods
+    }
+}
+
+async fn materialized_object_counts(
+    kube: Client,
+    namespace: &str,
+    instance_id: &str,
+) -> TestResult<MaterializedObjectCounts> {
+    let labels = instance_label_selector(instance_id);
+    let pvs: Api<PersistentVolume> = Api::all(kube.clone());
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube.clone(), namespace);
+    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(kube.clone(), namespace);
+    let pods: Api<Pod> = Api::namespaced(kube, namespace);
+
+    Ok(MaterializedObjectCounts {
+        persistent_volumes: pvs
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len(),
+        persistent_volume_claims: pvcs
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len(),
+        stateful_sets: stateful_sets
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len(),
+        services: services
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len(),
+        pods: pods
+            .list(&ListParams::default().labels(&labels))
+            .await?
+            .items
+            .len(),
+    })
+}
+
+fn instance_label_selector(instance_id: &str) -> String {
+    format!("sleepypods.io/instance-id={instance_id}")
+}
+
+async fn restart_control_plane_pod(
+    kube: Client,
+    namespace: &str,
+    operator_endpoint: &str,
+) -> TestResult<()> {
+    let pods: Api<Pod> = Api::namespaced(kube, namespace);
+    let selected = pods
+        .list(&ListParams::default().labels(CONTROL_PLANE_LABEL))
+        .await?
+        .into_iter()
+        .find(pod_ready)
+        .ok_or("no ready control-plane pod found to restart")?;
+    let old_name = selected
+        .metadata
+        .name
+        .clone()
+        .ok_or("control-plane pod is missing name")?;
+    let old_uid = selected.metadata.uid.clone();
+
+    pods.delete(&old_name, &DeleteParams::default()).await?;
+    wait_for_replacement_control_plane_pod(pods, old_uid, Duration::from_secs(120)).await?;
+    connect_operator(operator_endpoint).await?;
+
+    Ok(())
+}
+
+async fn wait_for_replacement_control_plane_pod(
+    pods: Api<Pod>,
+    old_uid: Option<String>,
+    timeout: Duration,
+) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ready = pods
+            .list(&ListParams::default().labels(CONTROL_PLANE_LABEL))
+            .await?
+            .into_iter()
+            .any(|pod| {
+                pod_ready(&pod)
+                    && old_uid
+                        .as_ref()
+                        .is_none_or(|uid| pod.metadata.uid.as_ref() != Some(uid))
+            });
+        if ready {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for replacement control-plane pod".into());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
 async fn assert_single_node_cluster(kube: Client) -> TestResult<()> {
     let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(kube);
     let node_count = nodes.list(&ListParams::default()).await?.items.len();
@@ -704,6 +1452,21 @@ async fn assert_single_node_cluster(kube: Client) -> TestResult<()> {
 
 fn is_not_found<T>(result: Result<T, KubeError>) -> bool {
     matches!(result, Err(KubeError::Api(status)) if status.is_not_found())
+}
+
+fn pod_ready(pod: &Pod) -> bool {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+
+    pod.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+        })
 }
 
 fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
@@ -761,6 +1524,14 @@ fn literal_text(value: &str) -> TemplateText {
     TemplateText {
         parts: vec![TemplateTextPart {
             kind: Some(template_text_part::Kind::Literal(value.to_owned())),
+        }],
+    }
+}
+
+fn instance_value_text(field: &str) -> TemplateText {
+    TemplateText {
+        parts: vec![TemplateTextPart {
+            kind: Some(template_text_part::Kind::InstanceValue(field.to_owned())),
         }],
     }
 }

@@ -4,7 +4,8 @@ use proxy_core::observability::{
     metrics::{RUNTIME_MATERIALIZATION_FAILURES_TOTAL_NAME, RUNTIME_WAKE_LATENCY_SECONDS_NAME},
     recorder::{
         InMemoryObservability, ObservabilityEvent, EVENT_MATERIALIZATION_FAILURE, EVENT_WAKE,
-        FIELD_CLUSTER_ID, FIELD_ERROR_REASON, FIELD_INSTANCE_ID, FIELD_NAMESPACE,
+        FIELD_CLUSTER_ID, FIELD_ERROR_REASON, FIELD_EXCLUSIVITY_ACTION, FIELD_EXCLUSIVITY_KEY_NAME,
+        FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID, FIELD_INSTANCE_ID, FIELD_NAMESPACE,
     },
 };
 
@@ -41,8 +42,8 @@ use crate::{
     sleep_policy::WorkloadSleepPolicy,
     store::{StoreFuture, StoreResult},
     workload::{
-        CreateWorkloadClassVersionRequest, WorkloadClassVersion, WorkloadClassVersionRef,
-        WorkloadValueSchema,
+        CreateWorkloadClassVersionRequest, RenderedExclusivityKey, WorkloadClassVersion,
+        WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadValueSchema,
     },
     KubernetesMaterializerClient,
 };
@@ -64,6 +65,7 @@ struct FakeStoreState {
     delete_before_record_materialization: bool,
     delete_after_record_materialization: bool,
     reject_record_materialization_collision: bool,
+    reject_record_materialization_exclusivity_conflict: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +115,7 @@ struct FakeKubernetesState {
     readiness_calls: Vec<Vec<RenderedObjectRef>>,
     backend: BackendEndpoint,
     fail_pvc_wait: Option<(String, String)>,
+    fail_apply: Option<RenderedObjectRef>,
     fail_readiness: bool,
     first_apply_store_events: Option<Vec<StoreEvent>>,
 }
@@ -126,6 +129,7 @@ impl Default for FakeKubernetesState {
             readiness_calls: Vec::new(),
             backend: backend("http://svc-acme-instance.apps.svc.cluster.local:80"),
             fail_pvc_wait: None,
+            fail_apply: None,
             fail_readiness: false,
             first_apply_store_events: None,
         }
@@ -247,6 +251,326 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
     assert_env(&sidecar.env, "SLEEPYPODS_IDLE_TIMEOUT_MS", "120000");
     assert_env(&sidecar.env, "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", "5000");
     assert_env(&sidecar.env, "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS", "30000");
+}
+
+#[tokio::test]
+async fn wake_records_rendered_exclusivity_keys_before_kubernetes_apply() {
+    let mut instance = instance("instance-a", InstanceState::Cold, 1);
+    instance
+        .values
+        .insert("volume_handle".to_owned(), "disk-a".to_owned());
+    instance
+        .values
+        .insert("license_handle".to_owned(), "license-a".to_owned());
+    let store = FakeStore::new(instance, Some(exclusive_workload_class()));
+    let client = FakeKubernetesClient::observing_store(store.clone());
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let result = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect("wake succeeds");
+
+    let WakeInstanceResult::Completed { result } = result else {
+        panic!("expected completed wake");
+    };
+    let expected_keys = vec![
+        RenderedExclusivityKey::new("disk", "disk-a"),
+        RenderedExclusivityKey::new("license", "license-a"),
+    ];
+    assert_eq!(result.materialization.exclusivity_keys, expected_keys);
+    assert_eq!(
+        store
+            .materialization()
+            .expect("materialization is recorded")
+            .exclusivity_keys,
+        expected_keys
+    );
+    assert_eq!(
+        client.first_apply_store_events(),
+        Some(vec![
+            StoreEvent::Cas {
+                expected: Generation::new(1),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(2),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
+                ],
+            },
+        ])
+    );
+}
+
+#[tokio::test]
+async fn exclusivity_conflict_prevents_kubernetes_apply_and_materialization_record() {
+    let mut instance = instance("instance-a", InstanceState::Cold, 1);
+    instance
+        .values
+        .insert("volume_handle".to_owned(), "disk-a".to_owned());
+    instance
+        .values
+        .insert("license_handle".to_owned(), "license-a".to_owned());
+    let store = FakeStore::new(instance, Some(exclusive_workload_class()));
+    store.reject_record_materialization_exclusivity_conflict();
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("exclusivity conflict rejects wake before apply");
+
+    assert!(matches!(
+        error,
+        WakeInstanceError::Store(StoreError::ExclusivityConflict {
+            key_name,
+            owner_instance_id: Some(owner),
+            ..
+        }) if key_name == "disk" && owner == "instance-b"
+    ));
+    assert_eq!(store.instance().state, InstanceState::Failed);
+    assert_eq!(store.instance().generation, Generation::new(3));
+    assert!(store.materialization().is_none());
+    assert!(client.applied_objects().is_empty());
+    assert!(client.deleted_objects().is_empty());
+    assert!(client.readiness_calls().is_empty());
+}
+
+#[tokio::test]
+async fn exclusivity_conflict_observability_uses_bounded_fields() {
+    let mut instance = instance("instance-a", InstanceState::Cold, 1);
+    instance
+        .values
+        .insert("volume_handle".to_owned(), "disk-secret-ish".to_owned());
+    instance
+        .values
+        .insert("license_handle".to_owned(), "license-a".to_owned());
+    let store = FakeStore::new(instance, Some(exclusive_workload_class()));
+    store.reject_record_materialization_exclusivity_conflict();
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client);
+    let sink = InMemoryObservability::default();
+
+    let error = wake_instance_with_observability(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        ),
+        sink.recorder(),
+    )
+    .await
+    .expect_err("exclusivity conflict rejects wake");
+
+    assert!(matches!(
+        error,
+        WakeInstanceError::Store(StoreError::ExclusivityConflict { .. })
+    ));
+    let events = sink.events();
+    let wake_log = events
+        .iter()
+        .find_map(|event| match event {
+            ObservabilityEvent::Log(log) if log.name() == EVENT_WAKE => Some(log),
+            _ => None,
+        })
+        .expect("wake log is recorded");
+    assert_eq!(
+        wake_log.field_value(FIELD_ERROR_REASON),
+        Some("exclusivity_conflict")
+    );
+    assert_eq!(
+        wake_log.field_value(FIELD_EXCLUSIVITY_ACTION),
+        Some("conflict")
+    );
+    assert_eq!(
+        wake_log.field_value(FIELD_EXCLUSIVITY_KEY_NAME),
+        Some("disk")
+    );
+    assert_eq!(
+        wake_log.field_value(FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID),
+        Some("instance-b")
+    );
+    assert!(
+        wake_log
+            .fields()
+            .iter()
+            .all(|field| field.value() != "disk-secret-ish"),
+        "rendered opaque key values must not be logged"
+    );
+}
+
+#[tokio::test]
+async fn first_apply_failure_after_exclusivity_acquire_releases_pending_key() {
+    let mut instance = instance("instance-a", InstanceState::Cold, 1);
+    instance
+        .values
+        .insert("volume_handle".to_owned(), "disk-a".to_owned());
+    instance
+        .values
+        .insert("license_handle".to_owned(), "license-a".to_owned());
+    let store = FakeStore::new(instance, Some(exclusive_stateful_workload_class()));
+    let client = FakeKubernetesClient::default();
+    client.fail_apply(object_ref("v1", "PersistentVolume", "", "pv-acme-instance"));
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("first Kubernetes apply failure fails wake");
+
+    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(client.applied_objects().is_empty());
+    assert!(client.deleted_objects().is_empty());
+    assert!(client.readiness_calls().is_empty());
+    assert_eq!(store.instance().state, InstanceState::Failed);
+    let materialization = store
+        .materialization()
+        .expect("failed no-object wake records deleted materialization");
+    assert_eq!(materialization.state, MaterializationState::Deleted);
+    assert!(materialization.rendered_objects.is_empty());
+    assert!(materialization.exclusivity_keys.is_empty());
+    assert!(
+        store
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                instance_id("instance-a"),
+                target("cluster-a", "apps"),
+            ))
+            .await
+            .expect("active materialization loads")
+            .is_none(),
+        "deleted no-object materialization must not keep the key held"
+    );
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(1),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(2),
+                rendered_objects: vec![
+                    object_ref("v1", "PersistentVolume", "", "pv-acme-instance"),
+                    object_ref(
+                        "v1",
+                        "PersistentVolumeClaim",
+                        "apps",
+                        "pvc-acme-instance"
+                    ),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "StatefulSet", "apps", "app-acme-instance"),
+                ],
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Deleted,
+                backend_generation: BackendGeneration::new(2),
+                rendered_objects: Vec::new(),
+            },
+            StoreEvent::Cas {
+                expected: Generation::new(2),
+                next_state: InstanceState::Failed,
+                reason: StateTransitionReason::FailureReported(
+                    "materialization failed: failed to apply PersistentVolume /pv-acme-instance: apply failed".to_owned()
+                ),
+            },
+            StoreEvent::LoadActiveMaterialization {
+                instance_id: instance_id("instance-a"),
+                target: target("cluster-a", "apps"),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn apply_failure_after_objects_may_exist_keeps_exclusivity_key_held() {
+    let mut instance = instance("instance-a", InstanceState::Cold, 1);
+    instance
+        .values
+        .insert("volume_handle".to_owned(), "disk-a".to_owned());
+    instance
+        .values
+        .insert("license_handle".to_owned(), "license-a".to_owned());
+    let store = FakeStore::new(instance, Some(exclusive_stateful_workload_class()));
+    let client = FakeKubernetesClient::default();
+    client.fail_apply(object_ref("v1", "Service", "apps", "svc-acme-instance"));
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("later Kubernetes apply failure fails wake");
+
+    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert_eq!(client.applied_objects().len(), 2);
+    assert_eq!(
+        client.deleted_objects(),
+        vec![
+            object_ref("v1", "PersistentVolumeClaim", "apps", "pvc-acme-instance"),
+            object_ref("v1", "PersistentVolume", "", "pv-acme-instance"),
+        ]
+    );
+    let materialization = store
+        .materialization()
+        .expect("failed partial apply keeps pending materialization");
+    assert_eq!(materialization.state, MaterializationState::Pending);
+    assert_eq!(
+        materialization.exclusivity_keys,
+        vec![
+            RenderedExclusivityKey::new("disk", "disk-a"),
+            RenderedExclusivityKey::new("license", "license-a"),
+        ]
+    );
+    assert!(
+        store
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                instance_id("instance-a"),
+                target("cluster-a", "apps"),
+            ))
+            .await
+            .expect("active materialization loads")
+            .is_some(),
+        "partial apply failure must keep the key held until cleanup is finalized"
+    );
 }
 
 #[tokio::test]
@@ -1327,6 +1651,7 @@ impl FakeStore {
                 delete_before_record_materialization: false,
                 delete_after_record_materialization: false,
                 reject_record_materialization_collision: false,
+                reject_record_materialization_exclusivity_conflict: false,
             })),
         }
     }
@@ -1382,6 +1707,13 @@ impl FakeStore {
             .lock()
             .expect("fake store lock not poisoned")
             .reject_record_materialization_collision = true;
+    }
+
+    fn reject_record_materialization_exclusivity_conflict(&self) {
+        self.inner
+            .lock()
+            .expect("fake store lock not poisoned")
+            .reject_record_materialization_exclusivity_conflict = true;
     }
 
     fn set_materialization(&self, materialization: MaterializationRecord) {
@@ -1516,10 +1848,28 @@ impl ControlPlaneStore for FakeStore {
                     resource: "instance",
                 });
             }
+            let instance = inner.instance.as_ref().ok_or(StoreError::NotFound {
+                resource: "instance",
+            })?;
+            if instance.generation != request.instance_generation {
+                return Err(StoreError::GenerationConflict {
+                    expected: request.instance_generation,
+                    actual: instance.generation,
+                });
+            }
             if inner.reject_record_materialization_collision {
                 return Err(StoreError::invalid_argument(
                     "rendered Kubernetes object ref collision in cluster cluster-a: v1 Service apps/shared-service is already owned by active materialization for instance other-instance",
                 ));
+            }
+            if inner.reject_record_materialization_exclusivity_conflict {
+                return Err(StoreError::ExclusivityConflict {
+                    cluster_id: request.target.cluster_id().to_owned(),
+                    namespace: request.target.namespace().to_owned(),
+                    key_name: "disk".to_owned(),
+                    owner_instance_id: Some("instance-b".to_owned()),
+                    owner_generation: Some(Generation::new(3)),
+                });
             }
             if inner.materialization.as_ref().is_some_and(|existing| {
                 existing.instance_id == request.instance_id
@@ -1545,6 +1895,7 @@ impl ControlPlaneStore for FakeStore {
                 backend: request.backend,
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
+                exclusivity_keys: request.exclusivity_keys,
             };
             inner.materialization = Some(record.clone());
             if inner.delete_after_record_materialization {
@@ -1646,6 +1997,7 @@ impl ControlPlaneStore for FakeStore {
                 backend: Some(request.backend),
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
+                exclusivity_keys: request.exclusivity_keys,
             };
 
             Ok(CompleteWakeResult {
@@ -1790,6 +2142,13 @@ impl FakeKubernetesClient {
             .fail_pvc_wait = Some((namespace.to_owned(), name.to_owned()));
     }
 
+    fn fail_apply(&self, object: RenderedObjectRef) {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .fail_apply = Some(object);
+    }
+
     fn fail_readiness(&self) {
         self.inner
             .lock()
@@ -1804,6 +2163,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         object: &'a KubernetesObject,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
+            let object_ref = crate::materializer::rendered_object_ref(object);
             let first_apply_store_events = self.observed_store.as_ref().and_then(|store| {
                 let should_capture = self
                     .inner
@@ -1819,6 +2179,13 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .expect("fake kubernetes lock not poisoned");
             if inner.first_apply_store_events.is_none() {
                 inner.first_apply_store_events = first_apply_store_events;
+            }
+            if inner
+                .fail_apply
+                .as_ref()
+                .is_some_and(|failed| failed == &object_ref)
+            {
+                return Err(KubernetesClientError::new("apply failed"));
             }
             inner.applied_objects.push(object.clone());
             Ok(())
@@ -1910,6 +2277,7 @@ fn workload_class() -> WorkloadClassVersion {
         default_values: InstanceValues::new(),
         value_schema: WorkloadValueSchema::new(true),
         sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy"),
+        exclusivity_keys: vec![],
     }
 }
 
@@ -1921,7 +2289,30 @@ fn stateful_workload_class() -> WorkloadClassVersion {
         default_values: InstanceValues::new(),
         value_schema: WorkloadValueSchema::new(true),
         sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy"),
+        exclusivity_keys: vec![],
     }
+}
+
+fn exclusive_workload_class() -> WorkloadClassVersion {
+    let mut workload_class = workload_class();
+    add_exclusivity_keys(&mut workload_class);
+    workload_class
+}
+
+fn exclusive_stateful_workload_class() -> WorkloadClassVersion {
+    let mut workload_class = stateful_workload_class();
+    add_exclusivity_keys(&mut workload_class);
+    workload_class
+}
+
+fn add_exclusivity_keys(workload_class: &mut WorkloadClassVersion) {
+    workload_class.exclusivity_keys = vec![
+        WorkloadExclusivityKeyTemplate::new(
+            "license",
+            TemplateText::instance_value("license_handle"),
+        ),
+        WorkloadExclusivityKeyTemplate::new("disk", TemplateText::instance_value("volume_handle")),
+    ];
 }
 
 fn deployment_template() -> ManifestTemplate {
@@ -2087,6 +2478,7 @@ fn materialization(
             target.namespace(),
             instance_id,
         )],
+        exclusivity_keys: vec![],
     }
 }
 

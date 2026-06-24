@@ -25,7 +25,8 @@ use crate::{
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{StoreError, StoreResult},
     workload::{
-        WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+        RenderedExclusivityKey, WorkloadClassVersion, WorkloadClassVersionRef,
+        WorkloadExclusivityKeyTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
     },
 };
 
@@ -54,6 +55,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
     let default_values: Value = row.get("default_values");
     let value_schema: Value = row.get("value_schema");
     let sleep_policy: Value = row.get("sleep_policy");
+    let exclusivity_keys: Value = row.get("exclusivity_keys");
 
     Ok(WorkloadClassVersion {
         reference: WorkloadClassVersionRef {
@@ -65,6 +67,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
         default_values: values_from_json(default_values)?,
         value_schema: value_schema_from_json(value_schema)?,
         sleep_policy: sleep_policy_from_json(sleep_policy)?,
+        exclusivity_keys: workload_exclusivity_keys_from_json(exclusivity_keys)?,
     })
 }
 
@@ -143,6 +146,7 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
     let backend_uri: Option<String> = row.get("backend_uri");
     let backend_generation: i64 = row.get("backend_generation");
     let rendered_objects: Value = row.get("rendered_objects");
+    let exclusivity_keys: Value = row.get("exclusivity_keys");
 
     Ok(MaterializationRecord {
         id: MaterializationId::new(materialization_id).map_err(invalid_stored_data)?,
@@ -156,6 +160,7 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
             .map_err(invalid_stored_data)?,
         backend_generation: backend_generation_from_i64(backend_generation)?,
         rendered_objects: rendered_objects_from_json(rendered_objects)?,
+        exclusivity_keys: rendered_exclusivity_keys_from_json(exclusivity_keys)?,
     })
 }
 
@@ -312,6 +317,26 @@ pub(crate) fn sleep_policy_from_json(value: Value) -> StoreResult<WorkloadSleepP
     Ok(policy)
 }
 
+pub(crate) fn workload_exclusivity_keys_to_json(
+    keys: &[WorkloadExclusivityKeyTemplate],
+) -> StoreResult<Value> {
+    serde_json::to_value(keys).map_err(|error| {
+        StoreError::internal(format!(
+            "failed to encode workload exclusivity keys: {error}"
+        ))
+    })
+}
+
+pub(crate) fn workload_exclusivity_keys_from_json(
+    value: Value,
+) -> StoreResult<Vec<WorkloadExclusivityKeyTemplate>> {
+    serde_json::from_value(value).map_err(|error| {
+        StoreError::internal(format!(
+            "stored workload exclusivity keys were not supported key templates: {error}"
+        ))
+    })
+}
+
 pub(crate) fn rendered_objects_to_json(objects: &[RenderedObjectRef]) -> Value {
     Value::Array(
         objects
@@ -349,6 +374,45 @@ pub(crate) fn rendered_objects_from_json(value: Value) -> StoreResult<Vec<Render
                 kind: take_json_string(&mut object, "kind")?,
                 namespace: take_json_string(&mut object, "namespace")?,
                 name: take_json_string(&mut object, "name")?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn rendered_exclusivity_keys_to_json(keys: &[RenderedExclusivityKey]) -> Value {
+    Value::Array(
+        keys.iter()
+            .map(|key| {
+                json!({
+                    "name": key.name,
+                    "value": key.value,
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn rendered_exclusivity_keys_from_json(
+    value: Value,
+) -> StoreResult<Vec<RenderedExclusivityKey>> {
+    let Value::Array(values) = value else {
+        return Err(StoreError::internal(
+            "stored rendered exclusivity keys were not an array",
+        ));
+    };
+
+    values
+        .into_iter()
+        .map(|value| {
+            let Value::Object(mut object) = value else {
+                return Err(StoreError::internal(
+                    "stored rendered exclusivity key entry was not an object",
+                ));
+            };
+
+            Ok(RenderedExclusivityKey {
+                name: take_json_string(&mut object, "name")?,
+                value: take_json_string(&mut object, "value")?,
             })
         })
         .collect()

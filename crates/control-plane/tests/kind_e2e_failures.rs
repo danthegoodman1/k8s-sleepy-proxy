@@ -218,6 +218,7 @@ async fn invalid_volume_template_is_rejected_by_operator_api(
                 }],
             }),
             sleep_policy: Some(sleep_policy()),
+            exclusivity_keys: vec![],
         })
         .await
         .expect_err("invalid volume template must be rejected by deployed operator API");
@@ -465,6 +466,7 @@ async fn create_class_instance_and_route(
                 volumes: spec.volumes,
             }),
             sleep_policy: Some(sleep_policy()),
+            exclusivity_keys: vec![],
         })
         .await?;
 

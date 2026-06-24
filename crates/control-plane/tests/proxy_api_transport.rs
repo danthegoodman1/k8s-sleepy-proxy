@@ -1627,6 +1627,7 @@ impl ControlPlaneStore for FakeWakeStore {
                 backend: request.backend,
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
+                exclusivity_keys: request.exclusivity_keys,
             };
             let mut materializations = self
                 .materializations
@@ -1716,6 +1717,7 @@ impl ControlPlaneStore for FakeWakeStore {
                 backend: Some(request.backend),
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
+                exclusivity_keys: request.exclusivity_keys,
             };
             self.materializations
                 .lock()
@@ -1950,6 +1952,7 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
         value_schema: control_plane::WorkloadValueSchema::new(true),
         sleep_policy: control_plane::WorkloadSleepPolicy::new(300_000, 5_000, 30_000)
             .expect("valid sleep policy"),
+        exclusivity_keys: vec![],
     }
 }
 
@@ -1996,6 +1999,7 @@ fn materialization_with_state_and_target(
         ),
         backend_generation: BackendGeneration::new(generation),
         rendered_objects: Vec::new(),
+        exclusivity_keys: vec![],
     }
 }
 

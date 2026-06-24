@@ -306,7 +306,8 @@ pub(crate) async fn load_ready_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects
+                namespace, state, backend_uri, backend_generation, rendered_objects,
+                exclusivity_keys
             FROM materializations
             WHERE instance_id = $1 AND instance_generation = $2 AND state = 'ready'
             ORDER BY backend_generation DESC, materialization_id

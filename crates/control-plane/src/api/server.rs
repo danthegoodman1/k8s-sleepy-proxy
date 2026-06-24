@@ -30,7 +30,10 @@ use crate::{
     workload::{self as domain_workload, WorkloadClassVersion, WorkloadClassVersionRef},
 };
 
-use super::template::{manifest_template_from_proto, manifest_template_to_proto};
+use super::template::{
+    manifest_template_from_proto, manifest_template_to_proto, template_text_from_proto,
+    template_text_to_proto,
+};
 
 pub const OPERATOR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.OperatorControlPlane";
 
@@ -510,10 +513,27 @@ fn create_workload_class_request_from_proto(
             .sleep_policy
             .ok_or_else(|| Status::invalid_argument("sleep_policy is required"))
             .and_then(workload_sleep_policy_from_proto)?,
+        exclusivity_keys: request
+            .exclusivity_keys
+            .into_iter()
+            .map(workload_exclusivity_key_from_proto)
+            .collect::<Result<_, _>>()?,
     };
+    workload_class.validate().map_err(invalid_argument_status)?;
 
     Ok(domain_workload::CreateWorkloadClassVersionRequest::new(
         workload_class,
+    ))
+}
+
+fn workload_exclusivity_key_from_proto(
+    key: pb::WorkloadExclusivityKey,
+) -> Result<domain_workload::WorkloadExclusivityKeyTemplate, Status> {
+    Ok(domain_workload::WorkloadExclusivityKeyTemplate::new(
+        key.name,
+        key.value
+            .ok_or_else(|| Status::invalid_argument("exclusivity_keys.value is required"))
+            .and_then(template_text_from_proto)?,
     ))
 }
 
@@ -695,6 +715,20 @@ fn workload_class_to_proto(workload_class: WorkloadClassVersion) -> pb::Workload
         value_schema: Some(workload_value_schema_to_proto(workload_class.value_schema)),
         template: Some(manifest_template_to_proto(workload_class.template)),
         sleep_policy: Some(workload_sleep_policy_to_proto(workload_class.sleep_policy)),
+        exclusivity_keys: workload_class
+            .exclusivity_keys
+            .into_iter()
+            .map(workload_exclusivity_key_to_proto)
+            .collect(),
+    }
+}
+
+fn workload_exclusivity_key_to_proto(
+    key: domain_workload::WorkloadExclusivityKeyTemplate,
+) -> pb::WorkloadExclusivityKey {
+    pb::WorkloadExclusivityKey {
+        name: key.name,
+        value: Some(template_text_to_proto(key.value)),
     }
 }
 
@@ -875,6 +909,24 @@ fn store_error_to_status(error: StoreError) -> Status {
         StoreError::GenerationConflict { expected, actual } => Status::failed_precondition(
             format!("generation conflict: expected generation {expected}, found {actual}"),
         ),
+        StoreError::ExclusivityConflict {
+            cluster_id,
+            namespace,
+            key_name,
+            owner_instance_id,
+            owner_generation,
+        } => {
+            let mut message = format!(
+                "exclusivity key {key_name:?} is already held for target {cluster_id}/{namespace}"
+            );
+            if let Some(owner_instance_id) = owner_instance_id {
+                message.push_str(&format!(" by instance {owner_instance_id}"));
+            }
+            if let Some(owner_generation) = owner_generation {
+                message.push_str(&format!(" generation {owner_generation}"));
+            }
+            Status::failed_precondition(message)
+        }
         StoreError::IdempotencyConflict => {
             Status::already_exists("idempotency key was already used for a different request")
         }

@@ -160,10 +160,17 @@ Attach an existing volume:
 2. Reference those values from a `VolumeTemplate` `source.csi.volume_handle` or
    `source.host_path.path`, plus `pv_name`, `pvc_name`, `capacity`, access
    modes, reclaim policy, and optional storage class.
-3. Create the instance with the provider volume handle/path in `values`.
+3. For singleton external resources that must not be attached by two active
+   materializations at once, declare a workload-class `exclusivity_keys` entry
+   such as `name: "disk"` and `value: "{{ volume_handle }}"`.
+4. Create the instance with the provider volume handle/path in `values`.
 
 The control plane renders PVs first, then PVCs, then Service and workload. PVCs
-are bound before the backend is published.
+are bound before the backend is published. Exclusivity keys are opt-in and
+opaque to SleepyPods: the control plane does not parse provider disk IDs or infer
+shared singleton resources from template values. A rendered key is acquired
+before Kubernetes apply starts and stays held until sleep/delete cleanup
+finalizes the materialization.
 
 Delete an instance or route:
 
@@ -202,6 +209,8 @@ Sleep and wake:
 - Persistent disk behavior: PV/PVC manifests are active materialization objects.
   Use reclaim policy and provider volume handles deliberately; data continuity
   comes from the external volume, not from keeping Sleeping Kubernetes objects.
+  Declare workload-class exclusivity keys for external resources that require
+  single-writer or single-attachment behavior across instances.
 
 ## Installation And Configuration
 
