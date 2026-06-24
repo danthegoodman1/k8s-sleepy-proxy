@@ -1,0 +1,18 @@
+ARG POSTGRES_BASE_IMAGE=postgres:17.5-alpine3.22
+FROM ${POSTGRES_BASE_IMAGE}
+
+RUN mkdir -p /etc/postgresql/tls
+COPY scripts/kind-e2e-tls-cert.pem /etc/postgresql/tls/tls.crt
+COPY scripts/kind-e2e-tls-key.pem /etc/postgresql/tls/tls.key
+COPY scripts/kind-e2e-libpq-sni-init.sql /docker-entrypoint-initdb.d/001-libpq-sni.sql
+
+RUN chown postgres:postgres \
+      /etc/postgresql/tls/tls.crt \
+      /etc/postgresql/tls/tls.key \
+      /docker-entrypoint-initdb.d/001-libpq-sni.sql \
+    && chmod 0644 \
+      /etc/postgresql/tls/tls.crt \
+      /docker-entrypoint-initdb.d/001-libpq-sni.sql \
+    && chmod 0600 /etc/postgresql/tls/tls.key
+
+CMD ["postgres", "-c", "ssl=on", "-c", "ssl_cert_file=/etc/postgresql/tls/tls.crt", "-c", "ssl_key_file=/etc/postgresql/tls/tls.key"]
