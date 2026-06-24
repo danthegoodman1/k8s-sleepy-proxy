@@ -1081,6 +1081,108 @@ Done when:
   generated files, commands, test gates, and design constraints without
   duplicating full specs.
 
+## Milestone 11: Rendered Kubernetes Name Safety
+
+Prevent different instances from accidentally rendering the same Kubernetes
+object names. Operators still choose readable naming templates, but SleepyPods
+must enforce the platform invariant before any Kubernetes apply: a rendered
+object ref belongs to exactly one active materialization.
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Require `instance_id` to be Kubernetes DNS-label safe at instance creation. | Must reject IDs outside lowercase `a-z`, digits, `-`, start/end alphanumeric, and the Kubernetes name budget. |
+| Incomplete | Add a name-rendering helper for instance-scoped Kubernetes objects. | Helper must keep names readable while reserving room at the end for an injected instance ID prefix. |
+| Incomplete | Reserve at least eight characters plus separator for the injected instance ID prefix. | Long rendered base names must truncate the base, not the injected instance ID prefix. |
+| Incomplete | Do not encode the Kubernetes object kind into generated names. | Object kind is already known from the manifest and must not consume name budget. |
+| Incomplete | Validate every rendered `Deployment`, `StatefulSet`, `Service`, `PVC`, and `PV` name before apply. | Names must be DNS-label safe and at most 63 characters. |
+| Incomplete | Reject duplicate rendered object refs inside one manifest. | A single rendered manifest must not contain the same object ref twice. |
+| Incomplete | Reject cross-instance rendered object-ref collisions before apply. | Wake must fail before Kubernetes apply when another active materialization for a different instance already owns the same rendered object ref. |
+| Incomplete | Use correct collision keys for namespaced and cluster-scoped objects. | Namespaced refs use `(apiVersion, kind, namespace, name)`; cluster-scoped refs such as PVs use `(apiVersion, kind, "", name)`. |
+| Incomplete | Document custom naming template behavior. | Explicit custom naming templates are allowed, but the control plane still injects the instance ID prefix suffix and rejects invalid or colliding final names. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | 11A: Instance ID validation tightening in protobuf/API/domain/store paths. | Not implemented. |
+| Incomplete | 11B: Shared Kubernetes name-rendering helper. | Needs instance ID prefix suffix reservation and truncation rules. |
+| Incomplete | 11C: Manifest renderer integration for workload, Service, PVC, and PV names. | Not implemented. |
+| Incomplete | 11D: Store-level rendered object-ref collision check. | Must check active materializations before Kubernetes apply. |
+| Incomplete | 11E: Materializer and wake failure behavior. | Name collisions must apply no Kubernetes objects and leave the instance in a clear retryable state. |
+| Incomplete | 11F: Operator documentation for naming rules, examples, and collision errors. | Not implemented. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Instance creation rejects IDs that cannot safely participate in Kubernetes object names. | Needs API/domain/store tests. |
+| Incomplete | Rendered object names are always valid DNS labels and at most 63 characters. | Needs renderer validation tests. |
+| Incomplete | Long operator-provided base names are truncated while preserving the required instance ID prefix suffix. | Needs boundary tests. |
+| Incomplete | Two different instances using the same base workload, Service, PVC, or PV template cannot both materialize to the same final object ref. | Needs store/materializer collision tests. |
+| Incomplete | A name collision is rejected before Kubernetes apply. | Rejected wake must create no PV, PVC, Service, Deployment, or StatefulSet objects. |
+| Incomplete | Unit tests cover valid/invalid instance IDs, truncation boundaries, short and long instance IDs, duplicate refs, namespaced collisions, and cluster-scoped PV collisions. | Not implemented. |
+| Incomplete | kind E2E proves intentionally colliding base templates are separated or rejected safely. | Must prove injected instance ID prefixes prevent collisions, or final object-ref collisions fail before apply. |
+| Incomplete | Operator docs cover naming rules. | Docs must recommend readable base names, explain the injected instance ID prefix suffix, and state that object kind is not encoded into names. |
+
+## Milestone 12: WorkloadClass Exclusivity Keys
+
+Add an opt-in primitive for workloads that reference external singleton
+resources, such as pre-created disks, without making SleepyPods provider-aware.
+The default V1 contract remains simple: SleepyPods guarantees at most one active
+materialization per `Instance`, but it does not infer that two different
+instances share the same external disk, license, network identity, or other
+resource just because their template values happen to match.
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Add `WorkloadClass` exclusivity keys rendered from instance values. | Example shape: `name: "disk"` and `value: "{{ volume_handle }}"`. |
+| Incomplete | Treat the rendered key as opaque. | The control plane must not understand or validate provider-specific disk IDs beyond normal value-schema validation. |
+| Incomplete | Acquire exclusivity during wake before Kubernetes PV/PVC/workload objects are applied. | Not implemented. |
+| Incomplete | Reject or use only bounded/cancellable waiting when another active materialization holds the same rendered key. | Wake must never wait indefinitely on an exclusivity key. |
+| Incomplete | Acquire multiple exclusivity keys in deterministic sorted order. | Prevents deadlocks when one workload class declares more than one exclusive resource. |
+| Incomplete | Release partially acquired keys when later acquisition or wake setup fails. | A failed multi-key wake must not strand earlier acquired keys. |
+| Incomplete | Keep unrelated exclusivity keys independent. | Concurrent wakes for different rendered keys must not serialize on a global lock. |
+| Incomplete | Release the key only after safe cleanup. | Release after sleep/delete cleanup removes recorded Kubernetes objects, or after wake fails before any objects are applied. |
+| Incomplete | Bind locks to instance ID, generation, target, and rendered key. | Stale generations must not release or overwrite another generation's lock. |
+| Incomplete | Reconcile exclusivity state from durable active materializations after control-plane restart. | Not implemented. |
+| Incomplete | Emit structured observability for lock acquire, conflict, timeout, release, and reconciliation. | Operators need enough signal to diagnose blocked stateful workloads. |
+| Incomplete | Document explicit operator responsibility for singleton external resources. | Operators must declare exclusivity for stateful workloads that require single-writer access; otherwise duplicate external resource references are outside the platform safety contract. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | 12A: Protobuf, domain model, validation, and Postgres schema for `WorkloadClass` exclusivity keys. | Not implemented. |
+| Incomplete | 12B: Store APIs and transaction semantics for acquiring, observing, and releasing rendered exclusivity keys. | Not implemented. |
+| Incomplete | 12C: Wake/sleep/delete integration. | Kubernetes apply must not begin until all required keys are acquired; keys release only after cleanup. |
+| Incomplete | 12D: Restart reconciliation for locks derived from active materializations. | Not implemented. |
+| Incomplete | 12E: Operator documentation and runbook updates for exclusive external resources. | Not implemented. |
+| Incomplete | 12F: Unit and component concurrency tests. | Cover same-key contention, different-key independence, deterministic multi-key ordering, partial acquisition rollback, stale generation release rejection, and cleanup ordering. |
+| Incomplete | 12G: kind E2E tests for same-key contention, restart, and cleanup. | Use real control plane, Postgres, Kubernetes API, PV/PVC/StatefulSet objects, and production images. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Two cold instances with the same rendered exclusivity key cannot both materialize at the same time. | Needs concurrency tests. |
+| Incomplete | Same-key concurrent wake has a bounded result. | Exactly one wake may materialize; other callers must receive a structured conflict/block response or bounded timeout, not hang. |
+| Incomplete | Different-key concurrent wakes proceed independently. | Tests must prove there is no global exclusivity bottleneck. |
+| Incomplete | Multi-key acquisition is deadlock-free. | Keys are acquired in deterministic order, and cancellation or timeout releases any partial acquisitions. |
+| Incomplete | A blocked or rejected wake creates no Kubernetes objects. | Must create no PV, PVC, Service, Deployment, or StatefulSet objects. |
+| Incomplete | Sleep/delete releases the key only after rendered Kubernetes objects are gone. | Needs cleanup ordering tests. |
+| Incomplete | Control-plane restart reconstructs held keys from active durable materializations and prevents duplicate wake after restart. | Needs restart test. |
+| Incomplete | Crash/restart tests cover every lock boundary. | Cover restart after lock acquire before apply, after apply before ready, while running, and during cleanup. |
+| Incomplete | Cleanup failure keeps the key held until cleanup succeeds or operator intervention marks it safe. | Prevents a second stateful materialization while old Kubernetes objects may still exist. |
+| Incomplete | Stale generations cannot release, steal, or overwrite another generation's lock. | Needs store and wake/delete race tests. |
+| Incomplete | Failure tests cover wake failure before apply, wake failure after lock acquire, Kubernetes cleanup failure, delete retry, stale generation, cancellation/timeout, and concurrent wake attempts. | Not implemented. |
+| Incomplete | kind E2E proves a stateful workload class using `{{ volume_handle }}` as an exclusivity key prevents duplicate attachment while allowing unrelated handles. | Must race two same-handle instances, verify only one materialized object set exists, verify the blocked instance creates no objects, then sleep/delete the first and prove the second can wake. |
+| Incomplete | kind E2E proves restart safety while an exclusivity key is held. | Restart the control plane while the first instance holds the key, then verify a second same-key wake remains blocked and no duplicate Kubernetes objects are created. |
+| Incomplete | Operator docs clearly state the exclusivity boundary. | SleepyPods does not own external volume lifecycle or infer singleton resources unless the `WorkloadClass` declares an exclusivity key. |
+
 ## Stretch
 
 The original goal is complete when the plan reaches this line. Do not start
