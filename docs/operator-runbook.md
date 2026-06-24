@@ -131,6 +131,18 @@ Cold wakes are slow or failing:
 4. Check Postgres availability and the instance state/generation with
    `GetInstance`.
 
+Rendered object name collision:
+
+1. Search `runtime.wake.event` for `error.reason=store` and an error containing
+   `rendered Kubernetes object ref collision`.
+2. The wake failed before Kubernetes apply; inspect the failed instance and the
+   owner instance named in the error.
+3. Use DNS-label-safe `instance_id` values and readable base templates. The
+   control plane appends `-<instance-id-prefix>` to final object names and
+   truncates the base first.
+4. Retry after changing the naming template or deleting/finalizing the
+   conflicting active materialization.
+
 Hot routes are missing or unexpectedly cold:
 
 1. Check route-cache miss rate and

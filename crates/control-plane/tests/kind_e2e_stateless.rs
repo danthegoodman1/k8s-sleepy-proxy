@@ -36,6 +36,7 @@ const INSTANCE_ID: &str = "e2e-stateless";
 const ROUTE_ID: &str = "e2e-stateless-route";
 const ROUTE_HOST: &str = "e2e.sleepypods.test";
 const WORKLOAD_NAME: &str = "e2e-app";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-app-e2e-stat";
 const APP_RESPONSE: &str = "sleepypods-stateless-app";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
@@ -358,7 +359,7 @@ async fn assert_materialized_deployment_and_service(
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), &config.namespace);
     let services: Api<Service> = Api::namespaced(kube, &config.namespace);
-    let deployment = deployments.get(WORKLOAD_NAME).await?;
+    let deployment = deployments.get(RENDERED_WORKLOAD_NAME).await?;
     let pod_spec = deployment
         .spec
         .as_ref()
@@ -398,7 +399,7 @@ async fn assert_materialized_deployment_and_service(
         ),
     )?;
 
-    let service = services.get(WORKLOAD_NAME).await?;
+    let service = services.get(RENDERED_WORKLOAD_NAME).await?;
     let target_port = service
         .spec
         .as_ref()
@@ -441,15 +442,15 @@ async fn wait_for_materialized_objects_deleted(
     let services: Api<Service> = Api::namespaced(kube, namespace);
     let deadline = Instant::now() + timeout;
     loop {
-        let deployment_absent = is_not_found(deployments.get(WORKLOAD_NAME).await);
-        let service_absent = is_not_found(services.get(WORKLOAD_NAME).await);
+        let deployment_absent = is_not_found(deployments.get(RENDERED_WORKLOAD_NAME).await);
+        let service_absent = is_not_found(services.get(RENDERED_WORKLOAD_NAME).await);
         if deployment_absent && service_absent {
             return Ok(());
         }
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for materialized Deployment/Service {namespace}/{WORKLOAD_NAME} to be deleted"
+                "timed out waiting for materialized Deployment/Service {namespace}/{RENDERED_WORKLOAD_NAME} to be deleted"
             )
             .into());
         }

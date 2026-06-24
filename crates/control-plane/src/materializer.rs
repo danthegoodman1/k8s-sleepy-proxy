@@ -1,6 +1,13 @@
-use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    future::Future,
+    pin::Pin,
+};
 
 use crate::{
+    kubernetes_name::is_dns_label,
     manifest::{
         ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject,
         ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
@@ -355,10 +362,13 @@ pub fn rendered_object_refs(
 ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
     validate_manifest_generations(manifest)?;
 
-    Ok(ordered_objects(manifest)
+    let rendered_objects = ordered_objects(manifest)
         .into_iter()
         .map(|object| rendered_object_ref(&object.object))
-        .collect())
+        .collect::<Vec<_>>();
+    validate_rendered_object_refs(&rendered_objects)?;
+
+    Ok(rendered_objects)
 }
 
 fn ordered_objects(manifest: &RenderedManifest) -> Vec<&RenderedManifestObject> {
@@ -383,6 +393,71 @@ fn delete_order(objects: &[RenderedObjectRef]) -> Vec<&RenderedObjectRef> {
 
 fn is_workload_ref(object: &RenderedObjectRef) -> bool {
     matches!(object.kind.as_str(), "Deployment" | "StatefulSet")
+}
+
+fn validate_rendered_object_refs(objects: &[RenderedObjectRef]) -> Result<(), MaterializerError> {
+    let mut refs = BTreeSet::new();
+
+    for object in objects {
+        validate_rendered_object_ref(object)?;
+        let key = (
+            object.api_version.as_str(),
+            object.kind.as_str(),
+            object.namespace.as_str(),
+            object.name.as_str(),
+        );
+        if !refs.insert(key) {
+            return Err(MaterializerError::InvalidManifest {
+                message: format!(
+                    "duplicate rendered Kubernetes object ref {} {} {}/{}",
+                    object.api_version, object.kind, object.namespace, object.name
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_rendered_object_ref(object: &RenderedObjectRef) -> Result<(), MaterializerError> {
+    if !is_dns_label(&object.name) {
+        return Err(MaterializerError::InvalidManifest {
+            message: format!(
+                "{} {} {}/{} name must be a Kubernetes DNS label with at most 63 characters",
+                object.api_version, object.kind, object.namespace, object.name
+            ),
+        });
+    }
+
+    match object.kind.as_str() {
+        "PersistentVolume" => {
+            if !object.namespace.is_empty() {
+                return Err(MaterializerError::InvalidManifest {
+                    message: format!(
+                        "PersistentVolume {} must be cluster-scoped with an empty namespace",
+                        object.name
+                    ),
+                });
+            }
+        }
+        "Deployment" | "StatefulSet" | "Service" | "PersistentVolumeClaim" => {
+            if !is_dns_label(&object.namespace) {
+                return Err(MaterializerError::InvalidManifest {
+                    message: format!(
+                        "{} {} namespace {:?} must be a Kubernetes DNS label",
+                        object.kind, object.name, object.namespace
+                    ),
+                });
+            }
+        }
+        other => {
+            return Err(MaterializerError::InvalidManifest {
+                message: format!("unsupported rendered Kubernetes object kind {other}"),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 impl KubernetesClientError {
@@ -659,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn retrying_materializer_client_retries_transient_apply_failure_until_success() {
         let client = FakeKubernetesClient::default();
-        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme-instance");
         client.fail_next(
             FakeOperation::Apply(service_ref.clone()),
             KubernetesClientError::transient("apply conflict"),
@@ -675,7 +750,7 @@ mod tests {
             refs,
             vec![
                 service_ref.clone(),
-                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
             ]
         );
         assert_eq!(
@@ -683,7 +758,12 @@ mod tests {
             vec![
                 FakeOperation::Apply(service_ref.clone()),
                 FakeOperation::Apply(service_ref),
-                FakeOperation::Apply(object_ref("apps/v1", "Deployment", "apps", "app-acme")),
+                FakeOperation::Apply(object_ref(
+                    "apps/v1",
+                    "Deployment",
+                    "apps",
+                    "app-acme-instance"
+                )),
             ]
         );
     }
@@ -691,8 +771,8 @@ mod tests {
     #[tokio::test]
     async fn retrying_materializer_client_retries_transient_delete_failure_until_success() {
         let client = FakeKubernetesClient::default();
-        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
-        let workload_ref = object_ref("apps/v1", "Deployment", "apps", "app-acme");
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme-instance");
+        let workload_ref = object_ref("apps/v1", "Deployment", "apps", "app-acme-instance");
         client.fail_next(
             FakeOperation::Delete(workload_ref.clone()),
             KubernetesClientError::transient("delete timeout"),
@@ -719,7 +799,7 @@ mod tests {
         let client = FakeKubernetesClient::default();
         let pvc_wait = FakeOperation::WaitPvcBound {
             namespace: "data".to_owned(),
-            name: "pvc-acme".to_owned(),
+            name: "pvc-acme-postgres".to_owned(),
         };
         client.fail_next(
             pvc_wait.clone(),
@@ -735,17 +815,22 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme-postgres")),
                 FakeOperation::Apply(object_ref(
                     "v1",
                     "PersistentVolumeClaim",
                     "data",
-                    "pvc-acme"
+                    "pvc-acme-postgres"
                 )),
                 pvc_wait.clone(),
                 pvc_wait,
-                FakeOperation::Apply(object_ref("v1", "Service", "data", "db-acme")),
-                FakeOperation::Apply(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
+                FakeOperation::Apply(object_ref("v1", "Service", "data", "db-acme-postgres")),
+                FakeOperation::Apply(object_ref(
+                    "apps/v1",
+                    "StatefulSet",
+                    "data",
+                    "db-acme-postgres"
+                )),
             ]
         );
     }
@@ -753,11 +838,11 @@ mod tests {
     #[tokio::test]
     async fn retrying_materializer_client_retries_transient_readiness_failure_until_success() {
         let client = FakeKubernetesClient::default();
-        let backend = backend_endpoint("http://svc-acme.apps.svc.cluster.local:80");
+        let backend = backend_endpoint("http://svc-acme-instance.apps.svc.cluster.local:80");
         client.set_readiness_backend(backend.clone());
         let refs = vec![
-            object_ref("v1", "Service", "apps", "svc-acme"),
-            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
         ];
         client.fail_next(
             FakeOperation::WaitReadiness(refs.clone()),
@@ -791,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn retrying_materializer_client_does_not_retry_permanent_apply_failure() {
         let client = FakeKubernetesClient::default();
-        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme-instance");
         client.fail_next(
             FakeOperation::Apply(service_ref.clone()),
             KubernetesClientError::new("invalid object"),
@@ -827,28 +912,33 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Apply(object_ref("v1", "PersistentVolume", "", "pv-acme-postgres")),
                 FakeOperation::Apply(object_ref(
                     "v1",
                     "PersistentVolumeClaim",
                     "data",
-                    "pvc-acme"
+                    "pvc-acme-postgres"
                 )),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
-                    name: "pvc-acme".to_owned(),
+                    name: "pvc-acme-postgres".to_owned(),
                 },
-                FakeOperation::Apply(object_ref("v1", "Service", "data", "db-acme")),
-                FakeOperation::Apply(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
+                FakeOperation::Apply(object_ref("v1", "Service", "data", "db-acme-postgres")),
+                FakeOperation::Apply(object_ref(
+                    "apps/v1",
+                    "StatefulSet",
+                    "data",
+                    "db-acme-postgres"
+                )),
             ]
         );
         assert_eq!(
             refs,
             vec![
-                object_ref("v1", "PersistentVolume", "", "pv-acme"),
-                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
-                object_ref("v1", "Service", "data", "db-acme"),
-                object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+                object_ref("v1", "PersistentVolume", "", "pv-acme-postgres"),
+                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres"),
+                object_ref("v1", "Service", "data", "db-acme-postgres"),
+                object_ref("apps/v1", "StatefulSet", "data", "db-acme-postgres"),
             ]
         );
     }
@@ -867,15 +957,20 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Apply(object_ref("v1", "Service", "apps", "svc-acme")),
-                FakeOperation::Apply(object_ref("apps/v1", "Deployment", "apps", "app-acme")),
+                FakeOperation::Apply(object_ref("v1", "Service", "apps", "svc-acme-instance")),
+                FakeOperation::Apply(object_ref(
+                    "apps/v1",
+                    "Deployment",
+                    "apps",
+                    "app-acme-instance"
+                )),
             ]
         );
         assert_eq!(
             refs,
             vec![
-                object_ref("v1", "Service", "apps", "svc-acme"),
-                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
             ]
         );
     }
@@ -883,13 +978,13 @@ mod tests {
     #[tokio::test]
     async fn applies_deployment_manifest_until_ready_after_all_objects_and_returns_backend() {
         let client = FakeKubernetesClient::default();
-        let backend = backend_endpoint("http://svc-acme.apps.svc.cluster.local:80");
+        let backend = backend_endpoint("http://svc-acme-instance.apps.svc.cluster.local:80");
         client.set_readiness_backend(backend.clone());
         let materializer = KubernetesMaterializer::new(client.clone());
         let manifest = deployment_manifest();
         let refs = vec![
-            object_ref("v1", "Service", "apps", "svc-acme"),
-            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
         ];
 
         let applied = materializer
@@ -917,15 +1012,15 @@ mod tests {
     #[tokio::test]
     async fn applies_stateful_manifest_until_ready_after_pvc_bound_service_and_workload() {
         let client = FakeKubernetesClient::default();
-        let backend = backend_endpoint("tcp://db-acme.data.svc.cluster.local:5432");
+        let backend = backend_endpoint("tcp://db-acme-postgres.data.svc.cluster.local:5432");
         client.set_readiness_backend(backend.clone());
         let materializer = KubernetesMaterializer::new(client.clone());
         let manifest = stateful_manifest();
         let refs = vec![
-            object_ref("v1", "PersistentVolume", "", "pv-acme"),
-            object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
-            object_ref("v1", "Service", "data", "db-acme"),
-            object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+            object_ref("v1", "PersistentVolume", "", "pv-acme-postgres"),
+            object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres"),
+            object_ref("v1", "Service", "data", "db-acme-postgres"),
+            object_ref("apps/v1", "StatefulSet", "data", "db-acme-postgres"),
         ];
 
         let applied = materializer
@@ -947,7 +1042,7 @@ mod tests {
                 FakeOperation::Apply(refs[1].clone()),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
-                    name: "pvc-acme".to_owned(),
+                    name: "pvc-acme-postgres".to_owned(),
                 },
                 FakeOperation::Apply(refs[2].clone()),
                 FakeOperation::Apply(refs[3].clone()),
@@ -959,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn apply_failure_returns_typed_error_for_failed_object() {
         let client = FakeKubernetesClient::default();
-        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme-instance");
         client.fail_apply(service_ref.clone());
         let materializer = KubernetesMaterializer::new(client.clone());
 
@@ -981,9 +1076,9 @@ mod tests {
     #[tokio::test]
     async fn apply_failure_after_partial_stateful_apply_deletes_known_refs() {
         let client = FakeKubernetesClient::default();
-        let service_ref = object_ref("v1", "Service", "data", "db-acme");
-        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme");
-        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme");
+        let service_ref = object_ref("v1", "Service", "data", "db-acme-postgres");
+        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres");
+        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme-postgres");
         client.fail_apply(service_ref.clone());
         let materializer = KubernetesMaterializer::new(client.clone());
 
@@ -1006,7 +1101,7 @@ mod tests {
                 FakeOperation::Apply(pvc_ref.clone()),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
-                    name: "pvc-acme".to_owned(),
+                    name: "pvc-acme-postgres".to_owned(),
                 },
                 FakeOperation::Apply(service_ref),
                 FakeOperation::Delete(pvc_ref),
@@ -1018,9 +1113,9 @@ mod tests {
     #[tokio::test]
     async fn pvc_bound_wait_failure_prevents_service_and_workload_apply() {
         let client = FakeKubernetesClient::default();
-        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme");
-        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme");
-        client.fail_pvc_wait("data", "pvc-acme");
+        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres");
+        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme-postgres");
+        client.fail_pvc_wait("data", "pvc-acme-postgres");
         let materializer = KubernetesMaterializer::new(client.clone());
 
         let error = materializer
@@ -1032,7 +1127,7 @@ mod tests {
             error,
             MaterializerError::PvcBoundWait {
                 namespace: "data".to_owned(),
-                name: "pvc-acme".to_owned(),
+                name: "pvc-acme-postgres".to_owned(),
                 source: KubernetesClientError::new("pvc did not bind"),
             }
         );
@@ -1043,7 +1138,7 @@ mod tests {
                 FakeOperation::Apply(pvc_ref.clone()),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
-                    name: "pvc-acme".to_owned(),
+                    name: "pvc-acme-postgres".to_owned(),
                 },
                 FakeOperation::Delete(pvc_ref),
                 FakeOperation::Delete(pv_ref),
@@ -1054,9 +1149,9 @@ mod tests {
     #[tokio::test]
     async fn pvc_bound_wait_failure_prevents_readiness_wait() {
         let client = FakeKubernetesClient::default();
-        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme");
-        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme");
-        client.fail_pvc_wait("data", "pvc-acme");
+        let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres");
+        let pv_ref = object_ref("v1", "PersistentVolume", "", "pv-acme-postgres");
+        client.fail_pvc_wait("data", "pvc-acme-postgres");
         let materializer = KubernetesMaterializer::new(client.clone());
 
         let error = materializer
@@ -1068,7 +1163,7 @@ mod tests {
             error,
             MaterializerError::PvcBoundWait {
                 namespace: "data".to_owned(),
-                name: "pvc-acme".to_owned(),
+                name: "pvc-acme-postgres".to_owned(),
                 source: KubernetesClientError::new("pvc did not bind"),
             }
         );
@@ -1079,7 +1174,7 @@ mod tests {
                 FakeOperation::Apply(pvc_ref.clone()),
                 FakeOperation::WaitPvcBound {
                     namespace: "data".to_owned(),
-                    name: "pvc-acme".to_owned(),
+                    name: "pvc-acme-postgres".to_owned(),
                 },
                 FakeOperation::Delete(pvc_ref),
                 FakeOperation::Delete(pv_ref),
@@ -1093,8 +1188,8 @@ mod tests {
         client.fail_readiness();
         let materializer = KubernetesMaterializer::new(client.clone());
         let refs = vec![
-            object_ref("v1", "Service", "apps", "svc-acme"),
-            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
         ];
 
         let error = materializer
@@ -1136,15 +1231,20 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Delete(object_ref("v1", "Service", "data", "db-acme")),
+                FakeOperation::Delete(object_ref("v1", "Service", "data", "db-acme-postgres")),
                 FakeOperation::Delete(object_ref(
                     "v1",
                     "PersistentVolumeClaim",
                     "data",
-                    "pvc-acme"
+                    "pvc-acme-postgres"
                 )),
-                FakeOperation::Delete(object_ref("v1", "PersistentVolume", "", "pv-acme")),
-                FakeOperation::Delete(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
+                FakeOperation::Delete(object_ref("v1", "PersistentVolume", "", "pv-acme-postgres")),
+                FakeOperation::Delete(object_ref(
+                    "apps/v1",
+                    "StatefulSet",
+                    "data",
+                    "db-acme-postgres"
+                )),
             ]
         );
     }
@@ -1161,10 +1261,10 @@ mod tests {
         assert_eq!(
             refs,
             vec![
-                object_ref("v1", "PersistentVolume", "", "pv-acme"),
-                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
-                object_ref("v1", "Service", "data", "db-acme"),
-                object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+                object_ref("v1", "PersistentVolume", "", "pv-acme-postgres"),
+                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres"),
+                object_ref("v1", "Service", "data", "db-acme-postgres"),
+                object_ref("apps/v1", "StatefulSet", "data", "db-acme-postgres"),
             ]
         );
     }
@@ -1182,10 +1282,10 @@ mod tests {
         assert_eq!(
             refs,
             vec![
-                object_ref("v1", "PersistentVolume", "", "pv-acme"),
-                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme"),
-                object_ref("v1", "Service", "data", "db-acme"),
-                object_ref("apps/v1", "StatefulSet", "data", "db-acme"),
+                object_ref("v1", "PersistentVolume", "", "pv-acme-postgres"),
+                object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-postgres"),
+                object_ref("v1", "Service", "data", "db-acme-postgres"),
+                object_ref("apps/v1", "StatefulSet", "data", "db-acme-postgres"),
             ]
         );
         assert!(
@@ -1198,8 +1298,8 @@ mod tests {
     async fn delete_failure_returns_typed_error_and_stops() {
         let client = FakeKubernetesClient::default();
         let materializer = KubernetesMaterializer::new(client.clone());
-        let service_ref = object_ref("v1", "Service", "apps", "svc-acme");
-        let workload_ref = object_ref("apps/v1", "Deployment", "apps", "app-acme");
+        let service_ref = object_ref("v1", "Service", "apps", "svc-acme-instance");
+        let workload_ref = object_ref("apps/v1", "Deployment", "apps", "app-acme-instance");
         client.fail_delete(service_ref.clone());
 
         let error = materializer
@@ -1262,7 +1362,7 @@ mod tests {
 
         assert_invalid_manifest(
             error,
-            "Deployment apps/app-acme metadata sleepypods.io/instance-generation must be \"7\"",
+            "Deployment apps/app-acme-instance metadata sleepypods.io/instance-generation must be \"7\"",
         );
         assert!(
             client.operations().is_empty(),
@@ -1295,11 +1395,94 @@ mod tests {
 
         assert_invalid_manifest(
             error,
-            "Deployment apps/app-acme pod template metadata sleepypods.io/template-generation must be \"3\"",
+            "Deployment apps/app-acme-instance pod template metadata sleepypods.io/template-generation must be \"3\"",
         );
         assert!(
             client.operations().is_empty(),
             "stale manifest must not be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_rendered_name_is_rejected_before_apply() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let mut manifest = deployment_manifest();
+        let service = manifest
+            .objects
+            .iter_mut()
+            .find_map(|object| match &mut object.object {
+                KubernetesObject::Service(service) => Some(service),
+                _ => None,
+            })
+            .expect("service object");
+        service.metadata.name = "Invalid_Service_Name".to_owned();
+
+        let error = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect_err("invalid rendered name is rejected");
+
+        assert_invalid_manifest(
+            error,
+            "v1 Service apps/Invalid_Service_Name name must be a Kubernetes DNS label",
+        );
+        assert!(
+            client.operations().is_empty(),
+            "invalid rendered names must not be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_volume_namespace_is_rejected_before_apply() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let mut manifest = stateful_manifest();
+        let pv = manifest
+            .objects
+            .iter_mut()
+            .find_map(|object| match &mut object.object {
+                KubernetesObject::PersistentVolume(pv) => Some(pv),
+                _ => None,
+            })
+            .expect("persistent volume object");
+        pv.metadata.namespace = Some("data".to_owned());
+
+        let error = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect_err("cluster-scoped PV namespace is rejected");
+
+        assert_invalid_manifest(
+            error,
+            "PersistentVolume pv-acme-postgres must be cluster-scoped with an empty namespace",
+        );
+        assert!(
+            client.operations().is_empty(),
+            "invalid rendered refs must not be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_rendered_refs_are_rejected_before_apply() {
+        let client = FakeKubernetesClient::default();
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let mut manifest = deployment_manifest();
+        let duplicate = manifest.objects[0].clone();
+        manifest.objects.push(duplicate);
+
+        let error = materializer
+            .apply_manifest(&manifest)
+            .await
+            .expect_err("duplicate rendered refs are rejected");
+
+        assert_invalid_manifest(
+            error,
+            "duplicate rendered Kubernetes object ref v1 Service apps/svc-acme-instance",
+        );
+        assert!(
+            client.operations().is_empty(),
+            "duplicate rendered refs must not be applied"
         );
     }
 

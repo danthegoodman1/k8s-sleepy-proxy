@@ -7,6 +7,7 @@ mod idle;
 pub mod ids;
 pub mod instance;
 mod kube_materializer;
+mod kubernetes_name;
 pub mod manifest;
 pub mod materialization;
 pub mod materializer;

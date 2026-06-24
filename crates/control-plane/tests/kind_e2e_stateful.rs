@@ -37,8 +37,9 @@ const ROUTE_ID: &str = "e2e-stateful-route";
 const ROUTE_HOST: &str = "stateful.sleepypods.test";
 const TENANT_VALUE: &str = "stateful";
 const WORKLOAD_NAME: &str = "e2e-stateful-app";
-const PVC_NAME: &str = "e2e-stateful-pvc";
-const PV_NAME: &str = "e2e-stateful-pv";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-e2e-stat";
+const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-e2e-stat";
+const RENDERED_PV_NAME: &str = "e2e-stateful-pv-e2e-stat";
 const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
 const SIDECAR_PORT: u32 = 15_000;
@@ -404,10 +405,10 @@ async fn assert_materialized_stateful_objects(kube: Client, config: &E2eConfig) 
     let services: Api<Service> = Api::namespaced(kube.clone(), &config.namespace);
     let pods: Api<Pod> = Api::namespaced(kube, &config.namespace);
 
-    let pv = pvs.get(PV_NAME).await?;
-    let pvc = pvcs.get(PVC_NAME).await?;
-    let stateful_set = stateful_sets.get(WORKLOAD_NAME).await?;
-    let service = services.get(WORKLOAD_NAME).await?;
+    let pv = pvs.get(RENDERED_PV_NAME).await?;
+    let pvc = pvcs.get(RENDERED_PVC_NAME).await?;
+    let stateful_set = stateful_sets.get(RENDERED_WORKLOAD_NAME).await?;
+    let service = services.get(RENDERED_WORKLOAD_NAME).await?;
 
     assert_resource_order(&pv, &pvc, &stateful_set)?;
     assert_pv_and_pvc(&pv, &pvc, config)?;
@@ -423,15 +424,15 @@ fn assert_resource_order(
     pvc: &PersistentVolumeClaim,
     stateful_set: &StatefulSet,
 ) -> TestResult<()> {
-    let pv_rv = resource_version(pv.metadata.resource_version.as_deref(), PV_NAME)?;
-    let pvc_rv = resource_version(pvc.metadata.resource_version.as_deref(), PVC_NAME)?;
+    let pv_rv = resource_version(pv.metadata.resource_version.as_deref(), RENDERED_PV_NAME)?;
+    let pvc_rv = resource_version(pvc.metadata.resource_version.as_deref(), RENDERED_PVC_NAME)?;
     let stateful_rv = resource_version(
         stateful_set.metadata.resource_version.as_deref(),
-        WORKLOAD_NAME,
+        RENDERED_WORKLOAD_NAME,
     )?;
     if !(pv_rv < pvc_rv && pvc_rv < stateful_rv) {
         return Err(format!(
-            "expected PV/PVC/StatefulSet resourceVersions to reflect apply order {PV_NAME} < {PVC_NAME} < {WORKLOAD_NAME}; got {pv_rv}, {pvc_rv}, {stateful_rv}"
+            "expected PV/PVC/StatefulSet resourceVersions to reflect apply order {RENDERED_PV_NAME} < {RENDERED_PVC_NAME} < {RENDERED_WORKLOAD_NAME}; got {pv_rv}, {pvc_rv}, {stateful_rv}"
         )
         .into());
     }
@@ -457,7 +458,7 @@ fn assert_pv_and_pvc(
         .map(|source| source.path.as_str());
     if actual_path != Some(config.host_path().as_str()) {
         return Err(format!(
-            "expected PersistentVolume {PV_NAME} hostPath {}, got {actual_path:?}",
+            "expected PersistentVolume {RENDERED_PV_NAME} hostPath {}, got {actual_path:?}",
             config.host_path()
         )
         .into());
@@ -468,11 +469,11 @@ fn assert_pv_and_pvc(
         .and_then(|spec| spec.claim_ref.as_ref())
         .ok_or("PersistentVolume is missing claimRef")?;
     if claim_ref.namespace.as_deref() != Some(config.namespace.as_str())
-        || claim_ref.name.as_deref() != Some(PVC_NAME)
+        || claim_ref.name.as_deref() != Some(RENDERED_PVC_NAME)
     {
         return Err(format!(
             "expected PersistentVolume claimRef {}/{}, got {:?}/{:?}",
-            config.namespace, PVC_NAME, claim_ref.namespace, claim_ref.name
+            config.namespace, RENDERED_PVC_NAME, claim_ref.namespace, claim_ref.name
         )
         .into());
     }
@@ -481,9 +482,9 @@ fn assert_pv_and_pvc(
         .spec
         .as_ref()
         .and_then(|spec| spec.volume_name.as_deref());
-    if volume_name != Some(PV_NAME) {
+    if volume_name != Some(RENDERED_PV_NAME) {
         return Err(format!(
-            "expected PersistentVolumeClaim {PVC_NAME} to target PV {PV_NAME}, got {volume_name:?}"
+            "expected PersistentVolumeClaim {RENDERED_PVC_NAME} to target PV {RENDERED_PV_NAME}, got {volume_name:?}"
         )
         .into());
     }
@@ -493,7 +494,7 @@ fn assert_pv_and_pvc(
         .and_then(|status| status.phase.as_deref());
     if phase != Some("Bound") {
         return Err(format!(
-            "expected PersistentVolumeClaim {PVC_NAME} to be Bound, got {phase:?}"
+            "expected PersistentVolumeClaim {RENDERED_PVC_NAME} to be Bound, got {phase:?}"
         )
         .into());
     }
@@ -505,9 +506,9 @@ fn assert_stateful_set_shape(stateful_set: &StatefulSet, config: &E2eConfig) -> 
         .spec
         .as_ref()
         .ok_or("materialized StatefulSet is missing spec")?;
-    if spec.service_name.as_deref() != Some(WORKLOAD_NAME) {
+    if spec.service_name.as_deref() != Some(RENDERED_WORKLOAD_NAME) {
         return Err(format!(
-            "expected StatefulSet serviceName {WORKLOAD_NAME}, got {:?}",
+            "expected StatefulSet serviceName {RENDERED_WORKLOAD_NAME}, got {:?}",
             spec.service_name
         )
         .into());
@@ -573,10 +574,11 @@ fn assert_stateful_set_shape(stateful_set: &StatefulSet, config: &E2eConfig) -> 
         .persistent_volume_claim
         .as_ref()
         .map(|claim| claim.claim_name.as_str());
-    if claim_name != Some(PVC_NAME) {
-        return Err(
-            format!("expected pod volume to use PVC {PVC_NAME}, got {claim_name:?}").into(),
-        );
+    if claim_name != Some(RENDERED_PVC_NAME) {
+        return Err(format!(
+            "expected pod volume to use PVC {RENDERED_PVC_NAME}, got {claim_name:?}"
+        )
+        .into());
     }
 
     Ok(())
@@ -601,7 +603,7 @@ fn assert_service_targets_sidecar(service: &Service) -> TestResult<()> {
 async fn assert_stateful_pod_mounts_pvc(pods: &Api<Pod>) -> TestResult<()> {
     let pod = pods
         .list(&ListParams::default().labels(&format!(
-            "sleepypods.io/instance-id={INSTANCE_ID},sleepypods.io/workload-name={WORKLOAD_NAME}"
+            "sleepypods.io/instance-id={INSTANCE_ID},sleepypods.io/workload-name={RENDERED_WORKLOAD_NAME}"
         )))
         .await?
         .items
@@ -633,10 +635,11 @@ async fn assert_stateful_pod_mounts_pvc(pods: &Api<Pod>) -> TestResult<()> {
         .persistent_volume_claim
         .as_ref()
         .map(|claim| claim.claim_name.as_str());
-    if claim_name != Some(PVC_NAME) {
-        return Err(
-            format!("expected StatefulSet pod to use PVC {PVC_NAME}, got {claim_name:?}").into(),
-        );
+    if claim_name != Some(RENDERED_PVC_NAME) {
+        return Err(format!(
+            "expected StatefulSet pod to use PVC {RENDERED_PVC_NAME}, got {claim_name:?}"
+        )
+        .into());
     }
     Ok(())
 }
@@ -669,17 +672,17 @@ async fn wait_for_materialized_objects_deleted(
     let services: Api<Service> = Api::namespaced(kube, namespace);
     let deadline = Instant::now() + timeout;
     loop {
-        let stateful_absent = is_not_found(stateful_sets.get(WORKLOAD_NAME).await);
-        let service_absent = is_not_found(services.get(WORKLOAD_NAME).await);
-        let pvc_absent = is_not_found(pvcs.get(PVC_NAME).await);
-        let pv_absent = is_not_found(pvs.get(PV_NAME).await);
+        let stateful_absent = is_not_found(stateful_sets.get(RENDERED_WORKLOAD_NAME).await);
+        let service_absent = is_not_found(services.get(RENDERED_WORKLOAD_NAME).await);
+        let pvc_absent = is_not_found(pvcs.get(RENDERED_PVC_NAME).await);
+        let pv_absent = is_not_found(pvs.get(RENDERED_PV_NAME).await);
         if stateful_absent && service_absent && pvc_absent && pv_absent {
             return Ok(());
         }
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for materialized StatefulSet/Service/PVC/PV objects for {namespace}/{WORKLOAD_NAME} to be deleted"
+                "timed out waiting for materialized StatefulSet/Service/PVC/PV objects for {namespace}/{RENDERED_WORKLOAD_NAME} to be deleted"
             )
             .into());
         }

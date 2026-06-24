@@ -63,6 +63,7 @@ struct FakeStoreState {
     complete_conflict: bool,
     delete_before_record_materialization: bool,
     delete_after_record_materialization: bool,
+    reject_record_materialization_collision: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +124,7 @@ impl Default for FakeKubernetesState {
             deleted_objects: Vec::new(),
             pvc_bound_calls: Vec::new(),
             readiness_calls: Vec::new(),
-            backend: backend("http://svc-acme.apps.svc.cluster.local:80"),
+            backend: backend("http://svc-acme-instance.apps.svc.cluster.local:80"),
             fail_pvc_wait: None,
             fail_readiness: false,
             first_apply_store_events: None,
@@ -161,7 +162,9 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
     );
     assert_eq!(
         result.materialization.backend,
-        Some(backend("http://svc-acme.apps.svc.cluster.local:80"))
+        Some(backend(
+            "http://svc-acme-instance.apps.svc.cluster.local:80"
+        ))
     );
     assert_eq!(
         store.events(),
@@ -176,16 +179,16 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(2),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(2),
                 backend_generation: BackendGeneration::new(2),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
         ]
@@ -193,8 +196,8 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
     assert_eq!(
         client.readiness_calls(),
         vec![vec![
-            object_ref("v1", "Service", "apps", "svc-acme"),
-            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
         ]]
     );
     assert_eq!(
@@ -210,8 +213,8 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(2),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
         ])
@@ -280,7 +283,7 @@ async fn already_running_returns_matching_ready_materialization_without_apply() 
         "instance-a",
         5,
         target("cluster-a", "apps"),
-        "http://svc-acme.apps.svc.cluster.local:80",
+        "http://svc-acme-instance.apps.svc.cluster.local:80",
     );
     store.set_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
@@ -328,7 +331,9 @@ async fn already_running_missing_or_filtered_materialization_errors_without_appl
                 5,
                 target("cluster-a", "other"),
                 MaterializationState::Ready,
-                Some(backend("http://svc-acme.other.svc.cluster.local:80")),
+                Some(backend(
+                    "http://svc-acme-instance.other.svc.cluster.local:80",
+                )),
             )),
         ),
         (
@@ -338,7 +343,9 @@ async fn already_running_missing_or_filtered_materialization_errors_without_appl
                 5,
                 target("cluster-a", "apps"),
                 MaterializationState::Pending,
-                Some(backend("http://svc-acme.apps.svc.cluster.local:80")),
+                Some(backend(
+                    "http://svc-acme-instance.apps.svc.cluster.local:80",
+                )),
             )),
         ),
     ];
@@ -394,7 +401,7 @@ async fn stale_running_expected_generation_does_not_load_materialization() {
         "instance-a",
         5,
         target("cluster-a", "apps"),
-        "http://svc-acme.apps.svc.cluster.local:80",
+        "http://svc-acme-instance.apps.svc.cluster.local:80",
     ));
     let client = FakeKubernetesClient::default();
     let materializer = KubernetesMaterializer::new(client.clone());
@@ -456,16 +463,16 @@ async fn restart_during_wake_resumes_waking_generation_without_new_cas() {
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(5),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(5),
                 backend_generation: BackendGeneration::new(5),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
         ]
@@ -517,16 +524,16 @@ async fn failed_and_draining_instances_can_start_wake() {
             state: MaterializationState::Pending,
             backend_generation: BackendGeneration::new(13),
             rendered_objects: vec![
-                object_ref("v1", "Service", "apps", "svc-acme"),
-                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
             ],
         });
         expected_events.push(StoreEvent::Complete {
             expected_waking_generation: Generation::new(13),
             backend_generation: BackendGeneration::new(13),
             rendered_objects: vec![
-                object_ref("v1", "Service", "apps", "svc-acme"),
-                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
             ],
         });
         assert_eq!(store.events(), expected_events);
@@ -627,8 +634,8 @@ async fn materializer_failure_marks_waking_generation_failed() {
                     assert_eq!(
                         rendered_objects,
                         vec![
-                            object_ref("v1", "Service", "apps", "svc-acme"),
-                            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                         ]
                     );
                     None
@@ -724,7 +731,7 @@ async fn retry_after_failed_high_backend_generation_does_not_rewind_pending_mate
             .backend
             .as_ref()
             .map(BackendEndpoint::uri),
-        Some("http://svc-acme.apps.svc.cluster.local:80")
+        Some("http://svc-acme-instance.apps.svc.cluster.local:80")
     );
     assert_eq!(retry_client.applied_objects().len(), 2);
     assert_eq!(
@@ -740,8 +747,8 @@ async fn retry_after_failed_high_backend_generation_does_not_rewind_pending_mate
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(100),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
             StoreEvent::Cas {
@@ -766,16 +773,16 @@ async fn retry_after_failed_high_backend_generation_does_not_rewind_pending_mate
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(100),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(4),
                 backend_generation: BackendGeneration::new(100),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
         ]
@@ -789,7 +796,7 @@ async fn pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry() {
         Some(stateful_workload_class()),
     );
     let client = FakeKubernetesClient::observing_store(store.clone());
-    client.fail_pvc_wait("apps", "pvc-acme");
+    client.fail_pvc_wait("apps", "pvc-acme-instance");
     let materializer = KubernetesMaterializer::new(client.clone());
 
     let error = wake_instance(
@@ -808,10 +815,10 @@ async fn pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry() {
     assert_eq!(store.instance().state, InstanceState::Failed);
     assert_eq!(store.instance().generation, Generation::new(8));
     let rendered_objects = vec![
-        object_ref("v1", "PersistentVolume", "", "pv-acme"),
-        object_ref("v1", "PersistentVolumeClaim", "apps", "pvc-acme"),
-        object_ref("v1", "Service", "apps", "svc-acme"),
-        object_ref("apps/v1", "StatefulSet", "apps", "app-acme"),
+        object_ref("v1", "PersistentVolume", "", "pv-acme-instance"),
+        object_ref("v1", "PersistentVolumeClaim", "apps", "pvc-acme-instance"),
+        object_ref("v1", "Service", "apps", "svc-acme-instance"),
+        object_ref("apps/v1", "StatefulSet", "apps", "app-acme-instance"),
     ];
     assert_eq!(
         store.materialization().map(|record| {
@@ -847,7 +854,7 @@ async fn pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry() {
     );
     assert_eq!(
         client.pvc_bound_calls(),
-        vec![("apps".to_owned(), "pvc-acme".to_owned())]
+        vec![("apps".to_owned(), "pvc-acme-instance".to_owned())]
     );
     assert!(client.readiness_calls().is_empty());
 }
@@ -933,8 +940,8 @@ async fn record_materialization_failure_prevents_kubernetes_apply() {
 
     assert!(matches!(error, WakeInstanceError::NotFound));
     let rendered_objects = vec![
-        object_ref("v1", "Service", "apps", "svc-acme"),
-        object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+        object_ref("v1", "Service", "apps", "svc-acme-instance"),
+        object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
     ];
     assert!(client.applied_objects().is_empty());
     assert!(client.deleted_objects().is_empty());
@@ -952,6 +959,74 @@ async fn record_materialization_failure_prevents_kubernetes_apply() {
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(9),
                 rendered_objects,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rendered_object_collision_failure_prevents_kubernetes_apply() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 8),
+        Some(stateful_workload_class()),
+    );
+    store.reject_record_materialization_collision();
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(8),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("rendered object collision should fail before apply");
+
+    match error {
+        WakeInstanceError::Store(StoreError::InvalidArgument { message }) => {
+            assert!(message.contains("rendered Kubernetes object ref collision"));
+        }
+        other => panic!("expected store collision error, got {other:?}"),
+    }
+    assert!(client.applied_objects().is_empty());
+    assert!(client.deleted_objects().is_empty());
+    assert!(client.pvc_bound_calls().is_empty());
+    assert!(client.readiness_calls().is_empty());
+    assert_eq!(store.instance().state, InstanceState::Failed);
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(8),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(9),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(9),
+                rendered_objects: vec![
+                    object_ref("v1", "PersistentVolume", "", "pv-acme-instance"),
+                    object_ref(
+                        "v1",
+                        "PersistentVolumeClaim",
+                        "apps",
+                        "pvc-acme-instance"
+                    ),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "StatefulSet", "apps", "app-acme-instance"),
+                ],
+            },
+            StoreEvent::Cas {
+                expected: Generation::new(9),
+                next_state: InstanceState::Failed,
+                reason: StateTransitionReason::FailureReported(
+                    "store operation failed: invalid store argument: rendered Kubernetes object ref collision in cluster cluster-a: v1 Service apps/shared-service is already owned by active materialization for instance other-instance".to_owned()
+                ),
             },
         ]
     );
@@ -981,8 +1056,8 @@ async fn delete_after_pending_before_apply_cleans_objects_applied_by_wake() {
 
     assert!(matches!(error, WakeInstanceError::NotFound));
     let rendered_objects = vec![
-        object_ref("v1", "Service", "apps", "svc-acme"),
-        object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+        object_ref("v1", "Service", "apps", "svc-acme-instance"),
+        object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
     ];
     assert_eq!(client.applied_objects().len(), 2);
     assert_eq!(
@@ -1053,8 +1128,8 @@ async fn delete_after_pending_before_readiness_failure_cleans_objects_applied_by
 
     assert!(matches!(error, WakeInstanceError::Materializer { .. }));
     let rendered_objects = vec![
-        object_ref("v1", "Service", "apps", "svc-acme"),
-        object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+        object_ref("v1", "Service", "apps", "svc-acme-instance"),
+        object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
     ];
     assert_eq!(client.applied_objects().len(), 2);
     assert_eq!(
@@ -1116,16 +1191,16 @@ async fn complete_generation_conflict_after_apply_is_returned_without_retry() {
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(44),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(10),
                 backend_generation: BackendGeneration::new(44),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
         ]
@@ -1222,16 +1297,16 @@ async fn draining_with_deleting_materialization_waits_for_sleep_cleanup() {
                 state: MaterializationState::Pending,
                 backend_generation: BackendGeneration::new(15),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(15),
                 backend_generation: BackendGeneration::new(15),
                 rendered_objects: vec![
-                    object_ref("v1", "Service", "apps", "svc-acme"),
-                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
                 ],
             },
         ]
@@ -1251,6 +1326,7 @@ impl FakeStore {
                 complete_conflict: false,
                 delete_before_record_materialization: false,
                 delete_after_record_materialization: false,
+                reject_record_materialization_collision: false,
             })),
         }
     }
@@ -1299,6 +1375,13 @@ impl FakeStore {
             .lock()
             .expect("fake store lock not poisoned")
             .delete_after_record_materialization = true;
+    }
+
+    fn reject_record_materialization_collision(&self) {
+        self.inner
+            .lock()
+            .expect("fake store lock not poisoned")
+            .reject_record_materialization_collision = true;
     }
 
     fn set_materialization(&self, materialization: MaterializationRecord) {
@@ -1432,6 +1515,11 @@ impl ControlPlaneStore for FakeStore {
                 return Err(StoreError::NotFound {
                     resource: "instance",
                 });
+            }
+            if inner.reject_record_materialization_collision {
+                return Err(StoreError::invalid_argument(
+                    "rendered Kubernetes object ref collision in cluster cluster-a: v1 Service apps/shared-service is already owned by active materialization for instance other-instance",
+                ));
             }
             if inner.materialization.as_ref().is_some_and(|existing| {
                 existing.instance_id == request.instance_id

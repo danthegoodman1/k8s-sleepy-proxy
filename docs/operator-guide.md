@@ -92,6 +92,36 @@ CreateInstance({
 })
 ```
 
+### Kubernetes Naming Rules
+
+`instance_id` must be a Kubernetes DNS label: lowercase `a-z`, digits, and
+hyphens only, starting and ending alphanumeric, with a maximum length of 63
+characters. Invalid IDs are rejected by `CreateInstance` before any instance is
+stored.
+
+Workload, Service, PVC, and PV template names are operator-readable base names,
+not final Kubernetes object names. On wake, SleepyPods appends an instance
+suffix to every instance-scoped object name:
+
+```text
+<base-name-truncated-if-needed>-<instance-id-prefix>
+```
+
+For instance IDs of at least eight characters, the prefix is the first eight
+characters. Shorter valid IDs use the whole ID. The suffix is preserved and the
+operator base name is truncated first so the final name remains a DNS label no
+longer than 63 characters. SleepyPods does not add the Kubernetes object kind to
+generated names; choose base names such as `web`, `api`, `data-pvc`, or
+`tenant-pv` when kind readability is useful.
+
+Explicit custom naming templates are allowed, including templates that render
+the same base for a workload and Service. The control plane still injects the
+instance suffix, validates the final Deployment, StatefulSet, Service, PVC, and
+PV names, and rejects duplicate or colliding rendered object refs before any
+Kubernetes apply. PersistentVolumes are cluster-scoped and are collision-checked
+with an empty namespace; namespaced objects are checked with their rendered
+namespace.
+
 Add a route or custom domain:
 
 ```text

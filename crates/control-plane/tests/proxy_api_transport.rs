@@ -116,7 +116,7 @@ async fn proxy_wake_cold_instance_returns_ready_backend() {
     assert_eq!(ready.instance_generation, 3);
     assert_eq!(
         ready.backend_uri,
-        "http://svc-acme.apps.svc.cluster.local:80"
+        "http://svc-acme-instance.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 44);
     assert_eq!(client.applied_objects_len(), 2);
@@ -971,7 +971,7 @@ async fn proxy_wake_after_restart_resumes_waking_generation() {
     assert_eq!(ready.instance_generation, 7);
     assert_eq!(
         ready.backend_uri,
-        "http://svc-acme.apps.svc.cluster.local:80"
+        "http://svc-acme-instance.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 6);
     assert_eq!(client.applied_objects_len(), 2);
@@ -1609,9 +1609,36 @@ impl ControlPlaneStore for FakeWakeStore {
 
     fn record_materialization<'a>(
         &'a self,
-        _request: control_plane::RecordMaterializationRequest,
+        request: control_plane::RecordMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<control_plane::MaterializationRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let record = MaterializationRecord {
+                id: MaterializationId::new(format!(
+                    "{}:{}:{}",
+                    request.instance_id.as_str(),
+                    request.target.cluster_id(),
+                    request.target.namespace()
+                ))
+                .expect("materialization ID is valid"),
+                instance_id: request.instance_id,
+                instance_generation: request.instance_generation,
+                target: request.target,
+                state: request.state,
+                backend: request.backend,
+                backend_generation: request.backend_generation,
+                rendered_objects: request.rendered_objects,
+            };
+            let mut materializations = self
+                .materializations
+                .lock()
+                .expect("fake store lock is available");
+            materializations.retain(|existing| {
+                !(existing.instance_id == record.instance_id && existing.target == record.target)
+            });
+            materializations.push(record.clone());
+
+            Ok(record)
+        })
     }
 
     fn load_ready_materialization<'a>(
@@ -1790,7 +1817,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 return Err(KubernetesClientError::new("not ready"));
             }
 
-            BackendEndpoint::new("http://svc-acme.apps.svc.cluster.local:80")
+            BackendEndpoint::new("http://svc-acme-instance.apps.svc.cluster.local:80")
                 .map_err(|error| KubernetesClientError::new(error.to_string()))
         })
     }

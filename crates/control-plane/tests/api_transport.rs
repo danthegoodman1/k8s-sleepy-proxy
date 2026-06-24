@@ -282,6 +282,28 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 }
 
 #[tokio::test]
+async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let service = store_operator_api(store);
+
+    let error = service
+        .create_instance(tonic::Request::new(CreateInstanceRequest {
+            idempotency_key: "create-invalid-instance".to_owned(),
+            instance_id: "Tenant_One".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-1".to_owned(),
+                version: 7,
+            }),
+            values: [("tenant".to_owned(), "tenant-one".to_owned())].into(),
+        }))
+        .await
+        .expect_err("invalid instance IDs are rejected at the API boundary");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("Kubernetes DNS label"));
+}
+
+#[tokio::test]
 async fn operator_delete_cleans_active_materialization_before_store_delete() {
     let store = Arc::new(FakeInstanceStore::default());
     store.seed_instance(domain_instance(
@@ -311,8 +333,8 @@ async fn operator_delete_cleans_active_materialization_before_store_delete() {
     assert_eq!(
         client.deleted(),
         vec![
-            object_ref("apps/v1", "Deployment", "apps", "instance-delete-active"),
             object_ref("v1", "Service", "apps", "instance-delete-active-svc"),
+            object_ref("apps/v1", "Deployment", "apps", "instance-delete-active"),
         ]
     );
     assert_eq!(store.delete_requests().len(), 1);
@@ -420,16 +442,16 @@ async fn operator_delete_cleans_stale_generation_active_materialization_for_targ
         client.deleted(),
         vec![
             object_ref(
-                "apps/v1",
-                "Deployment",
-                "apps",
-                "instance-delete-stale-generation"
-            ),
-            object_ref(
                 "v1",
                 "Service",
                 "apps",
                 "instance-delete-stale-generation-svc"
+            ),
+            object_ref(
+                "apps/v1",
+                "Deployment",
+                "apps",
+                "instance-delete-stale-generation"
             ),
         ]
     );
@@ -470,10 +492,12 @@ async fn operator_delete_kubernetes_failure_preserves_store_state_for_retry() {
     assert_eq!(store.delete_requests(), Vec::new());
     assert_eq!(
         client.deleted(),
-        vec![
-            object_ref("apps/v1", "Deployment", "apps", "instance-delete-fails"),
-            object_ref("v1", "Service", "apps", "instance-delete-fails-svc"),
-        ]
+        vec![object_ref(
+            "v1",
+            "Service",
+            "apps",
+            "instance-delete-fails-svc"
+        ),]
     );
 }
 
@@ -525,8 +549,8 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
     assert_eq!(
         retry_client.deleted(),
         vec![
-            object_ref("apps/v1", "Deployment", "apps", "instance-delete-retry"),
             object_ref("v1", "Service", "apps", "instance-delete-retry-svc"),
+            object_ref("apps/v1", "Deployment", "apps", "instance-delete-retry"),
         ]
     );
 }

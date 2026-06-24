@@ -92,7 +92,7 @@ fn renders_deployment_and_service_without_volumes() {
         KubernetesObject::Service(service) => service,
         other => panic!("expected Service, got {}", other.kind()),
     };
-    assert_eq!(service.metadata.name, "svc-acme");
+    assert_eq!(service.metadata.name, "svc-acme-instance");
     assert_eq!(service.spec.selector[LABEL_INSTANCE_ID], "instance-a");
     assert_eq!(service.spec.ports[0].port, 80);
     assert_eq!(service.spec.ports[0].target_port, 15000);
@@ -101,7 +101,7 @@ fn renders_deployment_and_service_without_volumes() {
         KubernetesObject::Deployment(deployment) => deployment,
         other => panic!("expected Deployment, got {}", other.kind()),
     };
-    assert_eq!(deployment.metadata.name, "app-acme");
+    assert_eq!(deployment.metadata.name, "app-acme-instance");
     assert_eq!(deployment.metadata.labels[LABEL_INSTANCE_ID], "instance-a");
     assert_eq!(deployment.metadata.labels[LABEL_INSTANCE_GENERATION], "7");
     assert_eq!(deployment.metadata.labels[LABEL_WORKLOAD_CLASS_ID], "web");
@@ -202,6 +202,109 @@ fn renders_deployment_and_service_without_volumes() {
 }
 
 #[test]
+fn rendered_names_use_whole_short_instance_id_suffix() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &deployment_template(),
+        instance: &instance("abc", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect("deployment renders");
+
+    assert_eq!(object_name(&rendered.objects[0].object), "svc-acme-abc");
+    assert_eq!(object_name(&rendered.objects[1].object), "app-acme-abc");
+}
+
+#[test]
+fn rendered_names_use_eight_character_long_instance_id_prefix_suffix() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &deployment_template(),
+        instance: &instance("abcdefghijk", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect("deployment renders");
+
+    assert_eq!(
+        object_name(&rendered.objects[0].object),
+        "svc-acme-abcdefgh"
+    );
+    assert_eq!(
+        object_name(&rendered.objects[1].object),
+        "app-acme-abcdefgh"
+    );
+}
+
+#[test]
+fn rendered_names_truncate_operator_base_before_instance_suffix() {
+    let mut template = deployment_template();
+    template.workload.name = TemplateText::literal("w".repeat(55));
+    template.service.as_mut().expect("service").name = TemplateText::literal("s".repeat(55));
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect("deployment renders");
+
+    let service_name = object_name(&rendered.objects[0].object);
+    let workload_name = object_name(&rendered.objects[1].object);
+    assert_eq!(service_name.len(), 63);
+    assert_eq!(workload_name.len(), 63);
+    assert!(service_name.ends_with("-instance"));
+    assert!(workload_name.ends_with("-instance"));
+    assert_eq!(&service_name[..54], "s".repeat(54));
+    assert_eq!(&workload_name[..54], "w".repeat(54));
+}
+
+#[test]
+fn rendered_names_do_not_add_kubernetes_kind_tokens() {
+    let mut template = deployment_template();
+    template.workload.name = TemplateText::literal("shared");
+    template.service.as_mut().expect("service").name = TemplateText::literal("shared");
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect("deployment renders");
+
+    assert_eq!(object_name(&rendered.objects[0].object), "shared-instance");
+    assert_eq!(object_name(&rendered.objects[1].object), "shared-instance");
+}
+
+#[test]
+fn rejects_invalid_custom_rendered_object_name() {
+    let mut template = deployment_template();
+    template.workload.name = TemplateText::literal("App");
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("invalid custom name is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidName {
+            field: "workload.name",
+            value: "App-instance".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn renders_optional_sidecar_mode_env() {
     let mut template = deployment_template();
     template.sidecar.mode = Some("tcp".to_owned());
@@ -249,7 +352,7 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     let service = &objects[0];
     assert_eq!(service["apiVersion"], json!("v1"));
     assert_eq!(service["kind"], json!("Service"));
-    assert_eq!(service["metadata"]["name"], json!("svc-acme"));
+    assert_eq!(service["metadata"]["name"], json!("svc-acme-instance"));
     assert_eq!(service["metadata"]["namespace"], json!("apps"));
     assert_eq!(
         service["metadata"]["labels"][LABEL_INSTANCE_ID],
@@ -275,7 +378,7 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     let deployment = &objects[1];
     assert_eq!(deployment["apiVersion"], json!("apps/v1"));
     assert_eq!(deployment["kind"], json!("Deployment"));
-    assert_eq!(deployment["metadata"]["name"], json!("app-acme"));
+    assert_eq!(deployment["metadata"]["name"], json!("app-acme-instance"));
     assert_eq!(deployment["metadata"]["namespace"], json!("apps"));
     assert_eq!(deployment["spec"]["replicas"], json!(1));
     assert_eq!(
@@ -345,7 +448,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         KubernetesObject::PersistentVolume(pv) => pv,
         other => panic!("expected PersistentVolume, got {}", other.kind()),
     };
-    assert_eq!(pv.metadata.name, "pv-acme");
+    assert_eq!(pv.metadata.name, "pv-acme-postgres");
     assert_eq!(pv.metadata.labels[LABEL_INSTANCE_ID], "postgres-a");
     assert_eq!(
         pv.spec.access_modes,
@@ -358,7 +461,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     );
     assert_eq!(pv.spec.storage_class_name.as_deref(), Some("manual"));
     assert_eq!(pv.spec.claim_ref.namespace, "data");
-    assert_eq!(pv.spec.claim_ref.name, "pvc-acme");
+    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-postgres");
     assert_eq!(
         pv.spec.source,
         PersistentVolumeSource::Csi(CsiPersistentVolumeSource {
@@ -374,17 +477,17 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         KubernetesObject::PersistentVolumeClaim(pvc) => pvc,
         other => panic!("expected PersistentVolumeClaim, got {}", other.kind()),
     };
-    assert_eq!(pvc.metadata.name, "pvc-acme");
+    assert_eq!(pvc.metadata.name, "pvc-acme-postgres");
     assert_eq!(pvc.metadata.namespace.as_deref(), Some("data"));
-    assert_eq!(pvc.spec.volume_name, "pv-acme");
+    assert_eq!(pvc.spec.volume_name, "pv-acme-postgres");
     assert_eq!(pvc.spec.resources.requests_storage, "10Gi");
 
     let stateful_set = match &rendered.objects[3].object {
         KubernetesObject::StatefulSet(stateful_set) => stateful_set,
         other => panic!("expected StatefulSet, got {}", other.kind()),
     };
-    assert_eq!(stateful_set.metadata.name, "db-acme");
-    assert_eq!(stateful_set.spec.service_name, "db-acme");
+    assert_eq!(stateful_set.metadata.name, "db-acme-postgres");
+    assert_eq!(stateful_set.spec.service_name, "db-acme-postgres");
     assert_eq!(stateful_set.spec.replicas, 1);
     assert_eq!(stateful_set.spec.template.spec.containers.len(), 2);
     assert_eq!(
@@ -408,7 +511,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         stateful_set.spec.template.spec.volumes[0]
             .persistent_volume_claim
             .claim_name,
-        "pvc-acme"
+        "pvc-acme-postgres"
     );
     assert_eq!(
         stateful_set.spec.template.spec.containers[0].volume_mounts[0].name,
@@ -442,7 +545,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     let pv = &objects[0];
     assert_eq!(pv["apiVersion"], json!("v1"));
     assert_eq!(pv["kind"], json!("PersistentVolume"));
-    assert_eq!(pv["metadata"]["name"], json!("pv-acme"));
+    assert_eq!(pv["metadata"]["name"], json!("pv-acme-postgres"));
     assert!(
         pv["metadata"].get("namespace").is_none(),
         "PersistentVolumes are cluster-scoped"
@@ -458,7 +561,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
             "storageClassName": "manual",
             "claimRef": {
                 "namespace": "data",
-                "name": "pvc-acme",
+                "name": "pvc-acme-postgres",
             },
             "csi": {
                 "driver": "csi.example.com",
@@ -475,7 +578,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     let pvc = &objects[1];
     assert_eq!(pvc["apiVersion"], json!("v1"));
     assert_eq!(pvc["kind"], json!("PersistentVolumeClaim"));
-    assert_eq!(pvc["metadata"]["name"], json!("pvc-acme"));
+    assert_eq!(pvc["metadata"]["name"], json!("pvc-acme-postgres"));
     assert_eq!(pvc["metadata"]["namespace"], json!("data"));
     assert_eq!(
         pvc["spec"],
@@ -487,7 +590,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
                 },
             },
             "storageClassName": "manual",
-            "volumeName": "pv-acme",
+            "volumeName": "pv-acme-postgres",
         })
     );
 
@@ -498,15 +601,18 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     let stateful_set = &objects[3];
     assert_eq!(stateful_set["apiVersion"], json!("apps/v1"));
     assert_eq!(stateful_set["kind"], json!("StatefulSet"));
-    assert_eq!(stateful_set["metadata"]["name"], json!("db-acme"));
-    assert_eq!(stateful_set["spec"]["serviceName"], json!("db-acme"));
+    assert_eq!(stateful_set["metadata"]["name"], json!("db-acme-postgres"));
+    assert_eq!(
+        stateful_set["spec"]["serviceName"],
+        json!("db-acme-postgres")
+    );
     assert_eq!(stateful_set["spec"]["replicas"], json!(1));
     assert_eq!(
         stateful_set["spec"]["template"]["spec"]["volumes"][0],
         json!({
             "name": "data",
             "persistentVolumeClaim": {
-                "claimName": "pvc-acme",
+                "claimName": "pvc-acme-postgres",
             },
         })
     );
@@ -603,17 +709,13 @@ fn rejects_stateful_set_scale_above_one() {
 }
 
 #[test]
-fn rejects_instance_id_that_is_not_label_value_safe() {
-    let error = render_manifests(RenderManifestRequest {
-        template: &deployment_template(),
-        instance: &instance("tenant/foo", 7, values([("tenant", "acme")])),
-        sleep_policy: sleep_policy(),
-        namespace: "apps",
-        template_generation: None,
-    })
-    .expect_err("invalid instance ID label is rejected");
+fn instance_id_rejects_values_that_cannot_be_used_in_rendered_names() {
+    for value in ["tenant/foo", "tenant_foo", "Tenant", "-tenant", "tenant-"] {
+        let error = InstanceId::new(value).expect_err("invalid instance ID is rejected");
 
-    assert_invalid_field(error, LABEL_INSTANCE_ID, "tenant/foo");
+        assert_eq!(error.field(), "InstanceId");
+        assert_eq!(error.value(), value);
+    }
 }
 
 #[test]
@@ -1138,6 +1240,16 @@ fn assert_env(env: &[EnvVar], name: &str, expected: &str) {
         .unwrap_or_else(|| panic!("missing env var {name}"));
 
     assert_eq!(value.value, expected);
+}
+
+fn object_name(object: &KubernetesObject) -> &str {
+    match object {
+        KubernetesObject::Deployment(object) => &object.metadata.name,
+        KubernetesObject::StatefulSet(object) => &object.metadata.name,
+        KubernetesObject::Service(object) => &object.metadata.name,
+        KubernetesObject::PersistentVolume(object) => &object.metadata.name,
+        KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.name,
+    }
 }
 
 fn composed(prefix: &str, field: &str) -> TemplateText {

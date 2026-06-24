@@ -1092,39 +1092,39 @@ Scope:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Require `instance_id` to be Kubernetes DNS-label safe at instance creation. | Must reject IDs outside lowercase `a-z`, digits, `-`, start/end alphanumeric, and the Kubernetes name budget. |
-| Incomplete | Add a name-rendering helper for instance-scoped Kubernetes objects. | Helper must keep names readable while reserving room at the end for an injected instance ID prefix. |
-| Incomplete | Reserve at least eight characters plus separator for the injected instance ID prefix. | Long rendered base names must truncate the base, not the injected instance ID prefix. |
-| Incomplete | Do not encode the Kubernetes object kind into generated names. | Object kind is already known from the manifest and must not consume name budget. |
-| Incomplete | Validate every rendered `Deployment`, `StatefulSet`, `Service`, `PVC`, and `PV` name before apply. | Names must be DNS-label safe and at most 63 characters. |
-| Incomplete | Reject duplicate rendered object refs inside one manifest. | A single rendered manifest must not contain the same object ref twice. |
-| Incomplete | Reject cross-instance rendered object-ref collisions before apply. | Wake must fail before Kubernetes apply when another active materialization for a different instance already owns the same rendered object ref. |
-| Incomplete | Use correct collision keys for namespaced and cluster-scoped objects. | Namespaced refs use `(apiVersion, kind, namespace, name)`; cluster-scoped refs such as PVs use `(apiVersion, kind, "", name)`. |
-| Incomplete | Document custom naming template behavior. | Explicit custom naming templates are allowed, but the control plane still injects the instance ID prefix suffix and rejects invalid or colliding final names. |
+| Complete | Require `instance_id` to be Kubernetes DNS-label safe at instance creation. | `InstanceId` now rejects invalid DNS labels and over-63-byte IDs; API transport covers invalid operator create requests. |
+| Complete | Add a name-rendering helper for instance-scoped Kubernetes objects. | `kubernetes_name::render_instance_scoped_name` appends a stable instance prefix suffix and is used by manifest rendering. |
+| Complete | Reserve at least eight characters plus separator for the injected instance ID prefix. | Renderer tests cover short IDs, eight-character long ID prefixes, max-length output, and base truncation with suffix preservation. |
+| Complete | Do not encode the Kubernetes object kind into generated names. | Renderer tests prove shared base names render as `<base>-<instance-prefix>` without kind tokens. |
+| Complete | Validate every rendered `Deployment`, `StatefulSet`, `Service`, `PVC`, and `PV` name before apply. | Renderer and materializer preflight validate DNS-label names and reject invalid rendered names before Kubernetes apply. |
+| Complete | Reject duplicate rendered object refs inside one manifest. | Materializer preflight rejects duplicate `(apiVersion, kind, namespace, name)` refs before any apply. |
+| Complete | Reject cross-instance rendered object-ref collisions before apply. | Postgres materialization upsert checks active materializations for other instances; wake collision test proves no Kubernetes apply occurs. |
+| Complete | Use correct collision keys for namespaced and cluster-scoped objects. | Materializer validates PV refs with empty namespace; Postgres conformance covers namespaced Service and cluster-scoped PV collisions. |
+| Complete | Document custom naming template behavior. | Operator guide documents base templates, injected suffix, kind-free names, validation, and collision failures. |
 
 Sub-phases:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | 11A: Instance ID validation tightening in protobuf/API/domain/store paths. | Not implemented. |
-| Incomplete | 11B: Shared Kubernetes name-rendering helper. | Needs instance ID prefix suffix reservation and truncation rules. |
-| Incomplete | 11C: Manifest renderer integration for workload, Service, PVC, and PV names. | Not implemented. |
-| Incomplete | 11D: Store-level rendered object-ref collision check. | Must check active materializations before Kubernetes apply. |
-| Incomplete | 11E: Materializer and wake failure behavior. | Name collisions must apply no Kubernetes objects and leave the instance in a clear retryable state. |
-| Incomplete | 11F: Operator documentation for naming rules, examples, and collision errors. | Not implemented. |
+| Complete | 11A: Instance ID validation tightening in protobuf/API/domain/store paths. | Shared `InstanceId` enforces DNS-label rules; API transport and Postgres mapping use the same type. |
+| Complete | 11B: Shared Kubernetes name-rendering helper. | Helper reserves the suffix budget and truncates only the operator base. |
+| Complete | 11C: Manifest renderer integration for workload, Service, PVC, and PV names. | Deployment, StatefulSet, Service, PVC, and PV rendering all use the helper. |
+| Complete | 11D: Store-level rendered object-ref collision check. | Postgres `record_materialization`/`complete_wake` upsert path rejects collisions with other active materializations. |
+| Complete | 11E: Materializer and wake failure behavior. | Materializer preflight rejects invalid/duplicate refs; wake records collision failure as `Failed` without applying Kubernetes objects. |
+| Complete | 11F: Operator documentation for naming rules, examples, and collision errors. | `docs/operator-guide.md` and `docs/operator-runbook.md` updated. |
 
 Done criteria:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Instance creation rejects IDs that cannot safely participate in Kubernetes object names. | Needs API/domain/store tests. |
-| Incomplete | Rendered object names are always valid DNS labels and at most 63 characters. | Needs renderer validation tests. |
-| Incomplete | Long operator-provided base names are truncated while preserving the required instance ID prefix suffix. | Needs boundary tests. |
-| Incomplete | Two different instances using the same base workload, Service, PVC, or PV template cannot both materialize to the same final object ref. | Needs store/materializer collision tests. |
-| Incomplete | A name collision is rejected before Kubernetes apply. | Rejected wake must create no PV, PVC, Service, Deployment, or StatefulSet objects. |
-| Incomplete | Unit tests cover valid/invalid instance IDs, truncation boundaries, short and long instance IDs, duplicate refs, namespaced collisions, and cluster-scoped PV collisions. | Not implemented. |
-| Incomplete | kind E2E proves intentionally colliding base templates are separated or rejected safely. | Must prove injected instance ID prefixes prevent collisions, or final object-ref collisions fail before apply. |
-| Incomplete | Operator docs cover naming rules. | Docs must recommend readable base names, explain the injected instance ID prefix suffix, and state that object kind is not encoded into names. |
+| Complete | Instance creation rejects IDs that cannot safely participate in Kubernetes object names. | `sleepypods-types` and `api_transport` tests cover valid/invalid IDs. |
+| Complete | Rendered object names are always valid DNS labels and at most 63 characters. | Manifest and materializer tests cover DNS-label validation and pre-apply rejection. |
+| Complete | Long operator-provided base names are truncated while preserving the required instance ID prefix suffix. | Boundary tests assert 63-byte names ending in the injected suffix. |
+| Complete | Two different instances using the same base workload, Service, PVC, or PV template cannot both materialize to the same final object ref. | Renderer suffix tests prove normal separation; Postgres conformance rejects explicit namespaced and PV ref collisions. |
+| Complete | A name collision is rejected before Kubernetes apply. | Wake test simulates store collision and asserts no PV, PVC, Service, Deployment, or StatefulSet apply/readiness calls occur. |
+| Complete | Unit tests cover valid/invalid instance IDs, truncation boundaries, short and long instance IDs, duplicate refs, namespaced collisions, and cluster-scoped PV collisions. | Covered by `cargo test -p control-plane` plus `cargo test -p sleepypods-types`. |
+| Complete | kind E2E proves intentionally colliding base templates are separated or rejected safely. | `scripts/test-kind-e2e-stateless.sh` and `scripts/test-kind-e2e-stateful.sh` passed on 2026-06-24 with production images in disposable kind clusters, asserting suffixed rendered names for Deployment, StatefulSet, Service, PVC, and PV objects. |
+| Complete | Operator docs cover naming rules. | Operator guide recommends readable base names, explains suffix injection, and states object kind is not encoded. |
 
 ## Milestone 12: WorkloadClass Exclusivity Keys
 
@@ -1182,6 +1182,51 @@ Done criteria:
 | Incomplete | kind E2E proves a stateful workload class using `{{ volume_handle }}` as an exclusivity key prevents duplicate attachment while allowing unrelated handles. | Must race two same-handle instances, verify only one materialized object set exists, verify the blocked instance creates no objects, then sleep/delete the first and prove the second can wake. |
 | Incomplete | kind E2E proves restart safety while an exclusivity key is held. | Restart the control plane while the first instance holds the key, then verify a second same-key wake remains blocked and no duplicate Kubernetes objects are created. |
 | Incomplete | Operator docs clearly state the exclusivity boundary. | SleepyPods does not own external volume lifecycle or infer singleton resources unless the `WorkloadClass` declares an exclusivity key. |
+
+## Milestone 13: Control Plane Authentication and Authorization
+
+Add authentication and authorization at the control-plane API boundary. This is
+control-plane auth, not application end-user auth and not per-route workload auth.
+It covers both the operator-facing APIs and the internal proxy/sidecar APIs, with
+separate policy because those callers have different trust models.
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Add an auth layer for native gRPC control-plane services. | Operator, proxy, and sidecar services must reject unauthenticated requests before business logic runs. |
+| Incomplete | Add matching auth behavior for gRPC-Web operator APIs. | Browser/V8 clients must be able to send `Authorization` through CORS, and failures must map to structured gRPC-Web errors. |
+| Incomplete | Separate operator and runtime caller policy. | Operator clients may create/delete resources; frontline and sidecar clients may only use runtime RPCs such as subscribe, wake, and report-idle. |
+| Incomplete | Support a simple first auth provider. | Start with static bearer tokens or shared secrets from config/env so local and kind tests remain easy. |
+| Incomplete | Leave room for stronger providers. | The auth interface should allow later mTLS/workload-identity/JWT providers without changing API handlers. |
+| Incomplete | Fail closed when auth is configured. | Missing, malformed, or wrong credentials must return `Unauthenticated` or `PermissionDenied` and must not mutate store state. |
+| Incomplete | Keep explicit development/test mode. | Any no-auth mode must be an intentional config choice suitable only for local development and tests. |
+| Incomplete | Emit structured observability for auth decisions. | Log/metric fields should distinguish missing credentials, invalid credentials, wrong role, and accepted calls without logging secrets. |
+| Incomplete | Document deployment responsibility and examples. | Operator docs must explain direct control-plane exposure, gateway/service-mesh placement, secret rotation expectations, and runtime API separation. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | 13A: Auth domain model, config, and provider trait. | Define caller roles, credentials, failure mapping, no-auth dev mode, and a static-token provider. |
+| Incomplete | 13B: Native gRPC server integration. | Apply auth to operator, proxy, and sidecar services before handlers run. |
+| Incomplete | 13C: gRPC-Web integration. | Preserve CORS support for `Authorization`, return structured gRPC-Web auth failures, and keep unary operator parity. |
+| Incomplete | 13D: Authorization checks by service and method. | Runtime callers cannot call operator APIs; operator credentials cannot accidentally bypass runtime-only constraints unless explicitly configured. |
+| Incomplete | 13E: Tests and kind gates. | Unit/component tests cover success/failure paths; kind E2E proves configured auth for operator, frontline, and sidecar control-plane calls. |
+| Incomplete | 13F: Operator documentation and runbook updates. | Document configuration, rotation, failure diagnosis, and recommended network boundaries. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Incomplete | Native gRPC operator APIs reject unauthenticated and unauthorized requests before store mutation. | Needs API transport tests and store mutation assertions. |
+| Incomplete | Native gRPC proxy and sidecar APIs reject unauthenticated and unauthorized requests before wake/sleep/subscribe logic runs. | Needs proxy/sidecar transport tests. |
+| Incomplete | gRPC-Web operator requests support authenticated browser-shaped calls. | Needs CORS preflight and unary request tests with accepted/rejected credentials. |
+| Incomplete | Auth failures use stable `Unauthenticated` or `PermissionDenied` status codes. | Tests must assert status codes and no secret leakage in messages/logs. |
+| Incomplete | Static-token config supports distinct operator, proxy, and sidecar credentials. | Needs config parsing tests and runtime startup tests. |
+| Incomplete | No-auth mode is explicit and documented as local-development only. | Production examples must configure auth. |
+| Incomplete | Observability records accepted, rejected, and unauthorized calls without recording credential material. | Needs structured log/metric tests. |
+| Incomplete | kind E2E proves auth-enabled control plane works with deployed frontend and sidecar. | Build/load production images, configure secrets, prove valid runtime clients work and invalid credentials fail. |
 
 ## Stretch
 

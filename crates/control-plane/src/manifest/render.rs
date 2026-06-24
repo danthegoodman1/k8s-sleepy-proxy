@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::instance::InstanceRecord;
+use crate::{
+    instance::InstanceRecord,
+    kubernetes_name::{is_dns_label, render_instance_scoped_name},
+};
 
 use super::{
     ApplyOrder, Container, ContainerPort, ContainerTemplate, CsiPersistentVolumeSource, Deployment,
@@ -535,7 +538,8 @@ fn render_object_name(
     template: &TemplateText,
     instance: &InstanceRecord,
 ) -> Result<String, ManifestRenderError> {
-    let value = render_non_empty(field, template, instance)?;
+    let base = render_non_empty(field, template, instance)?;
+    let value = render_instance_scoped_name(&base, &instance.id);
     validate_dns_label(field, &value)?;
     Ok(value)
 }
@@ -571,20 +575,7 @@ fn validate_port(field: &'static str, value: u16) -> Result<(), ManifestRenderEr
 }
 
 fn validate_dns_label(field: &'static str, value: &str) -> Result<(), ManifestRenderError> {
-    let valid = !value.is_empty()
-        && value.len() <= 63
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric);
-    if valid {
+    if is_dns_label(value) {
         Ok(())
     } else {
         Err(ManifestRenderError::InvalidName {

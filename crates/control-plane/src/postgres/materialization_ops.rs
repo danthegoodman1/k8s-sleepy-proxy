@@ -308,6 +308,8 @@ async fn upsert_materialization(
     client: &impl GenericClient,
     request: &RecordMaterializationRequest,
 ) -> StoreResult<MaterializationRecord> {
+    ensure_no_rendered_object_ref_collision(client, request).await?;
+
     let id = materialization_id(&request.instance_id, &request.target)?;
     let instance_id = request.instance_id.as_str();
     let instance_generation = generation_to_i64(request.instance_generation)?;
@@ -374,6 +376,64 @@ async fn upsert_materialization(
     };
 
     materialization_from_row(&row)
+}
+
+async fn ensure_no_rendered_object_ref_collision(
+    client: &impl GenericClient,
+    request: &RecordMaterializationRequest,
+) -> StoreResult<()> {
+    if request.rendered_objects.is_empty() || request.state == MaterializationState::Deleted {
+        return Ok(());
+    }
+
+    client
+        .batch_execute("LOCK TABLE materializations IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .map_err(map_postgres_error)?;
+
+    let cluster_id = request.target.cluster_id();
+    let instance_id = request.instance_id.as_str();
+    let rendered_objects = rendered_objects_to_json(&request.rendered_objects);
+    let collision = client
+        .query_opt(
+            "
+            SELECT
+                materializations.instance_id AS owner_instance_id,
+                existing.object ->> 'api_version' AS api_version,
+                existing.object ->> 'kind' AS kind,
+                existing.object ->> 'namespace' AS namespace,
+                existing.object ->> 'name' AS name
+            FROM materializations
+            CROSS JOIN LATERAL jsonb_array_elements(materializations.rendered_objects)
+                AS existing(object)
+            CROSS JOIN LATERAL jsonb_array_elements($3::jsonb)
+                AS incoming(object)
+            WHERE materializations.cluster_id = $1
+                AND materializations.instance_id <> $2
+                AND materializations.state <> 'deleted'
+                AND existing.object ->> 'api_version' = incoming.object ->> 'api_version'
+                AND existing.object ->> 'kind' = incoming.object ->> 'kind'
+                AND existing.object ->> 'namespace' = incoming.object ->> 'namespace'
+                AND existing.object ->> 'name' = incoming.object ->> 'name'
+            LIMIT 1
+            ",
+            &[&cluster_id, &instance_id, &rendered_objects],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(row) = collision else {
+        return Ok(());
+    };
+
+    let owner_instance_id: String = row.get("owner_instance_id");
+    let api_version: String = row.get("api_version");
+    let kind: String = row.get("kind");
+    let namespace: String = row.get("namespace");
+    let name: String = row.get("name");
+    Err(StoreError::invalid_argument(format!(
+        "rendered Kubernetes object ref collision in cluster {cluster_id}: {api_version} {kind} {namespace}/{name} is already owned by active materialization for instance {owner_instance_id}"
+    )))
 }
 
 async fn load_active_materialization_from_client(

@@ -360,6 +360,7 @@ async fn run_conformance(store: &PostgresStore) -> Result<(), StoreError> {
     exercise_route_bindings(store, class.reference.clone()).await?;
     exercise_instance_lifecycle(store, class.reference.clone()).await?;
     exercise_complete_wake(store, class.reference.clone()).await?;
+    exercise_rendered_object_ref_collision_rejection(store, class.reference.clone()).await?;
 
     let delete_target = store
         .create_instance(create_instance_request(
@@ -990,6 +991,145 @@ async fn create_lifecycle_instance(
             vec![],
         ))
         .await
+}
+
+async fn exercise_rendered_object_ref_collision_rejection(
+    store: &PostgresStore,
+    workload_class: WorkloadClassVersionRef,
+) -> Result<(), StoreError> {
+    let owner = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-collision-service-owner",
+        "instance-collision-service-owner",
+    )
+    .await?;
+    let owner_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            owner.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let service_target =
+        MaterializationTarget::new("cluster-collision", "apps").expect("valid target");
+    let mut owner_materialization = RecordMaterializationRequest::new(
+        owner.instance.id.clone(),
+        owner_waking.generation,
+        service_target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    owner_materialization.rendered_objects =
+        vec![object_ref("v1", "Service", "apps", "shared-service")];
+    store.record_materialization(owner_materialization).await?;
+
+    let contender = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-collision-service-contender",
+        "instance-collision-service-contender",
+    )
+    .await?;
+    let contender_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            contender.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut contender_materialization = RecordMaterializationRequest::new(
+        contender.instance.id.clone(),
+        contender_waking.generation,
+        service_target,
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    contender_materialization.rendered_objects =
+        vec![object_ref("v1", "Service", "apps", "shared-service")];
+    let service_collision = store
+        .record_materialization(contender_materialization)
+        .await
+        .expect_err("namespaced rendered object ref collision is rejected");
+    assert_collision_error(
+        service_collision,
+        "v1 Service apps/shared-service",
+        "instance-collision-service-owner",
+    );
+    assert_eq!(
+        store
+            .get_instance(GetInstanceRequest::new(contender.instance.id.clone()))
+            .await?
+            .expect("contender instance remains")
+            .state,
+        InstanceState::Waking
+    );
+
+    let pv_owner = create_lifecycle_instance(
+        store,
+        workload_class.clone(),
+        "idem-collision-pv-owner",
+        "instance-collision-pv-owner",
+    )
+    .await?;
+    let pv_owner_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            pv_owner.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut pv_owner_materialization = RecordMaterializationRequest::new(
+        pv_owner.instance.id.clone(),
+        pv_owner_waking.generation,
+        MaterializationTarget::new("cluster-collision", "pv-owner").expect("valid target"),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    pv_owner_materialization.rendered_objects =
+        vec![object_ref("v1", "PersistentVolume", "", "shared-pv")];
+    store
+        .record_materialization(pv_owner_materialization)
+        .await?;
+
+    let pv_contender = create_lifecycle_instance(
+        store,
+        workload_class,
+        "idem-collision-pv-contender",
+        "instance-collision-pv-contender",
+    )
+    .await?;
+    let pv_contender_waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            pv_contender.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let mut pv_contender_materialization = RecordMaterializationRequest::new(
+        pv_contender.instance.id.clone(),
+        pv_contender_waking.generation,
+        MaterializationTarget::new("cluster-collision", "pv-contender").expect("valid target"),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    pv_contender_materialization.rendered_objects =
+        vec![object_ref("v1", "PersistentVolume", "", "shared-pv")];
+    let pv_collision = store
+        .record_materialization(pv_contender_materialization)
+        .await
+        .expect_err("cluster-scoped PV rendered object ref collision is rejected");
+    assert_collision_error(
+        pv_collision,
+        "v1 PersistentVolume /shared-pv",
+        "instance-collision-pv-owner",
+    );
+
+    Ok(())
 }
 
 async fn wake_to_running(
@@ -1939,6 +2079,35 @@ fn sni_route(host: &str) -> RouteBindingSpec {
         },
         ProtocolRoute::TlsSni,
     )
+}
+
+fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
+    RenderedObjectRef {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
+    }
+}
+
+fn assert_collision_error(error: StoreError, object: &str, owner_instance_id: &str) {
+    match error {
+        StoreError::InvalidArgument { message } => {
+            assert!(
+                message.contains("rendered Kubernetes object ref collision"),
+                "message {message:?} should identify a rendered object collision"
+            );
+            assert!(
+                message.contains(object),
+                "message {message:?} should include collided object {object:?}"
+            );
+            assert!(
+                message.contains(owner_instance_id),
+                "message {message:?} should include owner instance {owner_instance_id:?}"
+            );
+        }
+        other => panic!("expected rendered object collision invalid argument, got {other}"),
+    }
 }
 
 fn unique_schema_name() -> String {
