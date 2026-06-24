@@ -103,10 +103,11 @@ impl TlsCertificateStore {
         private_key: PrivateKeyDer<'static>,
     ) -> Result<(), TlsCertificateError> {
         let key = canonical_sni_key(sni.as_ref()).map_err(TlsCertificateError::InvalidSni)?;
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key)
             .map_err(TlsCertificateError::InvalidCertificate)?;
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         self.configs
             .write()

@@ -2,8 +2,9 @@ use std::{
     convert::Infallible,
     env,
     error::Error,
-    fmt, io,
+    fmt, fs, io,
     net::SocketAddr,
+    path::{Path, PathBuf},
     process,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -23,7 +24,8 @@ use control_plane::{
 use futures_util::{SinkExt, StreamExt};
 use http::{
     header::{CONTENT_TYPE, HOST},
-    HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode, Version,
+    HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode, Uri,
+    Version,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, client::conn::http2 as client_http2, service::service_fn};
@@ -32,11 +34,19 @@ use hyper_util::{
     server::conn::auto,
 };
 use proxy_core::websocket_upgrade_response;
+use rcgen::generate_simple_self_signed;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinSet,
     time::timeout,
+};
+use tokio_rustls::{
+    rustls::{
+        pki_types::{CertificateDer, ServerName},
+        ClientConfig as RustlsClientConfig, RootCertStore,
+    },
+    TlsConnector,
 };
 use tokio_tungstenite::{
     connect_async,
@@ -44,7 +54,9 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 use tonic::{
-    codegen::tokio_stream::wrappers::ReceiverStream, transport::Server, Request, Response, Status,
+    codegen::tokio_stream::wrappers::ReceiverStream,
+    transport::{Channel, Endpoint, Server},
+    Request, Response, Status,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -61,6 +73,8 @@ const DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE: u64 = 16_384;
 const DEFAULT_ROUTE_HOST: &str = "app.example.test";
 const DEFAULT_ROUTE_PATH: &str = "/smoke";
 const DEFAULT_COLD_ROUTE_PATH: &str = "/cold-smoke";
+const DEFAULT_GRPC_BACKEND_ADDR: &str = "0.0.0.0:18082";
+const REAL_GRPC_PATH: &str = "/sleepypods.controlplane.v1.ProxyControlPlane/WakeInstance";
 const STATS_PATH: &str = "/__sleepypods_load_smoke_stats";
 const ROUTE_CACHE_TTL_MILLIS: u64 = 600_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,8 +95,9 @@ async fn run() -> Result<(), BoxError> {
     match args.next().as_deref() {
         None | Some("server") => run_server(ServerConfig::from_env()?).await,
         Some("client") => run_client(ClientConfig::from_args(args)?).await,
+        Some("cert") => write_self_signed_cert(CertConfig::from_args(args)?),
         Some(command) => Err(Box::new(InvalidArgs(format!(
-            "unknown command {command:?}; expected server or client"
+            "unknown command {command:?}; expected server, client, or cert"
         )))),
     }
 }
@@ -90,8 +105,10 @@ async fn run() -> Result<(), BoxError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServerConfig {
     backend_addr: SocketAddr,
+    grpc_backend_addr: SocketAddr,
     control_plane_addr: SocketAddr,
     backend_uri: String,
+    grpc_backend_uri: String,
     route_host: String,
     route_path: String,
     cold_route_path: String,
@@ -103,10 +120,16 @@ impl ServerConfig {
     fn from_env() -> Result<Self, InvalidArgs> {
         let backend_addr =
             socket_addr_from_env("SLEEPYPODS_LOAD_SMOKE_BACKEND_ADDR", "0.0.0.0:18080")?;
+        let grpc_backend_addr = socket_addr_from_env(
+            "SLEEPYPODS_LOAD_SMOKE_GRPC_BACKEND_ADDR",
+            DEFAULT_GRPC_BACKEND_ADDR,
+        )?;
         let control_plane_addr =
             socket_addr_from_env("SLEEPYPODS_LOAD_SMOKE_CONTROL_PLANE_ADDR", "0.0.0.0:19090")?;
         let backend_uri = env::var("SLEEPYPODS_LOAD_SMOKE_BACKEND_URI")
             .unwrap_or_else(|_| format!("http://127.0.0.1:{}", backend_addr.port()));
+        let grpc_backend_uri = env::var("SLEEPYPODS_LOAD_SMOKE_GRPC_BACKEND_URI")
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{}", grpc_backend_addr.port()));
         let route_host = env::var("SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST")
             .unwrap_or_else(|_| DEFAULT_ROUTE_HOST.to_owned());
         let route_path = env::var("SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH")
@@ -128,8 +151,10 @@ impl ServerConfig {
 
         Ok(Self {
             backend_addr,
+            grpc_backend_addr,
             control_plane_addr,
             backend_uri,
+            grpc_backend_uri,
             route_host,
             route_path,
             cold_route_path,
@@ -159,15 +184,21 @@ fn parse_positive_u64_env(name: &'static str, default: u64) -> Result<u64, Inval
 async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
     let backend_listener = TcpListener::bind(config.backend_addr).await?;
     let backend_addr = backend_listener.local_addr()?;
+    let grpc_backend_addr = config.grpc_backend_addr;
     let stats = SmokeStats::default();
     eprintln!("load-smoke backend listening on {backend_addr}");
+    eprintln!("load-smoke generated gRPC backend listening on {grpc_backend_addr}");
     eprintln!(
         "load-smoke frontline control plane listening on {}",
         config.control_plane_addr
     );
     eprintln!(
-        "load-smoke route host={} path={} cold_path={} backend={}",
-        config.route_host, config.route_path, config.cold_route_path, config.backend_uri
+        "load-smoke route host={} path={} cold_path={} backend={} grpc_backend={}",
+        config.route_host,
+        config.route_path,
+        config.cold_route_path,
+        config.backend_uri,
+        config.grpc_backend_uri
     );
     eprintln!(
         "load-smoke websocket stream bytes={} chunk_size={}",
@@ -180,18 +211,25 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
         config.websocket_stream_bytes,
         config.websocket_stream_chunk_size,
     );
+    let grpc_backend = Server::builder()
+        .add_service(ProxyControlPlaneServer::new(GeneratedGrpcBackend::new(
+            stats.clone(),
+        )))
+        .serve(grpc_backend_addr);
     let control_plane = Server::builder()
         .add_service(ProxyControlPlaneServer::new(FakeProxyControlPlane::new(
             config.route_host,
             config.route_path,
             config.cold_route_path,
             config.backend_uri,
+            config.grpc_backend_uri,
             stats,
         )))
         .serve(config.control_plane_addr);
 
     tokio::select! {
         result = backend => result,
+        result = grpc_backend => result.map_err(|error| Box::new(error) as BoxError),
         result = control_plane => result.map_err(|error| Box::new(error) as BoxError),
     }
 }
@@ -584,6 +622,7 @@ struct FakeProxyControlPlane {
     route_path: Arc<str>,
     cold_route_path: Arc<str>,
     backend_uri: Arc<str>,
+    grpc_backend_uri: Arc<str>,
     stats: SmokeStats,
 }
 
@@ -593,6 +632,7 @@ impl FakeProxyControlPlane {
         route_path: String,
         cold_route_path: String,
         backend_uri: String,
+        grpc_backend_uri: String,
         stats: SmokeStats,
     ) -> Self {
         Self {
@@ -600,6 +640,7 @@ impl FakeProxyControlPlane {
             route_path: route_path.into(),
             cold_route_path: cold_route_path.into(),
             backend_uri: backend_uri.into(),
+            grpc_backend_uri: grpc_backend_uri.into(),
             stats,
         }
     }
@@ -635,6 +676,8 @@ impl FakeProxyControlPlane {
                 self.cold_matched_identity(),
                 self.cold_route_entry(),
             ))
+        } else if self.real_grpc_route_matches(&request_identity) {
+            Ok(self.resolved_response(request_id, request_identity, self.real_grpc_route_entry()))
         } else if self.route_matches(&request_identity) {
             Ok(pb::ProxySubscribeResponse {
                 output: Some(pb::proxy_subscribe_response::Output::RouteResolved(
@@ -664,6 +707,17 @@ impl FakeProxyControlPlane {
 
     fn route_matches(&self, identity: &pb::RouteIdentity) -> bool {
         self.http_identity_matches(identity, self.route_path.as_ref())
+    }
+
+    fn real_grpc_route_matches(&self, identity: &pb::RouteIdentity) -> bool {
+        let Some(pb::route_identity::Kind::Http(identity)) = identity.kind.as_ref() else {
+            return false;
+        };
+
+        path_prefix_matches(
+            identity.path_prefix.as_deref().unwrap_or("/"),
+            REAL_GRPC_PATH,
+        )
     }
 
     fn cold_route_matches(&self, identity: &pb::RouteIdentity) -> bool {
@@ -725,12 +779,33 @@ impl FakeProxyControlPlane {
     }
 
     fn route_entry(&self) -> pb::ProxyRouteEntry {
+        self.route_entry_for(
+            "frontline-load-smoke-route",
+            "frontline-load-smoke-instance",
+            &self.backend_uri,
+        )
+    }
+
+    fn real_grpc_route_entry(&self) -> pb::ProxyRouteEntry {
+        self.route_entry_for(
+            "frontline-load-smoke-real-grpc-route",
+            "frontline-load-smoke-real-grpc-instance",
+            &self.grpc_backend_uri,
+        )
+    }
+
+    fn route_entry_for(
+        &self,
+        route_binding_id: &str,
+        instance_id: &str,
+        backend_uri: &str,
+    ) -> pb::ProxyRouteEntry {
         pb::ProxyRouteEntry {
-            route_binding_id: "frontline-load-smoke-route".to_owned(),
-            instance_id: "frontline-load-smoke-instance".to_owned(),
+            route_binding_id: route_binding_id.to_owned(),
+            instance_id: instance_id.to_owned(),
             instance_state: pb::InstanceState::Running as i32,
             instance_generation: 1,
-            backend_uri: Some(self.backend_uri.to_string()),
+            backend_uri: Some(backend_uri.to_owned()),
             backend_generation: Some(1),
         }
     }
@@ -805,6 +880,53 @@ impl ProxyControlPlane for FakeProxyControlPlane {
     }
 }
 
+#[derive(Clone, Debug)]
+struct GeneratedGrpcBackend {
+    stats: SmokeStats,
+}
+
+impl GeneratedGrpcBackend {
+    fn new(stats: SmokeStats) -> Self {
+        Self { stats }
+    }
+}
+
+#[tonic::async_trait]
+impl ProxyControlPlane for GeneratedGrpcBackend {
+    type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
+
+    async fn wake_instance(
+        &self,
+        request: Request<pb::ProxyWakeInstanceRequest>,
+    ) -> Result<Response<pb::ProxyWakeInstanceResponse>, Status> {
+        self.stats.record_backend_http_request();
+        let request = request.into_inner();
+        if request.instance_id.trim().is_empty() {
+            return Err(Status::invalid_argument("instance_id is required"));
+        }
+
+        Ok(Response::new(pb::ProxyWakeInstanceResponse {
+            outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
+                pb::ProxyWakeReadyResult {
+                    instance_id: request.instance_id,
+                    instance_generation: request.expected_generation,
+                    backend_uri: "http://generated-grpc-backend.example.test".to_owned(),
+                    backend_generation: 1,
+                },
+            )),
+        }))
+    }
+
+    async fn subscribe(
+        &self,
+        _request: Request<tonic::Streaming<pb::ProxySubscribeRequest>>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        Err(Status::unimplemented(
+            "load-smoke generated gRPC backend only implements WakeInstance",
+        ))
+    }
+}
+
 fn non_empty(value: String, field: &'static str) -> Result<String, Status> {
     if value.trim().is_empty() {
         return Err(Status::invalid_argument(format!(
@@ -837,6 +959,7 @@ struct ClientConfig {
     requests: u64,
     concurrency: u64,
     protocol: ClientProtocol,
+    tls_ca_cert_path: Option<PathBuf>,
     websocket_stream_bytes: u64,
     websocket_stream_chunk_size: u64,
 }
@@ -849,6 +972,7 @@ impl ClientConfig {
         let mut requests = 100;
         let mut concurrency = 4;
         let mut protocol = ClientProtocol::Http1;
+        let mut tls_ca_cert_path = None;
         let mut websocket_stream_bytes = DEFAULT_WEBSOCKET_STREAM_BYTES;
         let mut websocket_stream_chunk_size = DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE;
         let mut args = args.peekable();
@@ -869,6 +993,9 @@ impl ClientConfig {
                 "--protocol" => {
                     protocol = ClientProtocol::parse(&next_arg(&mut args, "--protocol")?)?
                 }
+                "--tls-ca-cert" => {
+                    tls_ca_cert_path = Some(PathBuf::from(next_arg(&mut args, "--tls-ca-cert")?))
+                }
                 "--websocket-stream-bytes" => {
                     websocket_stream_bytes = parse_positive_u64(
                         "--websocket-stream-bytes",
@@ -883,7 +1010,7 @@ impl ClientConfig {
                 }
                 _ => {
                     return Err(InvalidArgs(format!(
-                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, --concurrency, --protocol, --websocket-stream-bytes, or --websocket-stream-chunk-size"
+                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, --concurrency, --protocol, --tls-ca-cert, --websocket-stream-bytes, or --websocket-stream-chunk-size"
                     )));
                 }
             }
@@ -901,6 +1028,7 @@ impl ClientConfig {
             requests,
             concurrency,
             protocol,
+            tls_ca_cert_path,
             websocket_stream_bytes,
             websocket_stream_chunk_size,
         })
@@ -911,6 +1039,8 @@ impl ClientConfig {
 enum ClientProtocol {
     Http1,
     H2cGrpc,
+    H2TlsGrpc,
+    GeneratedGrpc,
     WebSocket,
 }
 
@@ -919,12 +1049,62 @@ impl ClientProtocol {
         match value {
             "http1" => Ok(Self::Http1),
             "h2c-grpc" => Ok(Self::H2cGrpc),
+            "h2-tls-grpc" => Ok(Self::H2TlsGrpc),
+            "generated-grpc" => Ok(Self::GeneratedGrpc),
             "websocket" => Ok(Self::WebSocket),
             _ => Err(InvalidArgs(format!(
-                "--protocol must be http1, h2c-grpc, or websocket, got {value:?}"
+                "--protocol must be http1, h2c-grpc, h2-tls-grpc, generated-grpc, or websocket, got {value:?}"
             ))),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CertConfig {
+    host: String,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+impl CertConfig {
+    fn from_args(args: impl Iterator<Item = String>) -> Result<Self, InvalidArgs> {
+        let mut host = None;
+        let mut cert_path = None;
+        let mut key_path = None;
+        let mut args = args.peekable();
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--host" => host = Some(next_arg(&mut args, "--host")?),
+                "--cert-path" => {
+                    cert_path = Some(PathBuf::from(next_arg(&mut args, "--cert-path")?))
+                }
+                "--key-path" => key_path = Some(PathBuf::from(next_arg(&mut args, "--key-path")?)),
+                _ => {
+                    return Err(InvalidArgs(format!(
+                        "unknown cert argument {arg:?}; expected --host, --cert-path, or --key-path"
+                    )));
+                }
+            }
+        }
+
+        let host = host.ok_or_else(|| InvalidArgs("--host is required".to_owned()))?;
+        validate_header_value("--host", &host)?;
+
+        Ok(Self {
+            host,
+            cert_path: cert_path
+                .ok_or_else(|| InvalidArgs("--cert-path is required".to_owned()))?,
+            key_path: key_path.ok_or_else(|| InvalidArgs("--key-path is required".to_owned()))?,
+        })
+    }
+}
+
+fn write_self_signed_cert(config: CertConfig) -> Result<(), BoxError> {
+    let certified_key = generate_simple_self_signed(vec![config.host])?;
+    fs::write(config.cert_path, certified_key.cert.pem())?;
+    fs::write(config.key_path, certified_key.signing_key.serialize_pem())?;
+    Ok(())
 }
 
 fn next_arg(
@@ -990,6 +1170,7 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
         let host_header = config.host_header.clone();
         let requests = config.requests;
         let protocol = config.protocol;
+        let tls_ca_cert_path = config.tls_ca_cert_path.clone();
         let websocket_stream_bytes = config.websocket_stream_bytes;
         let websocket_stream_chunk_size = config.websocket_stream_chunk_size;
 
@@ -1008,6 +1189,23 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     }
                     ClientProtocol::H2cGrpc => {
                         send_h2c_grpc_request(&target, &host_header, request_id).await
+                    }
+                    ClientProtocol::H2TlsGrpc => match tls_ca_cert_path.as_deref() {
+                        Some(ca_cert_path) => {
+                            send_h2_tls_grpc_request(
+                                &target,
+                                &host_header,
+                                request_id,
+                                ca_cert_path,
+                            )
+                            .await
+                        }
+                        None => Err(Box::new(InvalidArgs(
+                            "--tls-ca-cert is required for h2-tls-grpc".to_owned(),
+                        )) as BoxError),
+                    },
+                    ClientProtocol::GeneratedGrpc => {
+                        send_generated_grpc_request(&target, &host_header, request_id).await
                     }
                     ClientProtocol::WebSocket => {
                         send_websocket_request(
@@ -1048,7 +1246,10 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
         ClientProtocol::WebSocket => config
             .requests
             .saturating_mul(config.websocket_stream_bytes),
-        ClientProtocol::Http1 | ClientProtocol::H2cGrpc => 0,
+        ClientProtocol::Http1
+        | ClientProtocol::H2cGrpc
+        | ClientProtocol::H2TlsGrpc
+        | ClientProtocol::GeneratedGrpc => 0,
     };
     let mib_per_s = stream_bytes as f64 / (1024.0 * 1024.0) / elapsed_secs;
     let latency = latencies.snapshot();
@@ -1329,6 +1530,136 @@ async fn send_h2c_grpc_request(
     Ok(())
 }
 
+async fn send_h2_tls_grpc_request(
+    target: &HttpTarget,
+    host_header: &str,
+    request_id: u64,
+    ca_cert_path: &Path,
+) -> Result<(), BoxError> {
+    let stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
+        .await
+        .map_err(|_| timeout_error("h2 TLS connect"))??;
+    let server_name = ServerName::try_from(host_header.to_owned())
+        .map_err(|error| InvalidArgs(format!("--host must be a TLS server name: {error}")))?;
+    let tls = timeout(
+        REQUEST_TIMEOUT,
+        tls_connector(ca_cert_path)?.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| timeout_error("h2 TLS handshake"))??;
+
+    let negotiated = tls
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .ok_or(ResponseValidationError::MissingAlpnProtocol)?;
+    if negotiated != b"h2" {
+        return Err(Box::new(ResponseValidationError::UnexpectedAlpnProtocol(
+            String::from_utf8_lossy(negotiated).into_owned(),
+        )));
+    }
+
+    let (mut sender, connection) = timeout(
+        REQUEST_TIMEOUT,
+        client_http2::handshake(TokioExecutor::new(), TokioIo::new(tls)),
+    )
+    .await
+    .map_err(|_| timeout_error("h2 TLS HTTP/2 handshake"))??;
+    let connection_task = tokio::spawn(async move { connection.await });
+    let request = HttpRequest::builder()
+        .method("POST")
+        .uri(format!(
+            "https://{}{}",
+            host_header,
+            target.request_path(request_id)
+        ))
+        .version(Version::HTTP_2)
+        .header(CONTENT_TYPE, "application/grpc")
+        .body(Full::new(Bytes::from_static(GRPC_BODY)))?;
+    let response = timeout(REQUEST_TIMEOUT, sender.send_request(request))
+        .await
+        .map_err(|_| timeout_error("h2 TLS send request"))??;
+
+    validate_h2c_grpc_response(response).await?;
+    drop(sender);
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    Ok(())
+}
+
+fn tls_connector(ca_cert_path: &Path) -> Result<TlsConnector, BoxError> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_pem_certificates(ca_cert_path)? {
+        roots.add(cert)?;
+    }
+    let mut config = RustlsClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+fn load_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, BoxError> {
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err(Box::new(InvalidArgs(format!(
+            "TLS CA certificate file {:?} has no certificates",
+            path
+        ))));
+    }
+    Ok(certs)
+}
+
+async fn send_generated_grpc_request(
+    target: &HttpTarget,
+    host_header: &str,
+    request_id: u64,
+) -> Result<(), BoxError> {
+    let channel = generated_grpc_channel(target).await?;
+    let origin = generated_grpc_origin(target, host_header)?;
+    let mut client =
+        pb::proxy_control_plane_client::ProxyControlPlaneClient::with_origin(channel, origin);
+    let response = timeout(
+        REQUEST_TIMEOUT,
+        client.wake_instance(pb::ProxyWakeInstanceRequest {
+            instance_id: format!("generated-grpc-load-smoke-{request_id}"),
+            expected_generation: 7,
+            backend_generation: Some(1),
+        }),
+    )
+    .await
+    .map_err(|_| timeout_error("generated gRPC request"))??
+    .into_inner();
+
+    let Some(pb::proxy_wake_instance_response::Outcome::Ready(ready)) = response.outcome else {
+        return Err(Box::new(ResponseValidationError::UnexpectedGrpcOutcome));
+    };
+    if ready.instance_generation != 7 || ready.backend_generation != 1 {
+        return Err(Box::new(ResponseValidationError::UnexpectedGrpcOutcome));
+    }
+
+    Ok(())
+}
+
+async fn generated_grpc_channel(target: &HttpTarget) -> Result<Channel, BoxError> {
+    if target.scheme != TargetScheme::Http {
+        return Err(Box::new(InvalidArgs(
+            "generated-grpc only supports http:// targets".to_owned(),
+        )));
+    }
+    let endpoint_uri = format!("{}://{}", target.scheme.as_str(), target.authority());
+    Ok(Endpoint::from_shared(endpoint_uri)?.connect().await?)
+}
+
+fn generated_grpc_origin(target: &HttpTarget, host_header: &str) -> Result<Uri, InvalidArgs> {
+    format!("{}://{}", target.scheme.as_str(), host_header)
+        .parse()
+        .map_err(|error| InvalidArgs(format!("generated gRPC origin is invalid: {error}")))
+}
+
 async fn validate_h2c_grpc_response(
     response: HttpResponse<Incoming>,
 ) -> Result<(), ResponseValidationError> {
@@ -1395,6 +1726,7 @@ fn timeout_error(stage: &'static str) -> io::Error {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HttpTarget {
+    scheme: TargetScheme,
     host: String,
     port: u16,
     path: String,
@@ -1402,9 +1734,15 @@ struct HttpTarget {
 
 impl HttpTarget {
     fn parse(url: &str) -> Result<Self, InvalidArgs> {
-        let rest = url
-            .strip_prefix("http://")
-            .ok_or_else(|| InvalidArgs("only http:// URLs are supported".to_owned()))?;
+        let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
+            (TargetScheme::Http, rest)
+        } else if let Some(rest) = url.strip_prefix("https://") {
+            (TargetScheme::Https, rest)
+        } else {
+            return Err(InvalidArgs(
+                "only http:// and https:// URLs are supported".to_owned(),
+            ));
+        };
         let (authority, path) = match rest.find('/') {
             Some(index) => (&rest[..index], &rest[index..]),
             None => (rest, "/"),
@@ -1426,6 +1764,7 @@ impl HttpTarget {
         }
 
         Ok(Self {
+            scheme,
             host: host.to_owned(),
             port,
             path: path.to_owned(),
@@ -1439,6 +1778,21 @@ impl HttpTarget {
     fn request_path(&self, request_id: u64) -> String {
         let separator = if self.path.contains('?') { '&' } else { '?' };
         format!("{}{}smoke_request={request_id}", self.path, separator)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetScheme {
+    Http,
+    Https,
+}
+
+impl TargetScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
     }
 }
 
@@ -1496,6 +1850,7 @@ enum ResponseValidationError {
     MissingHeaders,
     MissingHeader(&'static str),
     MissingTrailers,
+    MissingAlpnProtocol,
     NonUtf8Headers,
     MissingStatus,
     UnexpectedVersion(Version),
@@ -1504,6 +1859,8 @@ enum ResponseValidationError {
         name: &'static str,
         value: String,
     },
+    UnexpectedAlpnProtocol(String),
+    UnexpectedGrpcOutcome,
     UnexpectedBody {
         len: usize,
     },
@@ -1527,6 +1884,7 @@ impl fmt::Display for ResponseValidationError {
             Self::MissingHeaders => write!(f, "HTTP response headers are missing"),
             Self::MissingHeader(name) => write!(f, "HTTP response header {name} is missing"),
             Self::MissingTrailers => write!(f, "HTTP response trailers are missing"),
+            Self::MissingAlpnProtocol => write!(f, "TLS ALPN protocol is missing"),
             Self::NonUtf8Headers => write!(f, "HTTP response headers are not UTF-8"),
             Self::MissingStatus => write!(f, "HTTP response status line is missing"),
             Self::UnexpectedVersion(version) => {
@@ -1536,6 +1894,10 @@ impl fmt::Display for ResponseValidationError {
             Self::UnexpectedHeader { name, value } => {
                 write!(f, "unexpected HTTP response header {name}: {value}")
             }
+            Self::UnexpectedAlpnProtocol(protocol) => {
+                write!(f, "unexpected TLS ALPN protocol {protocol:?}")
+            }
+            Self::UnexpectedGrpcOutcome => write!(f, "unexpected generated gRPC response outcome"),
             Self::UnexpectedBody { len } => {
                 write!(f, "unexpected HTTP response body length {len}")
             }
@@ -1577,16 +1939,19 @@ mod tests {
         LatencyStats, SmokeStats, BACKEND_BODY, DEFAULT_WEBSOCKET_STREAM_BYTES,
         DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE, GRPC_BODY, STATS_PATH,
     };
+    use crate::REAL_GRPC_PATH;
     use bytes::Bytes;
     use control_plane::api::pb;
     use http::{header::CONTENT_TYPE, Request as HttpRequest};
     use http_body_util::{BodyExt, Full};
+    use std::path::PathBuf;
 
     #[test]
     fn parses_http_target_with_path_and_query() {
         assert_eq!(
             HttpTarget::parse("http://127.0.0.1:18080/smoke?ready=true").expect("target parses"),
             HttpTarget {
+                scheme: super::TargetScheme::Http,
                 host: "127.0.0.1".to_owned(),
                 port: 18080,
                 path: "/smoke?ready=true".to_owned(),
@@ -1650,6 +2015,50 @@ mod tests {
         .expect("h2c gRPC-shaped client config parses");
 
         assert_eq!(config.protocol, ClientProtocol::H2cGrpc);
+    }
+
+    #[test]
+    fn client_config_parses_h2_tls_grpc_protocol() {
+        let config = ClientConfig::from_args(
+            [
+                "--url",
+                "https://127.0.0.1:18443/",
+                "--host",
+                "app.example.test",
+                "--protocol",
+                "h2-tls-grpc",
+                "--tls-ca-cert",
+                "/tmp/load-smoke.crt",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("h2 TLS gRPC-shaped client config parses");
+
+        assert_eq!(config.protocol, ClientProtocol::H2TlsGrpc);
+        assert_eq!(
+            config.tls_ca_cert_path,
+            Some(PathBuf::from("/tmp/load-smoke.crt"))
+        );
+    }
+
+    #[test]
+    fn client_config_parses_generated_grpc_protocol() {
+        let config = ClientConfig::from_args(
+            [
+                "--url",
+                "http://127.0.0.1:18082/",
+                "--host",
+                "app.example.test",
+                "--protocol",
+                "generated-grpc",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("generated gRPC client config parses");
+
+        assert_eq!(config.protocol, ClientProtocol::GeneratedGrpc);
     }
 
     #[test]
@@ -1752,6 +2161,7 @@ mod tests {
             "/smoke".to_owned(),
             "/cold-smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
+            "http://127.0.0.1:18082".to_owned(),
             SmokeStats::default(),
         );
 
@@ -1774,6 +2184,7 @@ mod tests {
             "/smoke".to_owned(),
             "/cold-smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
+            "http://127.0.0.1:18082".to_owned(),
             stats.clone(),
         );
 
@@ -1803,12 +2214,56 @@ mod tests {
     }
 
     #[test]
+    fn fake_control_plane_matches_generated_grpc_route_path() {
+        let service = FakeProxyControlPlane::new(
+            "app.example.test".to_owned(),
+            "/smoke".to_owned(),
+            "/cold-smoke".to_owned(),
+            "http://127.0.0.1:18080".to_owned(),
+            "http://127.0.0.1:18082".to_owned(),
+            SmokeStats::default(),
+        );
+
+        assert!(service.real_grpc_route_matches(&pb::RouteIdentity {
+            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                host: Some(pb::RouteHost {
+                    kind: pb::RouteHostKind::Exact as i32,
+                    host: "127.0.0.1".to_owned(),
+                }),
+                path_prefix: Some(REAL_GRPC_PATH.to_owned()),
+            })),
+        }));
+
+        let request_identity = pb::RouteIdentity {
+            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                host: Some(pb::RouteHost {
+                    kind: pb::RouteHostKind::Exact as i32,
+                    host: "127.0.0.1".to_owned(),
+                }),
+                path_prefix: Some(REAL_GRPC_PATH.to_owned()),
+            })),
+        };
+        let response = service
+            .subscribe_route_response(pb::ProxySubscribeRouteRequest {
+                request_id: "generated-grpc-request".to_owned(),
+                identity: Some(request_identity.clone()),
+            })
+            .expect("generated gRPC route resolves");
+        let Some(pb::proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output
+        else {
+            panic!("expected resolved route");
+        };
+        assert_eq!(resolved.matched_identity, Some(request_identity));
+    }
+
+    #[test]
     fn fake_control_plane_returns_cold_route_for_cold_path() {
         let service = FakeProxyControlPlane::new(
             "app.example.test".to_owned(),
             "/smoke".to_owned(),
             "/cold-smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
+            "http://127.0.0.1:18082".to_owned(),
             SmokeStats::default(),
         );
 

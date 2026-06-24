@@ -22,10 +22,20 @@ grpc_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS:-${requests}}"
 grpc_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY:-${concurrency}}"
 if [[ "${strict_budgets}" == "1" ]]; then
   grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-0.75}"
+  h2_tls_grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MIN_RATIO:-0.75}"
+  real_grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MIN_RATIO:-0.75}"
 else
   grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-${min_ratio}}"
+  h2_tls_grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MIN_RATIO:-${min_ratio}}"
+  real_grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MIN_RATIO:-${min_ratio}}"
 fi
 grpc_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
+h2_tls_grpc_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_REQUESTS:-${grpc_requests}}"
+h2_tls_grpc_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_CONCURRENCY:-${grpc_concurrency}}"
+h2_tls_grpc_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
+real_grpc_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_REQUESTS:-${grpc_requests}}"
+real_grpc_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_CONCURRENCY:-${grpc_concurrency}}"
+real_grpc_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 websocket_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS:-${requests}}"
 websocket_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY:-${concurrency}}"
 websocket_stream_bytes="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES:-262144}"
@@ -45,7 +55,9 @@ route_host="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST:-app.example.test}"
 route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH:-/smoke}"
 cold_route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH:-/cold-smoke}"
 backend_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT:-18080}"
+grpc_backend_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_BACKEND_PORT:-18082}"
 frontline_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_PORT:-18081}"
+frontline_tls_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_TLS_PORT:-18443}"
 control_plane_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT:-19090}"
 skip_build="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_SKIP_BUILD:-0}"
 
@@ -112,19 +124,29 @@ require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS "${requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY "${concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS "${grpc_requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY "${grpc_concurrency}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_REQUESTS "${h2_tls_grpc_requests}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_CONCURRENCY "${h2_tls_grpc_concurrency}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_REQUESTS "${real_grpc_requests}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_CONCURRENCY "${real_grpc_concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS "${websocket_requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY "${websocket_concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES "${websocket_stream_bytes}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_CHUNK_SIZE "${websocket_stream_chunk_size}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT "${backend_container_port}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_BACKEND_PORT "${grpc_backend_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_PORT "${frontline_container_port}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_TLS_PORT "${frontline_tls_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO "${grpc_min_ratio}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MIN_RATIO "${h2_tls_grpc_min_ratio}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MIN_RATIO "${real_grpc_min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO "${websocket_min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO "${websocket_stream_min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS "${max_added_p99_ms}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS "${grpc_max_added_p99_ms}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MAX_ADDED_P99_MS "${h2_tls_grpc_max_added_p99_ms}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MAX_ADDED_P99_MS "${real_grpc_max_added_p99_ms}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS "${websocket_max_added_p99_ms}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS "${cold_wake_max_latency_ms}"
 if [[ "${strict_budgets}" != "0" && "${strict_budgets}" != "1" ]]; then
@@ -143,12 +165,20 @@ direct_output_file="$(mktemp)"
 frontline_output_file="$(mktemp)"
 grpc_direct_output_file="$(mktemp)"
 grpc_frontline_output_file="$(mktemp)"
+h2_tls_grpc_direct_output_file="$(mktemp)"
+h2_tls_grpc_frontline_output_file="$(mktemp)"
+real_grpc_direct_output_file="$(mktemp)"
+real_grpc_frontline_output_file="$(mktemp)"
 websocket_direct_output_file="$(mktemp)"
 websocket_frontline_output_file="$(mktemp)"
 cold_frontline_output_file="$(mktemp)"
+tls_cert_dir="$(mktemp -d)"
+tls_cert_path="${tls_cert_dir}/frontline-load-smoke.crt"
+tls_key_path="${tls_cert_dir}/frontline-load-smoke.key"
 
 cleanup() {
-  rm -f "${direct_output_file}" "${frontline_output_file}" "${grpc_direct_output_file}" "${grpc_frontline_output_file}" "${websocket_direct_output_file}" "${websocket_frontline_output_file}" "${cold_frontline_output_file}"
+  rm -f "${direct_output_file}" "${frontline_output_file}" "${grpc_direct_output_file}" "${grpc_frontline_output_file}" "${h2_tls_grpc_direct_output_file}" "${h2_tls_grpc_frontline_output_file}" "${real_grpc_direct_output_file}" "${real_grpc_frontline_output_file}" "${websocket_direct_output_file}" "${websocket_frontline_output_file}" "${cold_frontline_output_file}" "${tls_cert_path}" "${tls_key_path}"
+  rmdir "${tls_cert_dir}" >/dev/null 2>&1 || true
   docker rm -f "${frontline_name}" "${helper_name}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -186,6 +216,7 @@ wait_for_url() {
       --requests 1 \
       --concurrency 1 \
       --protocol "${protocol}" \
+      --tls-ca-cert "${tls_cert_path}" \
       --websocket-stream-bytes "${websocket_stream_bytes}" \
       --websocket-stream-chunk-size "${websocket_stream_chunk_size}" >/dev/null 2>&1; then
       return 0
@@ -229,6 +260,7 @@ run_load() {
     --requests "${request_count}" \
     --concurrency "${concurrency_count}" \
     --protocol "${protocol}" \
+    --tls-ca-cert "${tls_cert_path}" \
     --websocket-stream-bytes "${websocket_stream_bytes}" \
     --websocket-stream-chunk-size "${websocket_stream_chunk_size}" 2>&1)"
   status=$?
@@ -339,6 +371,12 @@ read_backend_http_requests() {
 echo "Building local frontline load-smoke client"
 cargo build -p frontline --example frontline_load_smoke
 
+echo "Generating temporary frontline TLS certificate"
+"${client_bin}" cert \
+  --host "${route_host}" \
+  --cert-path "${tls_cert_path}" \
+  --key-path "${tls_key_path}"
+
 if [[ "${skip_build}" == "1" ]]; then
   docker image inspect "${frontline_image}" >/dev/null
   docker image inspect "${helper_image}" >/dev/null
@@ -361,10 +399,14 @@ echo "Starting frontline load-smoke helper"
 docker run -d \
   --name "${helper_name}" \
   --publish "127.0.0.1::${backend_container_port}" \
+  --publish "127.0.0.1::${grpc_backend_container_port}" \
   --publish "127.0.0.1::${frontline_container_port}" \
+  --publish "127.0.0.1::${frontline_tls_container_port}" \
   --env "SLEEPYPODS_LOAD_SMOKE_BACKEND_ADDR=0.0.0.0:${backend_container_port}" \
+  --env "SLEEPYPODS_LOAD_SMOKE_GRPC_BACKEND_ADDR=0.0.0.0:${grpc_backend_container_port}" \
   --env "SLEEPYPODS_LOAD_SMOKE_CONTROL_PLANE_ADDR=0.0.0.0:${control_plane_container_port}" \
   --env "SLEEPYPODS_LOAD_SMOKE_BACKEND_URI=http://127.0.0.1:${backend_container_port}" \
+  --env "SLEEPYPODS_LOAD_SMOKE_GRPC_BACKEND_URI=http://127.0.0.1:${grpc_backend_container_port}" \
   --env "SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST=${route_host}" \
   --env "SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH=${route_path}" \
   --env "SLEEPYPODS_LOAD_SMOKE_COLD_ROUTE_PATH=${cold_route_path}" \
@@ -373,9 +415,14 @@ docker run -d \
   "${helper_image}" >/dev/null
 
 direct_port="$(published_port "${helper_name}" "${backend_container_port}")"
+grpc_direct_port="$(published_port "${helper_name}" "${grpc_backend_container_port}")"
 frontline_port="$(published_port "${helper_name}" "${frontline_container_port}")"
+frontline_tls_port="$(published_port "${helper_name}" "${frontline_tls_container_port}")"
 direct_url="http://127.0.0.1:${direct_port}${route_path}"
+grpc_direct_url="http://127.0.0.1:${grpc_direct_port}/"
 frontline_url="http://127.0.0.1:${frontline_port}${route_path}"
+frontline_tls_url="https://127.0.0.1:${frontline_tls_port}${route_path}"
+grpc_frontline_url="http://127.0.0.1:${frontline_port}/"
 cold_frontline_url="http://127.0.0.1:${frontline_port}${cold_route_path}"
 stats_url="http://127.0.0.1:${direct_port}/__sleepypods_load_smoke_stats"
 
@@ -385,7 +432,10 @@ echo "Starting ${frontline_image}"
 docker run -d \
   --name "${frontline_name}" \
   --network "container:${helper_name}" \
+  --volume "${tls_cert_dir}:/load-smoke-tls:ro" \
   --env "SLEEPYPODS_FRONTLINE_LISTEN_ADDR=0.0.0.0:${frontline_container_port}" \
+  --env "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR=0.0.0.0:${frontline_tls_container_port}" \
+  --env "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS=${route_host}|/load-smoke-tls/$(basename "${tls_cert_path}")|/load-smoke-tls/$(basename "${tls_key_path}")" \
   --env "SLEEPYPODS_CONTROL_PLANE_ENDPOINT=http://127.0.0.1:${control_plane_container_port}" \
   --env "SLEEPYPODS_ROUTE_CACHE_CAPACITY=32" \
   --env "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS=5000" \
@@ -452,6 +502,69 @@ assert_ratio_at_least "h2c_grpc" "${grpc_direct_rps}" "${grpc_frontline_rps}" "$
 assert_added_p99_at_most "h2c_grpc" "${grpc_direct_p99_ms}" "${grpc_frontline_p99_ms}" "${grpc_max_added_p99_ms}"
 
 echo "hot_cache_h2c_grpc_subscribe_route_calls=0 subscribe_route_calls_before=${grpc_subscribe_route_calls_before} subscribe_route_calls_after=${grpc_subscribe_route_calls_after}"
+
+echo "Warming negotiated h2-over-TLS gRPC-shaped hot-cache route"
+wait_for_url frontline-tls "${frontline_tls_url}" h2-tls-grpc
+
+echo "Running direct-backend h2c baseline for negotiated h2-over-TLS gRPC-shaped smoke load"
+run_load direct-h2-tls-grpc "${direct_url}" "${h2_tls_grpc_direct_output_file}" "${h2_tls_grpc_requests}" "${h2_tls_grpc_concurrency}" h2c-grpc
+
+h2_tls_grpc_subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
+echo "SubscribeRoute calls before measured negotiated h2-over-TLS gRPC-shaped frontline phase=${h2_tls_grpc_subscribe_route_calls_before}"
+
+echo "Running frontline negotiated h2-over-TLS gRPC-shaped smoke load"
+run_load frontline-h2-tls-grpc "${frontline_tls_url}" "${h2_tls_grpc_frontline_output_file}" "${h2_tls_grpc_requests}" "${h2_tls_grpc_concurrency}" h2-tls-grpc
+
+h2_tls_grpc_subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
+
+if [[ "${h2_tls_grpc_subscribe_route_calls_after}" != "${h2_tls_grpc_subscribe_route_calls_before}" ]]; then
+  echo "hot-cache negotiated h2-over-TLS gRPC-shaped frontline load made additional SubscribeRoute calls: before=${h2_tls_grpc_subscribe_route_calls_before} after=${h2_tls_grpc_subscribe_route_calls_after}" >&2
+  dump_logs
+  exit 1
+fi
+
+h2_tls_grpc_direct_result="$(cat "${h2_tls_grpc_direct_output_file}")"
+h2_tls_grpc_frontline_result="$(cat "${h2_tls_grpc_frontline_output_file}")"
+h2_tls_grpc_direct_rps="$(extract_metric "${h2_tls_grpc_direct_result}" rps)"
+h2_tls_grpc_frontline_rps="$(extract_metric "${h2_tls_grpc_frontline_result}" rps)"
+h2_tls_grpc_direct_p99_ms="$(extract_metric "${h2_tls_grpc_direct_result}" p99_ms)"
+h2_tls_grpc_frontline_p99_ms="$(extract_metric "${h2_tls_grpc_frontline_result}" p99_ms)"
+assert_ratio_at_least "h2_tls_grpc" "${h2_tls_grpc_direct_rps}" "${h2_tls_grpc_frontline_rps}" "${h2_tls_grpc_min_ratio}"
+assert_added_p99_at_most "h2_tls_grpc" "${h2_tls_grpc_direct_p99_ms}" "${h2_tls_grpc_frontline_p99_ms}" "${h2_tls_grpc_max_added_p99_ms}"
+
+echo "hot_cache_h2_tls_grpc_subscribe_route_calls=0 subscribe_route_calls_before=${h2_tls_grpc_subscribe_route_calls_before} subscribe_route_calls_after=${h2_tls_grpc_subscribe_route_calls_after}"
+
+echo "Warming real generated gRPC backend and hot-cache route"
+wait_for_url direct-generated-grpc "${grpc_direct_url}" generated-grpc
+wait_for_url frontline-generated-grpc "${grpc_frontline_url}" generated-grpc
+
+echo "Running direct-backend real generated gRPC smoke load"
+run_load direct-real-grpc "${grpc_direct_url}" "${real_grpc_direct_output_file}" "${real_grpc_requests}" "${real_grpc_concurrency}" generated-grpc
+
+real_grpc_subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
+echo "SubscribeRoute calls before measured real generated gRPC frontline phase=${real_grpc_subscribe_route_calls_before}"
+
+echo "Running frontline real generated gRPC smoke load"
+run_load frontline-real-grpc "${grpc_frontline_url}" "${real_grpc_frontline_output_file}" "${real_grpc_requests}" "${real_grpc_concurrency}" generated-grpc
+
+real_grpc_subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
+
+if [[ "${real_grpc_subscribe_route_calls_after}" != "${real_grpc_subscribe_route_calls_before}" ]]; then
+  echo "hot-cache real generated gRPC frontline load made additional SubscribeRoute calls: before=${real_grpc_subscribe_route_calls_before} after=${real_grpc_subscribe_route_calls_after}" >&2
+  dump_logs
+  exit 1
+fi
+
+real_grpc_direct_result="$(cat "${real_grpc_direct_output_file}")"
+real_grpc_frontline_result="$(cat "${real_grpc_frontline_output_file}")"
+real_grpc_direct_rps="$(extract_metric "${real_grpc_direct_result}" rps)"
+real_grpc_frontline_rps="$(extract_metric "${real_grpc_frontline_result}" rps)"
+real_grpc_direct_p99_ms="$(extract_metric "${real_grpc_direct_result}" p99_ms)"
+real_grpc_frontline_p99_ms="$(extract_metric "${real_grpc_frontline_result}" p99_ms)"
+assert_ratio_at_least "real_grpc" "${real_grpc_direct_rps}" "${real_grpc_frontline_rps}" "${real_grpc_min_ratio}"
+assert_added_p99_at_most "real_grpc" "${real_grpc_direct_p99_ms}" "${real_grpc_frontline_p99_ms}" "${real_grpc_max_added_p99_ms}"
+
+echo "hot_cache_real_grpc_subscribe_route_calls=0 subscribe_route_calls_before=${real_grpc_subscribe_route_calls_before} subscribe_route_calls_after=${real_grpc_subscribe_route_calls_after}"
 
 echo "Warming WebSocket hot-cache route"
 wait_for_url frontline "${frontline_url}" websocket

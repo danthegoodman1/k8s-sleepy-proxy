@@ -183,10 +183,11 @@ behavior. Its throughput and p99 stream gates are
 same-run direct-baseline TCP checks, not cross-machine absolute throughput or
 latency SLOs.
 
-## Production Image Frontline HTTP, h2c gRPC-Shaped, WebSocket, and Cold-Wake Load Smoke
+## Production Image Frontline HTTP, h2/gRPC, WebSocket, and Cold-Wake Load Smoke
 
 Milestone 7E also has a narrow production-image smoke for the frontline
-HTTP/1.1, h2c gRPC-shaped, WebSocket, and cold-wake paths:
+HTTP/1.1, h2c gRPC-shaped, negotiated h2-over-TLS gRPC-shaped, real generated
+gRPC, WebSocket, and cold-wake paths:
 
 ```sh
 ./scripts/smoke-frontline-load.sh
@@ -217,6 +218,22 @@ body asserted by the helper, a fixed gRPC-framed response body, and
 HTTP/1.1 and h2c, so the h2c phase uses the same direct-backend baseline and the
 same production frontline image. The h2c phase also fails if measured hot-cache
 requests make additional `SubscribeRoute` calls.
+
+The script then generates a temporary self-signed certificate for the route
+host, mounts it into the production frontline container, enables the production
+TLS-termination listener, and warms/measures the same gRPC-shaped request over
+negotiated HTTP/2-over-TLS. The client trusts only that generated certificate
+and fails unless TLS ALPN negotiates `h2`, so this phase cannot silently fall
+back to h2c. Its same-run direct baseline is the helper's direct h2c backend
+path, so the frontend ratio and p99 gates intentionally include TLS termination
+and proxy overhead rather than comparing against a separate direct TLS backend.
+
+The smoke also starts a small generated gRPC backend using the existing
+generated `ProxyControlPlane` service and measures generated
+`ProxyControlPlaneClient/WakeInstance` calls directly to that backend and
+through the production frontline HTTP listener. The fake control plane routes
+only the generated method path to this backend, and the measured hot-cache phase
+fails if it makes additional `SubscribeRoute` calls after warmup.
 
 The script then warms and measures WebSocket forwarding through the same cached
 ready route. The helper client performs a real HTTP upgrade, sends text and
@@ -256,16 +273,19 @@ threshold.
 By default, this remains a conservative developer smoke:
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO=0.10`,
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO=0.10`,
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MIN_RATIO=0.10`,
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MIN_RATIO=0.10`,
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.10`,
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO=0.10`, each
 `*_MAX_ADDED_P99_MS` defaulting to `1000`, and
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS=5000`.
 Release-style runs can set
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS=1`, which changes the default
-HTTP/1.1 ratio to `0.80`, h2c gRPC-shaped ratio to `0.75`, WebSocket session
-ratio to `0.80`, WebSocket stream throughput ratio to `0.80`, each max p99
-added-latency threshold to `25` ms, and fake-control-plane cold-wake latency to
-`250` ms. The explicit env vars still override those strict defaults.
+HTTP/1.1 ratio to `0.80`, h2c gRPC-shaped, h2-over-TLS gRPC-shaped, and real
+generated gRPC ratios to `0.75`, WebSocket session ratio to `0.80`, WebSocket
+stream throughput ratio to `0.80`, each max p99 added-latency threshold to
+`25` ms, and fake-control-plane cold-wake latency to `250` ms. The explicit env
+vars still override those strict defaults.
 
 Useful knobs:
 
@@ -274,6 +294,10 @@ SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS=500 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY=16 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS=500 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY=16 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_REQUESTS=500 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_CONCURRENCY=16 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_REQUESTS=500 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_CONCURRENCY=16 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS=500 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY=16 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES=1048576 \
@@ -284,12 +308,13 @@ SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH=/cold-smoke \
 ./scripts/smoke-frontline-load.sh
 ```
 
-This smoke only covers frontline HTTP/1.1, prior-knowledge h2c gRPC-shaped, and
-WebSocket cached ready-route forwarding and byte-streaming plus one
-fake-control-plane cold wake through the production frontline image. It does
-not cover Kubernetes, the real control plane, TLS/SNI, negotiated HTTP/2 over
-TLS, real generated gRPC clients, TCP, real Kubernetes cold materialization
-latency, or route-cache invalidation behavior.
+This smoke only covers frontline HTTP/1.1, prior-knowledge h2c gRPC-shaped,
+negotiated HTTP/2 over the production TLS-termination listener, real generated
+gRPC unary forwarding, and WebSocket cached ready-route forwarding and
+byte-streaming plus one fake-control-plane cold wake through the production
+frontline image. It does not cover Kubernetes, the real control plane, SNI
+passthrough, TCP, real Kubernetes cold materialization latency, or route-cache
+invalidation behavior.
 
 ## Production-Image Load Budget Gates
 
@@ -310,6 +335,8 @@ Strict defaults:
 | --- | --- | --- | --- | --- |
 | `smoke-frontline-load.sh` HTTP/1.1 | frontline RPS / direct RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO=0.80` | frontend `p99_ms` - direct `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS=25` |
 | `smoke-frontline-load.sh` h2c gRPC-shaped | frontline RPS / direct RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO=0.75` | frontend `p99_ms` - direct `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS=25` |
+| `smoke-frontline-load.sh` h2-over-TLS gRPC-shaped | frontline TLS h2 RPS / direct h2c RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MIN_RATIO=0.75` | frontend TLS h2 `p99_ms` - direct h2c `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_H2_TLS_GRPC_MAX_ADDED_P99_MS=25` |
+| `smoke-frontline-load.sh` real generated gRPC | frontline generated gRPC RPS / direct generated gRPC RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MIN_RATIO=0.75` | frontend generated gRPC `p99_ms` - direct generated gRPC `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REAL_GRPC_MAX_ADDED_P99_MS=25` |
 | `smoke-frontline-load.sh` WebSocket | frontline sessions/s / direct sessions/s | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.80` | frontend session `p99_ms` - direct session `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS=25` |
 | `smoke-frontline-load.sh` WebSocket stream | frontline MiB/s / direct MiB/s | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO=0.80` | Covered by WebSocket session p99 gate | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS=25` |
 | `smoke-frontline-load.sh` fake-control-plane cold wake | absolute frontend single-request p99 | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS=250` | Not baseline-relative | Not applicable |
@@ -317,11 +344,11 @@ Strict defaults:
 | `smoke-sidecar-tcp-load.sh` TCP large streams | sidecar MiB/s / direct MiB/s | `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO=0.85` | sidecar stream `p99_ms` - direct stream `p99_ms` | `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS=500` |
 
 Smoke defaults use the same env vars but remain intentionally loose: frontline
-and sidecar HTTP/WebSocket/h2c ratios default to `0.10`, frontline WebSocket
-stream throughput ratio defaults to `0.10`, sidecar TCP throughput ratio
-defaults to `0.05`, HTTP/WebSocket/h2c p99 added latency defaults to `1000` ms,
-fake-control-plane cold-wake latency defaults to `5000` ms, and TCP stream p99
-added latency defaults to `10000` ms.
+and sidecar HTTP/WebSocket/h2c/h2-TLS/generated-gRPC ratios default to `0.10`,
+frontline WebSocket stream throughput ratio defaults to `0.10`, sidecar TCP
+throughput ratio defaults to `0.05`, HTTP/WebSocket/h2c/h2-TLS/generated-gRPC
+p99 added latency defaults to `1000` ms, fake-control-plane cold-wake latency
+defaults to `5000` ms, and TCP stream p99 added latency defaults to `10000` ms.
 
 ## Budget Principles
 
