@@ -99,14 +99,7 @@ where
         manifest: &RenderedManifest,
     ) -> Result<AppliedMaterialization, MaterializerError> {
         let rendered_objects = self.apply_manifest(manifest).await?;
-        let backend = self
-            .client
-            .wait_for_readiness(&rendered_objects)
-            .await
-            .map_err(|source| MaterializerError::ReadinessWait {
-                rendered_objects: rendered_objects.clone(),
-                source,
-            })?;
+        let backend = self.wait_for_readiness(&rendered_objects).await?;
 
         Ok(AppliedMaterialization {
             rendered_objects,
@@ -154,6 +147,19 @@ where
         }
 
         Ok(applied_refs)
+    }
+
+    pub async fn wait_for_readiness(
+        &self,
+        rendered_objects: &[RenderedObjectRef],
+    ) -> Result<BackendEndpoint, MaterializerError> {
+        self.client
+            .wait_for_readiness(rendered_objects)
+            .await
+            .map_err(|source| MaterializerError::ReadinessWait {
+                rendered_objects: rendered_objects.to_vec(),
+                source,
+            })
     }
 
     pub async fn delete_rendered_objects(

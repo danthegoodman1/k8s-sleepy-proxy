@@ -19,7 +19,7 @@ use crate::{
     materialization::{
         CompleteWakeRequest, CompleteWakeResult, FinalizeSleepRequest,
         LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
-        MaterializationState, MaterializationTarget,
+        MaterializationState, MaterializationTarget, RecordMaterializationRequest,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     sleep_policy::SleepPolicyError,
@@ -266,8 +266,8 @@ where
         }
     };
 
-    let applied = match materializer.apply_manifest_until_ready(&manifest).await {
-        Ok(applied) => applied,
+    let rendered_objects = match materializer.apply_manifest(&manifest).await {
+        Ok(rendered_objects) => rendered_objects,
         Err(error) => {
             return Err(fail_waking(
                 store,
@@ -284,14 +284,44 @@ where
     let backend_generation = request
         .backend_generation
         .unwrap_or_else(|| BackendGeneration::new(waking.generation.get()));
+    let mut pending = RecordMaterializationRequest::new(
+        request.instance_id.clone(),
+        waking.generation,
+        request.target.clone(),
+        MaterializationState::Pending,
+        backend_generation,
+    );
+    pending.rendered_objects = rendered_objects.clone();
+    if let Err(error) = store.record_materialization(pending).await {
+        let _ = materializer
+            .delete_rendered_objects(&rendered_objects)
+            .await;
+        return Err(fail_waking_with_store_error(store, &waking, error).await);
+    }
+
+    let backend = match materializer.wait_for_readiness(&rendered_objects).await {
+        Ok(backend) => backend,
+        Err(error) => {
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Materializer {
+                    instance: waking.clone(),
+                    source: error,
+                },
+            )
+            .await);
+        }
+    };
+
     let mut complete = CompleteWakeRequest::new(
         request.instance_id,
         waking.generation,
         request.target,
-        applied.backend,
+        backend,
         backend_generation,
     );
-    complete.rendered_objects = applied.rendered_objects;
+    complete.rendered_objects = rendered_objects;
 
     store
         .complete_wake(complete)

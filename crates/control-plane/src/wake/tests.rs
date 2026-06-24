@@ -60,6 +60,7 @@ struct FakeStoreState {
     materialization: Option<MaterializationRecord>,
     events: Vec<StoreEvent>,
     complete_conflict: bool,
+    delete_before_record_materialization: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +72,12 @@ enum StoreEvent {
     },
     Complete {
         expected_waking_generation: Generation,
+        backend_generation: BackendGeneration,
+        rendered_objects: Vec<RenderedObjectRef>,
+    },
+    RecordMaterialization {
+        instance_generation: Generation,
+        state: MaterializationState,
         backend_generation: BackendGeneration,
         rendered_objects: Vec<RenderedObjectRef>,
     },
@@ -154,6 +161,15 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
                 expected: Generation::new(1),
                 next_state: InstanceState::Waking,
                 reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(2),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(2),
@@ -402,14 +418,25 @@ async fn restart_during_wake_resumes_waking_generation_without_new_cas() {
     );
     assert_eq!(
         store.events(),
-        vec![StoreEvent::Complete {
-            expected_waking_generation: Generation::new(5),
-            backend_generation: BackendGeneration::new(5),
-            rendered_objects: vec![
-                object_ref("v1", "Service", "apps", "svc-acme"),
-                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
-            ],
-        }]
+        vec![
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(5),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(5),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+            StoreEvent::Complete {
+                expected_waking_generation: Generation::new(5),
+                backend_generation: BackendGeneration::new(5),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
+        ]
     );
     assert_eq!(client.applied_objects().len(), 2);
 }
@@ -446,6 +473,15 @@ async fn failed_and_draining_instances_can_start_wake() {
             expected: Generation::new(12),
             next_state: InstanceState::Waking,
             reason: StateTransitionReason::WakeRequested,
+        });
+        expected_events.push(StoreEvent::RecordMaterialization {
+            instance_generation: Generation::new(13),
+            state: MaterializationState::Pending,
+            backend_generation: BackendGeneration::new(13),
+            rendered_objects: vec![
+                object_ref("v1", "Service", "apps", "svc-acme"),
+                object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+            ],
         });
         expected_events.push(StoreEvent::Complete {
             expected_waking_generation: Generation::new(13),
@@ -540,7 +576,25 @@ async fn materializer_failure_marks_waking_generation_failed() {
                     expected,
                     next_state,
                     ..
-                } => (expected, next_state),
+                } => Some((expected, next_state)),
+                StoreEvent::RecordMaterialization {
+                    instance_generation,
+                    state,
+                    backend_generation,
+                    rendered_objects,
+                } => {
+                    assert_eq!(instance_generation, Generation::new(7));
+                    assert_eq!(state, MaterializationState::Pending);
+                    assert_eq!(backend_generation, BackendGeneration::new(7));
+                    assert_eq!(
+                        rendered_objects,
+                        vec![
+                            object_ref("v1", "Service", "apps", "svc-acme"),
+                            object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                        ]
+                    );
+                    None
+                }
                 StoreEvent::Complete { .. } => panic!("wake must not complete"),
                 StoreEvent::LoadReadyMaterialization { .. } => {
                     panic!("cold wake failure must not load materialization")
@@ -552,6 +606,7 @@ async fn materializer_failure_marks_waking_generation_failed() {
                     panic!("cold wake failure must not finalize sleep")
                 }
             })
+            .flatten()
             .collect::<Vec<_>>(),
         vec![
             (Generation::new(6), InstanceState::Waking),
@@ -618,6 +673,57 @@ async fn materializer_failure_records_wake_and_failure_observability_fields() {
 }
 
 #[tokio::test]
+async fn record_materialization_failure_after_apply_deletes_rendered_objects() {
+    let store = FakeStore::new(
+        instance("instance-a", InstanceState::Cold, 8),
+        Some(workload_class()),
+    );
+    store.delete_before_record_materialization();
+    let client = FakeKubernetesClient::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+
+    let error = wake_instance(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(8),
+            target("cluster-a", "apps"),
+        ),
+    )
+    .await
+    .expect_err("recording pending materialization should fail after apply");
+
+    assert!(matches!(error, WakeInstanceError::NotFound));
+    let rendered_objects = vec![
+        object_ref("v1", "Service", "apps", "svc-acme"),
+        object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+    ];
+    assert_eq!(client.applied_objects().len(), 2);
+    assert_eq!(
+        client.deleted_objects(),
+        vec![rendered_objects[1].clone(), rendered_objects[0].clone()]
+    );
+    assert!(client.readiness_calls().is_empty());
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(8),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(9),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(9),
+                rendered_objects,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn complete_generation_conflict_after_apply_is_returned_without_retry() {
     let store = FakeStore::new(
         instance("instance-a", InstanceState::Cold, 9),
@@ -648,6 +754,15 @@ async fn complete_generation_conflict_after_apply_is_returned_without_retry() {
                 expected: Generation::new(9),
                 next_state: InstanceState::Waking,
                 reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(10),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(44),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
             },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(10),
@@ -745,6 +860,15 @@ async fn draining_with_deleting_materialization_waits_for_sleep_cleanup() {
                 next_state: InstanceState::Waking,
                 reason: StateTransitionReason::WakeRequested,
             },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(15),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(15),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme"),
+                ],
+            },
             StoreEvent::Complete {
                 expected_waking_generation: Generation::new(15),
                 backend_generation: BackendGeneration::new(15),
@@ -768,6 +892,7 @@ impl FakeStore {
                 materialization: None,
                 events: Vec::new(),
                 complete_conflict: false,
+                delete_before_record_materialization: false,
             })),
         }
     }
@@ -794,6 +919,13 @@ impl FakeStore {
             .lock()
             .expect("fake store lock not poisoned")
             .complete_conflict = true;
+    }
+
+    fn delete_before_record_materialization(&self) {
+        self.inner
+            .lock()
+            .expect("fake store lock not poisoned")
+            .delete_before_record_materialization = true;
     }
 
     fn set_materialization(&self, materialization: MaterializationRecord) {
@@ -912,9 +1044,41 @@ impl ControlPlaneStore for FakeStore {
 
     fn record_materialization<'a>(
         &'a self,
-        _request: RecordMaterializationRequest,
+        request: RecordMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-        Box::pin(async { Err(StoreError::internal("not implemented")) })
+        Box::pin(async move {
+            let mut inner = self.inner.lock().expect("fake store lock not poisoned");
+            inner.events.push(StoreEvent::RecordMaterialization {
+                instance_generation: request.instance_generation,
+                state: request.state,
+                backend_generation: request.backend_generation,
+                rendered_objects: request.rendered_objects.clone(),
+            });
+            if inner.delete_before_record_materialization {
+                inner.instance = None;
+                return Err(StoreError::NotFound {
+                    resource: "instance",
+                });
+            }
+            let record = MaterializationRecord {
+                id: MaterializationId::new(format!(
+                    "{}:{}:{}",
+                    request.instance_id.as_str(),
+                    request.target.cluster_id(),
+                    request.target.namespace()
+                ))
+                .expect("valid materialization id"),
+                instance_id: request.instance_id,
+                instance_generation: request.instance_generation,
+                target: request.target,
+                state: request.state,
+                backend: request.backend,
+                backend_generation: request.backend_generation,
+                rendered_objects: request.rendered_objects,
+            };
+            inner.materialization = Some(record.clone());
+            Ok(record)
+        })
     }
 
     fn load_ready_materialization<'a>(
