@@ -35,7 +35,7 @@ pub const CLUSTER_ID_ENV: &str = "SLEEPYPODS_CLUSTER_ID";
 pub const NAMESPACE_ENV: &str = "SLEEPYPODS_NAMESPACE";
 
 pub type NativeControlPlaneRouter = Router<Identity>;
-pub type OperatorGrpcWebRouter = Router<Stack<CorsLayer, Stack<tonic_web::GrpcWebLayer, Identity>>>;
+pub type OperatorGrpcWebRouter = Router<Stack<tonic_web::GrpcWebLayer, Stack<CorsLayer, Identity>>>;
 pub type RuntimeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

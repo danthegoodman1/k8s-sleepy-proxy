@@ -79,7 +79,7 @@ impl<C> StoreBackedOperatorApi<C> {
 pub type OperatorGrpcService = OperatorControlPlaneServer<OperatorApiPlaceholder>;
 pub type StoreBackedOperatorGrpcService<C> = OperatorControlPlaneServer<StoreBackedOperatorApi<C>>;
 pub type OperatorGrpcWebServerBuilder =
-    Server<Stack<CorsLayer, Stack<tonic_web::GrpcWebLayer, Identity>>>;
+    Server<Stack<tonic_web::GrpcWebLayer, Stack<CorsLayer, Identity>>>;
 
 pub fn operator_grpc_service() -> OperatorGrpcService {
     OperatorControlPlaneServer::new(OperatorApiPlaceholder::new())
@@ -103,8 +103,8 @@ pub fn operator_grpc_server_builder() -> Server {
 pub fn operator_grpc_web_server_builder() -> OperatorGrpcWebServerBuilder {
     Server::builder()
         .accept_http1(true)
-        .layer(tonic_web::GrpcWebLayer::new())
         .layer(operator_grpc_web_cors_layer())
+        .layer(tonic_web::GrpcWebLayer::new())
 }
 
 pub fn operator_grpc_web_cors_layer() -> CorsLayer {
