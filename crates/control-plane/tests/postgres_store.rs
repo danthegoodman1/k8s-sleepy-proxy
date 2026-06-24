@@ -5,7 +5,8 @@ use std::{
 };
 
 use control_plane::materialization::{
-    LoadActiveMaterializationRequest, LoadMaterializationRequest, LoadReadyMaterializationRequest,
+    LoadActiveMaterializationRequest, LoadMaterializationOperationalMetricsRequest,
+    LoadMaterializationRequest, LoadReadyMaterializationRequest,
 };
 use control_plane::{
     render_manifests, BackendEndpoint, BackendGeneration, BeginSleepRequest,
@@ -1226,6 +1227,24 @@ async fn exercise_exclusivity_keys(
     assert_eq!(owner_materialization.exclusivity_keys, expected_owner_keys);
     let owner_record = store.record_materialization(owner_materialization).await?;
     assert_eq!(owner_record.exclusivity_keys, expected_owner_keys);
+    let operational_metrics = store
+        .load_materialization_operational_metrics(
+            LoadMaterializationOperationalMetricsRequest::new(SystemTime::now()),
+        )
+        .await?;
+    let pending_metrics = operational_metrics
+        .backlog_states
+        .iter()
+        .find(|state| state.state == MaterializationState::Pending)
+        .expect("pending operational metrics are grouped by state");
+    assert!(pending_metrics.count >= 1);
+    assert!(pending_metrics.oldest_age.is_some());
+    let pending_key_metrics = operational_metrics
+        .held_key_states
+        .iter()
+        .find(|state| state.state == MaterializationState::Pending)
+        .expect("pending held-key metrics are grouped by state");
+    assert!(pending_key_metrics.exclusivity_keys_held >= 2);
 
     let stale_record = RecordMaterializationRequest::new(
         owner.instance.id.clone(),
@@ -1371,6 +1390,24 @@ async fn exercise_exclusivity_keys(
         completed.materialization.exclusivity_keys,
         expected_owner_keys
     );
+    let ready_operational_metrics = store
+        .load_materialization_operational_metrics(
+            LoadMaterializationOperationalMetricsRequest::new(SystemTime::now()),
+        )
+        .await?;
+    assert!(
+        ready_operational_metrics
+            .backlog_states
+            .iter()
+            .all(|state| state.state != MaterializationState::Ready),
+        "ready materializations must not be counted as backlog"
+    );
+    let ready_key_metrics = ready_operational_metrics
+        .held_key_states
+        .iter()
+        .find(|state| state.state == MaterializationState::Ready)
+        .expect("ready held-key metrics are grouped by state");
+    assert!(ready_key_metrics.exclusivity_keys_held >= 2);
 
     let begin = store
         .begin_sleep(BeginSleepRequest::new(

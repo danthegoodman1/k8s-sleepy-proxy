@@ -93,6 +93,30 @@ pub struct ListMaterializationReconciliationCandidatesRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadMaterializationOperationalMetricsRequest {
+    pub now: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationOperationalMetrics {
+    pub backlog_states: Vec<MaterializationBacklogOperationalMetrics>,
+    pub held_key_states: Vec<MaterializationHeldKeysOperationalMetrics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationBacklogOperationalMetrics {
+    pub state: MaterializationState,
+    pub count: u64,
+    pub oldest_age: Option<std::time::Duration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationHeldKeysOperationalMetrics {
+    pub state: MaterializationState,
+    pub exclusivity_keys_held: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimMaterializationReconciliationRequest {
     pub materialization_id: MaterializationId,
     pub owner: String,
@@ -313,6 +337,47 @@ impl ListMaterializationReconciliationCandidatesRequest {
     }
 }
 
+impl LoadMaterializationOperationalMetricsRequest {
+    pub fn new(now: SystemTime) -> Self {
+        Self { now }
+    }
+}
+
+impl MaterializationOperationalMetrics {
+    pub fn new(
+        backlog_states: Vec<MaterializationBacklogOperationalMetrics>,
+        held_key_states: Vec<MaterializationHeldKeysOperationalMetrics>,
+    ) -> Self {
+        Self {
+            backlog_states,
+            held_key_states,
+        }
+    }
+}
+
+impl MaterializationBacklogOperationalMetrics {
+    pub fn new(
+        state: MaterializationState,
+        count: u64,
+        oldest_age: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            state,
+            count,
+            oldest_age,
+        }
+    }
+}
+
+impl MaterializationHeldKeysOperationalMetrics {
+    pub fn new(state: MaterializationState, exclusivity_keys_held: u64) -> Self {
+        Self {
+            state,
+            exclusivity_keys_held,
+        }
+    }
+}
+
 impl ClaimMaterializationReconciliationRequest {
     pub fn new(
         materialization_id: MaterializationId,
@@ -461,6 +526,26 @@ impl MaterializationTarget {
 
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+}
+
+impl MaterializationState {
+    pub const BACKLOG_STATES: &'static [Self] = &[Self::Pending, Self::Deleting];
+    pub const HELD_KEY_STATES: &'static [Self] =
+        &[Self::Pending, Self::Ready, Self::Failed, Self::Deleting];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+            Self::Deleting => "deleting",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub const fn metric_label(self) -> proxy_core::observability::metrics::MetricLabel {
+        proxy_core::observability::metrics::MetricLabel::state(self.as_str())
     }
 }
 

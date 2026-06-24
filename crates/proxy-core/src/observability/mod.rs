@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub mod metrics;
+pub mod prometheus;
 pub mod recorder;
 pub mod trace;
 
@@ -51,6 +52,9 @@ pub enum Operation {
     Materialize,
     Http01Resolve,
     ReportIdle,
+    Apply,
+    Delete,
+    Readiness,
 }
 
 /// Generic low-cardinality operation outcomes.
@@ -136,6 +140,9 @@ impl Operation {
         Self::Materialize,
         Self::Http01Resolve,
         Self::ReportIdle,
+        Self::Apply,
+        Self::Delete,
+        Self::Readiness,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -155,6 +162,9 @@ impl Operation {
             Self::Materialize => "materialize",
             Self::Http01Resolve => "http01_resolve",
             Self::ReportIdle => "report_idle",
+            Self::Apply => "apply",
+            Self::Delete => "delete",
+            Self::Readiness => "readiness",
         }
     }
 }
@@ -353,7 +363,10 @@ mod tests {
                 "wake_instance",
                 "materialize",
                 "http01_resolve",
-                "report_idle"
+                "report_idle",
+                "apply",
+                "delete",
+                "readiness"
             ]
         );
         assert_eq!(

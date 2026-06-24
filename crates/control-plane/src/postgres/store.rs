@@ -14,7 +14,8 @@ use crate::{
         FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
         ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
-        LoadMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
+        LoadMaterializationOperationalMetricsRequest, LoadMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
         RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
@@ -161,6 +162,15 @@ impl ControlPlaneStore for PostgresStore {
     ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
         Box::pin(async move {
             materialization_ops::list_materialization_reconciliation_candidates(self, request).await
+        })
+    }
+
+    fn load_materialization_operational_metrics<'a>(
+        &'a self,
+        request: LoadMaterializationOperationalMetricsRequest,
+    ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>> {
+        Box::pin(async move {
+            materialization_ops::load_materialization_operational_metrics(self, request).await
         })
     }
 

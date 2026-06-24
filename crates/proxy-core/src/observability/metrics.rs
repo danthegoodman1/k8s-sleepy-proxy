@@ -55,6 +55,18 @@ pub const RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME: &str =
 pub const RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL_NAME: &str =
     "sleepypods_runtime_subscribe_stream_events_total";
 pub const RUNTIME_WAKE_LATENCY_SECONDS_NAME: &str = "sleepypods_runtime_wake_latency_seconds";
+pub const RECONCILER_RUNS_TOTAL_NAME: &str = "sleepypods_reconciler_runs_total";
+pub const RECONCILER_RUN_DURATION_SECONDS_NAME: &str = "sleepypods_reconciler_run_duration_seconds";
+pub const RECONCILER_CANDIDATES_TOTAL_NAME: &str = "sleepypods_reconciler_candidates_total";
+pub const RECONCILER_CLAIMS_TOTAL_NAME: &str = "sleepypods_reconciler_claims_total";
+pub const RECONCILER_LEASE_RENEWALS_TOTAL_NAME: &str = "sleepypods_reconciler_lease_renewals_total";
+pub const MATERIALIZATIONS_NONTERMINAL_NAME: &str = "sleepypods_materializations_nonterminal";
+pub const MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS_NAME: &str =
+    "sleepypods_materialization_oldest_nonterminal_age_seconds";
+pub const EXCLUSIVITY_KEYS_HELD_NAME: &str = "sleepypods_exclusivity_keys_held";
+pub const KUBERNETES_OPERATIONS_TOTAL_NAME: &str = "sleepypods_kubernetes_operations_total";
+pub const KUBERNETES_OPERATION_DURATION_SECONDS_NAME: &str =
+    "sleepypods_kubernetes_operation_duration_seconds";
 
 const PROTOCOL_LABELS: &[LabelKey] = &[LabelKey::Protocol];
 const PROTOCOL_OUTCOME_LABELS: &[LabelKey] = &[LabelKey::Protocol, LabelKey::Outcome];
@@ -186,6 +198,86 @@ pub const RUNTIME_WAKE_LATENCY_SECONDS: MetricDescriptor = MetricDescriptor::new
     OUTCOME_LABELS,
 );
 
+pub const RECONCILER_RUNS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RECONCILER_RUNS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("runs"),
+    "Materialization reconciler loop runs grouped by bounded outcome.",
+    OUTCOME_LABELS,
+);
+
+pub const RECONCILER_RUN_DURATION_SECONDS: MetricDescriptor = MetricDescriptor::new(
+    RECONCILER_RUN_DURATION_SECONDS_NAME,
+    MetricKind::Histogram,
+    Some("seconds"),
+    "Duration of one materialization reconciler pass.",
+    OUTCOME_LABELS,
+);
+
+pub const RECONCILER_CANDIDATES_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RECONCILER_CANDIDATES_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("candidates"),
+    "Materialization rows selected as reconciliation candidates.",
+    &[LabelKey::State],
+);
+
+pub const RECONCILER_CLAIMS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RECONCILER_CLAIMS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("claims"),
+    "Materialization reconciliation lease claim outcomes by candidate state.",
+    STATE_OUTCOME_LABELS,
+);
+
+pub const RECONCILER_LEASE_RENEWALS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    RECONCILER_LEASE_RENEWALS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("renewals"),
+    "Materialization reconciliation lease renewal outcomes.",
+    OUTCOME_LABELS,
+);
+
+pub const MATERIALIZATIONS_NONTERMINAL: MetricDescriptor = MetricDescriptor::new(
+    MATERIALIZATIONS_NONTERMINAL_NAME,
+    MetricKind::Gauge,
+    Some("materializations"),
+    "Current non-terminal materializations grouped by bounded state.",
+    &[LabelKey::State],
+);
+
+pub const MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS: MetricDescriptor = MetricDescriptor::new(
+    MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS_NAME,
+    MetricKind::Gauge,
+    Some("seconds"),
+    "Age of the oldest non-terminal materialization grouped by bounded state.",
+    &[LabelKey::State],
+);
+
+pub const EXCLUSIVITY_KEYS_HELD: MetricDescriptor = MetricDescriptor::new(
+    EXCLUSIVITY_KEYS_HELD_NAME,
+    MetricKind::Gauge,
+    Some("keys"),
+    "Rendered exclusivity keys held by non-terminal materializations.",
+    &[LabelKey::State],
+);
+
+pub const KUBERNETES_OPERATIONS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    KUBERNETES_OPERATIONS_TOTAL_NAME,
+    MetricKind::Counter,
+    Some("operations"),
+    "Controller Kubernetes apply, delete, and readiness operation outcomes.",
+    OPERATION_OUTCOME_LABELS,
+);
+
+pub const KUBERNETES_OPERATION_DURATION_SECONDS: MetricDescriptor = MetricDescriptor::new(
+    KUBERNETES_OPERATION_DURATION_SECONDS_NAME,
+    MetricKind::Histogram,
+    Some("seconds"),
+    "Controller Kubernetes apply, delete, and readiness operation duration.",
+    OPERATION_OUTCOME_LABELS,
+);
+
 pub const ALL_METRICS: &[MetricDescriptor] = &[
     PROXY_ACTIVE_STREAMS,
     PROXY_ADMISSION_DECISIONS_TOTAL,
@@ -202,6 +294,16 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
     RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
     RUNTIME_WAKE_LATENCY_SECONDS,
+    RECONCILER_RUNS_TOTAL,
+    RECONCILER_RUN_DURATION_SECONDS,
+    RECONCILER_CANDIDATES_TOTAL,
+    RECONCILER_CLAIMS_TOTAL,
+    RECONCILER_LEASE_RENEWALS_TOTAL,
+    MATERIALIZATIONS_NONTERMINAL,
+    MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS,
+    EXCLUSIVITY_KEYS_HELD,
+    KUBERNETES_OPERATIONS_TOTAL,
+    KUBERNETES_OPERATION_DURATION_SECONDS,
 ];
 
 impl LabelKey {
@@ -283,6 +385,10 @@ impl MetricLabel {
 
     pub const fn value(self) -> &'static str {
         self.value
+    }
+
+    pub const fn state(value: &'static str) -> Self {
+        Self::new(LabelKey::State, value)
     }
 }
 
@@ -423,6 +529,66 @@ mod tests {
                 MetricKind::Histogram,
                 Some("seconds"),
                 &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_reconciler_runs_total",
+                MetricKind::Counter,
+                Some("runs"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_reconciler_run_duration_seconds",
+                MetricKind::Histogram,
+                Some("seconds"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_reconciler_candidates_total",
+                MetricKind::Counter,
+                Some("candidates"),
+                &[LabelKey::State],
+            ),
+            (
+                "sleepypods_reconciler_claims_total",
+                MetricKind::Counter,
+                Some("claims"),
+                &[LabelKey::State, LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_reconciler_lease_renewals_total",
+                MetricKind::Counter,
+                Some("renewals"),
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_materializations_nonterminal",
+                MetricKind::Gauge,
+                Some("materializations"),
+                &[LabelKey::State],
+            ),
+            (
+                "sleepypods_materialization_oldest_nonterminal_age_seconds",
+                MetricKind::Gauge,
+                Some("seconds"),
+                &[LabelKey::State],
+            ),
+            (
+                "sleepypods_exclusivity_keys_held",
+                MetricKind::Gauge,
+                Some("keys"),
+                &[LabelKey::State],
+            ),
+            (
+                "sleepypods_kubernetes_operations_total",
+                MetricKind::Counter,
+                Some("operations"),
+                &[LabelKey::Operation, LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_kubernetes_operation_duration_seconds",
+                MetricKind::Histogram,
+                Some("seconds"),
+                &[LabelKey::Operation, LabelKey::Outcome],
             ),
         ];
 

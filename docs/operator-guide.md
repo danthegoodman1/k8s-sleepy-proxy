@@ -296,6 +296,7 @@ Important environment variables:
 | control plane | `SLEEPYPODS_STORE_PROVIDER=postgres` |
 | control plane | `SLEEPYPODS_POSTGRES_URL` |
 | control plane | `SLEEPYPODS_CLUSTER_ID`, `SLEEPYPODS_NAMESPACE` |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 | frontline | `SLEEPYPODS_FRONTLINE_LISTEN_ADDR` |
 | frontline | `SLEEPYPODS_CONTROL_PLANE_ENDPOINT` |
 | frontline | `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN` when control-plane static auth is enabled |
@@ -305,7 +306,9 @@ Important environment variables:
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` as `sni|cert|key;...` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
+| frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 | sidecar | rendered by the control plane: listen address, app port, instance ID, generation, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
+| sidecar | `SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 
 Kubernetes permissions must allow the control plane service account to
 server-side apply and delete rendered Deployments, StatefulSets, Services, PVs,
@@ -327,5 +330,7 @@ running instances have moved through the intended class-version upgrade path.
 - Rich route predicates beyond host/SNI and optional HTTP path prefix are
   deferred.
 - Generated examples are illustrative request shapes until a CLI exists.
-- Metrics are emitted as structured observations today; a Prometheus exporter is
-  not currently shipped.
+- Prometheus metrics are intentionally limited to low-cardinality runtime,
+  proxy, reconciler, materialization backlog, held-key, and Kubernetes
+  controller-operation metrics. Use Kubernetes/container telemetry for CPU,
+  memory, restarts, pod scheduling, network, and filesystem metrics.

@@ -16,7 +16,8 @@ use crate::{
         FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
         ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
-        LoadMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
+        LoadMaterializationOperationalMetricsRequest, LoadMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
         RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
@@ -177,6 +178,14 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
         let _ = request;
         unsupported_store_method("list_materialization_reconciliation_candidates")
+    }
+
+    fn load_materialization_operational_metrics<'a>(
+        &'a self,
+        request: LoadMaterializationOperationalMetricsRequest,
+    ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>> {
+        let _ = request;
+        unsupported_store_method("load_materialization_operational_metrics")
     }
 
     fn claim_materialization_reconciliation<'a>(
@@ -531,6 +540,15 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
             store.list_materialization_reconciliation_candidates(request.clone())
+        })
+    }
+
+    fn load_materialization_operational_metrics<'a>(
+        &'a self,
+        request: LoadMaterializationOperationalMetricsRequest,
+    ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.load_materialization_operational_metrics(request.clone())
         })
     }
 

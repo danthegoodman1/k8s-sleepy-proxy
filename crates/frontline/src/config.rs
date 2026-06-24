@@ -32,6 +32,7 @@ const DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const TLS_TERMINATION_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR";
 const TLS_TERMINATION_CERTS: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS";
 const TLS_PASSTHROUGH_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR";
+const METRICS_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontlineEnvConfig {
@@ -42,6 +43,7 @@ pub struct FrontlineEnvConfig {
     control_plane_operator_token: Option<BearerToken>,
     route_cache_capacity: usize,
     drain_grace_timeout: Duration,
+    metrics_listen_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +153,8 @@ impl FrontlineEnvConfig {
             optional_tls_termination_listener_config(&vars, TLS_TERMINATION_LISTEN_ADDR)?;
         let tls_passthrough = optional_listener_config(&vars, TLS_PASSTHROUGH_LISTEN_ADDR)?
             .map(|listener| FrontlineTlsPassthroughListenerConfig::new(listener.listen_addr()));
+        let metrics_listen_addr = optional_listener_config(&vars, METRICS_LISTEN_ADDR)?
+            .map(|listener| listener.listen_addr());
         let tls_certificates = optional_tls_certificates(&vars, tls_termination.is_some())?;
         let listeners =
             FrontlineListenersConfig::new(FrontlineHttpListenerConfig::new(listen_addr))
@@ -165,6 +169,7 @@ impl FrontlineEnvConfig {
             control_plane_operator_token,
             route_cache_capacity,
             drain_grace_timeout,
+            metrics_listen_addr,
         })
     }
 
@@ -230,6 +235,10 @@ impl FrontlineEnvConfig {
 
     pub fn drain_grace_timeout(&self) -> Duration {
         self.drain_grace_timeout
+    }
+
+    pub fn metrics_listen_addr(&self) -> Option<SocketAddr> {
+        self.metrics_listen_addr
     }
 }
 
@@ -568,6 +577,7 @@ mod tests {
         );
         assert!(config.tls_termination_listener().is_none());
         assert!(config.tls_passthrough_listener().is_none());
+        assert_eq!(config.metrics_listen_addr(), None);
         assert!(config.tls_certificates().is_empty());
         assert!(config
             .load_tls_certificate_store()
@@ -584,6 +594,7 @@ mod tests {
             (CONTROL_PLANE_OPERATOR_TOKEN, "operator-secret"),
             (ROUTE_CACHE_CAPACITY, "17"),
             (DRAIN_GRACE_TIMEOUT_MS, "250"),
+            (METRICS_LISTEN_ADDR, "127.0.0.1:19091"),
         ])
         .expect("config parses");
 
@@ -609,6 +620,10 @@ mod tests {
         );
         assert_eq!(config.route_cache_capacity(), 17);
         assert_eq!(config.drain_grace_timeout(), Duration::from_millis(250));
+        assert_eq!(
+            config.metrics_listen_addr(),
+            Some("127.0.0.1:19091".parse().expect("socket address"))
+        );
     }
 
     #[test]

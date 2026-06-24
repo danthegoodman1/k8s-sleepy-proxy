@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use deadpool_postgres::GenericClient;
 
 use crate::{
@@ -10,8 +12,10 @@ use crate::{
         FinalizeSleepReconciliationRequest, FinalizeSleepRequest, FinalizeSleepResult,
         ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
         ForceReleaseExclusivityKeyResult, ListMaterializationReconciliationCandidatesRequest,
-        LoadActiveMaterializationRequest, LoadMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationRecord, MaterializationState,
+        LoadActiveMaterializationRequest, LoadMaterializationOperationalMetricsRequest,
+        LoadMaterializationRequest, LoadReadyMaterializationRequest,
+        MaterializationBacklogOperationalMetrics, MaterializationHeldKeysOperationalMetrics,
+        MaterializationOperationalMetrics, MaterializationRecord, MaterializationState,
         RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
@@ -23,8 +27,8 @@ use super::{
     error::map_postgres_error,
     mapping::{
         backend_generation_to_i64, generation_to_i64, instance_from_row, instance_state_to_db,
-        materialization_from_row, materialization_id, materialization_state_to_db,
-        rendered_exclusivity_keys_to_json, rendered_objects_to_json,
+        materialization_from_row, materialization_id, materialization_state_from_db,
+        materialization_state_to_db, rendered_exclusivity_keys_to_json, rendered_objects_to_json,
     },
 };
 
@@ -379,6 +383,77 @@ pub(crate) async fn list_materialization_reconciliation_candidates(
         .map_err(map_postgres_error)?;
 
     rows.iter().map(materialization_from_row).collect()
+}
+
+pub(crate) async fn load_materialization_operational_metrics(
+    store: &PostgresStore,
+    request: LoadMaterializationOperationalMetricsRequest,
+) -> StoreResult<MaterializationOperationalMetrics> {
+    let client = store.client().await?;
+    let now = unix_millis_from_system_time(request.now).map_err(StoreError::invalid_argument)?;
+    let backlog_rows = client
+        .query(
+            "
+            SELECT state,
+                COUNT(*)::bigint AS backlog_count,
+                MIN(updated_at_unix_millis) AS oldest_updated_at_unix_millis
+            FROM materializations
+            WHERE state IN ('pending', 'deleting')
+            GROUP BY state
+            ORDER BY state
+            ",
+            &[],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let held_key_rows = client
+        .query(
+            "
+            SELECT state,
+                COALESCE(SUM(jsonb_array_length(exclusivity_keys)), 0)::bigint
+                    AS exclusivity_keys_held
+            FROM materializations
+            WHERE state <> 'deleted'
+            GROUP BY state
+            ORDER BY state
+            ",
+            &[],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let mut backlog_states = Vec::with_capacity(backlog_rows.len());
+    for row in backlog_rows {
+        let state: String = row.get("state");
+        let backlog_count: i64 = row.get("backlog_count");
+        let oldest_updated_at_unix_millis: i64 = row.get("oldest_updated_at_unix_millis");
+        let age = now.saturating_sub(oldest_updated_at_unix_millis).max(0);
+        backlog_states.push(MaterializationBacklogOperationalMetrics::new(
+            materialization_state_from_db(&state)?,
+            u64::try_from(backlog_count)
+                .map_err(|_| StoreError::internal("materialization backlog count was negative"))?,
+            Some(Duration::from_millis(u64::try_from(age).map_err(|_| {
+                StoreError::internal("materialization oldest age was negative")
+            })?)),
+        ));
+    }
+
+    let mut held_key_states = Vec::with_capacity(held_key_rows.len());
+    for row in held_key_rows {
+        let state: String = row.get("state");
+        let exclusivity_keys_held: i64 = row.get("exclusivity_keys_held");
+        held_key_states.push(MaterializationHeldKeysOperationalMetrics::new(
+            materialization_state_from_db(&state)?,
+            u64::try_from(exclusivity_keys_held)
+                .map_err(|_| StoreError::internal("exclusivity key count was negative"))?,
+        ));
+    }
+
+    Ok(MaterializationOperationalMetrics::new(
+        backlog_states,
+        held_key_states,
+    ))
 }
 
 pub(crate) async fn claim_materialization_reconciliation(

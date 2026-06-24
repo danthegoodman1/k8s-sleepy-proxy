@@ -12,7 +12,13 @@ use frontline::{
     FrontlineRouteResolver, FrontlineTlsAdapter, GrpcOperatorHttp01Resolver,
     GrpcProxyControlPlaneClient, TlsCertificateStore, WakeTracker,
 };
-use proxy_core::{observability::recorder::ObservabilityRecorder, DrainTracker, Shutdown};
+use proxy_core::{
+    observability::{
+        prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
+        recorder::{CompositeObservabilitySink, ObservabilityRecorder, StderrObservabilitySink},
+    },
+    DrainTracker, Shutdown,
+};
 use tokio::time::{sleep, Instant};
 use tonic::transport::Endpoint;
 
@@ -29,9 +35,9 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     control_plane::install_rustls_crypto_provider();
-    let _ = ObservabilityRecorder::install_stderr_global();
-    let observability = ObservabilityRecorder::global();
     let env = FrontlineEnvConfig::from_env()?;
+    let prometheus = install_runtime_observability(env.metrics_listen_addr().is_some());
+    let observability = ObservabilityRecorder::global();
     let tls_certificates = env
         .load_tls_certificate_store()?
         .unwrap_or_else(TlsCertificateStore::new);
@@ -80,15 +86,52 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    serve_frontline(
-        env.listeners(),
-        runtime,
-        FrontlineTlsAdapter::new(tls_certificates),
-        shutdown,
-    )
-    .await?;
+    if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr(), prometheus) {
+        let metrics_shutdown = shutdown.clone();
+        tokio::try_join!(
+            async {
+                serve_frontline(
+                    env.listeners(),
+                    runtime,
+                    FrontlineTlsAdapter::new(tls_certificates),
+                    shutdown,
+                )
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            },
+            async {
+                serve_prometheus_metrics(metrics_addr, prometheus, metrics_shutdown.cancelled())
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            },
+        )?;
+    } else {
+        serve_frontline(
+            env.listeners(),
+            runtime,
+            FrontlineTlsAdapter::new(tls_certificates),
+            shutdown,
+        )
+        .await?;
+    }
 
     Ok(())
+}
+
+fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
+    if !metrics_enabled {
+        let _ = ObservabilityRecorder::install_stderr_global();
+        return None;
+    }
+
+    let prometheus = PrometheusMetricsSink::new();
+    let _ = ObservabilityRecorder::install_global(std::sync::Arc::new(
+        CompositeObservabilitySink::new(vec![
+            std::sync::Arc::new(StderrObservabilitySink),
+            std::sync::Arc::new(prometheus.clone()),
+        ]),
+    ));
+    Some(prometheus)
 }
 
 async fn connect_control_plane(

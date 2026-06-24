@@ -613,7 +613,7 @@ fn instance_state_from_db(value: &str) -> StoreResult<InstanceState> {
     }
 }
 
-fn materialization_state_from_db(value: &str) -> StoreResult<MaterializationState> {
+pub(crate) fn materialization_state_from_db(value: &str) -> StoreResult<MaterializationState> {
     match value {
         "pending" => Ok(MaterializationState::Pending),
         "ready" => Ok(MaterializationState::Ready),

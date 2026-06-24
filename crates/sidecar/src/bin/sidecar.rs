@@ -1,10 +1,16 @@
-use std::{env, error::Error, process, time::Duration};
+use std::{env, error::Error, net::SocketAddr, process, time::Duration};
 
 use control_plane::{
     api::pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken,
     OptionalBearerTokenInterceptor,
 };
-use proxy_core::{observability::recorder::ObservabilityRecorder, Shutdown};
+use proxy_core::{
+    observability::{
+        prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
+        recorder::{CompositeObservabilitySink, ObservabilityRecorder, StderrObservabilitySink},
+    },
+    Shutdown,
+};
 use sidecar::{
     runtime::{serve_http_with_idle, serve_tcp_with_idle, SidecarRuntimeConfig},
     GrpcSidecarControlPlaneClient, IdleReportConfig,
@@ -22,8 +28,8 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     control_plane::install_rustls_crypto_provider();
-    let _ = ObservabilityRecorder::install_stderr_global();
     let env = EnvConfig::from_env()?;
+    let prometheus = install_runtime_observability(env.metrics_listen_addr.is_some());
     let channel = Endpoint::from_shared(env.control_plane_endpoint.clone())?
         .connect()
         .await?;
@@ -36,12 +42,51 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let shutdown = Shutdown::new();
     let _shutdown_task = spawn_shutdown_signal(shutdown.clone())?;
 
-    match env.runtime_mode {
-        SidecarRuntimeMode::Http => serve_http_with_idle(env.runtime, client, shutdown).await?,
-        SidecarRuntimeMode::Tcp => serve_tcp_with_idle(env.runtime, client, shutdown).await?,
+    if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr, prometheus) {
+        let metrics_shutdown = shutdown.clone();
+        let runtime = env.runtime;
+        let runtime_mode = env.runtime_mode;
+        tokio::try_join!(
+            async {
+                match runtime_mode {
+                    SidecarRuntimeMode::Http => serve_http_with_idle(runtime, client, shutdown)
+                        .await
+                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>),
+                    SidecarRuntimeMode::Tcp => serve_tcp_with_idle(runtime, client, shutdown)
+                        .await
+                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>),
+                }
+            },
+            async {
+                serve_prometheus_metrics(metrics_addr, prometheus, metrics_shutdown.cancelled())
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+            },
+        )?;
+    } else {
+        match env.runtime_mode {
+            SidecarRuntimeMode::Http => serve_http_with_idle(env.runtime, client, shutdown).await?,
+            SidecarRuntimeMode::Tcp => serve_tcp_with_idle(env.runtime, client, shutdown).await?,
+        }
     }
 
     Ok(())
+}
+
+fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
+    if !metrics_enabled {
+        let _ = ObservabilityRecorder::install_stderr_global();
+        return None;
+    }
+
+    let prometheus = PrometheusMetricsSink::new();
+    let _ = ObservabilityRecorder::install_global(std::sync::Arc::new(
+        CompositeObservabilitySink::new(vec![
+            std::sync::Arc::new(StderrObservabilitySink),
+            std::sync::Arc::new(prometheus.clone()),
+        ]),
+    ));
+    Some(prometheus)
 }
 
 #[cfg(unix)]
@@ -81,6 +126,7 @@ struct EnvConfig {
     runtime_mode: SidecarRuntimeMode,
     control_plane_endpoint: String,
     control_plane_sidecar_token: Option<BearerToken>,
+    metrics_listen_addr: Option<SocketAddr>,
 }
 
 impl EnvConfig {
@@ -96,6 +142,7 @@ impl EnvConfig {
         let retry_backoff = duration_from_env_ms("SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", 5_000)?;
         let drain_grace_timeout =
             duration_from_env_ms("SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS", 30_000)?;
+        let metrics_listen_addr = optional_socket_addr("SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR")?;
         let runtime_mode = SidecarRuntimeMode::from_env()?;
         let idle_report = IdleReportConfig::new(idle_timeout, retry_backoff)?;
         let runtime = SidecarRuntimeConfig::new(
@@ -112,6 +159,7 @@ impl EnvConfig {
             runtime_mode,
             control_plane_endpoint,
             control_plane_sidecar_token,
+            metrics_listen_addr,
         })
     }
 }
@@ -165,6 +213,29 @@ fn duration_from_env_ms(
     Ok(Duration::from_millis(value))
 }
 
+fn optional_socket_addr(
+    name: &'static str,
+) -> Result<Option<SocketAddr>, Box<dyn Error + Send + Sync>> {
+    match env::var(name) {
+        Ok(value) => parse_optional_socket_addr_value(name, Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+fn parse_optional_socket_addr_value(
+    _name: &'static str,
+    value: Option<String>,
+) -> Result<Option<SocketAddr>, Box<dyn Error + Send + Sync>> {
+    value
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+        })
+        .transpose()
+}
+
 #[derive(Debug)]
 struct MissingEnvVar(&'static str);
 
@@ -190,3 +261,38 @@ impl std::fmt::Display for InvalidSidecarRuntimeMode {
 }
 
 impl Error for InvalidSidecarRuntimeMode {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_listener_value_is_optional() {
+        assert_eq!(
+            parse_optional_socket_addr_value("SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR", None)
+                .expect("missing value is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn metrics_listener_value_parses_socket_addr() {
+        assert_eq!(
+            parse_optional_socket_addr_value(
+                "SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR",
+                Some("127.0.0.1:19092".to_owned()),
+            )
+            .expect("socket address parses"),
+            Some("127.0.0.1:19092".parse().expect("socket address"))
+        );
+    }
+
+    #[test]
+    fn metrics_listener_value_rejects_invalid_socket_addr() {
+        assert!(parse_optional_socket_addr_value(
+            "SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR",
+            Some("localhost".to_owned()),
+        )
+        .is_err());
+    }
+}

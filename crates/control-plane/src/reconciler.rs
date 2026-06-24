@@ -1,11 +1,16 @@
 use std::{
     cmp, fmt,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use proxy_core::observability::{
-    metrics::RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
+    metrics::{
+        KUBERNETES_OPERATIONS_TOTAL, KUBERNETES_OPERATION_DURATION_SECONDS,
+        RECONCILER_CANDIDATES_TOTAL, RECONCILER_CLAIMS_TOTAL, RECONCILER_LEASE_RENEWALS_TOTAL,
+        RECONCILER_RUNS_TOTAL, RECONCILER_RUN_DURATION_SECONDS,
+        RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
+    },
     recorder::{
         LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
         EVENT_MATERIALIZATION_FAILURE,
@@ -19,11 +24,12 @@ use crate::{
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
     manifest::{render_manifests_with_options, RenderManifestOptions, RenderManifestRequest},
     materialization::{
-        ClaimMaterializationReconciliationRequest, CompleteWakeReconciliationRequest,
-        CompleteWakeRequest, DeleteMaterializationReconciliationRequest,
-        FinalizeSleepReconciliationRequest, FinalizeSleepRequest,
-        ListMaterializationReconciliationCandidatesRequest, MaterializationRecord,
-        MaterializationState, ReleaseMaterializationReconciliationLeaseRequest,
+        BackendEndpoint, ClaimMaterializationReconciliationRequest,
+        CompleteWakeReconciliationRequest, CompleteWakeRequest,
+        DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
+        FinalizeSleepRequest, ListMaterializationReconciliationCandidatesRequest,
+        MaterializationRecord, MaterializationState,
+        ReleaseMaterializationReconciliationLeaseRequest, RenderedObjectRef,
         RenewMaterializationReconciliationLeaseRequest,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
@@ -105,6 +111,7 @@ where
     }
 
     pub async fn run_once(&self) {
+        let started = Instant::now();
         let now = SystemTime::now();
         let candidates = match self
             .store
@@ -118,6 +125,7 @@ where
         {
             Ok(candidates) => candidates,
             Err(error) => {
+                self.record_reconciler_run(Outcome::Error, started.elapsed());
                 self.record_outcome("scan", Outcome::Error, Some(&error.to_string()));
                 return;
             }
@@ -126,6 +134,7 @@ where
         let concurrency = cmp::max(1, self.config.concurrency_limit);
         let mut join_set = JoinSet::new();
         for candidate in candidates {
+            self.record_candidate(candidate.state);
             while join_set.len() >= concurrency {
                 let _ = join_set.join_next().await;
             }
@@ -135,6 +144,7 @@ where
             });
         }
         while join_set.join_next().await.is_some() {}
+        self.record_reconciler_run(Outcome::Success, started.elapsed());
     }
 
     pub async fn reconcile_materialization(&self, materialization: MaterializationRecord) {
@@ -142,6 +152,7 @@ where
     }
 
     async fn claim_and_reconcile(&self, candidate: MaterializationRecord) {
+        let candidate_state = candidate.state;
         let lease_expires_at = SystemTime::now() + self.config.lease_ttl;
         let claimed = match self
             .store
@@ -153,12 +164,17 @@ where
             ))
             .await
         {
-            Ok(Some(claimed)) => claimed,
+            Ok(Some(claimed)) => {
+                self.record_claim(candidate_state, Outcome::Success);
+                claimed
+            }
             Ok(None) => {
+                self.record_claim(candidate_state, Outcome::Rejected);
                 self.record_outcome("claim", Outcome::Rejected, None);
                 return;
             }
             Err(error) => {
+                self.record_claim(candidate_state, Outcome::Error);
                 self.record_outcome("claim", Outcome::Error, Some(&error.to_string()));
                 return;
             }
@@ -229,15 +245,10 @@ where
             return Err(MaterializationReconcileError::StaleDesiredRefs);
         }
 
-        self.materializer
-            .apply_manifest(&manifest)
-            .await
-            .map_err(MaterializationReconcileError::Materializer)?;
+        self.apply_manifest_observed(&manifest).await?;
         let backend = self
-            .materializer
-            .wait_for_readiness(&materialization.rendered_objects)
-            .await
-            .map_err(MaterializationReconcileError::Materializer)?;
+            .wait_for_readiness_observed(&materialization.rendered_objects)
+            .await?;
         self.renew_or_lose(&materialization).await?;
 
         let mut complete = CompleteWakeRequest::new(
@@ -264,10 +275,8 @@ where
         &self,
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        self.materializer
-            .delete_rendered_objects(&materialization.rendered_objects)
-            .await
-            .map_err(MaterializationReconcileError::Materializer)?;
+        self.delete_rendered_objects_observed(&materialization.rendered_objects)
+            .await?;
         self.renew_or_lose(&materialization).await?;
 
         let Some(instance) = self
@@ -297,10 +306,8 @@ where
         &self,
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        self.materializer
-            .delete_rendered_objects(&materialization.rendered_objects)
-            .await
-            .map_err(MaterializationReconcileError::Materializer)?;
+        self.delete_rendered_objects_observed(&materialization.rendered_objects)
+            .await?;
         self.renew_or_lose(&materialization).await?;
         self.mark_deleted(materialization).await
     }
@@ -327,7 +334,7 @@ where
         &self,
         materialization: &MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        let renewed = self
+        let renewed = match self
             .store
             .renew_materialization_reconciliation_lease(
                 RenewMaterializationReconciliationLeaseRequest::new(
@@ -337,12 +344,67 @@ where
                 ),
             )
             .await
-            .map_err(MaterializationReconcileError::Store)?;
+        {
+            Ok(renewed) => renewed,
+            Err(error) => {
+                self.record_lease_renewal(Outcome::Error);
+                return Err(MaterializationReconcileError::Store(error));
+            }
+        };
         if renewed {
+            self.record_lease_renewal(Outcome::Success);
             Ok(())
         } else {
+            self.record_lease_renewal(Outcome::Rejected);
             Err(MaterializationReconcileError::LeaseLost)
         }
+    }
+
+    async fn apply_manifest_observed(
+        &self,
+        manifest: &crate::manifest::RenderedManifest,
+    ) -> Result<(), MaterializationReconcileError> {
+        let started = Instant::now();
+        let result = self.materializer.apply_manifest(manifest).await;
+        self.record_kubernetes_operation(
+            Operation::Apply,
+            outcome_for_result(&result),
+            started.elapsed(),
+        );
+        result
+            .map(|_| ())
+            .map_err(MaterializationReconcileError::Materializer)
+    }
+
+    async fn wait_for_readiness_observed(
+        &self,
+        rendered_objects: &[RenderedObjectRef],
+    ) -> Result<BackendEndpoint, MaterializationReconcileError> {
+        let started = Instant::now();
+        let result = self.materializer.wait_for_readiness(rendered_objects).await;
+        self.record_kubernetes_operation(
+            Operation::Readiness,
+            outcome_for_result(&result),
+            started.elapsed(),
+        );
+        result.map_err(MaterializationReconcileError::Materializer)
+    }
+
+    async fn delete_rendered_objects_observed(
+        &self,
+        rendered_objects: &[RenderedObjectRef],
+    ) -> Result<(), MaterializationReconcileError> {
+        let started = Instant::now();
+        let result = self
+            .materializer
+            .delete_rendered_objects(rendered_objects)
+            .await;
+        self.record_kubernetes_operation(
+            Operation::Delete,
+            outcome_for_result(&result),
+            started.elapsed(),
+        );
+        result.map_err(MaterializationReconcileError::Materializer)
     }
 
     async fn load_instance(
@@ -423,6 +485,69 @@ where
                 vec![LogField::error_reason(error)],
             ));
         }
+    }
+
+    fn record_reconciler_run(&self, outcome: Outcome, duration: Duration) {
+        self.observability.record_metric(MetricObservation::new(
+            RECONCILER_RUNS_TOTAL,
+            vec![outcome.metric_label()],
+            1.0,
+        ));
+        self.observability.record_metric(MetricObservation::new(
+            RECONCILER_RUN_DURATION_SECONDS,
+            vec![outcome.metric_label()],
+            duration.as_secs_f64(),
+        ));
+    }
+
+    fn record_candidate(&self, state: MaterializationState) {
+        self.observability.record_metric(MetricObservation::new(
+            RECONCILER_CANDIDATES_TOTAL,
+            vec![state.metric_label()],
+            1.0,
+        ));
+    }
+
+    fn record_claim(&self, state: MaterializationState, outcome: Outcome) {
+        self.observability.record_metric(MetricObservation::new(
+            RECONCILER_CLAIMS_TOTAL,
+            vec![state.metric_label(), outcome.metric_label()],
+            1.0,
+        ));
+    }
+
+    fn record_lease_renewal(&self, outcome: Outcome) {
+        self.observability.record_metric(MetricObservation::new(
+            RECONCILER_LEASE_RENEWALS_TOTAL,
+            vec![outcome.metric_label()],
+            1.0,
+        ));
+    }
+
+    fn record_kubernetes_operation(
+        &self,
+        operation: Operation,
+        outcome: Outcome,
+        duration: Duration,
+    ) {
+        self.observability.record_metric(MetricObservation::new(
+            KUBERNETES_OPERATIONS_TOTAL,
+            vec![operation.metric_label(), outcome.metric_label()],
+            1.0,
+        ));
+        self.observability.record_metric(MetricObservation::new(
+            KUBERNETES_OPERATION_DURATION_SECONDS,
+            vec![operation.metric_label(), outcome.metric_label()],
+            duration.as_secs_f64(),
+        ));
+    }
+}
+
+fn outcome_for_result<T, E>(result: &Result<T, E>) -> Outcome {
+    if result.is_ok() {
+        Outcome::Success
+    } else {
+        Outcome::Error
     }
 }
 
@@ -507,6 +632,7 @@ mod tests {
         },
         WorkloadSleepPolicy,
     };
+    use proxy_core::observability::recorder::{InMemoryObservability, ObservabilityEvent};
 
     use super::*;
 
@@ -562,6 +688,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_reconciliation_records_lease_loss_metric() {
+        let store = Arc::new(
+            FakeReconcileStore::new(
+                deleting_materialization("mat-delete-lease-metrics"),
+                draining_instance("instance-reconcile"),
+            )
+            .with_renew_result(false),
+        );
+        let materializer = KubernetesMaterializer::new(FakeKubernetesClient::default());
+        let sink = InMemoryObservability::default();
+        let reconciler = reconciler_with_observability(store, materializer, sink.recorder());
+
+        reconciler.run_once().await;
+
+        assert_metric(
+            &sink.events(),
+            RECONCILER_LEASE_RENEWALS_TOTAL.name(),
+            &[("outcome", "rejected")],
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_reconciliation_records_kubernetes_delete_error_metric() {
+        let store = Arc::new(FakeReconcileStore::new(
+            deleting_materialization("mat-delete-error-metrics"),
+            draining_instance("instance-reconcile"),
+        ));
+        let materializer = KubernetesMaterializer::new(
+            FakeKubernetesClient::default()
+                .with_delete_error(KubernetesClientError::transient("api unavailable")),
+        );
+        let sink = InMemoryObservability::default();
+        let reconciler = reconciler_with_observability(store, materializer, sink.recorder());
+
+        reconciler.run_once().await;
+
+        assert_metric(
+            &sink.events(),
+            KUBERNETES_OPERATIONS_TOTAL.name(),
+            &[("operation", "delete"), ("outcome", "error")],
+        );
+    }
+
+    #[tokio::test]
     async fn pending_reconciliation_applies_waits_and_completes_current_wake() {
         let instance = waking_instance("instance-reconcile");
         let materialization = pending_materialization("mat-pending-complete", &instance);
@@ -578,6 +748,50 @@ mod tests {
         assert_eq!(client.apply_calls(), 2);
         assert_eq!(client.wait_readiness_calls(), 1);
         assert_eq!(store.release_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_records_bounded_controller_metrics() {
+        let instance = waking_instance("instance-reconcile");
+        let materialization = pending_materialization("mat-pending-metrics", &instance);
+        let store = Arc::new(FakeReconcileStore::new(materialization, instance));
+        let materializer = KubernetesMaterializer::new(FakeKubernetesClient::default());
+        let sink = InMemoryObservability::default();
+        let reconciler = reconciler_with_observability(store, materializer, sink.recorder());
+
+        reconciler.run_once().await;
+
+        let events = sink.events();
+        assert_metric(
+            &events,
+            RECONCILER_RUNS_TOTAL.name(),
+            &[("outcome", "success")],
+        );
+        assert_metric(
+            &events,
+            RECONCILER_CANDIDATES_TOTAL.name(),
+            &[("state", "pending")],
+        );
+        assert_metric(
+            &events,
+            RECONCILER_CLAIMS_TOTAL.name(),
+            &[("state", "pending"), ("outcome", "success")],
+        );
+        assert_metric(
+            &events,
+            RECONCILER_LEASE_RENEWALS_TOTAL.name(),
+            &[("outcome", "success")],
+        );
+        assert_metric(
+            &events,
+            KUBERNETES_OPERATIONS_TOTAL.name(),
+            &[("operation", "apply"), ("outcome", "success")],
+        );
+        assert_metric(
+            &events,
+            KUBERNETES_OPERATIONS_TOTAL.name(),
+            &[("operation", "readiness"), ("outcome", "success")],
+        );
     }
 
     #[tokio::test]
@@ -665,6 +879,14 @@ mod tests {
         store: Arc<FakeReconcileStore>,
         materializer: KubernetesMaterializer<FakeKubernetesClient>,
     ) -> MaterializationReconciler<FakeKubernetesClient> {
+        reconciler_with_observability(store, materializer, ObservabilityRecorder::noop())
+    }
+
+    fn reconciler_with_observability(
+        store: Arc<FakeReconcileStore>,
+        materializer: KubernetesMaterializer<FakeKubernetesClient>,
+        observability: ObservabilityRecorder,
+    ) -> MaterializationReconciler<FakeKubernetesClient> {
         MaterializationReconciler::new(
             store,
             materializer,
@@ -675,8 +897,26 @@ mod tests {
                 batch_size: 10,
                 concurrency_limit: 1,
             },
-            ObservabilityRecorder::noop(),
+            observability,
         )
+    }
+
+    fn assert_metric(events: &[ObservabilityEvent], name: &str, expected_labels: &[(&str, &str)]) {
+        assert!(
+            events.iter().any(|event| {
+                let ObservabilityEvent::Metric(metric) = event else {
+                    return false;
+                };
+                metric.name() == name
+                    && expected_labels.iter().all(|(key, value)| {
+                        metric
+                            .labels()
+                            .iter()
+                            .any(|label| label.key().as_str() == *key && label.value() == *value)
+                    })
+            }),
+            "expected metric {name} with labels {expected_labels:?}, got {events:?}"
+        );
     }
 
     fn deleting_materialization(id: &str) -> MaterializationRecord {

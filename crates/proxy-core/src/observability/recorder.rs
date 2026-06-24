@@ -99,6 +99,10 @@ pub struct InMemoryObservability {
 struct NoopObservabilitySink;
 #[derive(Debug)]
 pub struct StderrObservabilitySink;
+#[derive(Clone)]
+pub struct CompositeObservabilitySink {
+    sinks: Vec<Arc<dyn ObservabilitySink>>,
+}
 
 static GLOBAL_OBSERVABILITY_SINK: OnceLock<Arc<dyn ObservabilitySink>> = OnceLock::new();
 
@@ -300,6 +304,12 @@ impl InMemoryObservability {
     }
 }
 
+impl CompositeObservabilitySink {
+    pub fn new(sinks: Vec<Arc<dyn ObservabilitySink>>) -> Self {
+        Self { sinks }
+    }
+}
+
 impl ObservabilitySink for InMemoryObservability {
     fn record(&self, event: ObservabilityEvent) {
         self.events
@@ -343,6 +353,14 @@ impl ObservabilitySink for StderrObservabilitySink {
                     fields
                 );
             }
+        }
+    }
+}
+
+impl ObservabilitySink for CompositeObservabilitySink {
+    fn record(&self, event: ObservabilityEvent) {
+        for sink in &self.sinks {
+            sink.record(event.clone());
         }
     }
 }

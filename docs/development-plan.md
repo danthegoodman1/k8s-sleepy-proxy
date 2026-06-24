@@ -1325,6 +1325,64 @@ Done criteria:
 | Complete | Operators have a safe manual escape hatch. | `ReconcileMaterialization` inspects state/lease/refs and triggers one attempt; `ForceDeleteMaterialization` and `ForceReleaseExclusivityKey` require operator/reason audit fields and are covered by transport tests and operator docs/runbook warnings. |
 | Complete | Existing wake/sleep/delete paths remain simple. | API paths still attempt synchronous progress; unfinished `Pending`/`Deleting` work is represented as durable materialization rows and resumed by the reconciler rather than process-local special cases. |
 
+## Milestone 15: Prometheus Export and Controller Operations Metrics
+
+Ship a small, production-useful Prometheus surface for the metrics operators
+need to run SleepyPods under failure. Do not duplicate metrics Kubernetes and
+the container runtime already provide, such as CPU, memory, restart count,
+network bytes, filesystem bytes, or pod scheduling status.
+
+Scope:
+
+- Add an optional Prometheus `/metrics` listener for `control-plane`,
+  `frontline`, and `sidecar`, configured with one explicit metrics listen
+  address per binary.
+- Preserve the existing backend-neutral observability recorder boundary so tests
+  and non-Prometheus deployments can still use stderr or another sink.
+- Export the existing low-cardinality `sleepypods_*` runtime/proxy metrics
+  without changing their names or labels.
+- Add only the missing controller-operation metrics needed to diagnose
+  reconciliation health, backlog, and lock safety.
+- Avoid labels with instance ids, route ids, hostnames, SNI values, volume
+  handles, Kubernetes object names, pod names, request paths, tokens, or error
+  strings.
+
+Prometheus metrics to add:
+
+| Metric | Kind | Labels | Use |
+| --- | --- | --- | --- |
+| `sleepypods_reconciler_runs_total` | counter | `outcome` | Scheduler/reconciler loop rate and failures. |
+| `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Time spent in one reconciliation pass. |
+| `sleepypods_reconciler_candidates_total` | counter | `state` | Number of `Pending`/`Deleting` rows selected for reconciliation. |
+| `sleepypods_reconciler_claims_total` | counter | `state`, `outcome` | Lease claim success/rejection/error rate across replicas. |
+| `sleepypods_reconciler_lease_renewals_total` | counter | `outcome` | Lease renewal success and lease-loss rate during long Kubernetes operations. |
+| `sleepypods_materializations_nonterminal` | gauge | `state` | Current backlog of `Pending` and `Deleting` materializations. |
+| `sleepypods_materialization_oldest_nonterminal_age_seconds` | gauge | `state` | Stuck-work age for alerting on held locks/finalizers/outages. |
+| `sleepypods_exclusivity_keys_held` | gauge | `state` | Number of held exclusivity keys by materialization state. |
+| `sleepypods_kubernetes_operations_total` | counter | `operation`, `outcome` | Apply/delete/readiness call success, failure, and timeout rate. |
+| `sleepypods_kubernetes_operation_duration_seconds` | histogram | `operation`, `outcome` | Kubernetes API/materializer latency excluding app traffic proxying. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 15A: Prometheus sink and text exposition. | `crates/proxy-core/src/observability/prometheus.rs` aggregates counters, gauges, and histograms from `MetricObservation`, rejects descriptor label mismatches, escapes text exposition, renders deterministic HELP/TYPE/sample lines, and has unit coverage for counters, gauges, histograms, escaping, label allow-listing, and `/metrics` scraping. |
+| Complete | 15B: Metrics listener wiring. | `SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR`, `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR`, and `SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR` opt into a dedicated `/metrics` listener while leaving stderr installed; env parsing tests cover disabled/default and configured listeners, and the exporter listener test proves `/metrics` does not intercept other paths. |
+| Complete | 15C: Controller metric descriptors. | `crates/proxy-core/src/observability/metrics.rs` defines exactly the Milestone 15 controller descriptors and keeps existing runtime/proxy descriptors unchanged; reconciler tests assert bounded run, candidate, claim, lease-renewal, apply, readiness, and delete observations. |
+| Complete | 15D: Store-backed operational gauges. | `ControlPlaneStore::load_materialization_operational_metrics` returns provider-neutral bounded aggregates split between pending/deleting backlog age/count and non-deleted held-key counts, the Postgres implementation uses grouped aggregate queries, and `postgres_store` conformance asserts ready materializations are not counted as backlog while held-key visibility remains available. |
+| Partial | 15E: Tests and operator docs. | Unit/local tests cover exposition, label allow-lists, histogram rendering, forbidden high-cardinality labels, env parsing, reconciler metrics, Postgres gauges, and a local `/metrics` scrape. `docs/operator-guide.md` and `docs/operator-runbook.md` list scrape config, metric names, dashboard panels, alert suggestions, and excluded CPU/memory/restart/network/filesystem/pod scheduling labels. A kind scrape gate was not added or run; exact command not run: `scripts/test-kind-e2e-metrics.sh` because no such hook exists yet. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Partial | Operators can scrape every production binary through a dedicated metrics listener. | All three binaries have explicit opt-in metrics listen env vars, and local exporter scrape coverage verifies `/metrics` and non-`/metrics` isolation. A deployed kind scrape check was not run. |
+| Complete | Prometheus output includes existing runtime/proxy metrics plus the small controller set above. | Descriptor tests assert all existing and new metric names, kinds, units, and labels; Prometheus tests render existing runtime gauges and new controller counters/histograms. |
+| Complete | Reconciler scheduling health is visible without per-instance labels. | Reconciler tests prove run rate, run duration, candidate state, claim outcomes, and lease-loss/renewal outcomes are recorded with only bounded `state`/`outcome` labels. |
+| Complete | Stuck materializations and held exclusivity keys are alertable. | Store-backed gauges expose pending/deleting backlog count and oldest age separately from held-key count by bounded state only, with Postgres conformance coverage. |
+| Complete | Kubernetes API/materializer failures are visible without duplicating Kubernetes resource metrics. | Reconciler tests assert apply/readiness success and delete error metrics; descriptors restrict Kubernetes controller metrics to `operation` and `outcome`. |
+| Complete | The metric surface remains intentionally small. | Operator guide and runbook updates explicitly exclude CPU, memory, restarts, pod scheduling, network, filesystem, instance ids, hostnames, route ids, SNI values, pod names, request paths, error strings, tokens, and volume handles from SleepyPods-owned Prometheus metrics. |
+
 ## Stretch
 
 The original goal is complete when the plan reaches this line. Do not start

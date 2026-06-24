@@ -1,6 +1,6 @@
 # SleepyPods Operator Runbook
 
-Runtime observability is backend-neutral today. Production binaries install the
+Runtime observability is backend-neutral. Production binaries install the
 process-wide stderr sink, which emits structured lines:
 
 ```text
@@ -8,8 +8,17 @@ observability.type=metric metric.name=<name> metric.value=<number> metric.labels
 observability.type=event event.name=<name> <field=value ...>
 ```
 
-There is no built-in Prometheus exporter yet. Operators can scrape, transform,
-or forward these structured observations into their metrics and log backend.
+Production binaries can also expose an opt-in Prometheus `/metrics` listener.
+It is disabled unless an explicit listen address is configured:
+
+| Binary | Env var |
+| --- | --- |
+| control-plane | `SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR` |
+| frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` |
+| sidecar | `SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR` |
+
+Bind metrics listeners on an internal address or behind your normal scrape
+auth/network policy. Do not expose them on the public proxy listener.
 
 ## Metric Names
 
@@ -33,6 +42,16 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline route-cache hit/miss results. |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream close/update/invalidation events. |
 | `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Control-plane wake latency. |
+| `sleepypods_reconciler_runs_total` | counter | `outcome` | Materialization reconciler loop runs. |
+| `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one materialization reconciler pass. |
+| `sleepypods_reconciler_candidates_total` | counter | `state` | Rows selected for reconciliation. |
+| `sleepypods_reconciler_claims_total` | counter | `state`, `outcome` | Reconciliation lease claim outcomes. |
+| `sleepypods_reconciler_lease_renewals_total` | counter | `outcome` | Lease renewal success, error, and lease-loss outcomes. |
+| `sleepypods_materializations_nonterminal` | gauge | `state` | Current pending/deleting materialization backlog by state. |
+| `sleepypods_materialization_oldest_nonterminal_age_seconds` | gauge | `state` | Oldest pending/deleting materialization age by state. |
+| `sleepypods_exclusivity_keys_held` | gauge | `state` | Held rendered exclusivity keys by non-deleted materialization state. |
+| `sleepypods_kubernetes_operations_total` | counter | `operation`, `outcome` | Controller apply/delete/readiness operation outcomes. |
+| `sleepypods_kubernetes_operation_duration_seconds` | histogram | `operation`, `outcome` | Controller apply/delete/readiness operation duration. |
 
 Known bounded label values:
 
@@ -41,11 +60,12 @@ Known bounded label values:
 - `operation`: `accept`, `admit`, `connect`, `forward`, `rewrite_request`,
   `drain`, `tls_client_hello`, `route_cache_lookup`, `subscribe_route`,
   `unsubscribe`, `subscribe_stream`, `wake_instance`, `materialize`,
-  `http01_resolve`, `report_idle`
+  `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`
 - `outcome`: `success`, `error`, `timeout`, `rejected`, `canceled`, `hit`,
   `miss`, `started`, `closed`, `updated`, `invalidated`, `already_running`,
   `already_waking`, `already_draining`
-- `state`: `accepting`, `active`, `draining`, `idle`
+- `state`: `accepting`, `active`, `draining`, `idle`, `pending`, `ready`,
+  `failed`, `deleting`
 - TLS ClientHello outcomes use the `outcome` label with `sni`, `no_sni`,
   `incomplete`, `not_tls`, `unsupported_version`, `not_client_hello`,
   `record_too_large`, `malformed`, or `invalid_hostname`.
@@ -104,6 +124,20 @@ Build dashboards from the exact names above:
 - Materialization failures: rate of
   `sleepypods_runtime_materialization_failures_total` by `operation,outcome`;
   page on nonzero sustained failures.
+- Reconciler health: rate of `sleepypods_reconciler_runs_total`,
+  p95/p99 over `sleepypods_reconciler_run_duration_seconds`, and
+  `sleepypods_reconciler_claims_total` by `state,outcome`. Alert when runs stop
+  or claim errors/rejections spike across replicas.
+- Materialization backlog and locks:
+  `sleepypods_materializations_nonterminal`,
+  `sleepypods_materialization_oldest_nonterminal_age_seconds`, and
+  `sleepypods_exclusivity_keys_held` by `state`. Page on old pending/deleting
+  work or held keys that do not fall after sleep cleanup.
+- Kubernetes controller operations: rate and latency for
+  `sleepypods_kubernetes_operations_total` and
+  `sleepypods_kubernetes_operation_duration_seconds` by `operation,outcome`.
+  Use Kubernetes/container metrics for CPU, memory, restarts, pod scheduling,
+  network, and filesystem signals instead of adding SleepyPods labels for them.
 - Drain duration and active streams:
   `sleepypods_runtime_drain_duration_seconds`,
   `sleepypods_runtime_active_streams`, and
