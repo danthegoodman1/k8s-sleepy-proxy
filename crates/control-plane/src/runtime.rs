@@ -14,8 +14,9 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     api::{
-        operator_grpc_service_with_store, operator_grpc_web_server_builder,
-        proxy_grpc_service_with_store, sidecar_grpc_service_with_store,
+        operator_grpc_service_with_store_and_route_events, operator_grpc_web_server_builder,
+        proxy_grpc_service_with_store_and_route_events, sidecar_grpc_service_with_store,
+        RouteSubscriptionBroker,
     },
     config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
     materialization::{InvalidMaterializationTarget, MaterializationTarget},
@@ -119,16 +120,31 @@ pub fn native_control_plane_router<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    let route_events = RouteSubscriptionBroker::new();
+    native_control_plane_router_with_route_events(store, materializer, target, route_events)
+}
+
+fn native_control_plane_router_with_route_events<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    route_events: RouteSubscriptionBroker,
+) -> NativeControlPlaneRouter
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
     tonic::transport::Server::builder()
-        .add_service(operator_grpc_service_with_store(
+        .add_service(operator_grpc_service_with_store_and_route_events(
             Arc::clone(&store),
             materializer.clone(),
             target.clone(),
+            route_events.clone(),
         ))
-        .add_service(proxy_grpc_service_with_store(
+        .add_service(proxy_grpc_service_with_store_and_route_events(
             Arc::clone(&store),
             materializer.clone(),
             target.clone(),
+            route_events,
         ))
         .add_service(sidecar_grpc_service_with_store(store, materializer, target))
 }
@@ -141,11 +157,31 @@ pub fn operator_grpc_web_router<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    operator_grpc_web_server_builder().add_service(operator_grpc_service_with_store(
+    operator_grpc_web_router_with_route_events(
         store,
         materializer,
         target,
-    ))
+        RouteSubscriptionBroker::new(),
+    )
+}
+
+fn operator_grpc_web_router_with_route_events<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    route_events: RouteSubscriptionBroker,
+) -> OperatorGrpcWebRouter
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    operator_grpc_web_server_builder().add_service(
+        operator_grpc_service_with_store_and_route_events(
+            store,
+            materializer,
+            target,
+            route_events,
+        ),
+    )
 }
 
 pub async fn run_from_env() -> RuntimeResult<()> {
@@ -170,10 +206,12 @@ pub async fn serve<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    let native_router = native_control_plane_router(
+    let route_events = RouteSubscriptionBroker::new();
+    let native_router = native_control_plane_router_with_route_events(
         Arc::clone(&store),
         materializer.clone(),
         config.target.clone(),
+        route_events.clone(),
     );
     let (shutdown_tx, _) = watch::channel(false);
     let native_shutdown = shutdown_tx.subscribe();
@@ -184,8 +222,12 @@ where
     });
 
     if let Some(operator_grpc_web_addr) = config.operator_grpc_web_listen_addr {
-        let operator_grpc_web_router =
-            operator_grpc_web_router(store, materializer.clone(), config.target.clone());
+        let operator_grpc_web_router = operator_grpc_web_router_with_route_events(
+            store,
+            materializer.clone(),
+            config.target.clone(),
+            route_events,
+        );
         let operator_grpc_web_shutdown = native_shutdown.clone();
 
         tokio::try_join!(

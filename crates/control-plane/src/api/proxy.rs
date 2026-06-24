@@ -1,13 +1,17 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
 use proxy_core::observability::recorder::ObservabilityRecorder;
+use tokio::sync::broadcast;
 use tonic::{
     codegen::tokio_stream::{self, wrappers::ReceiverStream},
     Request, Response, Status,
 };
 
 use crate::{
-    api::pb::{self, proxy_control_plane_server::ProxyControlPlaneServer},
+    api::{
+        pb::{self, proxy_control_plane_server::ProxyControlPlaneServer},
+        route_events::{RouteBindingChange, RouteBindingChangeReason, RouteSubscriptionBroker},
+    },
     ids::{BackendGeneration, Generation, InstanceId},
     instance::{self as domain_instance, InstanceState},
     materialization::{
@@ -31,12 +35,21 @@ type ProxySubscribeResponseStream = Pin<
     >,
 >;
 
+#[derive(Clone, Debug)]
+struct ActiveRouteSubscription {
+    route_binding_id: crate::ids::RouteBindingId,
+    request_identity: domain_route::RouteIdentity,
+    matched_identity: domain_route::RouteIdentity,
+    protocol: domain_route::ProtocolRoute,
+}
+
 #[derive(Clone)]
 pub struct StoreBackedProxyApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     observability: ObservabilityRecorder,
+    route_events: RouteSubscriptionBroker,
 }
 
 impl<C> StoreBackedProxyApi<C> {
@@ -59,11 +72,43 @@ impl<C> StoreBackedProxyApi<C> {
         target: MaterializationTarget,
         observability: ObservabilityRecorder,
     ) -> Self {
+        Self::with_observability_and_route_events(
+            store,
+            materializer,
+            target,
+            observability,
+            RouteSubscriptionBroker::new(),
+        )
+    }
+
+    pub fn with_route_events(
+        store: Arc<dyn ControlPlaneStore>,
+        materializer: KubernetesMaterializer<C>,
+        target: MaterializationTarget,
+        route_events: RouteSubscriptionBroker,
+    ) -> Self {
+        Self::with_observability_and_route_events(
+            store,
+            materializer,
+            target,
+            ObservabilityRecorder::default(),
+            route_events,
+        )
+    }
+
+    pub fn with_observability_and_route_events(
+        store: Arc<dyn ControlPlaneStore>,
+        materializer: KubernetesMaterializer<C>,
+        target: MaterializationTarget,
+        observability: ObservabilityRecorder,
+        route_events: RouteSubscriptionBroker,
+    ) -> Self {
         Self {
             store,
             materializer,
             target,
             observability,
+            route_events,
         }
     }
 }
@@ -78,11 +123,29 @@ pub fn proxy_grpc_service_with_store<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    ProxyControlPlaneServer::new(StoreBackedProxyApi::with_observability(
+    proxy_grpc_service_with_store_and_route_events(
+        store,
+        materializer,
+        target,
+        RouteSubscriptionBroker::new(),
+    )
+}
+
+pub fn proxy_grpc_service_with_store_and_route_events<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    route_events: RouteSubscriptionBroker,
+) -> StoreBackedProxyGrpcService<C>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    ProxyControlPlaneServer::new(StoreBackedProxyApi::with_observability_and_route_events(
         store,
         materializer,
         target,
         ObservabilityRecorder::global(),
+        route_events,
     ))
 }
 
@@ -136,38 +199,68 @@ where
         let mut requests = request.into_inner();
         let store = Arc::clone(&self.store);
         let target = self.target.clone();
+        let mut route_events = self.route_events.subscribe();
         let (responses, response_stream) = tokio::sync::mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
 
         tokio::spawn(async move {
             let mut subscriptions = HashMap::new();
             let mut next_subscription_number = 0_u64;
 
-            while let Some(request) = match requests.message().await {
-                Ok(request) => request,
-                Err(status) => {
-                    let _ = responses.send(Err(status)).await;
-                    return;
-                }
-            } {
-                let response = handle_subscribe_request(
-                    store.as_ref(),
-                    target.clone(),
-                    request,
-                    &mut subscriptions,
-                    &mut next_subscription_number,
-                )
-                .await;
-
-                match response {
-                    Ok(Some(response)) => {
-                        if responses.send(Ok(response)).await.is_err() {
+            loop {
+                tokio::select! {
+                    request = requests.message() => {
+                        let Some(request) = (match request {
+                            Ok(request) => request,
+                            Err(status) => {
+                                let _ = responses.send(Err(status)).await;
+                                return;
+                            }
+                        }) else {
                             return;
+                        };
+
+                        let response = handle_subscribe_request(
+                            store.as_ref(),
+                            target.clone(),
+                            request,
+                            &mut subscriptions,
+                            &mut next_subscription_number,
+                        )
+                        .await;
+
+                        match response {
+                            Ok(Some(response)) => {
+                                if responses.send(Ok(response)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(status) => {
+                                let _ = responses.send(Err(status)).await;
+                                return;
+                            }
                         }
                     }
-                    Ok(None) => {}
-                    Err(status) => {
-                        let _ = responses.send(Err(status)).await;
-                        return;
+                    event = route_events.recv() => {
+                        match event {
+                            Ok(event) => {
+                                for response in invalidations_for_route_event(
+                                    &mut subscriptions,
+                                    &event,
+                                ) {
+                                    if responses.send(Ok(response)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                let _ = responses
+                                    .send(Err(Status::unavailable("route update stream lagged")))
+                                    .await;
+                                return;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {}
+                        }
                     }
                 }
             }
@@ -179,11 +272,84 @@ where
     }
 }
 
+fn invalidations_for_route_event(
+    subscriptions: &mut HashMap<String, ActiveRouteSubscription>,
+    event: &RouteBindingChange,
+) -> Vec<pb::ProxySubscribeResponse> {
+    let mut invalidated = Vec::new();
+    subscriptions.retain(|subscription_id, dependency| {
+        if subscription_invalidated_by_event(dependency, event) {
+            invalidated.push(subscription_id.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    invalidated
+        .into_iter()
+        .map(|subscription_id| pb::ProxySubscribeResponse {
+            output: Some(pb::proxy_subscribe_response::Output::RouteInvalidated(
+                pb::ProxyRouteInvalidatedResponse {
+                    subscription_id,
+                    reason: route_change_reason_to_proto(event.reason) as i32,
+                },
+            )),
+        })
+        .collect()
+}
+
+fn subscription_invalidated_by_event(
+    subscription: &ActiveRouteSubscription,
+    event: &RouteBindingChange,
+) -> bool {
+    match event.reason {
+        RouteBindingChangeReason::Removed => {
+            subscription.route_binding_id == event.route_binding_id
+        }
+        RouteBindingChangeReason::Changed => {
+            if subscription.route_binding_id == event.route_binding_id {
+                return true;
+            }
+
+            let (Some(identity), Some(protocol)) = (&event.identity, event.protocol) else {
+                return false;
+            };
+            if subscription.protocol != protocol {
+                return false;
+            }
+
+            let Some(new_score) =
+                domain_route::route_match_score(identity, &subscription.request_identity)
+            else {
+                return false;
+            };
+            let Some(cached_score) = domain_route::route_match_score(
+                &subscription.matched_identity,
+                &subscription.request_identity,
+            ) else {
+                return true;
+            };
+
+            new_score > cached_score
+        }
+    }
+}
+
+fn route_change_reason_to_proto(
+    reason: RouteBindingChangeReason,
+) -> pb::ProxyRouteInvalidationReason {
+    match reason {
+        RouteBindingChangeReason::Removed => pb::ProxyRouteInvalidationReason::RouteRemoved,
+        RouteBindingChangeReason::Changed => pb::ProxyRouteInvalidationReason::RouteChanged,
+    }
+}
+
 async fn handle_subscribe_request(
     store: &dyn ControlPlaneStore,
     target: MaterializationTarget,
     request: pb::ProxySubscribeRequest,
-    subscriptions: &mut HashMap<String, domain_route::RouteDependencyLookup>,
+    subscriptions: &mut HashMap<String, ActiveRouteSubscription>,
     next_subscription_number: &mut u64,
 ) -> Result<Option<pb::ProxySubscribeResponse>, Status> {
     match request
@@ -213,7 +379,7 @@ async fn subscribe_route(
     store: &dyn ControlPlaneStore,
     target: MaterializationTarget,
     request: pb::ProxySubscribeRouteRequest,
-    subscriptions: &mut HashMap<String, domain_route::RouteDependencyLookup>,
+    subscriptions: &mut HashMap<String, ActiveRouteSubscription>,
     next_subscription_number: &mut u64,
 ) -> Result<pb::ProxySubscribeResponse, Status> {
     let request_id = non_empty_field(request.request_id, "request_id")?;
@@ -235,7 +401,12 @@ async fn subscribe_route(
             let subscription_id = next_subscription_id(next_subscription_number);
             subscriptions.insert(
                 subscription_id.clone(),
-                domain_route::RouteDependencyLookup::from_route_entry(&entry),
+                ActiveRouteSubscription {
+                    route_binding_id: entry.route_binding_id.clone(),
+                    request_identity: request_identity.clone(),
+                    matched_identity: matched_identity.clone(),
+                    protocol: protocol_for_route_identity(&matched_identity),
+                },
             );
 
             Ok(pb::ProxySubscribeResponse {
@@ -261,6 +432,15 @@ async fn subscribe_route(
                 },
             )),
         }),
+    }
+}
+
+fn protocol_for_route_identity(
+    identity: &domain_route::RouteIdentity,
+) -> domain_route::ProtocolRoute {
+    match identity {
+        domain_route::RouteIdentity::Http { .. } => domain_route::ProtocolRoute::Http,
+        domain_route::RouteIdentity::Sni { .. } => domain_route::ProtocolRoute::TlsSni,
     }
 }
 

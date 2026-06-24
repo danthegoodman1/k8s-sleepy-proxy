@@ -83,6 +83,12 @@ pub struct RouteDependencySet {
     pub materialization_generation: Option<BackendGeneration>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RouteMatchScore {
+    host: usize,
+    path: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProtocolRoute {
     Http,
@@ -170,6 +176,31 @@ impl RouteDependencyLookup {
 
     pub fn route_binding_id(&self) -> &RouteBindingId {
         &self.route_binding_id
+    }
+}
+
+pub fn route_match_score(
+    binding: &RouteIdentity,
+    lookup: &RouteIdentity,
+) -> Option<RouteMatchScore> {
+    match (binding, lookup) {
+        (
+            RouteIdentity::Http {
+                host: binding_host,
+                path: binding_path,
+            },
+            RouteIdentity::Http {
+                host: lookup_host,
+                path: lookup_path,
+            },
+        ) => host_score(binding_host, lookup_host).and_then(|host| {
+            path_score(binding_path.as_ref(), lookup_path.as_ref())
+                .map(|path| RouteMatchScore { host, path })
+        }),
+        (RouteIdentity::Sni { host: binding_host }, RouteIdentity::Sni { host: lookup_host }) => {
+            host_score(binding_host, lookup_host).map(|host| RouteMatchScore { host, path: 0 })
+        }
+        _ => None,
     }
 }
 
@@ -281,6 +312,49 @@ fn normalize_host(value: &str, wildcard: bool) -> Result<String, InvalidRouteHos
     }
 
     Ok(host)
+}
+
+fn host_score(binding: &RouteHost, lookup: &RouteHost) -> Option<usize> {
+    match binding.kind() {
+        RouteHostKind::Exact if binding.as_str() == lookup.as_str() => Some(usize::MAX),
+        RouteHostKind::Exact => None,
+        RouteHostKind::WildcardSuffix => {
+            let lookup_host = lookup.as_str();
+            let suffix = binding.as_str();
+            let suffix_start = lookup_host.len().checked_sub(suffix.len())?;
+            let prefix = lookup_host.get(..suffix_start)?;
+            if lookup_host.ends_with(suffix) && prefix.ends_with('.') {
+                Some(suffix.len())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn path_score(binding: Option<&PathPrefix>, lookup: Option<&PathPrefix>) -> Option<usize> {
+    match (binding, lookup) {
+        (None, _) => Some(0),
+        (Some(_), None) => None,
+        (Some(binding), Some(lookup)) if path_prefix_matches(lookup.as_str(), binding.as_str()) => {
+            Some(binding.as_str().len())
+        }
+        (Some(_), Some(_)) => None,
+    }
+}
+
+fn path_prefix_matches(lookup_path: &str, binding_path: &str) -> bool {
+    if binding_path == "/" || lookup_path == binding_path {
+        return true;
+    }
+
+    if binding_path.ends_with('/') {
+        return lookup_path.starts_with(binding_path);
+    }
+
+    lookup_path
+        .strip_prefix(binding_path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(test)]

@@ -404,34 +404,6 @@ pub(crate) fn validate_route_protocol(spec: &RouteBindingSpec) -> StoreResult<()
     }
 }
 
-pub(crate) fn route_matches(binding: &RouteIdentity, lookup: &RouteIdentity) -> Option<RouteScore> {
-    match (binding, lookup) {
-        (
-            RouteIdentity::Http {
-                host: binding_host,
-                path: binding_path,
-            },
-            RouteIdentity::Http {
-                host: lookup_host,
-                path: lookup_path,
-            },
-        ) => host_score(binding_host, lookup_host).and_then(|host| {
-            path_score(binding_path.as_ref(), lookup_path.as_ref())
-                .map(|path| RouteScore { host, path })
-        }),
-        (RouteIdentity::Sni { host: binding_host }, RouteIdentity::Sni { host: lookup_host }) => {
-            host_score(binding_host, lookup_host).map(|host| RouteScore { host, path: 0 })
-        }
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RouteScore {
-    host: usize,
-    path: usize,
-}
-
 pub(crate) fn materialization_id(
     instance_id: &InstanceId,
     target: &MaterializationTarget,
@@ -539,49 +511,6 @@ fn route_host_kind_to_db(kind: RouteHostKind) -> &'static str {
         RouteHostKind::Exact => "exact",
         RouteHostKind::WildcardSuffix => "wildcard_suffix",
     }
-}
-
-fn host_score(binding: &RouteHost, lookup: &RouteHost) -> Option<usize> {
-    match binding.kind() {
-        RouteHostKind::Exact if binding.as_str() == lookup.as_str() => Some(usize::MAX),
-        RouteHostKind::Exact => None,
-        RouteHostKind::WildcardSuffix => {
-            let lookup_host = lookup.as_str();
-            let suffix = binding.as_str();
-            let suffix_start = lookup_host.len().checked_sub(suffix.len())?;
-            let prefix = lookup_host.get(..suffix_start)?;
-            if lookup_host.ends_with(suffix) && prefix.ends_with('.') {
-                Some(suffix.len())
-            } else {
-                None
-            }
-        }
-    }
-}
-
-fn path_score(binding: Option<&PathPrefix>, lookup: Option<&PathPrefix>) -> Option<usize> {
-    match (binding, lookup) {
-        (None, _) => Some(0),
-        (Some(_), None) => None,
-        (Some(binding), Some(lookup)) if path_prefix_matches(lookup.as_str(), binding.as_str()) => {
-            Some(binding.as_str().len())
-        }
-        (Some(_), Some(_)) => None,
-    }
-}
-
-fn path_prefix_matches(lookup_path: &str, binding_path: &str) -> bool {
-    if binding_path == "/" || lookup_path == binding_path {
-        return true;
-    }
-
-    if binding_path.ends_with('/') {
-        return lookup_path.starts_with(binding_path);
-    }
-
-    lookup_path
-        .strip_prefix(binding_path)
-        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn instance_state_from_db(value: &str) -> StoreResult<InstanceState> {
@@ -697,8 +626,10 @@ fn invalid_stored_data(error: impl std::fmt::Display) -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{route_identity_key, route_matches};
-    use crate::route::{PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost, RouteIdentity};
+    use super::route_identity_key;
+    use crate::route::{
+        route_match_score, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost, RouteIdentity,
+    };
 
     #[test]
     fn route_identity_key_uses_normalized_domain_parts() {
@@ -728,7 +659,7 @@ mod tests {
             path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
         };
 
-        assert!(route_matches(&exact, &lookup) > route_matches(&wildcard, &lookup));
+        assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
     }
 
     #[test]
@@ -746,7 +677,7 @@ mod tests {
             path: Some(PathPrefix::new("/api/v1/users").expect("valid prefix")),
         };
 
-        assert!(route_matches(&exact, &lookup) > route_matches(&wildcard, &lookup));
+        assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
     }
 
     #[test]
@@ -764,7 +695,7 @@ mod tests {
             path: None,
         };
 
-        assert!(route_matches(&specific, &lookup) > route_matches(&broad, &lookup));
+        assert!(route_match_score(&specific, &lookup) > route_match_score(&broad, &lookup));
     }
 
     #[test]
@@ -782,7 +713,7 @@ mod tests {
             path: Some(PathPrefix::new("/api/v1/users").expect("valid prefix")),
         };
 
-        assert!(route_matches(&long, &lookup) > route_matches(&short, &lookup));
+        assert!(route_match_score(&long, &lookup) > route_match_score(&short, &lookup));
     }
 
     #[test]
@@ -804,9 +735,9 @@ mod tests {
             path: Some(PathPrefix::new("/apix").expect("valid prefix")),
         };
 
-        assert!(route_matches(&api, &exact).is_some());
-        assert!(route_matches(&api, &child).is_some());
-        assert!(route_matches(&api, &near_miss).is_none());
+        assert!(route_match_score(&api, &exact).is_some());
+        assert!(route_match_score(&api, &child).is_some());
+        assert!(route_match_score(&api, &near_miss).is_none());
     }
 
     #[test]
@@ -824,8 +755,8 @@ mod tests {
             host: RouteHost::exact("example.com").expect("valid host"),
         };
 
-        assert!(route_matches(&exact, &lookup) > route_matches(&wildcard, &lookup));
-        assert!(route_matches(&wildcard, &miss).is_none());
+        assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
+        assert!(route_match_score(&wildcard, &miss).is_none());
     }
 
     #[test]

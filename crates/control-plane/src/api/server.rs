@@ -12,9 +12,12 @@ use tower::layer::util::{Identity, Stack};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
-    api::pb::{
-        self,
-        operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
+    api::{
+        pb::{
+            self,
+            operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
+        },
+        route_events::RouteSubscriptionBroker,
     },
     http01 as domain_http01,
     ids::{IdempotencyKey, InstanceId, WorkloadClassId},
@@ -54,6 +57,7 @@ pub struct StoreBackedOperatorApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
+    route_events: RouteSubscriptionBroker,
 }
 
 impl OperatorApiPlaceholder {
@@ -68,10 +72,20 @@ impl<C> StoreBackedOperatorApi<C> {
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
+        Self::with_route_events(store, materializer, target, RouteSubscriptionBroker::new())
+    }
+
+    pub fn with_route_events(
+        store: Arc<dyn ControlPlaneStore>,
+        materializer: KubernetesMaterializer<C>,
+        target: MaterializationTarget,
+        route_events: RouteSubscriptionBroker,
+    ) -> Self {
         Self {
             store,
             materializer,
             target,
+            route_events,
         }
     }
 }
@@ -93,7 +107,29 @@ pub fn operator_grpc_service_with_store<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    OperatorControlPlaneServer::new(StoreBackedOperatorApi::new(store, materializer, target))
+    operator_grpc_service_with_store_and_route_events(
+        store,
+        materializer,
+        target,
+        RouteSubscriptionBroker::new(),
+    )
+}
+
+pub fn operator_grpc_service_with_store_and_route_events<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    route_events: RouteSubscriptionBroker,
+) -> StoreBackedOperatorGrpcService<C>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    OperatorControlPlaneServer::new(StoreBackedOperatorApi::with_route_events(
+        store,
+        materializer,
+        target,
+        route_events,
+    ))
 }
 
 pub fn operator_grpc_server_builder() -> Server {
@@ -320,6 +356,11 @@ where
             )?)
             .await
             .map_err(store_error_to_status)?;
+        self.route_events.notify_route_changed(
+            route_binding.id.clone(),
+            route_binding.identity.clone(),
+            route_binding.protocol,
+        );
 
         Ok(Response::new(route_binding_to_proto(route_binding)))
     }
@@ -345,14 +386,16 @@ where
         &self,
         request: Request<pb::DeleteRouteBindingRequest>,
     ) -> Result<Response<pb::DeleteRouteBindingResponse>, Status> {
-        let request = domain_route::DeleteRouteBindingRequest::new(parse_route_binding_id(
-            request.into_inner().route_binding_id,
-        )?);
+        let route_binding_id = parse_route_binding_id(request.into_inner().route_binding_id)?;
+        let request = domain_route::DeleteRouteBindingRequest::new(route_binding_id.clone());
         let deleted = self
             .store
             .delete_route_binding(request)
             .await
             .map_err(store_error_to_status)?;
+        if deleted {
+            self.route_events.notify_route_removed(route_binding_id);
+        }
 
         Ok(Response::new(pb::DeleteRouteBindingResponse { deleted }))
     }

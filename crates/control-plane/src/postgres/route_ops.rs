@@ -20,7 +20,7 @@ use super::{
     mapping::{
         default_negative_cache_policy, generation_to_i64, materialization_from_row, protocol_to_db,
         route_binding_from_row, route_binding_row_from_row, route_entry_from_rows,
-        route_identity_parts, route_matches, RouteBindingRow,
+        route_identity_parts, RouteBindingRow,
     },
 };
 
@@ -117,10 +117,10 @@ pub(crate) async fn resolve_route(
         .await
         .map_err(map_postgres_error)?;
 
-    let mut best: Option<(super::mapping::RouteScore, RouteBindingRow)> = None;
+    let mut best: Option<(crate::route::RouteMatchScore, RouteBindingRow)> = None;
     for row in rows {
         let route = route_binding_row_from_row(&row)?;
-        if let Some(score) = route_matches(&route.identity, &identity) {
+        if let Some(score) = crate::route::route_match_score(&route.identity, &identity) {
             if best
                 .as_ref()
                 .map(|(best_score, _)| score > *best_score)
