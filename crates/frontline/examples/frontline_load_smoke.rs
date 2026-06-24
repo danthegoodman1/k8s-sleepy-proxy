@@ -56,6 +56,8 @@ const WEBSOCKET_CLIENT_TEXT: &str = "frontline websocket text";
 const WEBSOCKET_BACKEND_TEXT: &str = "backend websocket text";
 const WEBSOCKET_CLIENT_BINARY: &[u8] = b"frontline websocket bytes";
 const WEBSOCKET_BACKEND_BINARY: &[u8] = b"backend websocket bytes";
+const DEFAULT_WEBSOCKET_STREAM_BYTES: u64 = 262_144;
+const DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE: u64 = 16_384;
 const DEFAULT_ROUTE_HOST: &str = "app.example.test";
 const DEFAULT_ROUTE_PATH: &str = "/smoke";
 const DEFAULT_COLD_ROUTE_PATH: &str = "/cold-smoke";
@@ -93,6 +95,8 @@ struct ServerConfig {
     route_host: String,
     route_path: String,
     cold_route_path: String,
+    websocket_stream_bytes: u64,
+    websocket_stream_chunk_size: u64,
 }
 
 impl ServerConfig {
@@ -109,6 +113,14 @@ impl ServerConfig {
             .unwrap_or_else(|_| DEFAULT_ROUTE_PATH.to_owned());
         let cold_route_path = env::var("SLEEPYPODS_LOAD_SMOKE_COLD_ROUTE_PATH")
             .unwrap_or_else(|_| DEFAULT_COLD_ROUTE_PATH.to_owned());
+        let websocket_stream_bytes = parse_positive_u64_env(
+            "SLEEPYPODS_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES",
+            DEFAULT_WEBSOCKET_STREAM_BYTES,
+        )?;
+        let websocket_stream_chunk_size = parse_positive_u64_env(
+            "SLEEPYPODS_LOAD_SMOKE_WEBSOCKET_STREAM_CHUNK_SIZE",
+            DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE,
+        )?;
 
         let route_host = canonical_route_host("SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST", &route_host)?;
         validate_route_path("SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH", &route_path)?;
@@ -121,6 +133,8 @@ impl ServerConfig {
             route_host,
             route_path,
             cold_route_path,
+            websocket_stream_bytes,
+            websocket_stream_chunk_size,
         })
     }
 }
@@ -133,6 +147,13 @@ fn socket_addr_from_env(
         .unwrap_or_else(|_| default.to_owned())
         .parse()
         .map_err(|error| InvalidArgs(format!("{name} must be a socket address: {error}")))
+}
+
+fn parse_positive_u64_env(name: &'static str, default: u64) -> Result<u64, InvalidArgs> {
+    match env::var(name) {
+        Ok(value) => parse_positive_u64(name, &value),
+        Err(_) => Ok(default),
+    }
 }
 
 async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
@@ -148,8 +169,17 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
         "load-smoke route host={} path={} cold_path={} backend={}",
         config.route_host, config.route_path, config.cold_route_path, config.backend_uri
     );
+    eprintln!(
+        "load-smoke websocket stream bytes={} chunk_size={}",
+        config.websocket_stream_bytes, config.websocket_stream_chunk_size
+    );
 
-    let backend = serve_backend(backend_listener, stats.clone());
+    let backend = serve_backend(
+        backend_listener,
+        stats.clone(),
+        config.websocket_stream_bytes,
+        config.websocket_stream_chunk_size,
+    );
     let control_plane = Server::builder()
         .add_service(ProxyControlPlaneServer::new(FakeProxyControlPlane::new(
             config.route_host,
@@ -166,7 +196,12 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
     }
 }
 
-async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), BoxError> {
+async fn serve_backend(
+    listener: TcpListener,
+    stats: SmokeStats,
+    websocket_stream_bytes: u64,
+    websocket_stream_chunk_size: u64,
+) -> Result<(), BoxError> {
     loop {
         let (stream, _) = listener.accept().await?;
         let stats = stats.clone();
@@ -175,7 +210,17 @@ async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), B
             let service = service_fn(move |request| {
                 let stats = stats.clone();
 
-                async move { Ok::<_, Infallible>(backend_response(request, &stats).await) }
+                async move {
+                    Ok::<_, Infallible>(
+                        backend_response(
+                            request,
+                            &stats,
+                            websocket_stream_bytes,
+                            websocket_stream_chunk_size,
+                        )
+                        .await,
+                    )
+                }
             });
 
             if let Err(error) = auto::Builder::new(TokioExecutor::new())
@@ -191,13 +236,20 @@ async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), B
 async fn backend_response<B>(
     request: HttpRequest<B>,
     stats: &SmokeStats,
+    websocket_stream_bytes: u64,
+    websocket_stream_chunk_size: u64,
 ) -> HttpResponse<BackendBody>
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: fmt::Display,
 {
     if is_websocket_upgrade_candidate(&request) {
-        return websocket_backend_response(request, stats);
+        return websocket_backend_response(
+            request,
+            stats,
+            websocket_stream_bytes,
+            websocket_stream_chunk_size,
+        );
     }
 
     if request.uri().path() == STATS_PATH {
@@ -273,6 +325,8 @@ fn bad_request_response(message: String) -> HttpResponse<BackendBody> {
 fn websocket_backend_response<B>(
     mut request: HttpRequest<B>,
     stats: &SmokeStats,
+    websocket_stream_bytes: u64,
+    websocket_stream_chunk_size: u64,
 ) -> HttpResponse<BackendBody>
 where
     B: Send + 'static,
@@ -291,6 +345,8 @@ where
         stats.record_backend_websocket_session();
         if let Err(error) = serve_backend_websocket(
             WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await,
+            websocket_stream_bytes,
+            websocket_stream_chunk_size,
         )
         .await
         {
@@ -301,7 +357,11 @@ where
     response
 }
 
-async fn serve_backend_websocket<S>(mut websocket: WebSocketStream<S>) -> Result<(), BoxError>
+async fn serve_backend_websocket<S>(
+    mut websocket: WebSocketStream<S>,
+    stream_bytes: u64,
+    chunk_size: u64,
+) -> Result<(), BoxError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -340,11 +400,98 @@ where
     )
     .await
     .map_err(|_| timeout_error("websocket write binary"))??;
+
+    read_and_echo_websocket_stream(&mut websocket, stream_bytes, chunk_size).await?;
+
     timeout(REQUEST_TIMEOUT, websocket.close(None))
         .await
         .map_err(|_| timeout_error("websocket close"))??;
 
     Ok(())
+}
+
+async fn read_and_echo_websocket_stream<S>(
+    websocket: &mut WebSocketStream<S>,
+    stream_bytes: u64,
+    chunk_size: u64,
+) -> Result<(), BoxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut received = 0;
+
+    while received < stream_bytes {
+        let remaining = stream_bytes - received;
+        let expected_len = remaining.min(chunk_size) as usize;
+        let message = timeout(REQUEST_TIMEOUT, websocket.next())
+            .await
+            .map_err(|_| timeout_error("websocket read stream chunk"))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "missing stream chunk")
+            })??;
+        let Message::Binary(bytes) = message else {
+            return Err(Box::new(
+                ResponseValidationError::UnexpectedWebSocketMessage(format!("{message:?}")),
+            ));
+        };
+
+        if bytes.len() != expected_len {
+            return Err(Box::new(ResponseValidationError::UnexpectedStreamChunk {
+                offset: received,
+                len: bytes.len(),
+                expected_len,
+            }));
+        }
+        validate_stream_chunk(&bytes, received)?;
+        received += bytes.len() as u64;
+
+        timeout(REQUEST_TIMEOUT, websocket.send(Message::Binary(bytes)))
+            .await
+            .map_err(|_| timeout_error("websocket write stream chunk"))??;
+    }
+
+    Ok(())
+}
+
+fn make_stream_chunk(offset: u64, len: usize) -> Vec<u8> {
+    let mut chunk = (0..len)
+        .map(|index| deterministic_stream_byte(offset, index as u64))
+        .collect::<Vec<_>>();
+
+    for (index, byte) in offset.to_le_bytes().iter().copied().enumerate().take(len) {
+        chunk[index] = byte;
+    }
+
+    chunk
+}
+
+fn validate_stream_chunk(bytes: &[u8], offset: u64) -> Result<(), ResponseValidationError> {
+    let expected = make_stream_chunk(offset, bytes.len());
+    for (index, (actual, expected)) in bytes
+        .iter()
+        .copied()
+        .zip(expected.iter().copied())
+        .enumerate()
+    {
+        if actual != expected {
+            return Err(ResponseValidationError::UnexpectedStreamByte {
+                offset: offset + index as u64,
+                expected,
+                actual,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn deterministic_stream_byte(chunk_offset: u64, index: u64) -> u8 {
+    let mut value = chunk_offset
+        .wrapping_add(index)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (value ^ (value >> 31)) as u8
 }
 
 fn is_websocket_upgrade_candidate<B>(request: &HttpRequest<B>) -> bool {
@@ -690,6 +837,8 @@ struct ClientConfig {
     requests: u64,
     concurrency: u64,
     protocol: ClientProtocol,
+    websocket_stream_bytes: u64,
+    websocket_stream_chunk_size: u64,
 }
 
 impl ClientConfig {
@@ -700,6 +849,8 @@ impl ClientConfig {
         let mut requests = 100;
         let mut concurrency = 4;
         let mut protocol = ClientProtocol::Http1;
+        let mut websocket_stream_bytes = DEFAULT_WEBSOCKET_STREAM_BYTES;
+        let mut websocket_stream_chunk_size = DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -718,9 +869,21 @@ impl ClientConfig {
                 "--protocol" => {
                     protocol = ClientProtocol::parse(&next_arg(&mut args, "--protocol")?)?
                 }
+                "--websocket-stream-bytes" => {
+                    websocket_stream_bytes = parse_positive_u64(
+                        "--websocket-stream-bytes",
+                        &next_arg(&mut args, "--websocket-stream-bytes")?,
+                    )?
+                }
+                "--websocket-stream-chunk-size" => {
+                    websocket_stream_chunk_size = parse_positive_u64(
+                        "--websocket-stream-chunk-size",
+                        &next_arg(&mut args, "--websocket-stream-chunk-size")?,
+                    )?
+                }
                 _ => {
                     return Err(InvalidArgs(format!(
-                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, --concurrency, or --protocol"
+                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, --concurrency, --protocol, --websocket-stream-bytes, or --websocket-stream-chunk-size"
                     )));
                 }
             }
@@ -738,6 +901,8 @@ impl ClientConfig {
             requests,
             concurrency,
             protocol,
+            websocket_stream_bytes,
+            websocket_stream_chunk_size,
         })
     }
 }
@@ -825,6 +990,8 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
         let host_header = config.host_header.clone();
         let requests = config.requests;
         let protocol = config.protocol;
+        let websocket_stream_bytes = config.websocket_stream_bytes;
+        let websocket_stream_chunk_size = config.websocket_stream_chunk_size;
 
         tasks.spawn(async move {
             loop {
@@ -843,7 +1010,14 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                         send_h2c_grpc_request(&target, &host_header, request_id).await
                     }
                     ClientProtocol::WebSocket => {
-                        send_websocket_request(&target, &host_header, request_id).await
+                        send_websocket_request(
+                            &target,
+                            &host_header,
+                            request_id,
+                            websocket_stream_bytes,
+                            websocket_stream_chunk_size,
+                        )
+                        .await
                     }
                 };
 
@@ -870,15 +1044,24 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let failures = failures.load(Ordering::Relaxed);
     let rps = config.requests as f64 / elapsed_secs;
+    let stream_bytes = match config.protocol {
+        ClientProtocol::WebSocket => config
+            .requests
+            .saturating_mul(config.websocket_stream_bytes),
+        ClientProtocol::Http1 | ClientProtocol::H2cGrpc => 0,
+    };
+    let mib_per_s = stream_bytes as f64 / (1024.0 * 1024.0) / elapsed_secs;
     let latency = latencies.snapshot();
 
     println!(
-        "{} requests={} failures={} elapsed_ms={} rps={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+        "{} requests={} failures={} elapsed_ms={} rps={:.1} stream_bytes={} mib_per_s={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
         config.label,
         config.requests,
         failures,
         elapsed_ms,
         rps,
+        stream_bytes,
+        mib_per_s,
         latency.p50_ms,
         latency.p95_ms,
         latency.p99_ms,
@@ -995,6 +1178,8 @@ async fn send_websocket_request(
     target: &HttpTarget,
     host_header: &str,
     request_id: u64,
+    stream_bytes: u64,
+    chunk_size: u64,
 ) -> Result<(), BoxError> {
     let mut request = format!(
         "ws://{}{}",
@@ -1051,9 +1236,58 @@ async fn send_websocket_request(
         ));
     }
 
+    send_and_validate_websocket_stream(&mut websocket, stream_bytes, chunk_size).await?;
+
     timeout(REQUEST_TIMEOUT, websocket.close(None))
         .await
         .map_err(|_| timeout_error("websocket close"))??;
+
+    Ok(())
+}
+
+async fn send_and_validate_websocket_stream<S>(
+    websocket: &mut WebSocketStream<S>,
+    stream_bytes: u64,
+    chunk_size: u64,
+) -> Result<(), BoxError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut sent = 0;
+
+    while sent < stream_bytes {
+        let remaining = stream_bytes - sent;
+        let len = remaining.min(chunk_size) as usize;
+        let chunk = make_stream_chunk(sent, len);
+        timeout(
+            REQUEST_TIMEOUT,
+            websocket.send(Message::Binary(WsBytes::from(chunk.clone()))),
+        )
+        .await
+        .map_err(|_| timeout_error("websocket write stream chunk"))??;
+
+        let response = timeout(REQUEST_TIMEOUT, websocket.next())
+            .await
+            .map_err(|_| timeout_error("websocket read stream chunk"))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "missing stream echo chunk")
+            })??;
+        let Message::Binary(bytes) = response else {
+            return Err(Box::new(
+                ResponseValidationError::UnexpectedWebSocketMessage(format!("{response:?}")),
+            ));
+        };
+        if bytes.as_ref() != chunk.as_slice() {
+            validate_stream_chunk(&bytes, sent)?;
+            return Err(Box::new(ResponseValidationError::UnexpectedStreamChunk {
+                offset: sent,
+                len: bytes.len(),
+                expected_len: len,
+            }));
+        }
+
+        sent += len as u64;
+    }
 
     Ok(())
 }
@@ -1266,9 +1500,24 @@ enum ResponseValidationError {
     MissingStatus,
     UnexpectedVersion(Version),
     UnexpectedStatus(String),
-    UnexpectedHeader { name: &'static str, value: String },
-    UnexpectedBody { len: usize },
+    UnexpectedHeader {
+        name: &'static str,
+        value: String,
+    },
+    UnexpectedBody {
+        len: usize,
+    },
     UnexpectedWebSocketMessage(String),
+    UnexpectedStreamChunk {
+        offset: u64,
+        len: usize,
+        expected_len: usize,
+    },
+    UnexpectedStreamByte {
+        offset: u64,
+        expected: u8,
+        actual: u8,
+    },
     BodyRead(String),
 }
 
@@ -1293,6 +1542,26 @@ impl fmt::Display for ResponseValidationError {
             Self::UnexpectedWebSocketMessage(message) => {
                 write!(f, "unexpected WebSocket message {message}")
             }
+            Self::UnexpectedStreamChunk {
+                offset,
+                len,
+                expected_len,
+            } => {
+                write!(
+                    f,
+                    "unexpected WebSocket stream chunk at offset {offset}: len={len} expected_len={expected_len}"
+                )
+            }
+            Self::UnexpectedStreamByte {
+                offset,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "unexpected WebSocket stream byte at offset {offset}: expected={expected} actual={actual}"
+                )
+            }
             Self::BodyRead(error) => write!(f, "failed to read HTTP response body: {error}"),
         }
     }
@@ -1303,9 +1572,10 @@ impl Error for ResponseValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_response, path_prefix_matches, validate_response, ClientConfig, ClientProtocol,
-        FakeProxyControlPlane, HttpTarget, LatencyStats, SmokeStats, BACKEND_BODY, GRPC_BODY,
-        STATS_PATH,
+        backend_response, make_stream_chunk, path_prefix_matches, validate_response,
+        validate_stream_chunk, ClientConfig, ClientProtocol, FakeProxyControlPlane, HttpTarget,
+        LatencyStats, SmokeStats, BACKEND_BODY, DEFAULT_WEBSOCKET_STREAM_BYTES,
+        DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE, GRPC_BODY, STATS_PATH,
     };
     use bytes::Bytes;
     use control_plane::api::pb;
@@ -1399,6 +1669,56 @@ mod tests {
         .expect("WebSocket client config parses");
 
         assert_eq!(config.protocol, ClientProtocol::WebSocket);
+        assert_eq!(
+            config.websocket_stream_bytes,
+            DEFAULT_WEBSOCKET_STREAM_BYTES
+        );
+        assert_eq!(
+            config.websocket_stream_chunk_size,
+            DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn client_config_parses_websocket_stream_options() {
+        let config = ClientConfig::from_args(
+            [
+                "--url",
+                "http://127.0.0.1:18080/",
+                "--host",
+                "app.example.test",
+                "--protocol",
+                "websocket",
+                "--websocket-stream-bytes",
+                "4096",
+                "--websocket-stream-chunk-size",
+                "1024",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("WebSocket stream config parses");
+
+        assert_eq!(config.websocket_stream_bytes, 4096);
+        assert_eq!(config.websocket_stream_chunk_size, 1024);
+    }
+
+    #[test]
+    fn websocket_stream_chunks_are_deterministic_and_validated() {
+        let chunk = make_stream_chunk(8, 32);
+        validate_stream_chunk(&chunk, 8).expect("deterministic chunk validates");
+
+        let mut corrupted = chunk;
+        corrupted[7] ^= 0xff;
+        validate_stream_chunk(&corrupted, 8).expect_err("corrupted chunk is rejected");
+    }
+
+    #[test]
+    fn websocket_stream_chunks_reject_wrong_default_chunk_offset() {
+        let chunk = make_stream_chunk(0, DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE as usize);
+
+        validate_stream_chunk(&chunk, DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE)
+            .expect_err("replayed full chunk at a later offset is rejected");
     }
 
     #[test]
@@ -1528,6 +1848,8 @@ mod tests {
                 .body(Full::new(Bytes::new()))
                 .expect("stats request builds"),
             &stats,
+            DEFAULT_WEBSOCKET_STREAM_BYTES,
+            DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE,
         )
         .await;
         let body = response
@@ -1554,6 +1876,8 @@ mod tests {
                 .body(Full::new(Bytes::from_static(GRPC_BODY)))
                 .expect("gRPC-shaped request builds"),
             &stats,
+            DEFAULT_WEBSOCKET_STREAM_BYTES,
+            DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE,
         )
         .await;
         assert_eq!(

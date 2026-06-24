@@ -110,3 +110,40 @@ load_budget_assert_added_p99_at_most() {
 
   echo "${label}_added_p99_ms=${added} direct_p99_ms=${direct_p99_ms} proxied_p99_ms=${proxied_p99_ms} max_added_p99_ms=${max_added_ms}"
 }
+
+load_budget_assert_value_at_most() {
+  local label="$1"
+  local value="$2"
+  local max="$3"
+  local formatted
+  local status
+
+  load_budget_require_decimal "${label} value" "${value}" || return 1
+  load_budget_require_decimal "${label} max" "${max}" || return 1
+
+  set +e
+  formatted="$(awk -v value="${value}" -v max="${max}" 'BEGIN {
+    if (value <= 0) {
+      print "nan"
+      exit 2
+    }
+    printf "%.3f", value
+    if (value > max) {
+      exit 1
+    }
+  }')"
+  status=$?
+  set -e
+
+  if [[ "${status}" -eq 2 ]]; then
+    echo "${label} value must be positive: value=${value}" >&2
+    return 1
+  fi
+
+  if [[ "${status}" -ne 0 ]]; then
+    echo "${label} value ${formatted} is above threshold ${max}" >&2
+    return 1
+  fi
+
+  echo "${label}=${formatted} max=${max}"
+}

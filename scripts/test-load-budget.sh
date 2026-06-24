@@ -45,11 +45,20 @@ expect_fail "ratio below threshold fails" \
 expect_fail "excessive p99 delta fails" \
   load_budget_assert_added_p99_at_most test_latency 10 40 25
 
+expect_fail "non-positive absolute value fails" \
+  load_budget_assert_value_at_most test_cold_wake 0 1000
+
+expect_fail "absolute value above threshold fails" \
+  load_budget_assert_value_at_most test_cold_wake 1200 1000
+
 expect_pass "valid ratio passes" \
   load_budget_assert_ratio_at_least test_rps 100 85 0.80
 
 expect_pass "valid p99 delta passes" \
   load_budget_assert_added_p99_at_most test_latency 10 30 25
+
+expect_pass "absolute value within threshold passes" \
+  load_budget_assert_value_at_most test_cold_wake 900 1000
 
 if [[ "${failures}" -ne 0 ]]; then
   echo "${failures} load-budget helper test(s) failed" >&2

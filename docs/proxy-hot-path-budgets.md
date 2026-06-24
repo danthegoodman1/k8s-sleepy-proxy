@@ -174,9 +174,13 @@ requests make additional `SubscribeRoute` calls.
 
 The script then warms and measures WebSocket forwarding through the same cached
 ready route. The helper client performs a real HTTP upgrade, sends text and
-binary frames, validates text and binary frames returned by the backend, and
-closes the WebSocket. The measured WebSocket phase has a direct-backend baseline
-and fails if it makes additional `SubscribeRoute` calls after warmup.
+binary frames, validates text and binary frames returned by the backend, then
+sends a deterministic binary byte stream in configurable frames. The helper
+backend validates the exact incoming stream bytes and echoes them; the client
+validates the exact echoed bytes. The measured WebSocket phase has a
+direct-backend baseline, emits `mib_per_s`, gates frontend/direct streaming
+throughput ratio, and fails if it makes additional `SubscribeRoute` calls after
+warmup.
 
 Finally, the script sends one request through the distinct cold route. The fake
 control plane returns `InstanceState::Cold` without a backend URI, the
@@ -184,26 +188,38 @@ production frontline calls `WakeInstance`, the fake control plane returns a
 ready backend, and the client request must succeed through the backend. The
 helper stats endpoint exposes separate `subscribe_route_calls`,
 `wake_instance_calls`, and `backend_http_requests` counters; the cold-wake smoke
-fails unless that phase increments each expected counter exactly once.
+fails unless that phase increments each expected counter exactly once. The same
+client result emits latency fields and the script gates the single-request p99
+against `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS`. This is a
+fake-control-plane/proxy cold-wake latency gate. It is not a Kubernetes
+materialization latency SLO and does not measure real workload creation,
+readiness, Service publication, or sidecar startup.
 
 The client sends the same request count directly to the backend and through
 frontline for each protocol phase, reporting request count, failures, elapsed
-milliseconds, rough RPS, and successful request/session latency percentiles as
-stable `key=value` fields: `p50_ms`, `p95_ms`, `p99_ms`, and `max_ms`. The smoke
-fails on correctness errors, startup or process failures, missing tools or
-images, malformed or missing load metrics, non-positive direct baselines,
-additional hot-cache `SubscribeRoute` calls, frontend/direct RPS ratios below
-their configured thresholds, and p99 added latency above configured thresholds.
+milliseconds, rough RPS, WebSocket stream bytes and MiB/s, and successful
+request/session latency percentiles as stable `key=value` fields: `stream_bytes`,
+`mib_per_s`, `p50_ms`, `p95_ms`, `p99_ms`, and `max_ms`. The smoke fails on
+correctness errors, startup or process failures, missing tools or images,
+malformed or missing load metrics, non-positive direct baselines, additional
+hot-cache `SubscribeRoute` calls, frontend/direct RPS or WebSocket throughput
+ratios below their configured thresholds, p99 added latency above configured
+thresholds, or fake-control-plane cold-wake latency above its configured
+threshold.
 
 By default, this remains a conservative developer smoke:
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO=0.10`,
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO=0.10`,
-`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.10`, and each
-`*_MAX_ADDED_P99_MS` defaulting to `1000`. Release-style runs can set
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.10`,
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO=0.10`, each
+`*_MAX_ADDED_P99_MS` defaulting to `1000`, and
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS=5000`.
+Release-style runs can set
 `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS=1`, which changes the default
 HTTP/1.1 ratio to `0.80`, h2c gRPC-shaped ratio to `0.75`, WebSocket session
-ratio to `0.80`, and each max p99 added-latency threshold to `25` ms. The
-explicit env vars still override those strict defaults.
+ratio to `0.80`, WebSocket stream throughput ratio to `0.80`, each max p99
+added-latency threshold to `25` ms, and fake-control-plane cold-wake latency to
+`250` ms. The explicit env vars still override those strict defaults.
 
 Useful knobs:
 
@@ -214,6 +230,8 @@ SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS=500 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY=16 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS=500 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY=16 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES=1048576 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_CHUNK_SIZE=32768 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST=app.example.test \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH=/smoke \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH=/cold-smoke \
@@ -221,11 +239,11 @@ SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH=/cold-smoke \
 ```
 
 This smoke only covers frontline HTTP/1.1, prior-knowledge h2c gRPC-shaped, and
-WebSocket cached ready-route forwarding plus one fake-control-plane cold wake
-through the production frontline image. It does not cover Kubernetes, the real
-control plane, TLS/SNI, negotiated HTTP/2 over TLS, real generated gRPC clients,
-TCP, WebSocket byte-streaming throughput, cold wake latency budgets, or
-route-cache invalidation behavior.
+WebSocket cached ready-route forwarding and byte-streaming plus one
+fake-control-plane cold wake through the production frontline image. It does
+not cover Kubernetes, the real control plane, TLS/SNI, negotiated HTTP/2 over
+TLS, real generated gRPC clients, TCP, real Kubernetes cold materialization
+latency, or route-cache invalidation behavior.
 
 ## Production-Image Load Budget Gates
 
@@ -247,13 +265,17 @@ Strict defaults:
 | `smoke-frontline-load.sh` HTTP/1.1 | frontline RPS / direct RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO=0.80` | frontend `p99_ms` - direct `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS=25` |
 | `smoke-frontline-load.sh` h2c gRPC-shaped | frontline RPS / direct RPS | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO=0.75` | frontend `p99_ms` - direct `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS=25` |
 | `smoke-frontline-load.sh` WebSocket | frontline sessions/s / direct sessions/s | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO=0.80` | frontend session `p99_ms` - direct session `p99_ms` | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS=25` |
+| `smoke-frontline-load.sh` WebSocket stream | frontline MiB/s / direct MiB/s | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO=0.80` | Covered by WebSocket session p99 gate | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS=25` |
+| `smoke-frontline-load.sh` fake-control-plane cold wake | absolute frontend single-request p99 | `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS=250` | Not baseline-relative | Not applicable |
 | `smoke-sidecar-load.sh` HTTP/1.1 | sidecar RPS / direct RPS | `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MIN_RATIO=0.80` | sidecar `p99_ms` - direct `p99_ms` | `SLEEPYPODS_SIDECAR_LOAD_SMOKE_MAX_ADDED_P99_MS=25` |
 | `smoke-sidecar-tcp-load.sh` TCP large streams | sidecar MiB/s / direct MiB/s | `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MIN_RATIO=0.85` | sidecar stream `p99_ms` - direct stream `p99_ms` | `SLEEPYPODS_SIDECAR_TCP_LOAD_SMOKE_MAX_ADDED_P99_MS=500` |
 
 Smoke defaults use the same env vars but remain intentionally loose: frontline
-and sidecar HTTP/WebSocket/h2c ratios default to `0.10`, sidecar TCP throughput
-ratio defaults to `0.05`, HTTP/WebSocket/h2c p99 added latency defaults to
-`1000` ms, and TCP stream p99 added latency defaults to `10000` ms.
+and sidecar HTTP/WebSocket/h2c ratios default to `0.10`, frontline WebSocket
+stream throughput ratio defaults to `0.10`, sidecar TCP throughput ratio
+defaults to `0.05`, HTTP/WebSocket/h2c p99 added latency defaults to `1000` ms,
+fake-control-plane cold-wake latency defaults to `5000` ms, and TCP stream p99
+added latency defaults to `10000` ms.
 
 ## Budget Principles
 

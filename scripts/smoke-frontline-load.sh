@@ -28,12 +28,19 @@ fi
 grpc_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
 websocket_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS:-${requests}}"
 websocket_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY:-${concurrency}}"
+websocket_stream_bytes="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES:-262144}"
+websocket_stream_chunk_size="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_CHUNK_SIZE:-16384}"
 if [[ "${strict_budgets}" == "1" ]]; then
   websocket_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO:-0.80}"
+  websocket_stream_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO:-0.80}"
+  default_cold_wake_max_latency_ms="250"
 else
   websocket_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO:-${min_ratio}}"
+  websocket_stream_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO:-${min_ratio}}"
+  default_cold_wake_max_latency_ms="5000"
 fi
 websocket_max_added_p99_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS:-${default_max_added_p99_ms}}"
+cold_wake_max_latency_ms="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS:-${default_cold_wake_max_latency_ms}}"
 route_host="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST:-app.example.test}"
 route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH:-/smoke}"
 cold_route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_PATH:-/cold-smoke}"
@@ -107,15 +114,19 @@ require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS "${grpc_r
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY "${grpc_concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_REQUESTS "${websocket_requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_CONCURRENCY "${websocket_concurrency}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES "${websocket_stream_bytes}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_CHUNK_SIZE "${websocket_stream_chunk_size}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT "${backend_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_PORT "${frontline_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO "${grpc_min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MIN_RATIO "${websocket_min_ratio}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_STREAM_MIN_RATIO "${websocket_stream_min_ratio}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MAX_ADDED_P99_MS "${max_added_p99_ms}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MAX_ADDED_P99_MS "${grpc_max_added_p99_ms}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_WEBSOCKET_MAX_ADDED_P99_MS "${websocket_max_added_p99_ms}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_COLD_WAKE_MAX_LATENCY_MS "${cold_wake_max_latency_ms}"
 if [[ "${strict_budgets}" != "0" && "${strict_budgets}" != "1" ]]; then
   echo "SLEEPYPODS_FRONTLINE_LOAD_SMOKE_STRICT_BUDGETS must be 0 or 1, got ${strict_budgets}" >&2
   exit 1
@@ -168,7 +179,15 @@ wait_for_url() {
   local attempt
 
   for attempt in $(seq 1 80); do
-    if "${client_bin}" client --label "${label}" --url "${url}" --host "${route_host}" --requests 1 --concurrency 1 --protocol "${protocol}" >/dev/null 2>&1; then
+    if "${client_bin}" client \
+      --label "${label}" \
+      --url "${url}" \
+      --host "${route_host}" \
+      --requests 1 \
+      --concurrency 1 \
+      --protocol "${protocol}" \
+      --websocket-stream-bytes "${websocket_stream_bytes}" \
+      --websocket-stream-chunk-size "${websocket_stream_chunk_size}" >/dev/null 2>&1; then
       return 0
     fi
 
@@ -209,7 +228,9 @@ run_load() {
     --host "${route_host}" \
     --requests "${request_count}" \
     --concurrency "${concurrency_count}" \
-    --protocol "${protocol}" 2>&1)"
+    --protocol "${protocol}" \
+    --websocket-stream-bytes "${websocket_stream_bytes}" \
+    --websocket-stream-chunk-size "${websocket_stream_chunk_size}" 2>&1)"
   status=$?
   set -e
 
@@ -234,6 +255,18 @@ assert_ratio_at_least() {
   fi
 }
 
+assert_throughput_ratio_at_least() {
+  local label="$1"
+  local direct="$2"
+  local proxied="$3"
+  local min="$4"
+
+  if ! load_budget_assert_ratio_at_least "frontline_direct_${label}_mib_per_s" "${direct}" "${proxied}" "${min}"; then
+    dump_logs
+    exit 1
+  fi
+}
+
 assert_added_p99_at_most() {
   local label="$1"
   local direct="$2"
@@ -241,6 +274,17 @@ assert_added_p99_at_most() {
   local max="$4"
 
   if ! load_budget_assert_added_p99_at_most "frontline_direct_${label}" "${direct}" "${proxied}" "${max}"; then
+    dump_logs
+    exit 1
+  fi
+}
+
+assert_value_at_most() {
+  local label="$1"
+  local value="$2"
+  local max="$3"
+
+  if ! load_budget_assert_value_at_most "${label}" "${value}" "${max}"; then
     dump_logs
     exit 1
   fi
@@ -324,6 +368,8 @@ docker run -d \
   --env "SLEEPYPODS_LOAD_SMOKE_ROUTE_HOST=${route_host}" \
   --env "SLEEPYPODS_LOAD_SMOKE_ROUTE_PATH=${route_path}" \
   --env "SLEEPYPODS_LOAD_SMOKE_COLD_ROUTE_PATH=${cold_route_path}" \
+  --env "SLEEPYPODS_LOAD_SMOKE_WEBSOCKET_STREAM_BYTES=${websocket_stream_bytes}" \
+  --env "SLEEPYPODS_LOAD_SMOKE_WEBSOCKET_STREAM_CHUNK_SIZE=${websocket_stream_chunk_size}" \
   "${helper_image}" >/dev/null
 
 direct_port="$(published_port "${helper_name}" "${backend_container_port}")"
@@ -433,7 +479,10 @@ websocket_direct_rps="$(extract_metric "${websocket_direct_result}" rps)"
 websocket_frontline_rps="$(extract_metric "${websocket_frontline_result}" rps)"
 websocket_direct_p99_ms="$(extract_metric "${websocket_direct_result}" p99_ms)"
 websocket_frontline_p99_ms="$(extract_metric "${websocket_frontline_result}" p99_ms)"
+websocket_direct_mib_per_s="$(extract_metric "${websocket_direct_result}" mib_per_s)"
+websocket_frontline_mib_per_s="$(extract_metric "${websocket_frontline_result}" mib_per_s)"
 assert_ratio_at_least "websocket" "${websocket_direct_rps}" "${websocket_frontline_rps}" "${websocket_min_ratio}"
+assert_throughput_ratio_at_least "websocket_stream" "${websocket_direct_mib_per_s}" "${websocket_frontline_mib_per_s}" "${websocket_stream_min_ratio}"
 assert_added_p99_at_most "websocket" "${websocket_direct_p99_ms}" "${websocket_frontline_p99_ms}" "${websocket_max_added_p99_ms}"
 
 echo "hot_cache_websocket_subscribe_route_calls=0 subscribe_route_calls_before=${websocket_subscribe_route_calls_before} subscribe_route_calls_after=${websocket_subscribe_route_calls_after}"
@@ -443,6 +492,9 @@ cold_wake_instance_calls_before="$(read_wake_instance_calls "${stats_url}")"
 cold_backend_http_requests_before="$(read_backend_http_requests "${stats_url}")"
 echo "Running cold-wake frontline smoke for host ${route_host} path ${cold_route_path}"
 run_load frontline-cold-wake "${cold_frontline_url}" "${cold_frontline_output_file}" 1 1 http1
+cold_frontline_result="$(cat "${cold_frontline_output_file}")"
+cold_wake_latency_ms="$(extract_metric "${cold_frontline_result}" p99_ms)"
+assert_value_at_most "frontline_fake_control_plane_cold_wake_latency_ms" "${cold_wake_latency_ms}" "${cold_wake_max_latency_ms}"
 
 cold_subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
 cold_wake_instance_calls_after="$(read_wake_instance_calls "${stats_url}")"
@@ -466,4 +518,4 @@ if [[ "${cold_backend_http_requests_after}" -ne $((cold_backend_http_requests_be
   exit 1
 fi
 
-echo "cold_wake_subscribe_route_calls=1 cold_wake_wake_instance_calls=1 cold_wake_backend_http_requests=1"
+echo "cold_wake_subscribe_route_calls=1 cold_wake_wake_instance_calls=1 cold_wake_backend_http_requests=1 cold_wake_latency_ms=${cold_wake_latency_ms} cold_wake_max_latency_ms=${cold_wake_max_latency_ms}"
