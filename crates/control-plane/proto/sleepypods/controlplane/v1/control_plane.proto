@@ -19,6 +19,9 @@ service OperatorControlPlane {
   rpc ResolveHttp01Challenge(ResolveHttp01ChallengeRequest) returns (ResolveHttp01ChallengeResponse);
   rpc DeleteHttp01Challenge(DeleteHttp01ChallengeRequest) returns (DeleteHttp01ChallengeResponse);
   rpc ExpireHttp01Challenges(ExpireHttp01ChallengesRequest) returns (ExpireHttp01ChallengesResponse);
+  rpc ReconcileMaterialization(ReconcileMaterializationRequest) returns (ReconcileMaterializationResponse);
+  rpc ForceDeleteMaterialization(ForceDeleteMaterializationRequest) returns (ForceDeleteMaterializationResponse);
+  rpc ForceReleaseExclusivityKey(ForceReleaseExclusivityKeyRequest) returns (ForceReleaseExclusivityKeyResponse);
 }
 
 // ProxyControlPlane is a native-gRPC-only proxy control-plane surface. It is
@@ -509,4 +512,51 @@ message ExpireHttp01ChallengesRequest {
 
 message ExpireHttp01ChallengesResponse {
   uint64 expired = 1;
+}
+
+message ReconcileMaterializationRequest {
+  string materialization_id = 1;
+}
+
+message ReconcileMaterializationResponse {
+  bool found = 1;
+  string materialization_id = 2;
+  string state = 3;
+  bool attempted = 4;
+  string lease_owner = 5;
+  int64 lease_expires_at_unix_millis = 6;
+  uint64 lease_attempt = 7;
+  repeated RenderedObjectRef observed_refs = 8;
+}
+
+message ForceDeleteMaterializationRequest {
+  string materialization_id = 1;
+  string operator = 2;
+  string reason = 3;
+}
+
+message ForceDeleteMaterializationResponse {
+  bool found = 1;
+  string materialization_id = 2;
+  repeated RenderedObjectRef observed_refs = 3;
+}
+
+message RenderedObjectRef {
+  string api_version = 1;
+  string kind = 2;
+  string namespace = 3;
+  string name = 4;
+}
+
+message ForceReleaseExclusivityKeyRequest {
+  string cluster_id = 1;
+  string namespace = 2;
+  string key_name = 3;
+  string key_value = 4;
+  string operator = 5;
+  string reason = 6;
+}
+
+message ForceReleaseExclusivityKeyResponse {
+  uint64 updated_materializations = 1;
 }

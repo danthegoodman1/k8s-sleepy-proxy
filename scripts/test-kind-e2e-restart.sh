@@ -13,6 +13,7 @@ late_app_image="${SLEEPYPODS_KIND_E2E_LATE_APP_IMAGE:-${image_prefix}/routing-ap
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19751}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19780}"
+control_plane_replicas="${SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS:-1}"
 kubeconfig="$(mktemp)"
 control_plane_pf_log="$(mktemp)"
 frontline_pf_log="$(mktemp)"
@@ -89,6 +90,11 @@ trap cleanup EXIT
 for command in kind kubectl docker cargo; do
   require_command "${command}"
 done
+
+if [[ ! "${control_plane_replicas}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS must be a positive integer; got ${control_plane_replicas}" >&2
+  exit 2
+fi
 
 if ! kind get clusters | grep -Fxq "${cluster_name}"; then
   created_cluster=1
@@ -255,7 +261,7 @@ metadata:
     app.kubernetes.io/name: sleepypods-control-plane
     sleepypods.io/kind-e2e: restart
 spec:
-  replicas: 1
+  replicas: ${control_plane_replicas}
   selector:
     matchLabels:
       app.kubernetes.io/name: sleepypods-control-plane
@@ -378,6 +384,7 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_LATE_APP_IMAGE="${late_app_image}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
+  SLEEPYPODS_E2E_CONTROL_PLANE_REPLICAS="${control_plane_replicas}" \
   cargo test -p control-plane --test kind_e2e_restart -- --ignored --nocapture
 
 echo "restart full-platform kind E2E completed"

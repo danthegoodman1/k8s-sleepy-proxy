@@ -10,9 +10,15 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        BeginSleepRequest, BeginSleepResult, CompleteWakeRequest, CompleteWakeResult,
-        FinalizeSleepRequest, FinalizeSleepResult, LoadActiveMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationRecord, RecordMaterializationRequest,
+        BeginSleepRequest, BeginSleepResult, ClaimMaterializationReconciliationRequest,
+        CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
+        DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
+        FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
+        ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
+        ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
+        LoadMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
+        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
+        RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
@@ -32,107 +38,250 @@ pub trait ControlPlaneStore: Send + Sync {
     fn create_instance<'a>(
         &'a self,
         request: CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>>;
+    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
+        let _ = request;
+        unsupported_store_method("create_instance")
+    }
 
     fn get_instance<'a>(
         &'a self,
         request: GetInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
+        let _ = request;
+        unsupported_store_method("get_instance")
+    }
 
     fn delete_instance<'a>(
         &'a self,
         request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>>;
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        let _ = request;
+        unsupported_store_method("delete_instance")
+    }
 
     fn create_workload_class_version<'a>(
         &'a self,
         request: CreateWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>>;
+    ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>> {
+        let _ = request;
+        unsupported_store_method("create_workload_class_version")
+    }
 
     fn load_workload_class_version<'a>(
         &'a self,
         request: LoadWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
+        let _ = request;
+        unsupported_store_method("load_workload_class_version")
+    }
 
     fn create_route_binding<'a>(
         &'a self,
         request: CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>>;
+    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
+        let _ = request;
+        unsupported_store_method("create_route_binding")
+    }
 
     fn get_route_binding<'a>(
         &'a self,
         request: GetRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>> {
+        let _ = request;
+        unsupported_store_method("get_route_binding")
+    }
 
     fn delete_route_binding<'a>(
         &'a self,
         request: DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>>;
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        let _ = request;
+        unsupported_store_method("delete_route_binding")
+    }
 
     fn resolve_route<'a>(
         &'a self,
         identity: RouteIdentity,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>>;
+    ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+        let _ = identity;
+        unsupported_store_method("resolve_route")
+    }
 
     fn compare_and_swap_instance_state<'a>(
         &'a self,
         request: CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>>;
+    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
+        let _ = request;
+        unsupported_store_method("compare_and_swap_instance_state")
+    }
 
     fn record_materialization<'a>(
         &'a self,
         request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>>;
+    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
+        let _ = request;
+        unsupported_store_method("record_materialization")
+    }
 
     fn load_ready_materialization<'a>(
         &'a self,
         request: LoadReadyMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("load_ready_materialization")
+    }
 
     fn load_active_materialization<'a>(
         &'a self,
         request: LoadActiveMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("load_active_materialization")
+    }
+
+    fn load_materialization<'a>(
+        &'a self,
+        request: LoadMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("load_materialization")
+    }
 
     fn complete_wake<'a>(
         &'a self,
         request: CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>>;
+    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+        let _ = request;
+        unsupported_store_method("complete_wake")
+    }
 
     fn begin_sleep<'a>(
         &'a self,
         request: BeginSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>>;
+    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
+        let _ = request;
+        unsupported_store_method("begin_sleep")
+    }
 
     fn finalize_sleep<'a>(
         &'a self,
         request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>>;
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        let _ = request;
+        unsupported_store_method("finalize_sleep")
+    }
+
+    fn list_materialization_reconciliation_candidates<'a>(
+        &'a self,
+        request: ListMaterializationReconciliationCandidatesRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("list_materialization_reconciliation_candidates")
+    }
+
+    fn claim_materialization_reconciliation<'a>(
+        &'a self,
+        request: ClaimMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("claim_materialization_reconciliation")
+    }
+
+    fn renew_materialization_reconciliation_lease<'a>(
+        &'a self,
+        request: RenewMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        let _ = request;
+        unsupported_store_method("renew_materialization_reconciliation_lease")
+    }
+
+    fn release_materialization_reconciliation_lease<'a>(
+        &'a self,
+        request: ReleaseMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        let _ = request;
+        unsupported_store_method("release_materialization_reconciliation_lease")
+    }
+
+    fn complete_wake_reconciliation<'a>(
+        &'a self,
+        request: CompleteWakeReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+        let _ = request;
+        unsupported_store_method("complete_wake_reconciliation")
+    }
+
+    fn finalize_sleep_reconciliation<'a>(
+        &'a self,
+        request: FinalizeSleepReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        let _ = request;
+        unsupported_store_method("finalize_sleep_reconciliation")
+    }
+
+    fn delete_materialization_reconciliation<'a>(
+        &'a self,
+        request: DeleteMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("delete_materialization_reconciliation")
+    }
+
+    fn force_delete_materialization<'a>(
+        &'a self,
+        request: ForceDeleteMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        let _ = request;
+        unsupported_store_method("force_delete_materialization")
+    }
+
+    fn force_release_exclusivity_key<'a>(
+        &'a self,
+        request: ForceReleaseExclusivityKeyRequest,
+    ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
+        let _ = request;
+        unsupported_store_method("force_release_exclusivity_key")
+    }
 
     fn lookup_route_dependencies<'a>(
         &'a self,
         request: RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
+        let _ = request;
+        unsupported_store_method("lookup_route_dependencies")
+    }
 
     fn put_http01_challenge<'a>(
         &'a self,
         request: PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>>;
+    ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>> {
+        let _ = request;
+        unsupported_store_method("put_http01_challenge")
+    }
 
     fn resolve_http01_challenge<'a>(
         &'a self,
         key: Http01ChallengeKey,
-    ) -> StoreFuture<'a, StoreResult<Option<Http01ChallengeRecord>>>;
+    ) -> StoreFuture<'a, StoreResult<Option<Http01ChallengeRecord>>> {
+        let _ = key;
+        unsupported_store_method("resolve_http01_challenge")
+    }
 
     fn delete_http01_challenge<'a>(
         &'a self,
         request: DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>>;
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        let _ = request;
+        unsupported_store_method("delete_http01_challenge")
+    }
 
     fn expire_http01_challenges<'a>(
         &'a self,
         request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>>;
+    ) -> StoreFuture<'a, StoreResult<usize>> {
+        let _ = request;
+        unsupported_store_method("expire_http01_challenges")
+    }
 }
 
 #[derive(Clone)]
@@ -340,6 +489,15 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
+    fn load_materialization<'a>(
+        &'a self,
+        request: LoadMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.load_materialization(request.clone())
+        })
+    }
+
     fn complete_wake<'a>(
         &'a self,
         request: CompleteWakeRequest,
@@ -364,6 +522,87 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
             store.finalize_sleep(request.clone())
+        })
+    }
+
+    fn list_materialization_reconciliation_candidates<'a>(
+        &'a self,
+        request: ListMaterializationReconciliationCandidatesRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.list_materialization_reconciliation_candidates(request.clone())
+        })
+    }
+
+    fn claim_materialization_reconciliation<'a>(
+        &'a self,
+        request: ClaimMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.claim_materialization_reconciliation(request.clone())
+        })
+    }
+
+    fn renew_materialization_reconciliation_lease<'a>(
+        &'a self,
+        request: RenewMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.renew_materialization_reconciliation_lease(request.clone())
+        })
+    }
+
+    fn release_materialization_reconciliation_lease<'a>(
+        &'a self,
+        request: ReleaseMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.release_materialization_reconciliation_lease(request.clone())
+        })
+    }
+
+    fn complete_wake_reconciliation<'a>(
+        &'a self,
+        request: CompleteWakeReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.complete_wake_reconciliation(request.clone())
+        })
+    }
+
+    fn finalize_sleep_reconciliation<'a>(
+        &'a self,
+        request: FinalizeSleepReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.finalize_sleep_reconciliation(request.clone())
+        })
+    }
+
+    fn delete_materialization_reconciliation<'a>(
+        &'a self,
+        request: DeleteMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.delete_materialization_reconciliation(request.clone())
+        })
+    }
+
+    fn force_delete_materialization<'a>(
+        &'a self,
+        request: ForceDeleteMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.force_delete_materialization(request.clone())
+        })
+    }
+
+    fn force_release_exclusivity_key<'a>(
+        &'a self,
+        request: ForceReleaseExclusivityKeyRequest,
+    ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.force_release_exclusivity_key(request.clone())
         })
     }
 
@@ -427,6 +666,17 @@ where
         policy
             .retry_if(|| operation(inner.as_ref()), StoreError::is_retryable)
             .await
+    })
+}
+
+fn unsupported_store_method<'a, T>(method: &'static str) -> StoreFuture<'a, StoreResult<T>>
+where
+    T: Send + 'a,
+{
+    Box::pin(async move {
+        Err(StoreError::internal(format!(
+            "control-plane store method {method} is not implemented"
+        )))
     })
 }
 

@@ -2,6 +2,7 @@ use crate::ids::InstanceId;
 
 pub(crate) const DNS_LABEL_MAX_LEN: usize = 63;
 const INSTANCE_ID_SUFFIX_RESERVED_LEN: usize = 8;
+const INSTANCE_ID_SUFFIX_MAX_LEN: usize = 16;
 const INSTANCE_ID_SEPARATOR_LEN: usize = 1;
 
 pub(crate) fn render_instance_scoped_name(base: &str, instance_id: &InstanceId) -> String {
@@ -30,8 +31,13 @@ pub(crate) fn is_dns_label(value: &str) -> bool {
 
 fn instance_id_suffix(instance_id: &InstanceId) -> &str {
     let value = instance_id.as_str();
-    let suffix_len = value.len().min(INSTANCE_ID_SUFFIX_RESERVED_LEN);
-    &value[..suffix_len]
+    let max_len = value.len().min(INSTANCE_ID_SUFFIX_MAX_LEN);
+    let mut suffix_len = value.len().min(INSTANCE_ID_SUFFIX_RESERVED_LEN);
+    while suffix_len < max_len && value.as_bytes()[suffix_len - 1] == b'-' {
+        suffix_len += 1;
+    }
+
+    value[..suffix_len].trim_end_matches('-')
 }
 
 fn truncate_to_byte_len(value: &str, max_len: usize) -> &str {
@@ -83,6 +89,22 @@ mod tests {
         assert_eq!(
             render_instance_scoped_name("api", &instance_id("instance-a")),
             "api-instance"
+        );
+    }
+
+    #[test]
+    fn instance_scoped_name_extends_suffix_when_eight_character_prefix_ends_in_hyphen() {
+        assert_eq!(
+            render_instance_scoped_name("api", &instance_id("restart-wake")),
+            "api-restart-w"
+        );
+    }
+
+    #[test]
+    fn instance_scoped_name_trims_suffix_when_extended_prefix_still_ends_in_hyphen() {
+        assert_eq!(
+            render_instance_scoped_name("api", &instance_id("a----------------b")),
+            "api-a"
         );
     }
 

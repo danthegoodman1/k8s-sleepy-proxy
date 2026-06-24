@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,10 +23,15 @@ use crate::{
         route_events::RouteSubscriptionBroker,
     },
     http01 as domain_http01,
-    ids::{IdempotencyKey, InstanceId, WorkloadClassId},
+    ids::{IdempotencyKey, InstanceId, MaterializationId, WorkloadClassId},
     instance::{self as domain_instance, InstanceState},
-    materialization::MaterializationTarget,
+    materialization::{
+        ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
+        LoadMaterializationRequest, MaterializationRecord, MaterializationState,
+        MaterializationTarget, RenderedObjectRef,
+    },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
+    reconciler::{MaterializationReconciler, MaterializationReconcilerConfig},
     route as domain_route,
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{ControlPlaneStore, StoreError},
@@ -50,6 +58,9 @@ pub const OPERATOR_UNARY_METHODS: &[&str] = &[
     "ResolveHttp01Challenge",
     "DeleteHttp01Challenge",
     "ExpireHttp01Challenges",
+    "ReconcileMaterialization",
+    "ForceDeleteMaterialization",
+    "ForceReleaseExclusivityKey",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -255,6 +266,27 @@ impl OperatorControlPlane for OperatorApiPlaceholder {
         _request: Request<pb::ExpireHttp01ChallengesRequest>,
     ) -> Result<Response<pb::ExpireHttp01ChallengesResponse>, Status> {
         Err(placeholder_status("ExpireHttp01Challenges"))
+    }
+
+    async fn reconcile_materialization(
+        &self,
+        _request: Request<pb::ReconcileMaterializationRequest>,
+    ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
+        Err(placeholder_status("ReconcileMaterialization"))
+    }
+
+    async fn force_delete_materialization(
+        &self,
+        _request: Request<pb::ForceDeleteMaterializationRequest>,
+    ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
+        Err(placeholder_status("ForceDeleteMaterialization"))
+    }
+
+    async fn force_release_exclusivity_key(
+        &self,
+        _request: Request<pb::ForceReleaseExclusivityKeyRequest>,
+    ) -> Result<Response<pb::ForceReleaseExclusivityKeyResponse>, Status> {
+        Err(placeholder_status("ForceReleaseExclusivityKey"))
     }
 }
 
@@ -469,6 +501,106 @@ where
 
         Ok(Response::new(pb::ExpireHttp01ChallengesResponse {
             expired: expired as u64,
+        }))
+    }
+
+    async fn reconcile_materialization(
+        &self,
+        request: Request<pb::ReconcileMaterializationRequest>,
+    ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
+        let materialization_id = MaterializationId::new(request.into_inner().materialization_id)
+            .map_err(invalid_argument_status)?;
+        let before = self
+            .store
+            .load_materialization(LoadMaterializationRequest::new(materialization_id.clone()))
+            .await
+            .map_err(store_error_to_status)?;
+
+        let Some(before) = before else {
+            return Ok(Response::new(pb::ReconcileMaterializationResponse {
+                found: false,
+                materialization_id: materialization_id.as_str().to_owned(),
+                state: String::new(),
+                attempted: false,
+                lease_owner: String::new(),
+                lease_expires_at_unix_millis: 0,
+                lease_attempt: 0,
+                observed_refs: Vec::new(),
+            }));
+        };
+
+        let attempted = matches!(
+            before.state,
+            MaterializationState::Pending | MaterializationState::Deleting
+        );
+        if attempted {
+            let reconciler = MaterializationReconciler::new(
+                Arc::clone(&self.store),
+                self.materializer.clone(),
+                MaterializationReconcilerConfig {
+                    owner: operator_reconcile_owner(),
+                    ..MaterializationReconcilerConfig::default()
+                },
+                proxy_core::observability::recorder::ObservabilityRecorder::noop(),
+            );
+            reconciler.reconcile_materialization(before.clone()).await;
+        }
+
+        let after = self
+            .store
+            .load_materialization(LoadMaterializationRequest::new(materialization_id))
+            .await
+            .map_err(store_error_to_status)?
+            .unwrap_or(before);
+
+        Ok(Response::new(reconcile_materialization_response(
+            &after, attempted,
+        )))
+    }
+
+    async fn force_delete_materialization(
+        &self,
+        request: Request<pb::ForceDeleteMaterializationRequest>,
+    ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
+        let request = force_delete_materialization_request_from_proto(request.into_inner())?;
+        let materialization_id = request.materialization_id.as_str().to_owned();
+        let materialization = self
+            .store
+            .force_delete_materialization(request)
+            .await
+            .map_err(store_error_to_status)?;
+        let observed_refs = materialization
+            .as_ref()
+            .map(|materialization| {
+                materialization
+                    .rendered_objects
+                    .iter()
+                    .map(rendered_object_ref_to_proto)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Response::new(pb::ForceDeleteMaterializationResponse {
+            found: materialization.is_some(),
+            materialization_id,
+            observed_refs,
+        }))
+    }
+
+    async fn force_release_exclusivity_key(
+        &self,
+        request: Request<pb::ForceReleaseExclusivityKeyRequest>,
+    ) -> Result<Response<pb::ForceReleaseExclusivityKeyResponse>, Status> {
+        let result = self
+            .store
+            .force_release_exclusivity_key(force_release_exclusivity_key_request_from_proto(
+                request.into_inner(),
+            )?)
+            .await
+            .map_err(store_error_to_status)?;
+
+        Ok(Response::new(pb::ForceReleaseExclusivityKeyResponse {
+            updated_materializations: result.updated_materializations as u64,
         }))
     }
 }
@@ -697,6 +829,69 @@ fn expire_http01_request_from_proto(
     Ok(domain_request)
 }
 
+fn force_delete_materialization_request_from_proto(
+    request: pb::ForceDeleteMaterializationRequest,
+) -> Result<ForceDeleteMaterializationRequest, Status> {
+    Ok(ForceDeleteMaterializationRequest::new(
+        MaterializationId::new(request.materialization_id).map_err(invalid_argument_status)?,
+        request.operator,
+        request.reason,
+    ))
+}
+
+fn force_release_exclusivity_key_request_from_proto(
+    request: pb::ForceReleaseExclusivityKeyRequest,
+) -> Result<ForceReleaseExclusivityKeyRequest, Status> {
+    Ok(ForceReleaseExclusivityKeyRequest::new(
+        MaterializationTarget::new(request.cluster_id, request.namespace)
+            .map_err(invalid_argument_status)?,
+        request.key_name,
+        request.key_value,
+        request.operator,
+        request.reason,
+    ))
+}
+
+fn reconcile_materialization_response(
+    materialization: &MaterializationRecord,
+    attempted: bool,
+) -> pb::ReconcileMaterializationResponse {
+    let lease = materialization.reconciliation_lease.as_ref();
+    pb::ReconcileMaterializationResponse {
+        found: true,
+        materialization_id: materialization.id.as_str().to_owned(),
+        state: materialization_state_name(materialization.state).to_owned(),
+        attempted,
+        lease_owner: lease.map(|lease| lease.owner.clone()).unwrap_or_default(),
+        lease_expires_at_unix_millis: lease
+            .and_then(|lease| unix_millis_from_system_time(lease.expires_at).ok())
+            .unwrap_or_default(),
+        lease_attempt: lease.map(|lease| lease.attempt).unwrap_or_default(),
+        observed_refs: materialization
+            .rendered_objects
+            .iter()
+            .map(rendered_object_ref_to_proto)
+            .collect(),
+    }
+}
+
+fn operator_reconcile_owner() -> String {
+    static OPERATOR_RECONCILE_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = OPERATOR_RECONCILE_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = unix_millis_from_system_time(SystemTime::now()).unwrap_or_default();
+    format!("operator-reconcile-{}-{now}-{counter}", std::process::id())
+}
+
+fn materialization_state_name(state: MaterializationState) -> &'static str {
+    match state {
+        MaterializationState::Pending => "Pending",
+        MaterializationState::Ready => "Ready",
+        MaterializationState::Failed => "Failed",
+        MaterializationState::Deleting => "Deleting",
+        MaterializationState::Deleted => "Deleted",
+    }
+}
+
 fn instance_to_proto(instance: domain_instance::InstanceRecord) -> pb::Instance {
     pb::Instance {
         instance_id: instance.id.as_str().to_owned(),
@@ -848,6 +1043,15 @@ fn http01_to_proto(
         key_authorization: challenge.key_authorization().to_owned(),
         expires_at_unix_millis: unix_millis_from_system_time(challenge.expires_at())?,
     })
+}
+
+fn rendered_object_ref_to_proto(object: &RenderedObjectRef) -> pb::RenderedObjectRef {
+    pb::RenderedObjectRef {
+        api_version: object.api_version.clone(),
+        kind: object.kind.clone(),
+        namespace: object.namespace.clone(),
+        name: object.name.clone(),
+    }
 }
 
 fn unix_millis_from_system_time(value: SystemTime) -> Result<i64, Status> {

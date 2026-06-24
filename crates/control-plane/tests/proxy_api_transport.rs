@@ -1863,6 +1863,7 @@ impl ControlPlaneStore for FakeWakeStore {
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
                 exclusivity_keys: request.exclusivity_keys,
+                reconciliation_lease: None,
             };
             let mut materializations = self
                 .materializations
@@ -1953,6 +1954,7 @@ impl ControlPlaneStore for FakeWakeStore {
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
                 exclusivity_keys: request.exclusivity_keys,
+                reconciliation_lease: None,
             };
             self.materializations
                 .lock()
@@ -2235,6 +2237,7 @@ fn materialization_with_state_and_target(
         backend_generation: BackendGeneration::new(generation),
         rendered_objects: Vec::new(),
         exclusivity_keys: vec![],
+        reconciliation_lease: None,
     }
 }
 

@@ -25,6 +25,7 @@ use crate::{
         KubernetesMaterializer, KubernetesMaterializerClient, RetryingKubernetesMaterializerClient,
     },
     postgres::PostgresStore,
+    reconciler::{MaterializationReconciler, MaterializationReconcilerConfig},
     store::{ControlPlaneStore, RetryingControlPlaneStore},
     KubeMaterializerClient,
 };
@@ -262,6 +263,16 @@ where
     );
     let (shutdown_tx, _) = watch::channel(false);
     let native_shutdown = shutdown_tx.subscribe();
+    let reconciler_shutdown = shutdown_tx.subscribe();
+    let reconciler = MaterializationReconciler::new(
+        Arc::clone(&store),
+        materializer.clone(),
+        MaterializationReconcilerConfig::default(),
+        ObservabilityRecorder::global(),
+    );
+    tokio::spawn(async move {
+        reconciler.run_until_shutdown(reconciler_shutdown).await;
+    });
 
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;

@@ -880,6 +880,27 @@ impl OperatorControlPlane for FakeOperatorControlPlane {
     ) -> Result<Response<pb::ExpireHttp01ChallengesResponse>, Status> {
         Err(Status::unimplemented("unused fake method"))
     }
+
+    async fn reconcile_materialization(
+        &self,
+        _request: Request<pb::ReconcileMaterializationRequest>,
+    ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn force_delete_materialization(
+        &self,
+        _request: Request<pb::ForceDeleteMaterializationRequest>,
+    ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
+
+    async fn force_release_exclusivity_key(
+        &self,
+        _request: Request<pb::ForceReleaseExclusivityKeyRequest>,
+    ) -> Result<Response<pb::ForceReleaseExclusivityKeyResponse>, Status> {
+        Err(Status::unimplemented("unused fake method"))
+    }
 }
 
 impl FakeOperatorControlPlane {

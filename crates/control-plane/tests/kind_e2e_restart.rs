@@ -25,7 +25,7 @@ use k8s_openapi::api::{
 };
 use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams},
-    Api, Client, Error as KubeError,
+    Api, Client,
 };
 use serde_json::json;
 use tokio::time::{sleep, timeout, Instant};
@@ -44,7 +44,7 @@ const APP_PORT: u32 = 8080;
 const APP_MARKER: &str = "sleepypods-routing-app";
 const CONTROL_PLANE_DEPLOYMENT: &str = "sleepypods-control-plane";
 const CONTROL_PLANE_LABEL: &str = "app.kubernetes.io/name=sleepypods-control-plane";
-const WORKLOAD_NAME_LABEL: &str = "sleepypods.io/workload-name";
+const INSTANCE_ID_LABEL: &str = "sleepypods.io/instance-id";
 const INSTANCE_GENERATION_LABEL: &str = "sleepypods.io/instance-generation";
 const WAKE_HOST: &str = "wake.restart.sleepypods.test";
 const SLEEP_HOST: &str = "sleep.restart.sleepypods.test";
@@ -131,6 +131,7 @@ struct E2eConfig {
     app_image: String,
     late_app_image: String,
     sidecar_image: String,
+    control_plane_replicas: i32,
 }
 
 #[derive(Debug)]
@@ -158,6 +159,11 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods/routing-app-late:kind-e2e-restart".to_owned()),
             sidecar_image: env::var("SLEEPYPODS_E2E_SIDECAR_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/sidecar:kind-e2e-restart".to_owned()),
+            control_plane_replicas: env::var("SLEEPYPODS_E2E_CONTROL_PLANE_REPLICAS")
+                .ok()
+                .map(|value| value.parse::<i32>())
+                .transpose()?
+                .unwrap_or(1),
         })
     }
 }
@@ -283,7 +289,12 @@ async fn restart_during_sleep_report_recovers(
     scale_control_plane(kube.clone(), &config.namespace, 0).await?;
     eprintln!("==> restart E2E: sleep recovery control-plane scaled down");
     sleep(Duration::from_secs(7)).await;
-    scale_control_plane(kube.clone(), &config.namespace, 1).await?;
+    scale_control_plane(
+        kube.clone(),
+        &config.namespace,
+        config.control_plane_replicas,
+    )
+    .await?;
     eprintln!("==> restart E2E: sleep recovery control-plane scaled up");
     wait_for_instance_state_reconnecting(
         &config.operator_endpoint,
@@ -353,7 +364,12 @@ async fn restart_before_delete_retry_finalizes_cleanup(
         );
     }
 
-    scale_control_plane(kube.clone(), &config.namespace, 1).await?;
+    scale_control_plane(
+        kube.clone(),
+        &config.namespace,
+        config.control_plane_replicas,
+    )
+    .await?;
     let mut operator = connect_operator(&config.operator_endpoint).await?;
     let deleted = operator
         .delete_instance(DeleteInstanceRequest {
@@ -996,13 +1012,9 @@ fn load_late_image_into_kind(config: &E2eConfig) -> TestResult<()> {
     Ok(())
 }
 
-async fn delete_workload_pods(
-    kube: Client,
-    namespace: &str,
-    workload_name: &str,
-) -> TestResult<()> {
+async fn delete_workload_pods(kube: Client, namespace: &str, instance_id: &str) -> TestResult<()> {
     let pods: Api<Pod> = Api::namespaced(kube, namespace);
-    let selector = format!("{WORKLOAD_NAME_LABEL}={workload_name}");
+    let selector = format!("{INSTANCE_ID_LABEL}={instance_id}");
     for pod in pods.list(&ListParams::default().labels(&selector)).await? {
         if let Some(name) = pod.metadata.name {
             let _ = pods.delete(&name, &DeleteParams::default()).await;
@@ -1015,28 +1027,52 @@ async fn delete_workload_pods(
 async fn assert_workload_generation(
     kube: Client,
     namespace: &str,
-    workload_name: &str,
+    instance_id: &str,
     generation: u64,
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), namespace);
     let services: Api<Service> = Api::namespaced(kube, namespace);
+    let selector = format!("{INSTANCE_ID_LABEL}={instance_id}");
     let expected = generation.to_string();
-    let deployment = deployments.get(workload_name).await?;
-    let service = services.get(workload_name).await?;
+    let deployment = single_labeled_object(
+        "Deployment",
+        instance_id,
+        deployments
+            .list(&ListParams::default().labels(&selector))
+            .await?,
+    )?;
+    let service = single_labeled_object(
+        "Service",
+        instance_id,
+        services
+            .list(&ListParams::default().labels(&selector))
+            .await?,
+    )?;
     assert_object_generation_label(
         "Deployment",
-        workload_name,
+        instance_id,
         &deployment.metadata.labels,
         &expected,
     )?;
-    assert_object_generation_label(
-        "Service",
-        workload_name,
-        &service.metadata.labels,
-        &expected,
-    )?;
+    assert_object_generation_label("Service", instance_id, &service.metadata.labels, &expected)?;
 
     Ok(())
+}
+
+fn single_labeled_object<K: Clone>(
+    kind: &str,
+    instance_id: &str,
+    objects: kube::api::ObjectList<K>,
+) -> TestResult<K> {
+    let mut items = objects.items.into_iter();
+    let object = items
+        .next()
+        .ok_or_else(|| format!("no {kind} found for instance {instance_id}"))?;
+    if items.next().is_some() {
+        return Err(format!("multiple {kind} objects found for instance {instance_id}").into());
+    }
+
+    Ok(object)
 }
 
 fn assert_object_generation_label(
@@ -1062,31 +1098,36 @@ fn assert_object_generation_label(
 async fn wait_for_workload_absent(
     kube: Client,
     namespace: &str,
-    workload_name: &str,
+    instance_id: &str,
     timeout: Duration,
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), namespace);
     let services: Api<Service> = Api::namespaced(kube, namespace);
+    let selector = format!("{INSTANCE_ID_LABEL}={instance_id}");
     let deadline = Instant::now() + timeout;
     loop {
-        let deployment_absent = is_not_found(deployments.get(workload_name).await);
-        let service_absent = is_not_found(services.get(workload_name).await);
+        let deployment_absent = deployments
+            .list(&ListParams::default().labels(&selector))
+            .await?
+            .items
+            .is_empty();
+        let service_absent = services
+            .list(&ListParams::default().labels(&selector))
+            .await?
+            .items
+            .is_empty();
         if deployment_absent && service_absent {
             return Ok(());
         }
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for workload {namespace}/{workload_name} Deployment and Service to be deleted"
+                "timed out waiting for workload objects in {namespace} for instance {instance_id} to be deleted"
             )
             .into());
         }
         sleep(Duration::from_secs(1)).await;
     }
-}
-
-fn is_not_found<T>(result: Result<T, KubeError>) -> bool {
-    matches!(result, Err(KubeError::Api(status)) if status.is_not_found())
 }
 
 async fn wait_for_instance_response(

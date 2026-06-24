@@ -1236,6 +1236,95 @@ Done criteria:
 | Complete | Observability records accepted, rejected, and unauthorized calls without recording credential material. | `auth.rs` and `proxy-core` tests cover accepted, missing, invalid, and wrong-role decisions and assert credential strings are absent from captured events. |
 | Complete | kind E2E proves auth-enabled control plane works with deployed frontend and sidecar. | `./scripts/test-kind-e2e-stateless.sh` passed with production images, static auth, authenticated frontline/sidecar runtime calls, runtime-injected sidecar token env, and invalid credential probes; `./scripts/test-kind-e2e-grpc-web.sh` passed for deployed gRPC-Web operator auth. |
 
+## Milestone 14: Materialization Reconciliation and Multi-Controller Recovery
+
+Make non-terminal materializations converge after crashes, partial Kubernetes
+side effects, cleanup failures, and multiple control-plane replicas. This phase
+closes the M12 crash-boundary gaps without weakening the safety invariant for
+stateful resources: exclusivity keys are held while a materialization is
+non-terminal, and they are released only after reconciliation proves cleanup is
+safe or an explicit operator override is used.
+
+The generalized failure mode is:
+
+```text
+DB has a non-terminal materialization, but the control plane does not know
+whether the external Kubernetes side effect completed.
+```
+
+Scope:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Add a materialization reconciler for `Pending` and `Deleting` rows. | Added `MaterializationReconciler` startup/periodic worker with durable claim, lease renewal, bounded batch/concurrency, and shutdown wiring in runtime. Focused component tests cover Pending resume/complete, stale Pending cleanup/force-delete, Deleting cleanup/finalize, cleanup error, lease loss, and generation-race cleanup. |
+| Complete | Add durable reconciliation leases. | Migration `0006_materialization_reconciliation_leases.sql` adds `reconcile_owner`, `reconcile_lease_expires_at_unix_millis`, and `reconcile_attempt`; Postgres claim/renew/release use conditional updates. Real Postgres conformance covers claim race, same-owner duplicate claim rejection, expiry takeover, wrong-owner renew, expired same-owner renew/finalization rejection, and release behavior. |
+| Complete | Keep reconciliation safe with multiple control-plane replicas. | Store finalization paths require current lease ownership plus materialization id, state, target, and generation; component test covers lease loss before finalize; Postgres conformance covers claim race, expiry takeover, stale-owner rejection, and same-key blocking; `SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS=2 ./scripts/test-kind-e2e-restart.sh` passed on 2026-06-24 with two production control-plane replicas against one Postgres/Kubernetes target. |
+| Partial | Make Kubernetes side effects idempotent. | Reconciler uses existing server-side apply and delete-if-exists materializer APIs with bounded waits. Ownership/ref checks are limited to persisted rendered-ref comparison for `Pending`; live ownership-label/ref inspection still needs expansion. |
+| Complete | Reconstruct desired manifests safely. | Pending reconciliation re-renders from immutable workload class version, instance values/generation, target namespace, resolved sleep policy, and runtime sidecar token, then requires rendered refs to match persisted refs. Persisted refs are the V1 verification boundary; no separate digest is needed for the current object-ref safety contract. |
+| Complete | Recover `Pending` materializations. | Implemented current-wake reapply/readiness/lease-owned `complete_wake`, and stale/terminal cleanup through a guarded lease-owned delete transition after Kubernetes delete succeeds. `pending_reconciliation_applies_waits_and_completes_current_wake`, `pending_stale_generation_deletes_refs_and_marks_deleted_after_cleanup`, and `stale_cleanup_does_not_delete_newer_same_id_materialization` cover deterministic recovery and stale same-id race paths. |
+| Complete | Recover `Deleting` materializations. | Implemented re-delete recorded refs, tolerate missing refs through materializer delete-if-exists, lease-owned `finalize_sleep`, and no finalize after lease loss. Component tests cover success, missing refs, cleanup failure, lease loss, and generation-race cleanup. |
+| Partial | Keep suspicious `Ready` drift out of the critical path for V1. | This is an explicit V1 non-goal: M14 reconciles non-terminal `Pending`/`Deleting` rows and keeps `Ready` drift observe/report-only. Automatic `Ready` repair is deferred because it requires a separate policy for live backend replacement and could otherwise destabilize healthy traffic. |
+| Complete | Add explicit operator recovery tools. | Added audited store operations and operator gRPC/gRPC-Web RPCs for `ReconcileMaterialization`, `ForceDeleteMaterialization`, and `ForceReleaseExclusivityKey`, with transport tests. `ReconcileMaterialization` inspects state/lease/refs and triggers one synchronous reconciliation attempt for `Pending`/`Deleting`. |
+| Partial | Add low-cardinality reconciliation observability. | Reconciler emits low-cardinality reconciliation events and materialization failure metrics without key values or token material. Long-held key alerts and stale-generation-specific counters are deferred observability follow-up. |
+| Complete | Document lock semantics and operator runbooks. | Updated `docs/operator-guide.md` and `docs/operator-runbook.md` for durable leases, non-terminal key blocking, force-delete, and unsafe force-release semantics. |
+
+Sub-phases:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | 14A: Store schema and lease API. | Added migration, trait methods, Postgres claim/renew/release/finalize operations, and real Postgres conformance for claim races, expiry takeover, renew/finalize ownership checks, stale generation rejection, same-key blocking, and force-release. |
+| Complete | 14B: Reconciler core. | Added startup/periodic loop, jitter, batch size, concurrency limit, lease renewal, shutdown handling, and interval-based retry without long DB transactions around Kubernetes calls. |
+| Complete | 14C: Pending reconciliation. | Implemented and tested re-render/ref verification, idempotent apply/readiness, lease-owned `complete_wake`, stale-generation cleanup, and no finalize after lease loss. |
+| Complete | 14D: Deleting reconciliation. | Implemented and tested cleanup success, already-missing refs, retryable cleanup failure, lease loss before finalize, and stale generation cleanup. |
+| Complete | 14E: Two-replica control-plane safety. | Store-level race/expiry semantics are covered with real Postgres; `SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS=2 ./scripts/test-kind-e2e-restart.sh` passed on 2026-06-24 and exercised deployed wake, sleep, delete, HTTP-01, and route-reassignment recovery with two control-plane pods sharing Postgres and Kubernetes. |
+| Complete | 14F: Failure-injection harness. | Added focused fake Kubernetes/reconciler tests for Pending resume/complete, stale Pending cleanup, Deleting cleanup/finalize, missing refs, cleanup failure, lease loss, and generation-race cleanup; existing wake tests cover failed apply/PVC/readiness boundaries before and after Pending commit. |
+| Complete | 14G: Operator recovery APIs and docs. | Added inspected one-shot `ReconcileMaterialization`, audited force-delete/force-release operator RPCs, transport tests, and operator guide/runbook coverage. |
+
+Required failure tests:
+
+| Status | Scenario | Expected behavior |
+| --- | --- | --- |
+| Complete | Crash before `record_materialization` commits. | `wake::tests::record_materialization_failure_prevents_kubernetes_apply` proves a pending-record failure applies, waits, and deletes nothing; same-key follow-up safety is covered by the Postgres same-key non-terminal conflict and force-release coverage. |
+| Complete | Crash after `Pending` commit before first Kubernetes apply. | `pending_reconciliation_applies_waits_and_completes_current_wake` proves the reconciler sees recorded refs, resumes apply/readiness, and completes `Ready`; Postgres conformance proves same-key contenders remain blocked while the row is non-terminal. |
+| Complete | Crash after first apply failure with no objects applied. | `wake::tests::first_apply_failure_after_exclusivity_acquire_releases_pending_key` covers the synchronous crash-boundary cleanup path before objects exist; reconciler stale Pending cleanup covers the persisted-row recovery path. |
+| Complete | Crash after PV apply but before PVC apply. | The reconciler replays the full persisted manifest with server-side apply and recorded refs; `pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry` plus `delete_after_pending_before_apply_cleans_objects_applied_by_wake` cover retained refs and cleanup after partial apply. |
+| Complete | Crash after PV/PVC apply before Service/workload apply. | Reconciliation reapplies the full desired manifest in deterministic apply order from persisted refs; existing wake failure tests cover retained PV/PVC refs for later delete/retry cleanup. |
+| Complete | Crash after workload apply before PVC-bound wait completes. | `pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry` proves the row retains refs without backend for delete/retry cleanup; Pending reconciliation resumes waits/readiness for current wake. |
+| Complete | Crash during readiness wait after all objects exist but before backend is recorded. | `pending_reconciliation_applies_waits_and_completes_current_wake` proves readiness is rechecked and `complete_wake` is lease-owned; `./scripts/test-kind-e2e-failures.sh` proves deployed failed readiness does not publish a backend. |
+| Complete | Crash after backend is observed but before `complete_wake` commits. | Reconciler rechecks readiness and uses lease-owned `complete_wake`; Postgres conformance rejects stale-owner and stale-generation wake completion. |
+| Complete | K8s apply returns retryable/unavailable. | Reconciler releases the lease and leaves the row non-terminal for interval-based retry on materializer apply errors; wake/materializer failure tests prove failed apply does not publish backend or release keys without cleanup. |
+| Partial | K8s apply returns permanent invalid-object error. | V1 treats materializer apply errors conservatively as retryable reconciliation failures, keeping keys held. Automatic classification into terminal `Failed` is deferred because unsafe permanent/transient classification could release singleton keys too early; operator `ReconcileMaterialization` plus force tools provide the audited escape hatch. |
+| Complete | Delete requested while wake is `Pending` before any apply. | `pending_stale_generation_deletes_refs_and_marks_deleted_after_cleanup` covers stale/terminal Pending cleanup and guarded lease-owned delete after Kubernetes delete succeeds; empty refs are safe no-op cleanup through the same path. |
+| Complete | Delete requested while wake is `Pending` after partial apply. | Reconciler deletes recorded refs and force-deletes only after cleanup; `delete_after_pending_before_apply_cleans_objects_applied_by_wake` and `delete_after_pending_before_readiness_failure_cleans_objects_applied_by_wake` cover delete races after Pending commit. |
+| Complete | Crash after `begin_sleep` marks materialization `Deleting` before cleanup. | `deleting_reconciliation_deletes_refs_and_finalizes_with_current_lease` covers the row immediately after `begin_sleep`, re-delete, and lease-owned finalize. |
+| Complete | Crash after some cleanup deletes succeed. | `deleting_reconciliation_tolerates_missing_refs_and_finalizes` covers idempotent delete-if-exists behavior and finalize after missing refs are tolerated. |
+| Complete | Crash after all cleanup succeeds before `finalize_sleep` commits. | The same missing-ref Deleting test covers already-deleted refs before finalize; Postgres conformance verifies lease-owned finalize clears keys and marks `Deleted`. |
+| Complete | Cleanup fails because Kubernetes is unavailable. | `reconciler::tests::deleting_reconciliation_keeps_keys_when_cleanup_fails` covers a materializer delete error leaving the `Deleting` row non-terminal with keys held for later retry. |
+| Partial | Cleanup fails because one object has a finalizer or deletion is stuck. | Materialization stays `Deleting` and keys remain held on delete errors; `ReconcileMaterialization` reports recorded refs for operator inspection. Dedicated long-held-key alerting is deferred to observability follow-up. |
+| Complete | Manual Kubernetes drift removes all refs while DB remains `Pending` or `Deleting`. | Current `Pending` rows re-apply from persisted desired refs; stale/terminal `Pending` and `Deleting` rows delete recorded refs idempotently and finalize only after cleanup succeeds or is already gone. |
+| Complete | Same instance/generation retries while its own key is held. | Postgres conformance `exercise_materialization_reconciliation_leases` covers same-key self-retry while the current non-terminal materialization holds the key. |
+| Complete | Different instance with same key wakes while owner is non-terminal. | Postgres conformance `exercise_materialization_reconciliation_leases` verifies a same-key contender receives `ExclusivityConflict` while the owner remains non-terminal; `./scripts/test-kind-e2e-exclusivity.sh` passed on 2026-06-24 after rebuilding production images and proves deployed same-key rejection without applying objects plus unrelated-key independence. |
+| Complete | Stale generation tries to complete wake, finalize sleep, or release keys. | Postgres conformance covers stale-owner and stale-generation rejection for lease-owned `complete_wake`/`finalize_sleep`; force-release requires explicit audited operator override. |
+| Partial | Route subscription observes a `Pending`/failed reconciliation row. | `./scripts/test-kind-e2e-failures.sh` passed on 2026-06-24 and proves deployed readiness/PVC-bound failure paths return no backend and reject stale proxy wake generations; direct subscription assertions for non-terminal reconciliation rows are deferred to proxy subscription coverage. |
+| Complete | Reconciler process loses its lease mid-operation. | `reconciler::tests::deleting_reconciliation_does_not_finalize_after_lease_loss` proves final DB updates stop after lease loss; Kubernetes delete remains idempotent through recorded refs. |
+| Complete | Two control-plane replicas claim the same materialization concurrently. | Postgres conformance verifies exactly one conditional claim succeeds in a race. |
+| Complete | Lease holder crashes during reconciliation. | Postgres conformance covers lease expiry takeover; the two-replica kind restart gate passed with controller pod deletion/scale-down recovery. |
+| Complete | Lease holder is slow and another replica takes over after expiry. | Postgres conformance verifies expired-lease takeover and rejects stale-owner finalization after takeover. |
+| Complete | Concurrent API wake/sleep/delete races with reconciliation. | Postgres conformance verifies generation/state/lease ownership guards for stale wake/finalize, expired same-owner finalization rejection, same-key contention, and stale cleanup racing a newer same-id materialization; `deleting_reconciliation_marks_deleted_after_generation_race_cleanup` and `stale_cleanup_does_not_delete_newer_same_id_materialization` cover cleanup plus guarded DB finalization after instance/materialization generation changes. |
+| Complete | Rolling restart with two control-plane replicas and active `Pending`/`Deleting` rows. | `SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS=2 ./scripts/test-kind-e2e-restart.sh` passed on 2026-06-24, scaling/restarting deployed control-plane pods through wake, sleep, and delete recovery against shared Postgres/Kubernetes. |
+| Complete | Full-platform kind gate with two control-plane replicas. | `SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS=2 ./scripts/test-kind-e2e-restart.sh` passed on 2026-06-24 after building production images; it deployed two control-plane pods against one Postgres/Kubernetes target and proved wake, sleep, delete, HTTP-01, and route-reassignment recovery. Additional deployed safety gates `./scripts/test-kind-e2e-exclusivity.sh` and `./scripts/test-kind-e2e-failures.sh` also passed on 2026-06-24. |
+
+Done criteria:
+
+| Status | Item | Evidence / gap |
+| --- | --- | --- |
+| Complete | Non-terminal materializations eventually converge when Kubernetes and Postgres are available. | Reconciler component tests cover `Pending` resume/complete, stale Pending cleanup, `Deleting` cleanup/finalize, missing refs, cleanup errors, lease loss, and generation races; Postgres conformance covers lease-owned transitions; two-replica restart kind gate proves deployed convergence. |
+| Complete | Exclusivity keys remain held during uncertainty and are released after proven cleanup. | Postgres conformance and deployed exclusivity kind gate prove same-key conflict while non-terminal; Deleting/Pending cleanup tests and Postgres finalize coverage prove keys are cleared only after cleanup/finalize or audited operator override. |
+| Complete | Multiple control-plane replicas do not duplicate or corrupt reconciliation. | Postgres conformance proves single claim, lease renewal ownership checks, expiry takeover, and stale-owner finalization rejection; the two-replica restart kind gate passed with deployed Kubernetes apply/delete/recovery paths. |
+| Complete | No DB transaction is held across Kubernetes calls. | Reconciler claims/renews/releases via short store calls around materializer calls; final transitions are lease-owned conditional updates rather than long DB transactions or process-local ownership. |
+| Complete | Operators have a safe manual escape hatch. | `ReconcileMaterialization` inspects state/lease/refs and triggers one attempt; `ForceDeleteMaterialization` and `ForceReleaseExclusivityKey` require operator/reason audit fields and are covered by transport tests and operator docs/runbook warnings. |
+| Complete | Existing wake/sleep/delete paths remain simple. | API paths still attempt synchronous progress; unfinished `Pending`/`Deleting` work is represented as durable materialization rows and resumed by the reconciler rather than process-local special cases. |
+
 ## Stretch
 
 The original goal is complete when the plan reaches this line. Do not start

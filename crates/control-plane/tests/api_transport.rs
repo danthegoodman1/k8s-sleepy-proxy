@@ -15,11 +15,13 @@ use control_plane::api::{
         CreateWorkloadClassVersionRequest, CsiVolumeSourceTemplate, DeleteHttp01ChallengeRequest,
         DeleteHttp01ChallengeResponse, DeleteInstanceRequest, DeleteInstanceResponse,
         DeleteRouteBindingRequest, DeleteRouteBindingResponse, EnvVarTemplate,
-        ExpireHttp01ChallengesRequest, GetInstanceRequest, GetRouteBindingRequest,
+        ExpireHttp01ChallengesRequest, ForceDeleteMaterializationRequest,
+        ForceReleaseExclusivityKeyRequest, GetInstanceRequest, GetRouteBindingRequest,
         GetWorkloadClassVersionRequest, HostPathVolumeSourceTemplate, Http01Challenge,
         Http01ChallengeKey, HttpRouteIdentity, IdleTimeoutOverridePolicy, Instance, InstanceState,
         ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
         PersistentVolumeSourceTemplate, ProtocolRoute, PutHttp01ChallengeRequest,
+        ReconcileMaterializationRequest, ReconcileMaterializationResponse,
         ResolveHttp01ChallengeRequest, ResolveHttp01ChallengeResponse, RouteBinding, RouteHost,
         RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
         SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersion,
@@ -144,6 +146,7 @@ fn materialization(
             object_ref("apps/v1", "Deployment", "apps", instance_id),
         ],
         exclusivity_keys: vec![],
+        reconciliation_lease: None,
     }
 }
 
@@ -583,7 +586,8 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
 
 #[tokio::test]
 async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
-    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let store = Arc::new(FakeInstanceStore::default());
+    let service = store_operator_api(store.clone());
     let template = stateful_manifest_template_proto();
 
     let created_class = service
@@ -782,6 +786,78 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .into_inner();
     assert!(deleted.deleted);
     assert!(expires_at > SystemTime::now());
+
+    store.seed_instance(domain_instance(
+        "instance-reconcile-operator",
+        DomainInstanceState::Draining,
+        3,
+    ));
+    let reconcile_materialization = materialization(
+        "instance-reconcile-operator",
+        3,
+        target(),
+        MaterializationState::Deleting,
+    );
+    let reconcile_materialization_id = reconcile_materialization.id.as_str().to_owned();
+    store.seed_materialization(reconcile_materialization);
+    let reconciled = service
+        .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            materialization_id: reconcile_materialization_id.clone(),
+        }))
+        .await
+        .expect("reconcile materialization succeeds")
+        .into_inner();
+    assert!(reconciled.found);
+    assert!(reconciled.attempted);
+    assert_eq!(reconciled.materialization_id, reconcile_materialization_id);
+    assert_eq!(reconciled.state, "Deleted");
+    assert_eq!(reconciled.observed_refs.len(), 0);
+    let claim_owners = store.reconciliation_claim_owners();
+    assert_eq!(claim_owners.len(), 1);
+    assert_ne!(claim_owners[0], "operator-reconcile");
+    assert!(claim_owners[0].starts_with("operator-reconcile-"));
+    assert_eq!(
+        store
+            .materialization()
+            .expect("materialization remains inspectable")
+            .state,
+        MaterializationState::Deleted
+    );
+
+    let force_materialization = materialization(
+        "instance-force-delete",
+        1,
+        target(),
+        MaterializationState::Deleting,
+    );
+    let force_materialization_id = force_materialization.id.as_str().to_owned();
+    store.seed_materialization(force_materialization);
+    let force_deleted = service
+        .force_delete_materialization(tonic::Request::new(ForceDeleteMaterializationRequest {
+            materialization_id: force_materialization_id.clone(),
+            operator: "operator-a".to_owned(),
+            reason: "inspected cleanup completed".to_owned(),
+        }))
+        .await
+        .expect("force-delete materialization succeeds")
+        .into_inner();
+    assert!(force_deleted.found);
+    assert_eq!(force_deleted.materialization_id, force_materialization_id);
+    assert_eq!(force_deleted.observed_refs.len(), 2);
+
+    let force_release = service
+        .force_release_exclusivity_key(tonic::Request::new(ForceReleaseExclusivityKeyRequest {
+            cluster_id: "cluster-a".to_owned(),
+            namespace: "apps".to_owned(),
+            key_name: "disk".to_owned(),
+            key_value: "disk-a".to_owned(),
+            operator: "operator-a".to_owned(),
+            reason: "emergency release after inspected cleanup".to_owned(),
+        }))
+        .await
+        .expect("force-release exclusivity key succeeds")
+        .into_inner();
+    assert_eq!(force_release.updated_materializations, 1);
 }
 
 #[tokio::test]
@@ -1851,7 +1927,7 @@ async fn native_grpc_and_grpc_web_requests_dispatch_to_same_placeholder_method()
 
 #[test]
 fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
-    assert_eq!(OPERATOR_UNARY_METHODS.len(), 12);
+    assert_eq!(OPERATOR_UNARY_METHODS.len(), 15);
     assert!(OPERATOR_UNARY_METHODS.contains(&"CreateWorkloadClassVersion"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"GetWorkloadClassVersion"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"CreateInstance"));
@@ -1861,6 +1937,9 @@ fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
     assert!(OPERATOR_UNARY_METHODS.contains(&"GetRouteBinding"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteRouteBinding"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
+    assert!(OPERATOR_UNARY_METHODS.contains(&"ReconcileMaterialization"));
+    assert!(OPERATOR_UNARY_METHODS.contains(&"ForceDeleteMaterialization"));
+    assert!(OPERATOR_UNARY_METHODS.contains(&"ForceReleaseExclusivityKey"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"WakeInstance"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"Subscribe"));
     assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveRoute"));
@@ -2400,6 +2479,33 @@ impl OperatorControlPlane for MetadataCapturingOperatorApi {
             "metadata test only implements CreateInstance",
         ))
     }
+
+    async fn reconcile_materialization(
+        &self,
+        _request: tonic::Request<ReconcileMaterializationRequest>,
+    ) -> Result<Response<ReconcileMaterializationResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn force_delete_materialization(
+        &self,
+        _request: tonic::Request<ForceDeleteMaterializationRequest>,
+    ) -> Result<Response<control_plane::api::pb::ForceDeleteMaterializationResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
+
+    async fn force_release_exclusivity_key(
+        &self,
+        _request: tonic::Request<ForceReleaseExclusivityKeyRequest>,
+    ) -> Result<Response<control_plane::api::pb::ForceReleaseExclusivityKeyResponse>, Status> {
+        Err(Status::unimplemented(
+            "metadata test only implements CreateInstance",
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -2410,6 +2516,7 @@ struct FakeInstanceStore {
     materialization: Mutex<Option<MaterializationRecord>>,
     delete_requests: Mutex<Vec<control_plane::DeleteInstanceRequest>>,
     http01: Mutex<BTreeMap<(String, String), control_plane::Http01ChallengeRecord>>,
+    reconciliation_claim_owners: Mutex<Vec<String>>,
 }
 
 impl FakeInstanceStore {
@@ -2443,6 +2550,13 @@ impl FakeInstanceStore {
 
     fn materialization(&self) -> Option<MaterializationRecord> {
         self.materialization
+            .lock()
+            .expect("fake store lock is available")
+            .clone()
+    }
+
+    fn reconciliation_claim_owners(&self) -> Vec<String> {
+        self.reconciliation_claim_owners
             .lock()
             .expect("fake store lock is available")
             .clone()
@@ -2828,6 +2942,120 @@ impl ControlPlaneStore for FakeInstanceStore {
             }
 
             Ok(expired)
+        })
+    }
+
+    fn force_delete_materialization<'a>(
+        &'a self,
+        request: control_plane::ForceDeleteMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async move {
+            let mut materialization = self
+                .materialization
+                .lock()
+                .expect("fake store lock is available");
+            let existing = materialization
+                .as_ref()
+                .filter(|record| record.id == request.materialization_id)
+                .cloned();
+            if existing.is_some() {
+                *materialization = None;
+            }
+            Ok(existing)
+        })
+    }
+
+    fn load_materialization<'a>(
+        &'a self,
+        request: control_plane::LoadMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .materialization
+                .lock()
+                .expect("fake store lock is available")
+                .as_ref()
+                .filter(|record| record.id == request.materialization_id)
+                .cloned())
+        })
+    }
+
+    fn claim_materialization_reconciliation<'a>(
+        &'a self,
+        request: control_plane::ClaimMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async move {
+            let mut materialization = self
+                .materialization
+                .lock()
+                .expect("fake store lock is available");
+            let Some(record) = materialization.as_mut() else {
+                return Ok(None);
+            };
+            if record.id != request.materialization_id {
+                return Ok(None);
+            }
+            self.reconciliation_claim_owners
+                .lock()
+                .expect("fake store lock is available")
+                .push(request.owner.clone());
+            record.reconciliation_lease = Some(control_plane::MaterializationReconciliationLease {
+                owner: request.owner,
+                expires_at: request.lease_expires_at,
+                attempt: 1,
+            });
+            Ok(Some(record.clone()))
+        })
+    }
+
+    fn renew_materialization_reconciliation_lease<'a>(
+        &'a self,
+        _request: control_plane::RenewMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async { Ok(true) })
+    }
+
+    fn finalize_sleep_reconciliation<'a>(
+        &'a self,
+        _request: control_plane::FinalizeSleepReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::FinalizeSleepResult>> {
+        Box::pin(async move {
+            let mut materialization = self
+                .materialization
+                .lock()
+                .expect("fake store lock is available");
+            let record = materialization.as_mut().ok_or(StoreError::NotFound {
+                resource: "materialization",
+            })?;
+            record.state = MaterializationState::Deleted;
+            record.rendered_objects.clear();
+            record.exclusivity_keys.clear();
+            record.reconciliation_lease = None;
+            let mut instance = self
+                .instances
+                .lock()
+                .expect("fake store lock is available")
+                .get(record.instance_id.as_str())
+                .cloned()
+                .ok_or(StoreError::NotFound {
+                    resource: "instance",
+                })?;
+            instance.state = DomainInstanceState::Cold;
+            Ok(control_plane::FinalizeSleepResult {
+                instance,
+                materialization: Some(record.clone()),
+            })
+        })
+    }
+
+    fn force_release_exclusivity_key<'a>(
+        &'a self,
+        _request: control_plane::ForceReleaseExclusivityKeyRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::ForceReleaseExclusivityKeyResult>> {
+        Box::pin(async {
+            Ok(control_plane::ForceReleaseExclusivityKeyResult {
+                updated_materializations: 1,
+            })
         })
     }
 }

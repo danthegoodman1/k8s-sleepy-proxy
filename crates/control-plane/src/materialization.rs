@@ -1,4 +1,8 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::ids::{
     BackendGeneration, EmptyStringError, Generation, InstanceId, MaterializationId, NonEmptyString,
@@ -17,6 +21,7 @@ pub struct MaterializationRecord {
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
     pub exclusivity_keys: Vec<RenderedExclusivityKey>,
+    pub reconciliation_lease: Option<MaterializationReconciliationLease>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +61,11 @@ pub struct LoadActiveMaterializationRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadMaterializationRequest {
+    pub materialization_id: MaterializationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginSleepRequest {
     pub instance_id: InstanceId,
     pub expected_running_generation: Generation,
@@ -67,6 +77,85 @@ pub struct FinalizeSleepRequest {
     pub instance_id: InstanceId,
     pub expected_draining_generation: Generation,
     pub target: MaterializationTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationReconciliationLease {
+    pub owner: String,
+    pub expires_at: SystemTime,
+    pub attempt: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListMaterializationReconciliationCandidatesRequest {
+    pub now: SystemTime,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimMaterializationReconciliationRequest {
+    pub materialization_id: MaterializationId,
+    pub owner: String,
+    pub now: SystemTime,
+    pub lease_expires_at: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewMaterializationReconciliationLeaseRequest {
+    pub materialization_id: MaterializationId,
+    pub owner: String,
+    pub lease_expires_at: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseMaterializationReconciliationLeaseRequest {
+    pub materialization_id: MaterializationId,
+    pub owner: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteWakeReconciliationRequest {
+    pub materialization_id: MaterializationId,
+    pub lease_owner: String,
+    pub complete: CompleteWakeRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeSleepReconciliationRequest {
+    pub materialization_id: MaterializationId,
+    pub lease_owner: String,
+    pub finalize: FinalizeSleepRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteMaterializationReconciliationRequest {
+    pub materialization_id: MaterializationId,
+    pub lease_owner: String,
+    pub expected_state: MaterializationState,
+    pub instance_id: InstanceId,
+    pub instance_generation: Generation,
+    pub target: MaterializationTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForceDeleteMaterializationRequest {
+    pub materialization_id: MaterializationId,
+    pub operator: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForceReleaseExclusivityKeyRequest {
+    pub target: MaterializationTarget,
+    pub key_name: String,
+    pub key_value: String,
+    pub operator: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForceReleaseExclusivityKeyResult {
+    pub updated_materializations: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +273,12 @@ impl LoadActiveMaterializationRequest {
     }
 }
 
+impl LoadMaterializationRequest {
+    pub fn new(materialization_id: MaterializationId) -> Self {
+        Self { materialization_id }
+    }
+}
+
 impl BeginSleepRequest {
     pub fn new(
         instance_id: InstanceId,
@@ -208,6 +303,131 @@ impl FinalizeSleepRequest {
             instance_id,
             expected_draining_generation,
             target,
+        }
+    }
+}
+
+impl ListMaterializationReconciliationCandidatesRequest {
+    pub fn new(now: SystemTime, limit: usize) -> Self {
+        Self { now, limit }
+    }
+}
+
+impl ClaimMaterializationReconciliationRequest {
+    pub fn new(
+        materialization_id: MaterializationId,
+        owner: impl Into<String>,
+        now: SystemTime,
+        lease_expires_at: SystemTime,
+    ) -> Self {
+        Self {
+            materialization_id,
+            owner: owner.into(),
+            now,
+            lease_expires_at,
+        }
+    }
+}
+
+impl RenewMaterializationReconciliationLeaseRequest {
+    pub fn new(
+        materialization_id: MaterializationId,
+        owner: impl Into<String>,
+        lease_expires_at: SystemTime,
+    ) -> Self {
+        Self {
+            materialization_id,
+            owner: owner.into(),
+            lease_expires_at,
+        }
+    }
+}
+
+impl ReleaseMaterializationReconciliationLeaseRequest {
+    pub fn new(materialization_id: MaterializationId, owner: impl Into<String>) -> Self {
+        Self {
+            materialization_id,
+            owner: owner.into(),
+        }
+    }
+}
+
+impl CompleteWakeReconciliationRequest {
+    pub fn new(
+        materialization_id: MaterializationId,
+        lease_owner: impl Into<String>,
+        complete: CompleteWakeRequest,
+    ) -> Self {
+        Self {
+            materialization_id,
+            lease_owner: lease_owner.into(),
+            complete,
+        }
+    }
+}
+
+impl FinalizeSleepReconciliationRequest {
+    pub fn new(
+        materialization_id: MaterializationId,
+        lease_owner: impl Into<String>,
+        finalize: FinalizeSleepRequest,
+    ) -> Self {
+        Self {
+            materialization_id,
+            lease_owner: lease_owner.into(),
+            finalize,
+        }
+    }
+}
+
+impl DeleteMaterializationReconciliationRequest {
+    pub fn new(
+        materialization_id: MaterializationId,
+        lease_owner: impl Into<String>,
+        expected_state: MaterializationState,
+        instance_id: InstanceId,
+        instance_generation: Generation,
+        target: MaterializationTarget,
+    ) -> Self {
+        Self {
+            materialization_id,
+            lease_owner: lease_owner.into(),
+            expected_state,
+            instance_id,
+            instance_generation,
+            target,
+        }
+    }
+}
+
+impl ForceDeleteMaterializationRequest {
+    pub fn new(
+        materialization_id: MaterializationId,
+        operator: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            materialization_id,
+            operator: operator.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl ForceReleaseExclusivityKeyRequest {
+    pub fn new(
+        target: MaterializationTarget,
+        key_name: impl Into<String>,
+        key_value: impl Into<String>,
+        operator: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            target,
+            key_name: key_name.into(),
+            key_value: key_value.into(),
+            operator: operator.into(),
+            reason: reason.into(),
         }
     }
 }
@@ -269,6 +489,18 @@ impl fmt::Display for InvalidMaterializationTarget {
 }
 
 impl Error for InvalidMaterializationTarget {}
+
+pub(crate) fn unix_millis_from_system_time(value: SystemTime) -> Result<i64, String> {
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis())
+            .map_err(|_| "system time does not fit in unix millis".to_owned()),
+        Err(error) => {
+            let millis = i64::try_from(error.duration().as_millis())
+                .map_err(|_| "system time does not fit in unix millis".to_owned())?;
+            Ok(-millis)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

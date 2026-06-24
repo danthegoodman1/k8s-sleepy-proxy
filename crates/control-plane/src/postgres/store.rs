@@ -8,9 +8,15 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        BeginSleepRequest, BeginSleepResult, CompleteWakeRequest, CompleteWakeResult,
-        FinalizeSleepRequest, FinalizeSleepResult, LoadActiveMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationRecord, RecordMaterializationRequest,
+        BeginSleepRequest, BeginSleepResult, ClaimMaterializationReconciliationRequest,
+        CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
+        DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
+        FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
+        ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
+        ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
+        LoadMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
+        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
+        RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
@@ -121,6 +127,13 @@ impl ControlPlaneStore for PostgresStore {
         )
     }
 
+    fn load_materialization<'a>(
+        &'a self,
+        request: LoadMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move { materialization_ops::load_materialization(self, request).await })
+    }
+
     fn complete_wake<'a>(
         &'a self,
         request: CompleteWakeRequest,
@@ -140,6 +153,87 @@ impl ControlPlaneStore for PostgresStore {
         request: FinalizeSleepRequest,
     ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
         Box::pin(async move { materialization_ops::finalize_sleep(self, request).await })
+    }
+
+    fn list_materialization_reconciliation_candidates<'a>(
+        &'a self,
+        request: ListMaterializationReconciliationCandidatesRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
+        Box::pin(async move {
+            materialization_ops::list_materialization_reconciliation_candidates(self, request).await
+        })
+    }
+
+    fn claim_materialization_reconciliation<'a>(
+        &'a self,
+        request: ClaimMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            materialization_ops::claim_materialization_reconciliation(self, request).await
+        })
+    }
+
+    fn renew_materialization_reconciliation_lease<'a>(
+        &'a self,
+        request: RenewMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            materialization_ops::renew_materialization_reconciliation_lease(self, request).await
+        })
+    }
+
+    fn release_materialization_reconciliation_lease<'a>(
+        &'a self,
+        request: ReleaseMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            materialization_ops::release_materialization_reconciliation_lease(self, request).await
+        })
+    }
+
+    fn complete_wake_reconciliation<'a>(
+        &'a self,
+        request: CompleteWakeReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
+        Box::pin(
+            async move { materialization_ops::complete_wake_reconciliation(self, request).await },
+        )
+    }
+
+    fn finalize_sleep_reconciliation<'a>(
+        &'a self,
+        request: FinalizeSleepReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
+        Box::pin(
+            async move { materialization_ops::finalize_sleep_reconciliation(self, request).await },
+        )
+    }
+
+    fn delete_materialization_reconciliation<'a>(
+        &'a self,
+        request: DeleteMaterializationReconciliationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            materialization_ops::delete_materialization_reconciliation(self, request).await
+        })
+    }
+
+    fn force_delete_materialization<'a>(
+        &'a self,
+        request: ForceDeleteMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(
+            async move { materialization_ops::force_delete_materialization(self, request).await },
+        )
+    }
+
+    fn force_release_exclusivity_key<'a>(
+        &'a self,
+        request: ForceReleaseExclusivityKeyRequest,
+    ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
+        Box::pin(
+            async move { materialization_ops::force_release_exclusivity_key(self, request).await },
+        )
     }
 
     fn lookup_route_dependencies<'a>(

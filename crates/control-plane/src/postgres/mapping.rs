@@ -15,8 +15,8 @@ use crate::{
     instance::{InstanceRecord, InstanceState, InstanceValues},
     manifest::ManifestTemplate,
     materialization::{
-        BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
-        RenderedObjectRef,
+        BackendEndpoint, MaterializationReconciliationLease, MaterializationRecord,
+        MaterializationState, MaterializationTarget, RenderedObjectRef,
     },
     route::{
         CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteEntry,
@@ -147,6 +147,10 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
     let backend_generation: i64 = row.get("backend_generation");
     let rendered_objects: Value = row.get("rendered_objects");
     let exclusivity_keys: Value = row.get("exclusivity_keys");
+    let reconcile_owner: Option<String> = row.get("reconcile_owner");
+    let reconcile_lease_expires_at_unix_millis: Option<i64> =
+        row.get("reconcile_lease_expires_at_unix_millis");
+    let reconcile_attempt: i64 = row.get("reconcile_attempt");
 
     Ok(MaterializationRecord {
         id: MaterializationId::new(materialization_id).map_err(invalid_stored_data)?,
@@ -161,6 +165,23 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
         backend_generation: backend_generation_from_i64(backend_generation)?,
         rendered_objects: rendered_objects_from_json(rendered_objects)?,
         exclusivity_keys: rendered_exclusivity_keys_from_json(exclusivity_keys)?,
+        reconciliation_lease: reconcile_owner
+            .map(|owner| {
+                Ok(MaterializationReconciliationLease {
+                    owner,
+                    expires_at: system_time_from_unix_millis(
+                        reconcile_lease_expires_at_unix_millis.ok_or_else(|| {
+                            StoreError::internal("stored materialization lease owner had no expiry")
+                        })?,
+                    )?,
+                    attempt: u64::try_from(reconcile_attempt).map_err(|_| {
+                        StoreError::internal(
+                            "stored materialization reconcile attempt was negative",
+                        )
+                    })?,
+                })
+            })
+            .transpose()?,
     })
 }
 

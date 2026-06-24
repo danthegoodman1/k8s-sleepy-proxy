@@ -47,6 +47,8 @@ The V1 operator service is unary-only:
 - `CreateRouteBinding`, `GetRouteBinding`, `DeleteRouteBinding`
 - `PutHttp01Challenge`, `ResolveHttp01Challenge`,
   `DeleteHttp01Challenge`, `ExpireHttp01Challenges`
+- `ReconcileMaterialization`, `ForceDeleteMaterialization`,
+  `ForceReleaseExclusivityKey`
 
 `WakeInstance`, `Subscribe`, and `ReportIdle` are runtime services for proxies
 and sidecars. They are not operator or gRPC-Web APIs.
@@ -202,6 +204,35 @@ opaque to SleepyPods: the control plane does not parse provider disk IDs or infe
 shared singleton resources from template values. A rendered key is acquired
 before Kubernetes apply starts and stays held until sleep/delete cleanup
 finalizes the materialization.
+
+### Materialization Recovery And Force Operations
+
+Every control-plane replica runs materialization reconciliation. `Pending` and
+`Deleting` materializations use durable database leases; process-local ownership
+is not authoritative. If a replica crashes, another replica may take over after
+the lease expires. Final store transitions require the current lease owner, the
+same materialization id, target, state, and generation.
+
+Non-terminal materializations intentionally keep exclusivity keys held. A
+different instance with the same rendered key should receive an exclusivity
+conflict until the owning materialization reaches `Deleted` or an operator uses
+an explicit force operation.
+
+`ReconcileMaterialization` is the first operator action for a stuck
+materialization. It loads the row by materialization id, returns current state,
+lease metadata, and recorded object refs, and triggers one synchronous
+reconciliation attempt when the row is `Pending` or `Deleting`.
+
+`ForceDeleteMaterialization` is an emergency cleanup tool for a materialization
+whose Kubernetes cleanup has already been inspected. The response includes the
+recorded object refs that were present before the row was cleared. Use it only
+after Kubernetes objects are gone or are known safe to abandon.
+
+`ForceReleaseExclusivityKey` removes a rendered key from matching active
+materializations without deleting the materialization. It requires the exact
+target, key name, key value, operator, and reason. This is a last-resort escape
+hatch; using it while external singleton resources still exist can allow two
+instances to attach the same resource.
 
 Delete an instance or route:
 

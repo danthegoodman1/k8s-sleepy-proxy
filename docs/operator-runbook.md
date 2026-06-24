@@ -61,6 +61,7 @@ Event names:
 - `runtime.subscribe_stream.event`
 - `runtime.wake.event`
 - `runtime.materialization.failure`
+- `runtime.materialization.reconciliation`
 - `runtime.idle_report.event`
 - `runtime.http01.event`
 - `control_plane.auth.decision`
@@ -164,6 +165,27 @@ Workload exclusivity key conflict:
 4. If cleanup is stuck, resolve Kubernetes deletion errors first. Do not wake a
    second same-key instance until the first materialization has safely finalized
    or an operator has deliberately changed the workload values/key declaration.
+5. If cleanup was externally verified but the database row remains non-terminal,
+   use `ForceDeleteMaterialization` with the materialization id, operator, and
+   reason. If only the lock must be released, use `ForceReleaseExclusivityKey`
+   with the exact target, key name, and key value. Treat key release as unsafe
+   unless the singleton resource cannot still be attached by the old instance.
+
+Non-terminal materialization is stuck:
+
+1. Search `runtime.materialization.reconciliation` for `operation=claim`,
+   `operation=reconcile`, `operation=lease_lost`, and `outcome=error`.
+2. Call `ReconcileMaterialization` with the materialization id. The response
+   reports current state, lease metadata, and recorded refs, and attempts one
+   reconciliation pass for `Pending` or `Deleting` rows.
+3. Check Kubernetes refs reported by the materialization. Missing refs during
+   delete are safe only when every recorded ref is gone or cleanup is otherwise
+   proven unnecessary.
+4. If a finalizer or Kubernetes outage blocks delete, do not force-release the
+   key. Fix the Kubernetes blocker and let reconciliation retry.
+5. If an operator has manually removed every recorded ref and verified no
+   singleton resource can be attached by the old workload, call
+   `ForceDeleteMaterialization`. Record a specific reason.
 
 Hot routes are missing or unexpectedly cold:
 
@@ -204,6 +226,9 @@ Delete cleanup is stuck or objects leak:
    PVC, and PV objects and whether finalizers block deletion.
 4. Compare leaked objects' SleepyPods labels with the recorded materialization
    generation before manual cleanup.
+5. After manual cleanup, prefer waiting for materialization reconciliation to
+   finalize. Use `ForceDeleteMaterialization` only when cleanup has been proven
+   and reconciliation cannot make progress.
 
 HTTP-01 challenge fails:
 

@@ -1896,6 +1896,7 @@ impl ControlPlaneStore for FakeStore {
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
                 exclusivity_keys: request.exclusivity_keys,
+                reconciliation_lease: None,
             };
             inner.materialization = Some(record.clone());
             if inner.delete_after_record_materialization {
@@ -1998,6 +1999,7 @@ impl ControlPlaneStore for FakeStore {
                 backend_generation: request.backend_generation,
                 rendered_objects: request.rendered_objects,
                 exclusivity_keys: request.exclusivity_keys,
+                reconciliation_lease: None,
             };
 
             Ok(CompleteWakeResult {
@@ -2479,6 +2481,7 @@ fn materialization(
             instance_id,
         )],
         exclusivity_keys: vec![],
+        reconciliation_lease: None,
     }
 }
 

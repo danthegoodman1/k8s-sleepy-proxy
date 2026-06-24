@@ -307,7 +307,8 @@ pub(crate) async fn load_ready_materialization(
             "
             SELECT materialization_id, instance_id, instance_generation, cluster_id,
                 namespace, state, backend_uri, backend_generation, rendered_objects,
-                exclusivity_keys
+                exclusivity_keys, reconcile_owner,
+                reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
             WHERE instance_id = $1 AND instance_generation = $2 AND state = 'ready'
             ORDER BY backend_generation DESC, materialization_id

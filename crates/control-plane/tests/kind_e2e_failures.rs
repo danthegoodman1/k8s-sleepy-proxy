@@ -39,6 +39,7 @@ const GOOD_ROUTE_ID: &str = "failure-good-route";
 const GOOD_ROUTE_HOST: &str = "good.failure.sleepypods.test";
 const GOOD_WORKLOAD_NAME: &str = "failure-good-app";
 const MISSING_ROUTE_HOST: &str = "missing.failure.sleepypods.test";
+const INSTANCE_ID_LABEL: &str = "sleepypods.io/instance-id";
 
 const READINESS_CLASS_ID: &str = "failure-readiness";
 const READINESS_INSTANCE_ID: &str = "failure-readiness";
@@ -176,7 +177,7 @@ async fn bad_route_misses_without_materializing_unrelated_instance(
     let after = get_instance(operator, GOOD_INSTANCE_ID).await?;
     assert_state(&after, PbInstanceState::Cold)?;
     assert_eq!(after.generation, created.generation);
-    assert_deployment_and_service_absent(kube, &config.namespace, GOOD_WORKLOAD_NAME).await?;
+    assert_deployment_and_service_absent(kube, &config.namespace, GOOD_INSTANCE_ID).await?;
 
     Ok(())
 }
@@ -318,7 +319,7 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
     assert_deployment_service_no_ready_backend(
         kube.clone(),
         &config.namespace,
-        READINESS_WORKLOAD_NAME,
+        READINESS_INSTANCE_ID,
     )
     .await?;
 
@@ -661,16 +662,24 @@ fn http_get_blocking(addr: SocketAddr, host: &str, path: &str) -> TestResult<Htt
 async fn assert_deployment_and_service_absent(
     kube: Client,
     namespace: &str,
-    workload_name: &str,
+    instance_id: &str,
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), namespace);
     let services: Api<Service> = Api::namespaced(kube, namespace);
-    if !is_not_found(deployments.get(workload_name).await) {
-        return Err(format!("unexpected Deployment {namespace}/{workload_name} exists").into());
-    }
-    if !is_not_found(services.get(workload_name).await) {
-        return Err(format!("unexpected Service {namespace}/{workload_name} exists").into());
-    }
+    assert_no_labeled_objects(
+        "Deployment",
+        instance_id,
+        deployments
+            .list(&ListParams::default().labels(&instance_selector(instance_id)))
+            .await?,
+    )?;
+    assert_no_labeled_objects(
+        "Service",
+        instance_id,
+        services
+            .list(&ListParams::default().labels(&instance_selector(instance_id)))
+            .await?,
+    )?;
     Ok(())
 }
 
@@ -705,23 +714,39 @@ async fn assert_stateful_service_pvc_pv_absent(
 async fn assert_deployment_service_no_ready_backend(
     kube: Client,
     namespace: &str,
-    workload_name: &str,
+    instance_id: &str,
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), namespace);
     let services: Api<Service> = Api::namespaced(kube.clone(), namespace);
     let endpoint_slices: Api<EndpointSlice> = Api::namespaced(kube, namespace);
-    deployments.get(workload_name).await?;
-    services.get(workload_name).await?;
+    let selector = instance_selector(instance_id);
+    single_labeled_object(
+        "Deployment",
+        instance_id,
+        deployments
+            .list(&ListParams::default().labels(&selector))
+            .await?,
+    )?;
+    let service = single_labeled_object(
+        "Service",
+        instance_id,
+        services
+            .list(&ListParams::default().labels(&selector))
+            .await?,
+    )?;
+    let service_name = service
+        .metadata
+        .name
+        .ok_or_else(|| format!("Service for instance {instance_id} is missing metadata.name"))?;
 
-    let selector = format!("kubernetes.io/service-name={workload_name}");
+    let selector = format!("kubernetes.io/service-name={service_name}");
     let slices = endpoint_slices
         .list(&ListParams::default().labels(&selector))
         .await?;
     if slices.iter().any(endpoint_slice_has_ready_endpoint) {
-        return Err(format!(
-            "Service {namespace}/{workload_name} unexpectedly has a ready backend"
-        )
-        .into());
+        return Err(
+            format!("Service {namespace}/{service_name} unexpectedly has a ready backend").into(),
+        );
     }
     Ok(())
 }
@@ -735,40 +760,107 @@ async fn assert_first_pvc_unbound_and_no_stateful_backend(
     let stateful_sets: Api<StatefulSet> = Api::namespaced(kube.clone(), namespace);
     let services: Api<Service> = Api::namespaced(kube, namespace);
 
-    let pv = pvs.get(UNBOUND_PV_NAME).await?;
-    let first_pvc = pvcs.get(UNBOUND_FIRST_PVC_NAME).await?;
-    let phase = first_pvc
-        .status
-        .as_ref()
-        .and_then(|status| status.phase.as_deref());
-    if phase == Some("Bound") {
-        return Err(format!("PVC {namespace}/{UNBOUND_FIRST_PVC_NAME} unexpectedly bound").into());
-    }
-    let claim_name = pv
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.claim_ref.as_ref())
-        .and_then(|claim| claim.name.as_deref());
-    if claim_name == Some(UNBOUND_FIRST_PVC_NAME) {
+    let selector = instance_selector(UNBOUND_INSTANCE_ID);
+    let pv_items = pvs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    if pv_items.len() > 1 {
         return Err(format!(
-            "PV {UNBOUND_PV_NAME} unexpectedly claims first PVC {UNBOUND_FIRST_PVC_NAME}"
+            "multiple PersistentVolume objects found for instance {UNBOUND_INSTANCE_ID}"
         )
         .into());
     }
-    pvcs.get(UNBOUND_SECOND_PVC_NAME).await?;
-    if !is_not_found(stateful_sets.get(UNBOUND_WORKLOAD_NAME).await) {
-        return Err(format!(
-            "StatefulSet {namespace}/{UNBOUND_WORKLOAD_NAME} should not be applied after PVC bind failure"
-        )
-        .into());
+    let pvc_items = pvcs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    if let Some(first_pvc) = pvc_items
+        .iter()
+        .find(|pvc| object_name_starts_with(&pvc.metadata.name, UNBOUND_FIRST_PVC_NAME))
+    {
+        let first_pvc_name = first_pvc
+            .metadata
+            .name
+            .as_deref()
+            .ok_or("first unbound PVC is missing metadata.name")?;
+        let phase = first_pvc
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref());
+        if phase == Some("Bound") {
+            return Err(format!("PVC {namespace}/{first_pvc_name} unexpectedly bound").into());
+        }
+        if let Some(pv) = pv_items.first() {
+            let pv_name = pv
+                .metadata
+                .name
+                .as_deref()
+                .ok_or("unbound PV is missing metadata.name")?;
+            let claim_name = pv
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.claim_ref.as_ref())
+                .and_then(|claim| claim.name.as_deref());
+            if claim_name == Some(first_pvc_name) {
+                return Err(
+                    format!("PV {pv_name} unexpectedly claims first PVC {first_pvc_name}").into(),
+                );
+            }
+        }
     }
-    if !is_not_found(services.get(UNBOUND_WORKLOAD_NAME).await) {
-        return Err(format!(
-            "Service {namespace}/{UNBOUND_WORKLOAD_NAME} should not be applied after PVC bind failure"
-        )
-        .into());
-    }
+    assert_no_labeled_objects(
+        "StatefulSet",
+        UNBOUND_INSTANCE_ID,
+        stateful_sets
+            .list(&ListParams::default().labels(&selector))
+            .await?,
+    )?;
+    assert_no_labeled_objects(
+        "Service",
+        UNBOUND_INSTANCE_ID,
+        services
+            .list(&ListParams::default().labels(&selector))
+            .await?,
+    )?;
     Ok(())
+}
+
+fn instance_selector(instance_id: &str) -> String {
+    format!("{INSTANCE_ID_LABEL}={instance_id}")
+}
+
+fn single_labeled_object<K: Clone>(
+    kind: &str,
+    instance_id: &str,
+    objects: kube::api::ObjectList<K>,
+) -> TestResult<K> {
+    let mut items = objects.items.into_iter();
+    let object = items
+        .next()
+        .ok_or_else(|| format!("no {kind} found for instance {instance_id}"))?;
+    if items.next().is_some() {
+        return Err(format!("multiple {kind} objects found for instance {instance_id}").into());
+    }
+
+    Ok(object)
+}
+
+fn assert_no_labeled_objects<K: Clone>(
+    kind: &str,
+    instance_id: &str,
+    objects: kube::api::ObjectList<K>,
+) -> TestResult<()> {
+    if !objects.items.is_empty() {
+        return Err(format!("unexpected {kind} exists for instance {instance_id}").into());
+    }
+
+    Ok(())
+}
+
+fn object_name_starts_with(name: &Option<String>, prefix: &str) -> bool {
+    name.as_deref()
+        .is_some_and(|name| name == prefix || name.starts_with(&format!("{prefix}-")))
 }
 
 fn endpoint_slice_has_ready_endpoint(slice: &EndpointSlice) -> bool {

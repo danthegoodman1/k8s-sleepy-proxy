@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod materialization;
 pub mod materializer;
 pub mod postgres;
+pub mod reconciler;
 pub mod retry;
 pub mod route;
 pub mod runtime;
@@ -61,10 +62,17 @@ pub use manifest::{
     VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind, WorkloadTemplate,
 };
 pub use materialization::{
-    BackendEndpoint, BeginSleepRequest, BeginSleepResult, CompleteWakeRequest, CompleteWakeResult,
-    FinalizeSleepRequest, FinalizeSleepResult, LoadActiveMaterializationRequest,
-    MaterializationRecord, MaterializationState, MaterializationTarget,
-    RecordMaterializationRequest, RenderedObjectRef,
+    BackendEndpoint, BeginSleepRequest, BeginSleepResult,
+    ClaimMaterializationReconciliationRequest, CompleteWakeReconciliationRequest,
+    CompleteWakeRequest, CompleteWakeResult, DeleteMaterializationReconciliationRequest,
+    FinalizeSleepReconciliationRequest, FinalizeSleepRequest, FinalizeSleepResult,
+    ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
+    ForceReleaseExclusivityKeyResult, ListMaterializationReconciliationCandidatesRequest,
+    LoadActiveMaterializationRequest, LoadMaterializationRequest,
+    MaterializationReconciliationLease, MaterializationRecord, MaterializationState,
+    MaterializationTarget, RecordMaterializationRequest,
+    ReleaseMaterializationReconciliationLeaseRequest, RenderedObjectRef,
+    RenewMaterializationReconciliationLeaseRequest,
 };
 pub use materializer::{
     rendered_object_ref, AppliedMaterialization, KubernetesClientError, KubernetesClientFuture,
@@ -72,6 +80,7 @@ pub use materializer::{
     MaterializerError, RetryingKubernetesMaterializerClient,
 };
 pub use postgres::PostgresStore;
+pub use reconciler::{MaterializationReconciler, MaterializationReconcilerConfig};
 pub use retry::RetryPolicy;
 pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,

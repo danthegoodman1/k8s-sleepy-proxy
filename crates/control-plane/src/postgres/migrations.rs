@@ -34,6 +34,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "workload_class_exclusivity_keys",
         sql: include_str!("../../migrations/0005_workload_class_exclusivity_keys.sql"),
     },
+    Migration {
+        version: 6,
+        name: "materialization_reconciliation_leases",
+        sql: include_str!("../../migrations/0006_materialization_reconciliation_leases.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &impl GenericClient) -> StoreResult<()> {
