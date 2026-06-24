@@ -20,6 +20,7 @@ pub use objects::{
     VolumeResourceRequirements,
 };
 pub use render::render_manifests;
+pub(crate) use render::render_manifests_with_options;
 pub use template::{
     ContainerPortTemplate, ContainerTemplate, EnvVarTemplate, ManifestTemplate,
     PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
@@ -41,6 +42,11 @@ pub struct RenderManifestRequest<'a> {
     pub sleep_policy: ResolvedSleepPolicy,
     pub namespace: &'a str,
     pub template_generation: Option<crate::ids::Generation>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RenderManifestOptions<'a> {
+    pub sidecar_control_plane_token: Option<&'a crate::auth::BearerToken>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

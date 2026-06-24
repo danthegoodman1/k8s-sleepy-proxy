@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
     pb::{
         sidecar_control_plane_server::SidecarControlPlane, sidecar_report_idle_response,
@@ -10,20 +10,45 @@ use control_plane::api::{
     OPERATOR_UNARY_METHODS, SIDECAR_SERVICE_NAME,
 };
 use control_plane::{
-    BackendEndpoint, BeginSleepRequest, BeginSleepResult, ControlPlaneStore, FinalizeSleepRequest,
-    FinalizeSleepResult, Generation, InstanceId, InstanceRecord,
-    InstanceState as DomainInstanceState, KubernetesClientFuture, KubernetesClientResult,
-    KubernetesMaterializer, KubernetesMaterializerClient, MaterializationId, MaterializationRecord,
-    MaterializationState, MaterializationTarget, RenderedObjectRef, StateTransitionReason,
-    StoreError, StoreFuture, StoreResult,
+    AuthConfig, BackendEndpoint, BeginSleepRequest, BeginSleepResult, CallerRole, ControlPlaneAuth,
+    ControlPlaneStore, FinalizeSleepRequest, FinalizeSleepResult, Generation, InstanceId,
+    InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientFuture,
+    KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
+    MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
+    RenderedObjectRef, StateTransitionReason, StaticBearerTokens, StoreError, StoreFuture,
+    StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use tonic::body::Body;
-use tonic::codegen::http::{header, Request, Version};
+use tonic::codegen::http::{header, HeaderMap, HeaderValue, Request, Version};
 use tonic::server::NamedService;
 use tonic::Code;
 use tower::ServiceExt;
+
+fn auth_config() -> AuthConfig {
+    AuthConfig::static_bearer_tokens(
+        StaticBearerTokens::new("operator-token", "proxy-token", "sidecar-token")
+            .expect("auth tokens are valid"),
+    )
+}
+
+fn control_plane_auth() -> ControlPlaneAuth {
+    ControlPlaneAuth::from_config(auth_config(), Default::default())
+}
+
+fn authenticated_sidecar_service(
+    store: Arc<dyn ControlPlaneStore>,
+    client: FakeKubernetesClient,
+) -> tonic::service::interceptor::InterceptedService<
+    StoreBackedSidecarGrpcService<FakeKubernetesClient>,
+    control_plane::ControlPlaneAuthInterceptor,
+> {
+    tonic::service::interceptor::InterceptedService::new(
+        sidecar_grpc_service_with_store(store, KubernetesMaterializer::new(client), target()),
+        control_plane_auth().interceptor(SIDECAR_SERVICE_NAME, CallerRole::Sidecar),
+    )
+}
 
 #[test]
 fn generated_api_contains_sidecar_report_idle_shape_without_operator_surface_change() {
@@ -419,6 +444,101 @@ async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
     assert_eq!(store.instance().state, DomainInstanceState::Cold);
 }
 
+#[tokio::test]
+async fn native_grpc_sidecar_auth_rejects_report_idle_before_sleep_logic() {
+    let store = Arc::new(FakeSidecarStore::default());
+    store.seed_instance(domain_instance(
+        "instance-auth-idle",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_materialization(ready_materialization("instance-auth-idle", 7));
+    let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
+
+    let missing_status = collect_grpc_status(
+        authenticated_sidecar_service(
+            Arc::clone(&store_for_service),
+            FakeKubernetesClient::default(),
+        )
+        .oneshot(grpc_sidecar_report_idle_request(
+            SidecarReportIdleRequest {
+                instance_id: "instance-auth-idle".to_owned(),
+                expected_generation: 7,
+                active_count: 0,
+            },
+            "application/grpc",
+            Version::HTTP_2,
+        ))
+        .await
+        .expect("missing auth returns gRPC response"),
+    )
+    .await;
+    assert_eq!(missing_status, "16");
+    assert_eq!(store.transition_requests().len(), 0);
+    assert_eq!(store.instance().state, DomainInstanceState::Running);
+
+    let wrong_role_status = collect_grpc_status(
+        authenticated_sidecar_service(store_for_service, FakeKubernetesClient::default())
+            .oneshot(with_authorization(
+                grpc_sidecar_report_idle_request(
+                    SidecarReportIdleRequest {
+                        instance_id: "instance-auth-idle".to_owned(),
+                        expected_generation: 7,
+                        active_count: 0,
+                    },
+                    "application/grpc",
+                    Version::HTTP_2,
+                ),
+                "Bearer proxy-token",
+            ))
+            .await
+            .expect("wrong role returns gRPC response"),
+    )
+    .await;
+    assert_eq!(wrong_role_status, "7");
+    assert_eq!(store.transition_requests().len(), 0);
+    assert_eq!(store.instance().state, DomainInstanceState::Running);
+}
+
+#[tokio::test]
+async fn native_grpc_sidecar_auth_accepts_valid_report_idle_credentials() {
+    let store = Arc::new(FakeSidecarStore::default());
+    store.seed_instance(domain_instance(
+        "instance-auth-valid-idle",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_materialization(ready_materialization("instance-auth-valid-idle", 7));
+    let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
+
+    let response =
+        authenticated_sidecar_service(store_for_service, FakeKubernetesClient::default())
+            .oneshot(with_authorization(
+                grpc_sidecar_report_idle_request(
+                    SidecarReportIdleRequest {
+                        instance_id: "instance-auth-valid-idle".to_owned(),
+                        expected_generation: 7,
+                        active_count: 0,
+                    },
+                    "application/grpc",
+                    Version::HTTP_2,
+                ),
+                "Bearer sidecar-token",
+            ))
+            .await
+            .expect("valid sidecar credentials dispatch report idle");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    assert_eq!(grpc_status(&headers, trailers.as_ref()), "0");
+    assert_eq!(store.transition_requests().len(), 2);
+    assert_eq!(store.instance().state, DomainInstanceState::Cold);
+}
+
 fn grpc_sidecar_report_idle_request(
     request: SidecarReportIdleRequest,
     content_type: &'static str,
@@ -434,6 +554,13 @@ fn grpc_sidecar_report_idle_request(
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::new(Full::new(body.freeze())))
         .expect("request builds")
+}
+
+fn with_authorization(mut request: Request<Body>, value: &'static str) -> Request<Body> {
+    request
+        .headers_mut()
+        .insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+    request
 }
 
 fn encode_grpc_message<M: Message>(request: M, body: &mut BytesMut) {
@@ -453,6 +580,31 @@ fn decode_grpc_sidecar_report_idle_response(bytes: &[u8]) -> SidecarReportIdleRe
             .expect("gRPC response frame has a length prefix"),
     ) as usize;
     SidecarReportIdleResponse::decode(&bytes[5..5 + length]).expect("gRPC response decodes")
+}
+
+async fn collect_grpc_status<B>(response: http::Response<B>) -> String
+where
+    B: tonic::codegen::Body<Data = Bytes>,
+    B::Error: std::fmt::Debug,
+{
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    grpc_status(&headers, trailers.as_ref())
+}
+
+fn grpc_status(headers: &HeaderMap, trailers: Option<&HeaderMap>) -> String {
+    trailers
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| headers.get("grpc-status"))
+        .expect("gRPC status is returned")
+        .to_str()
+        .expect("gRPC status is valid")
+        .to_owned()
 }
 
 fn sidecar_api(

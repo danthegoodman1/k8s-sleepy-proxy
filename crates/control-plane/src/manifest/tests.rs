@@ -3,15 +3,17 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::{
-    render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate,
-    CsiPersistentVolumeSource, EnvVar, EnvVarTemplate, HostPathPersistentVolumeSource,
-    KubernetesObject, ManifestRenderError, ManifestTemplate, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
-    RenderManifestRequest, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION,
-    LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION,
+    render_manifests, render_manifests_with_options, ApplyOrder, ContainerPortTemplate,
+    ContainerTemplate, CsiPersistentVolumeSource, EnvVar, EnvVarTemplate,
+    HostPathPersistentVolumeSource, KubernetesObject, ManifestRenderError, ManifestTemplate,
+    PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSource,
+    PersistentVolumeSourceTemplate, RenderManifestOptions, RenderManifestRequest,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
+    VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION,
 };
 use crate::{
+    auth::BearerToken,
     ids::{Generation, InstanceId, WorkloadClassId},
     instance::{InstanceRecord, InstanceState, InstanceValues},
     sleep_policy::ResolvedSleepPolicy,
@@ -192,6 +194,10 @@ fn renders_deployment_and_service_without_volumes() {
         "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS",
         "30000",
     );
+    assert_env_absent(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN",
+    );
     assert!(deployment.spec.template.spec.volumes.is_empty());
     assert!(deployment.spec.template.spec.containers[0]
         .volume_mounts
@@ -199,6 +205,35 @@ fn renders_deployment_and_service_without_volumes() {
     assert!(deployment.spec.template.spec.containers[1]
         .volume_mounts
         .is_empty());
+}
+
+#[test]
+fn private_render_options_inject_sidecar_control_plane_token() {
+    let token = BearerToken::new("sidecar_token", "sidecar-secret").expect("valid token");
+    let rendered = render_manifests_with_options(
+        RenderManifestRequest {
+            template: &deployment_template(),
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+            template_generation: Some(Generation::new(3)),
+        },
+        RenderManifestOptions {
+            sidecar_control_plane_token: Some(&token),
+        },
+    )
+    .expect("deployment renders");
+
+    let deployment = match &rendered.objects[1].object {
+        KubernetesObject::Deployment(deployment) => deployment,
+        other => panic!("expected Deployment, got {}", other.kind()),
+    };
+
+    assert_env(
+        &deployment.spec.template.spec.containers[1].env,
+        "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN",
+        "sidecar-secret",
+    );
 }
 
 #[test]
@@ -1240,6 +1275,13 @@ fn assert_env(env: &[EnvVar], name: &str, expected: &str) {
         .unwrap_or_else(|| panic!("missing env var {name}"));
 
     assert_eq!(value.value, expected);
+}
+
+fn assert_env_absent(env: &[EnvVar], name: &str) {
+    assert!(
+        env.iter().all(|var| var.name != name),
+        "env var {name} should be absent"
+    );
 }
 
 fn object_name(object: &KubernetesObject) -> &str {

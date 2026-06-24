@@ -1,8 +1,11 @@
 use std::{error::Error, process, time::Duration};
 
-use control_plane::api::pb::{
-    operator_control_plane_client::OperatorControlPlaneClient,
-    proxy_control_plane_client::ProxyControlPlaneClient,
+use control_plane::{
+    api::pb::{
+        operator_control_plane_client::OperatorControlPlaneClient,
+        proxy_control_plane_client::ProxyControlPlaneClient,
+    },
+    OptionalBearerTokenInterceptor,
 };
 use frontline::{
     serve_frontline, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
@@ -34,11 +37,20 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(TlsCertificateStore::new);
     let endpoint = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?;
     let channel = connect_control_plane(endpoint, env.control_plane_endpoint()).await?;
-    let route_client =
-        GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel.clone()));
-    let wake_client =
-        GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel.clone()));
-    let http01_resolver = GrpcOperatorHttp01Resolver::new(OperatorControlPlaneClient::new(channel));
+    let proxy_interceptor = OptionalBearerTokenInterceptor::new(env.control_plane_proxy_token())?;
+    let operator_interceptor =
+        OptionalBearerTokenInterceptor::new(env.control_plane_operator_token())?;
+    let route_client = GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::with_interceptor(
+        channel.clone(),
+        proxy_interceptor.clone(),
+    ));
+    let wake_client = GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::with_interceptor(
+        channel.clone(),
+        proxy_interceptor,
+    ));
+    let http01_resolver = GrpcOperatorHttp01Resolver::new(
+        OperatorControlPlaneClient::with_interceptor(channel, operator_interceptor),
+    );
     let resolver = FrontlineRouteResolver::with_observability(
         env.route_cache_capacity(),
         route_client,

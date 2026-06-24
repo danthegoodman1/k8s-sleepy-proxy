@@ -1,6 +1,9 @@
 use std::{env, error::Error, process, time::Duration};
 
-use control_plane::api::pb::sidecar_control_plane_client::SidecarControlPlaneClient;
+use control_plane::{
+    api::pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken,
+    OptionalBearerTokenInterceptor,
+};
 use proxy_core::{observability::recorder::ObservabilityRecorder, Shutdown};
 use sidecar::{
     runtime::{serve_http_with_idle, serve_tcp_with_idle, SidecarRuntimeConfig},
@@ -24,7 +27,12 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let channel = Endpoint::from_shared(env.control_plane_endpoint.clone())?
         .connect()
         .await?;
-    let client = GrpcSidecarControlPlaneClient::new(SidecarControlPlaneClient::new(channel));
+    let interceptor =
+        OptionalBearerTokenInterceptor::new(env.control_plane_sidecar_token.as_ref())?;
+    let client = GrpcSidecarControlPlaneClient::new(SidecarControlPlaneClient::with_interceptor(
+        channel,
+        interceptor,
+    ));
     let shutdown = Shutdown::new();
     let _shutdown_task = spawn_shutdown_signal(shutdown.clone())?;
 
@@ -72,6 +80,7 @@ struct EnvConfig {
     runtime: SidecarRuntimeConfig,
     runtime_mode: SidecarRuntimeMode,
     control_plane_endpoint: String,
+    control_plane_sidecar_token: Option<BearerToken>,
 }
 
 impl EnvConfig {
@@ -81,6 +90,8 @@ impl EnvConfig {
         let instance_id = InstanceId::new(required_env("SLEEPYPODS_INSTANCE_ID")?)?;
         let generation = Generation::new(required_env("SLEEPYPODS_INSTANCE_GENERATION")?.parse()?);
         let control_plane_endpoint = required_env("SLEEPYPODS_CONTROL_PLANE_ENDPOINT")?;
+        let control_plane_sidecar_token =
+            optional_bearer_token("SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN")?;
         let idle_timeout = duration_from_env_ms("SLEEPYPODS_IDLE_TIMEOUT_MS", 300_000)?;
         let retry_backoff = duration_from_env_ms("SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", 5_000)?;
         let drain_grace_timeout =
@@ -100,6 +111,7 @@ impl EnvConfig {
             runtime,
             runtime_mode,
             control_plane_endpoint,
+            control_plane_sidecar_token,
         })
     }
 }
@@ -129,6 +141,16 @@ impl SidecarRuntimeMode {
 
 fn required_env(name: &'static str) -> Result<String, MissingEnvVar> {
     env::var(name).map_err(|_| MissingEnvVar(name))
+}
+
+fn optional_bearer_token(
+    name: &'static str,
+) -> Result<Option<BearerToken>, Box<dyn Error + Send + Sync>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(BearerToken::new(name, value)?)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 fn duration_from_env_ms(

@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{
+    auth::BearerToken,
     kubernetes_name::is_dns_label,
     manifest::{
         ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject,
@@ -45,6 +46,7 @@ pub trait KubernetesMaterializerClient: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct KubernetesMaterializer<C> {
     client: C,
+    sidecar_control_plane_token: Option<BearerToken>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,11 +98,23 @@ where
     C: KubernetesMaterializerClient,
 {
     pub fn new(client: C) -> Self {
-        Self { client }
+        Self {
+            client,
+            sidecar_control_plane_token: None,
+        }
+    }
+
+    pub fn with_sidecar_control_plane_token(mut self, token: Option<BearerToken>) -> Self {
+        self.sidecar_control_plane_token = token;
+        self
     }
 
     pub fn client(&self) -> &C {
         &self.client
+    }
+
+    pub(crate) fn sidecar_control_plane_token(&self) -> Option<&BearerToken> {
+        self.sidecar_control_plane_token.as_ref()
     }
 
     pub async fn apply_manifest_until_ready(

@@ -18,6 +18,7 @@ use crate::{
         proxy_grpc_service_with_store_and_route_events, sidecar_grpc_service_with_store,
         RouteSubscriptionBroker,
     },
+    auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
     config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
     materialization::{InvalidMaterializationTarget, MaterializationTarget},
     materializer::{
@@ -34,6 +35,10 @@ pub const STORE_PROVIDER_ENV: &str = "SLEEPYPODS_STORE_PROVIDER";
 pub const POSTGRES_URL_ENV: &str = "SLEEPYPODS_POSTGRES_URL";
 pub const CLUSTER_ID_ENV: &str = "SLEEPYPODS_CLUSTER_ID";
 pub const NAMESPACE_ENV: &str = "SLEEPYPODS_NAMESPACE";
+pub const AUTH_MODE_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_AUTH_MODE";
+pub const AUTH_OPERATOR_TOKEN_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN";
+pub const AUTH_PROXY_TOKEN_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
+pub const AUTH_SIDECAR_TOKEN_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN";
 
 pub type NativeControlPlaneRouter = Router<Identity>;
 pub type OperatorGrpcWebRouter = Router<Stack<tonic_web::GrpcWebLayer, Stack<CorsLayer, Identity>>>;
@@ -62,6 +67,10 @@ pub enum RuntimeConfigError {
     },
     InvalidPostgresConfig(crate::ids::EmptyStringError),
     InvalidMaterializationTarget(InvalidMaterializationTarget),
+    InvalidAuthMode {
+        value: String,
+    },
+    InvalidAuthConfig(InvalidStaticBearerTokens),
 }
 
 impl RuntimeConfig {
@@ -97,6 +106,7 @@ impl RuntimeConfig {
                 )
             }
         };
+        let auth = parse_auth_config(&values)?;
         let target = MaterializationTarget::new(
             required_value(&values, CLUSTER_ID_ENV)?,
             required_value(&values, NAMESPACE_ENV)?,
@@ -106,7 +116,7 @@ impl RuntimeConfig {
         Ok(Self {
             listen_addr,
             operator_grpc_web_listen_addr,
-            control_plane: ControlPlaneConfig::new(store),
+            control_plane: ControlPlaneConfig::new(store, auth),
             target,
         })
     }
@@ -121,32 +131,58 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     let route_events = RouteSubscriptionBroker::new();
-    native_control_plane_router_with_route_events(store, materializer, target, route_events)
+    native_control_plane_router_with_route_events(
+        store,
+        materializer,
+        target,
+        AuthConfig::NoAuth,
+        route_events,
+    )
 }
 
 fn native_control_plane_router_with_route_events<C>(
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
+    auth_config: AuthConfig,
     route_events: RouteSubscriptionBroker,
 ) -> NativeControlPlaneRouter
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
     tonic::transport::Server::builder()
-        .add_service(operator_grpc_service_with_store_and_route_events(
-            Arc::clone(&store),
-            materializer.clone(),
-            target.clone(),
-            route_events.clone(),
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            operator_grpc_service_with_store_and_route_events(
+                Arc::clone(&store),
+                materializer.clone(),
+                target.clone(),
+                route_events.clone(),
+            ),
+            auth.interceptor(
+                crate::api::OPERATOR_SERVICE_NAME,
+                crate::auth::CallerRole::Operator,
+            ),
         ))
-        .add_service(proxy_grpc_service_with_store_and_route_events(
-            Arc::clone(&store),
-            materializer.clone(),
-            target.clone(),
-            route_events,
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            proxy_grpc_service_with_store_and_route_events(
+                Arc::clone(&store),
+                materializer.clone(),
+                target.clone(),
+                route_events,
+            ),
+            auth.interceptor(
+                crate::api::PROXY_SERVICE_NAME,
+                crate::auth::CallerRole::Proxy,
+            ),
         ))
-        .add_service(sidecar_grpc_service_with_store(store, materializer, target))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            sidecar_grpc_service_with_store(store, materializer, target),
+            auth.interceptor(
+                crate::api::SIDECAR_SERVICE_NAME,
+                crate::auth::CallerRole::Sidecar,
+            ),
+        ))
 }
 
 pub fn operator_grpc_web_router<C>(
@@ -161,6 +197,7 @@ where
         store,
         materializer,
         target,
+        AuthConfig::NoAuth,
         RouteSubscriptionBroker::new(),
     )
 }
@@ -169,17 +206,25 @@ fn operator_grpc_web_router_with_route_events<C>(
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
+    auth_config: AuthConfig,
     route_events: RouteSubscriptionBroker,
 ) -> OperatorGrpcWebRouter
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
     operator_grpc_web_server_builder().add_service(
-        operator_grpc_service_with_store_and_route_events(
-            store,
-            materializer,
-            target,
-            route_events,
+        tonic::service::interceptor::InterceptedService::new(
+            operator_grpc_service_with_store_and_route_events(
+                store,
+                materializer,
+                target,
+                route_events,
+            ),
+            auth.interceptor(
+                crate::api::OPERATOR_SERVICE_NAME,
+                crate::auth::CallerRole::Operator,
+            ),
         ),
     )
 }
@@ -206,11 +251,13 @@ pub async fn serve<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    let materializer = materializer_with_runtime_auth(materializer, &config.control_plane.auth);
     let route_events = RouteSubscriptionBroker::new();
     let native_router = native_control_plane_router_with_route_events(
         Arc::clone(&store),
         materializer.clone(),
         config.target.clone(),
+        config.control_plane.auth.clone(),
         route_events.clone(),
     );
     let (shutdown_tx, _) = watch::channel(false);
@@ -226,6 +273,7 @@ where
             store,
             materializer.clone(),
             config.target.clone(),
+            config.control_plane.auth.clone(),
             route_events,
         );
         let operator_grpc_web_shutdown = native_shutdown.clone();
@@ -245,6 +293,16 @@ where
     }
 
     Ok(())
+}
+
+fn materializer_with_runtime_auth<C>(
+    materializer: KubernetesMaterializer<C>,
+    auth_config: &AuthConfig,
+) -> KubernetesMaterializer<C>
+where
+    C: KubernetesMaterializerClient,
+{
+    materializer.with_sidecar_control_plane_token(auth_config.sidecar_bearer_token().cloned())
 }
 
 async fn connect_store(
@@ -313,6 +371,25 @@ fn parse_socket_addr(name: &'static str, value: &str) -> Result<SocketAddr, Runt
         })
 }
 
+fn parse_auth_config(values: &HashMap<String, String>) -> Result<AuthConfig, RuntimeConfigError> {
+    let mode = required_value(values, AUTH_MODE_ENV)?;
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "no-auth" => Ok(AuthConfig::NoAuth),
+        "static-bearer-token" | "static-bearer-tokens" => {
+            let tokens = StaticBearerTokens::new(
+                required_value(values, AUTH_OPERATOR_TOKEN_ENV)?,
+                required_value(values, AUTH_PROXY_TOKEN_ENV)?,
+                required_value(values, AUTH_SIDECAR_TOKEN_ENV)?,
+            )
+            .map_err(RuntimeConfigError::InvalidAuthConfig)?;
+            Ok(AuthConfig::static_bearer_tokens(tokens))
+        }
+        _ => Err(RuntimeConfigError::InvalidAuthMode {
+            value: mode.to_owned(),
+        }),
+    }
+}
+
 impl fmt::Display for RuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -330,6 +407,10 @@ impl fmt::Display for RuntimeConfigError {
             }
             Self::InvalidPostgresConfig(source) => source.fmt(f),
             Self::InvalidMaterializationTarget(source) => source.fmt(f),
+            Self::InvalidAuthMode { value } => {
+                write!(f, "{AUTH_MODE_ENV} value {value:?} is not supported")
+            }
+            Self::InvalidAuthConfig(source) => source.fmt(f),
         }
     }
 }
@@ -340,7 +421,10 @@ impl Error for RuntimeConfigError {
             Self::InvalidListenAddr { source, .. } => Some(source),
             Self::InvalidPostgresConfig(source) => Some(source),
             Self::InvalidMaterializationTarget(source) => Some(source),
-            Self::MissingEnv { .. } | Self::InvalidStoreProvider { .. } => None,
+            Self::InvalidAuthConfig(source) => Some(source),
+            Self::MissingEnv { .. }
+            | Self::InvalidStoreProvider { .. }
+            | Self::InvalidAuthMode { .. } => None,
         }
     }
 }
@@ -477,6 +561,146 @@ mod tests {
             config.control_plane.store.provider_name(),
             StoreProviderName::Postgres
         );
+        assert_eq!(config.control_plane.auth, AuthConfig::NoAuth);
+    }
+
+    #[test]
+    fn env_config_requires_explicit_auth_mode() {
+        let error = RuntimeConfig::from_key_values(valid_env_without(AUTH_MODE_ENV))
+            .expect_err("auth mode is required");
+
+        assert!(matches!(
+            error,
+            RuntimeConfigError::MissingEnv {
+                name: AUTH_MODE_ENV
+            }
+        ));
+    }
+
+    #[test]
+    fn env_config_parses_static_bearer_token_auth() {
+        let config = RuntimeConfig::from_key_values(static_auth_env()).expect("valid config");
+        let AuthConfig::StaticBearerTokens(tokens) = config.control_plane.auth else {
+            panic!("expected static bearer token config");
+        };
+
+        assert_eq!(
+            tokens
+                .token_for(crate::auth::CallerRole::Operator)
+                .authorization_header_value()
+                .expect("header value")
+                .to_str()
+                .expect("ascii"),
+            "Bearer operator-secret"
+        );
+        assert_eq!(
+            tokens
+                .token_for(crate::auth::CallerRole::Proxy)
+                .authorization_header_value()
+                .expect("header value")
+                .to_str()
+                .expect("ascii"),
+            "Bearer proxy-secret"
+        );
+        assert_eq!(
+            tokens
+                .token_for(crate::auth::CallerRole::Sidecar)
+                .authorization_header_value()
+                .expect("header value")
+                .to_str()
+                .expect("ascii"),
+            "Bearer sidecar-secret"
+        );
+    }
+
+    #[test]
+    fn serve_materializer_gets_sidecar_token_from_runtime_auth_config() {
+        let config = RuntimeConfig::from_key_values(static_auth_env()).expect("valid config");
+        let materializer = materializer_with_runtime_auth(
+            KubernetesMaterializer::new(NoopKubernetesClient),
+            &config.control_plane.auth,
+        );
+
+        let token = materializer
+            .sidecar_control_plane_token()
+            .expect("static auth sidecar token is attached to materializer");
+
+        assert_eq!(
+            token
+                .authorization_header_value()
+                .expect("header")
+                .to_str()
+                .expect("ascii"),
+            "Bearer sidecar-secret"
+        );
+    }
+
+    #[test]
+    fn env_config_static_auth_fails_closed_when_credentials_are_missing() {
+        let error = RuntimeConfig::from_key_values(
+            static_auth_env()
+                .into_iter()
+                .filter(|(key, _)| *key != AUTH_PROXY_TOKEN_ENV)
+                .collect::<Vec<_>>(),
+        )
+        .expect_err("missing proxy token is rejected");
+
+        assert!(matches!(
+            error,
+            RuntimeConfigError::MissingEnv {
+                name: AUTH_PROXY_TOKEN_ENV
+            }
+        ));
+    }
+
+    #[test]
+    fn env_config_static_auth_rejects_malformed_env_tokens() {
+        let error = RuntimeConfig::from_key_values(
+            static_auth_env()
+                .into_iter()
+                .map(|(key, value)| {
+                    if key == AUTH_OPERATOR_TOKEN_ENV {
+                        (key, "has space")
+                    } else {
+                        (key, value)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect_err("malformed token is rejected");
+
+        assert!(matches!(
+            error,
+            RuntimeConfigError::InvalidAuthConfig(InvalidStaticBearerTokens::InvalidToken {
+                role: crate::auth::CallerRole::Operator,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn env_config_static_auth_requires_distinct_role_tokens() {
+        let error = RuntimeConfig::from_key_values(
+            static_auth_env()
+                .into_iter()
+                .map(|(key, value)| {
+                    if key == AUTH_SIDECAR_TOKEN_ENV {
+                        (key, "proxy-secret")
+                    } else {
+                        (key, value)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect_err("duplicate role tokens are rejected");
+
+        assert!(matches!(
+            error,
+            RuntimeConfigError::InvalidAuthConfig(InvalidStaticBearerTokens::DuplicateToken {
+                first: crate::auth::CallerRole::Proxy,
+                second: crate::auth::CallerRole::Sidecar
+            })
+        ));
     }
 
     #[test]
@@ -500,7 +724,26 @@ mod tests {
             ),
             (CLUSTER_ID_ENV, "cluster-a"),
             (NAMESPACE_ENV, "apps"),
+            (AUTH_MODE_ENV, "no-auth"),
         ]
+    }
+
+    fn static_auth_env() -> Vec<(&'static str, &'static str)> {
+        valid_env()
+            .into_iter()
+            .map(|(key, value)| {
+                if key == AUTH_MODE_ENV {
+                    (key, "static-bearer-token")
+                } else {
+                    (key, value)
+                }
+            })
+            .chain([
+                (AUTH_OPERATOR_TOKEN_ENV, "operator-secret"),
+                (AUTH_PROXY_TOKEN_ENV, "proxy-secret"),
+                (AUTH_SIDECAR_TOKEN_ENV, "sidecar-secret"),
+            ])
+            .collect()
     }
 
     fn valid_env_without(name: &str) -> Vec<(&'static str, &'static str)> {

@@ -15,7 +15,10 @@ use crate::{
         CompareAndSwapInstanceStateRequest, GetInstanceRequest, InstanceRecord, InstanceState,
         StateTransitionReason,
     },
-    manifest::{render_manifests, ManifestRenderError, RenderManifestRequest},
+    manifest::{
+        render_manifests_with_options, ManifestRenderError, RenderManifestOptions,
+        RenderManifestRequest,
+    },
     materialization::{
         CompleteWakeRequest, CompleteWakeResult, FinalizeSleepRequest,
         LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
@@ -249,13 +252,18 @@ where
         }
     };
 
-    let manifest = match render_manifests(RenderManifestRequest {
-        template: &workload_class.template,
-        instance: &waking,
-        sleep_policy,
-        namespace: request.target.namespace(),
-        template_generation: Some(workload_class.template_generation),
-    }) {
+    let manifest = match render_manifests_with_options(
+        RenderManifestRequest {
+            template: &workload_class.template,
+            instance: &waking,
+            sleep_policy,
+            namespace: request.target.namespace(),
+            template_generation: Some(workload_class.template_generation),
+        },
+        RenderManifestOptions {
+            sidecar_control_plane_token: materializer.sidecar_control_plane_token(),
+        },
+    ) {
         Ok(manifest) => manifest,
         Err(error) => {
             return Err(fail_waking(

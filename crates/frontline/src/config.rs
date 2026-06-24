@@ -13,6 +13,8 @@ use std::{
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+use control_plane::{BearerToken, InvalidBearerToken};
+
 use crate::{
     FrontlineHttpListenerConfig, FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
     FrontlineTlsTerminationListenerConfig, RequestIdentityError, TlsCertificateError,
@@ -23,6 +25,8 @@ const DEFAULT_ROUTE_CACHE_CAPACITY: usize = 1024;
 const DEFAULT_DRAIN_GRACE_TIMEOUT_MS: u64 = 30_000;
 const FRONTLINE_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_LISTEN_ADDR";
 const CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
+const CONTROL_PLANE_PROXY_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
+const CONTROL_PLANE_OPERATOR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN";
 const ROUTE_CACHE_CAPACITY: &str = "SLEEPYPODS_ROUTE_CACHE_CAPACITY";
 const DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const TLS_TERMINATION_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR";
@@ -34,6 +38,8 @@ pub struct FrontlineEnvConfig {
     listeners: FrontlineListenersConfig,
     tls_certificates: Vec<FrontlineTlsCertificateConfig>,
     control_plane_endpoint: String,
+    control_plane_proxy_token: Option<BearerToken>,
+    control_plane_operator_token: Option<BearerToken>,
     route_cache_capacity: usize,
     drain_grace_timeout: Duration,
 }
@@ -69,6 +75,10 @@ pub enum FrontlineEnvConfigError {
         name: &'static str,
         value: String,
         reason: String,
+    },
+    InvalidControlPlaneBearerToken {
+        name: &'static str,
+        source: InvalidBearerToken,
     },
 }
 
@@ -127,6 +137,9 @@ impl FrontlineEnvConfig {
             }
         })?;
         let control_plane_endpoint = required(&vars, CONTROL_PLANE_ENDPOINT)?;
+        let control_plane_proxy_token = optional_bearer_token(&vars, CONTROL_PLANE_PROXY_TOKEN)?;
+        let control_plane_operator_token =
+            optional_bearer_token(&vars, CONTROL_PLANE_OPERATOR_TOKEN)?;
         let route_cache_capacity =
             optional_usize(&vars, ROUTE_CACHE_CAPACITY, DEFAULT_ROUTE_CACHE_CAPACITY)?;
         let drain_grace_timeout = optional_duration_ms(
@@ -148,6 +161,8 @@ impl FrontlineEnvConfig {
             listeners,
             tls_certificates,
             control_plane_endpoint,
+            control_plane_proxy_token,
+            control_plane_operator_token,
             route_cache_capacity,
             drain_grace_timeout,
         })
@@ -199,6 +214,14 @@ impl FrontlineEnvConfig {
 
     pub fn control_plane_endpoint(&self) -> &str {
         &self.control_plane_endpoint
+    }
+
+    pub fn control_plane_proxy_token(&self) -> Option<&BearerToken> {
+        self.control_plane_proxy_token.as_ref()
+    }
+
+    pub fn control_plane_operator_token(&self) -> Option<&BearerToken> {
+        self.control_plane_operator_token.as_ref()
     }
 
     pub fn route_cache_capacity(&self) -> usize {
@@ -370,6 +393,18 @@ fn optional_duration_ms(
     Ok(Duration::from_millis(value))
 }
 
+fn optional_bearer_token(
+    vars: &HashMap<String, String>,
+    name: &'static str,
+) -> Result<Option<BearerToken>, FrontlineEnvConfigError> {
+    let Some(value) = vars.get(name) else {
+        return Ok(None);
+    };
+    BearerToken::new(name, value.clone())
+        .map(Some)
+        .map_err(|source| FrontlineEnvConfigError::InvalidControlPlaneBearerToken { name, source })
+}
+
 fn load_certificate_chain(
     path: &Path,
 ) -> Result<Vec<CertificateDer<'static>>, FrontlineTlsCertificateLoadError> {
@@ -442,6 +477,9 @@ impl fmt::Display for FrontlineEnvConfigError {
                     "{name} must be TLS certificate entries, got {value:?}: {reason}"
                 )
             }
+            Self::InvalidControlPlaneBearerToken { name, source } => {
+                write!(f, "{name} is not a valid bearer token: {source}")
+            }
         }
     }
 }
@@ -481,6 +519,7 @@ impl Error for FrontlineEnvConfigError {
             Self::InvalidUsize { source, .. } | Self::InvalidDurationMs { source, .. } => {
                 Some(source)
             }
+            Self::InvalidControlPlaneBearerToken { source, .. } => Some(source),
             Self::Missing { .. } | Self::InvalidTlsCertificates { .. } => None,
         }
     }
@@ -520,6 +559,8 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap()
         );
         assert_eq!(config.control_plane_endpoint(), "http://127.0.0.1:50051");
+        assert!(config.control_plane_proxy_token().is_none());
+        assert!(config.control_plane_operator_token().is_none());
         assert_eq!(config.route_cache_capacity(), DEFAULT_ROUTE_CACHE_CAPACITY);
         assert_eq!(
             config.drain_grace_timeout(),
@@ -539,13 +580,54 @@ mod tests {
         let config = FrontlineEnvConfig::from_vars([
             (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
             (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
+            (CONTROL_PLANE_PROXY_TOKEN, "proxy-secret"),
+            (CONTROL_PLANE_OPERATOR_TOKEN, "operator-secret"),
             (ROUTE_CACHE_CAPACITY, "17"),
             (DRAIN_GRACE_TIMEOUT_MS, "250"),
         ])
         .expect("config parses");
 
+        assert_eq!(
+            config
+                .control_plane_proxy_token()
+                .expect("proxy token")
+                .authorization_header_value()
+                .expect("header value")
+                .to_str()
+                .expect("ascii"),
+            "Bearer proxy-secret"
+        );
+        assert_eq!(
+            config
+                .control_plane_operator_token()
+                .expect("operator token")
+                .authorization_header_value()
+                .expect("header value")
+                .to_str()
+                .expect("ascii"),
+            "Bearer operator-secret"
+        );
         assert_eq!(config.route_cache_capacity(), 17);
         assert_eq!(config.drain_grace_timeout(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn invalid_control_plane_token_is_reported_without_leaking_value() {
+        let error = FrontlineEnvConfig::from_vars([
+            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
+            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
+            (CONTROL_PLANE_PROXY_TOKEN, "has space"),
+        ])
+        .expect_err("token with whitespace is invalid");
+
+        assert!(matches!(
+            error,
+            FrontlineEnvConfigError::InvalidControlPlaneBearerToken {
+                name: CONTROL_PLANE_PROXY_TOKEN,
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("has space"));
     }
 
     #[test]

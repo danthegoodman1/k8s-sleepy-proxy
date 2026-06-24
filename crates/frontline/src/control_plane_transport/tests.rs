@@ -14,8 +14,9 @@ use control_plane::{
         proxy_control_plane_client::ProxyControlPlaneClient,
         proxy_control_plane_server::{ProxyControlPlane, ProxyControlPlaneServer},
     },
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey, InstanceId,
-    InstanceState, PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    BackendEndpoint, BackendGeneration, BearerToken, CachePolicy, Generation, Http01ChallengeKey,
+    InstanceId, InstanceState, OptionalBearerTokenInterceptor, PathPrefix, RouteBindingId,
+    RouteEntry, RouteHost, RouteIdentity,
 };
 use tokio::sync::{mpsc, Notify};
 use tonic::{
@@ -491,6 +492,38 @@ async fn http01_resolve_hit_sends_key_and_maps_challenge_record() {
 }
 
 #[tokio::test]
+async fn http01_resolve_with_operator_token_sends_authorization_metadata() {
+    let service = FakeOperatorControlPlane::default();
+    service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse {
+        challenge: Some(http01_challenge(
+            "app.example.com",
+            "token-a",
+            "token-a.key",
+        )),
+    }));
+    let token = BearerToken::new("operator_token", "operator-secret").expect("valid token");
+    let interceptor = OptionalBearerTokenInterceptor::new(Some(&token)).expect("valid interceptor");
+    let server = OperatorControlPlaneServer::new(service.clone());
+    let mut resolver = GrpcOperatorHttp01Resolver::new(
+        OperatorControlPlaneClient::with_interceptor(InProcessService::new(server), interceptor),
+    );
+
+    let response = resolver
+        .resolve_http01_challenge(
+            Http01ChallengeKey::new("app.example.com", "token-a").expect("valid key"),
+        )
+        .await
+        .expect("HTTP-01 resolve succeeds")
+        .expect("challenge resolves");
+
+    assert_eq!(response.key_authorization(), "token-a.key");
+    assert_eq!(
+        service.resolve_http01_authorizations(),
+        vec![Some("Bearer operator-secret".to_owned())]
+    );
+}
+
+#[tokio::test]
 async fn http01_resolve_miss_maps_to_none() {
     let service = FakeOperatorControlPlane::default();
     service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse { challenge: None }));
@@ -609,6 +642,7 @@ struct FakeProxyControlPlaneState {
 struct FakeOperatorControlPlaneState {
     resolve_http01_response: Option<Result<pb::ResolveHttp01ChallengeResponse, Status>>,
     resolve_http01_requests: Vec<pb::ResolveHttp01ChallengeRequest>,
+    resolve_http01_authorizations: Vec<Option<String>>,
 }
 
 struct SubscribeAction {
@@ -814,7 +848,14 @@ impl OperatorControlPlane for FakeOperatorControlPlane {
         request: Request<pb::ResolveHttp01ChallengeRequest>,
     ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
         let response = {
+            let authorization = request.metadata().get("authorization").map(|value| {
+                value
+                    .to_str()
+                    .expect("authorization metadata is ASCII")
+                    .to_owned()
+            });
             let mut state = self.state.lock().expect("fake state");
+            state.resolve_http01_authorizations.push(authorization);
             state.resolve_http01_requests.push(request.into_inner());
             state.resolve_http01_response.take().unwrap_or_else(|| {
                 Err(Status::failed_precondition(
@@ -857,6 +898,14 @@ impl FakeOperatorControlPlane {
             .lock()
             .expect("fake state")
             .resolve_http01_requests
+            .clone()
+    }
+
+    fn resolve_http01_authorizations(&self) -> Vec<Option<String>> {
+        self.state
+            .lock()
+            .expect("fake state")
+            .resolve_http01_authorizations
             .clone()
     }
 }

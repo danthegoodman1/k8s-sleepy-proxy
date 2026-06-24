@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
     operator_grpc_server_builder,
     pb::{
@@ -23,22 +23,48 @@ use control_plane::api::{
     StoreBackedProxyGrpcService, OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
 };
 use control_plane::{
-    BackendEndpoint, BackendGeneration, CachePolicy, CompleteWakeResult, ControlPlaneStore,
-    CreateInstanceResult, Generation, InstanceId, InstanceRecord,
-    InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
-    KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
-    MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
-    PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
-    RouteResolution, StoreError, StoreFuture, StoreResult,
+    AuthConfig, BackendEndpoint, BackendGeneration, CachePolicy, CallerRole, CompleteWakeResult,
+    ControlPlaneAuth, ControlPlaneStore, CreateInstanceResult, Generation, InstanceId,
+    InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientError,
+    KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
+    KubernetesMaterializerClient, MaterializationId, MaterializationRecord, MaterializationState,
+    MaterializationTarget, PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost,
+    RouteIdentity, RouteResolution, StaticBearerTokens, StoreError, StoreFuture, StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use tonic::body::Body;
-use tonic::codegen::http::{header, Request, Response as HttpResponse, Version};
+use tonic::codegen::http::{
+    header, HeaderMap, HeaderValue, Request, Response as HttpResponse, Version,
+};
 use tonic::codegen::tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::server::NamedService;
 use tonic::Code;
 use tower::{Service, ServiceExt};
+
+fn auth_config() -> AuthConfig {
+    AuthConfig::static_bearer_tokens(
+        StaticBearerTokens::new("operator-token", "proxy-token", "sidecar-token")
+            .expect("auth tokens are valid"),
+    )
+}
+
+fn control_plane_auth() -> ControlPlaneAuth {
+    ControlPlaneAuth::from_config(auth_config(), Default::default())
+}
+
+fn authenticated_proxy_service(
+    store: Arc<dyn ControlPlaneStore>,
+    client: FakeKubernetesClient,
+) -> tonic::service::interceptor::InterceptedService<
+    StoreBackedProxyGrpcService<FakeKubernetesClient>,
+    control_plane::ControlPlaneAuthInterceptor,
+> {
+    tonic::service::interceptor::InterceptedService::new(
+        proxy_grpc_service_with_store(store, KubernetesMaterializer::new(client), proxy_target()),
+        control_plane_auth().interceptor(PROXY_SERVICE_NAME, CallerRole::Proxy),
+    )
+}
 
 #[test]
 fn generated_api_contains_proxy_wake_shape_without_operator_surface_change() {
@@ -174,6 +200,101 @@ async fn native_grpc_request_dispatches_to_store_backed_proxy_wake_instance() {
 }
 
 #[tokio::test]
+async fn native_grpc_proxy_auth_rejects_wake_before_materialization_logic() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_instance(domain_instance(
+        "instance-auth-wake",
+        DomainInstanceState::Cold,
+        1,
+    ));
+    store.seed_workload_class(domain_workload_class());
+    let client = FakeKubernetesClient::default();
+    let store_for_service: Arc<dyn ControlPlaneStore> = store;
+
+    let missing_status = collect_grpc_status(
+        authenticated_proxy_service(Arc::clone(&store_for_service), client.clone())
+            .oneshot(grpc_proxy_wake_request(
+                ProxyWakeInstanceRequest {
+                    instance_id: "instance-auth-wake".to_owned(),
+                    expected_generation: 1,
+                    backend_generation: Some(55),
+                },
+                "application/grpc",
+                Version::HTTP_2,
+            ))
+            .await
+            .expect("missing auth returns gRPC response"),
+    )
+    .await;
+    assert_eq!(missing_status, "16");
+    assert_eq!(client.applied_objects_len(), 0);
+
+    let wrong_role_status = collect_grpc_status(
+        authenticated_proxy_service(store_for_service, client.clone())
+            .oneshot(with_authorization(
+                grpc_proxy_wake_request(
+                    ProxyWakeInstanceRequest {
+                        instance_id: "instance-auth-wake".to_owned(),
+                        expected_generation: 1,
+                        backend_generation: Some(55),
+                    },
+                    "application/grpc",
+                    Version::HTTP_2,
+                ),
+                "Bearer operator-token",
+            ))
+            .await
+            .expect("wrong role returns gRPC response"),
+    )
+    .await;
+    assert_eq!(wrong_role_status, "7");
+    assert_eq!(client.applied_objects_len(), 0);
+}
+
+#[tokio::test]
+async fn native_grpc_proxy_auth_accepts_valid_wake_credentials() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_instance(domain_instance(
+        "instance-auth-valid",
+        DomainInstanceState::Cold,
+        1,
+    ));
+    store.seed_workload_class(domain_workload_class());
+    let client = FakeKubernetesClient::default();
+    let store_for_service: Arc<dyn ControlPlaneStore> = store;
+
+    let response = authenticated_proxy_service(store_for_service, client.clone())
+        .oneshot(with_authorization(
+            grpc_proxy_wake_request(
+                ProxyWakeInstanceRequest {
+                    instance_id: "instance-auth-valid".to_owned(),
+                    expected_generation: 1,
+                    backend_generation: Some(56),
+                },
+                "application/grpc",
+                Version::HTTP_2,
+            ),
+            "Bearer proxy-token",
+        ))
+        .await
+        .expect("valid proxy credentials dispatch to wake handler");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    assert_eq!(grpc_status(&headers, trailers.as_ref()), "0");
+    let ready = expect_ready(decode_grpc_proxy_wake_response(
+        collected.to_bytes().as_ref(),
+    ));
+    assert_eq!(ready.instance_id, "instance-auth-valid");
+    assert_eq!(ready.backend_generation, 56);
+    assert_eq!(client.applied_objects_len(), 2);
+}
+
+#[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_proxy_subscribe() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
@@ -220,6 +341,72 @@ async fn native_grpc_request_dispatches_to_store_backed_proxy_subscribe() {
             })
             .map(|host| (host.kind, host.host.as_str())),
         Some((RouteHostKind::WildcardSuffix as i32, "example.com"))
+    );
+}
+
+#[tokio::test]
+async fn native_grpc_proxy_auth_rejects_subscribe_before_route_resolution() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("auth.example.com", Some("/")),
+        domain_route_entry("route-auth", "instance-auth", DomainInstanceState::Running),
+    );
+    let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
+    let request = subscribe_route_request(
+        "request-auth",
+        proto_http_identity(RouteHostKind::Exact, "auth.example.com", Some("/")),
+    );
+
+    let missing_status = collect_grpc_status(
+        authenticated_proxy_service(
+            Arc::clone(&store_for_service),
+            FakeKubernetesClient::default(),
+        )
+        .oneshot(grpc_proxy_subscribe_request(
+            vec![request.clone()],
+            "application/grpc",
+            Version::HTTP_2,
+        ))
+        .await
+        .expect("missing auth returns gRPC response"),
+    )
+    .await;
+    assert_eq!(missing_status, "16");
+    assert_eq!(store.resolve_route_requests(), 0);
+
+    let wrong_role_status = collect_grpc_status(
+        authenticated_proxy_service(
+            Arc::clone(&store_for_service),
+            FakeKubernetesClient::default(),
+        )
+        .oneshot(with_authorization(
+            grpc_proxy_subscribe_request(
+                vec![request.clone()],
+                "application/grpc",
+                Version::HTTP_2,
+            ),
+            "Bearer sidecar-token",
+        ))
+        .await
+        .expect("wrong role returns gRPC response"),
+    )
+    .await;
+    assert_eq!(wrong_role_status, "7");
+    assert_eq!(store.resolve_route_requests(), 0);
+
+    let response = authenticated_proxy_service(store_for_service, FakeKubernetesClient::default())
+        .oneshot(with_authorization(
+            grpc_proxy_subscribe_request(vec![request], "application/grpc", Version::HTTP_2),
+            "Bearer proxy-token",
+        ))
+        .await
+        .expect("valid proxy credentials dispatch subscribe");
+    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
+    assert_eq!(status, "0");
+    assert_eq!(store.resolve_route_requests(), 1);
+    assert_eq!(
+        expect_route_resolved(single_message(messages)).request_id,
+        "request-auth"
     );
 }
 
@@ -1179,6 +1366,13 @@ fn grpc_stream_request<M: Message>(
         .expect("request builds")
 }
 
+fn with_authorization(mut request: Request<Body>, value: &'static str) -> Request<Body> {
+    request
+        .headers_mut()
+        .insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+    request
+}
+
 fn encode_grpc_message<M: Message>(request: M, body: &mut BytesMut) {
     let mut message = BytesMut::new();
     request.encode(&mut message).expect("request encodes");
@@ -1192,9 +1386,13 @@ fn decode_grpc_proxy_wake_response(bytes: &[u8]) -> ProxyWakeInstanceResponse {
     decode_grpc_message(bytes)
 }
 
-async fn collect_grpc_proxy_subscribe_response(
-    response: HttpResponse<Body>,
-) -> (Vec<ProxySubscribeResponse>, String) {
+async fn collect_grpc_proxy_subscribe_response<B>(
+    response: HttpResponse<B>,
+) -> (Vec<ProxySubscribeResponse>, String)
+where
+    B: tonic::codegen::Body<Data = Bytes>,
+    B::Error: std::fmt::Debug,
+{
     let headers = response.headers().clone();
     let collected = response
         .into_body()
@@ -1212,6 +1410,31 @@ async fn collect_grpc_proxy_subscribe_response(
         .to_owned();
 
     (decode_grpc_messages(collected.to_bytes().as_ref()), status)
+}
+
+async fn collect_grpc_status<B>(response: HttpResponse<B>) -> String
+where
+    B: tonic::codegen::Body<Data = Bytes>,
+    B::Error: std::fmt::Debug,
+{
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native response body should collect");
+    let trailers = collected.trailers().cloned();
+    grpc_status(&headers, trailers.as_ref())
+}
+
+fn grpc_status(headers: &HeaderMap, trailers: Option<&HeaderMap>) -> String {
+    trailers
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| headers.get("grpc-status"))
+        .expect("gRPC status is returned")
+        .to_str()
+        .expect("gRPC status is valid")
+        .to_owned()
 }
 
 fn decode_grpc_message<M: Message + Default>(bytes: &[u8]) -> M {
@@ -1377,6 +1600,7 @@ struct FakeWakeStore {
     workload_class: Mutex<Option<control_plane::WorkloadClassVersion>>,
     materializations: Mutex<Vec<MaterializationRecord>>,
     route_resolution: Mutex<Option<FakeRouteResolution>>,
+    resolve_route_requests: Mutex<usize>,
 }
 
 impl FakeWakeStore {
@@ -1427,6 +1651,13 @@ impl FakeWakeStore {
             .lock()
             .expect("fake store lock is available") =
             Some(FakeRouteResolution::Unavailable(message.to_owned()));
+    }
+
+    fn resolve_route_requests(&self) -> usize {
+        *self
+            .resolve_route_requests
+            .lock()
+            .expect("fake store lock is available")
     }
 }
 
@@ -1561,6 +1792,10 @@ impl ControlPlaneStore for FakeWakeStore {
         _identity: control_plane::RouteIdentity,
     ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
         Box::pin(async move {
+            *self
+                .resolve_route_requests
+                .lock()
+                .expect("fake store lock is available") += 1;
             match self
                 .route_resolution
                 .lock()

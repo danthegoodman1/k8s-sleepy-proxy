@@ -33,9 +33,40 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         return Ok(());
     }
 
-    let endpoint = E2eConfig::from_env()?.grpc_web_endpoint;
+    let config = E2eConfig::from_env()?;
+    let endpoint = config.grpc_web_endpoint;
 
     assert_preflight(&endpoint, "CreateWorkloadClassVersion")?;
+    grpc_web_unary_expect_status_with_authorization::<Instance, _>(
+        &endpoint,
+        "CreateInstance",
+        CreateInstanceRequest {
+            idempotency_key: "kind-e2e-grpc-web-auth-missing".to_owned(),
+            instance_id: "grpc-web-kind-auth-missing".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: CLASS_ID.to_owned(),
+                version: 1,
+            }),
+            values: Default::default(),
+        },
+        "16",
+        None,
+    )?;
+    grpc_web_unary_expect_status_with_authorization::<Instance, _>(
+        &endpoint,
+        "CreateInstance",
+        CreateInstanceRequest {
+            idempotency_key: "kind-e2e-grpc-web-auth-invalid".to_owned(),
+            instance_id: "grpc-web-kind-auth-invalid".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: CLASS_ID.to_owned(),
+                version: 1,
+            }),
+            values: Default::default(),
+        },
+        "16",
+        Some(&format!("Bearer {}", config.invalid_token)),
+    )?;
 
     let created_class: WorkloadClassVersion = grpc_web_unary(
         &endpoint,
@@ -101,6 +132,23 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
     )?;
     assert_eq!(loaded_instance, created_instance);
 
+    for missing_instance_id in ["grpc-web-kind-auth-missing", "grpc-web-kind-auth-invalid"] {
+        let missing = grpc_web_unary_expect_status::<Instance, _>(
+            &endpoint,
+            "GetInstance",
+            GetInstanceRequest {
+                instance_id: missing_instance_id.to_owned(),
+            },
+            "5",
+        )?;
+        let message = missing
+            .grpc_message()
+            .ok_or("missing grpc-message for auth-rejected create probe")?;
+        if !message.contains("instance%20not%20found") {
+            return Err(format!("expected not-found grpc-message, got {message:?}").into());
+        }
+    }
+
     let deleted: DeleteInstanceResponse = grpc_web_unary(
         &endpoint,
         "DeleteInstance",
@@ -131,6 +179,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
 #[derive(Clone, Debug)]
 struct E2eConfig {
     grpc_web_endpoint: SocketAddr,
+    invalid_token: String,
 }
 
 #[derive(Debug)]
@@ -153,6 +202,8 @@ impl E2eConfig {
             grpc_web_endpoint: env::var("SLEEPYPODS_E2E_GRPC_WEB_ENDPOINT")
                 .unwrap_or_else(|_| "127.0.0.1:19652".to_owned())
                 .parse()?,
+            invalid_token: env::var("SLEEPYPODS_E2E_INVALID_TOKEN")
+                .unwrap_or_else(|_| "invalid-token".to_owned()),
         })
     }
 }
@@ -237,8 +288,45 @@ where
     R: Message,
 {
     let body = grpc_frame(request);
-    let response = http_request(endpoint, build_grpc_web_request(endpoint, method, &body))?;
+    let authorization = format!(
+        "Bearer {}",
+        env::var("SLEEPYPODS_E2E_OPERATOR_TOKEN").unwrap_or_else(|_| "operator-token".to_owned())
+    );
+    let response = http_request(
+        endpoint,
+        build_grpc_web_request(endpoint, method, &body, Some(&authorization)),
+    )?;
+    decode_grpc_web_response(endpoint, method, response, expected_status)
+}
 
+fn grpc_web_unary_expect_status_with_authorization<M, R>(
+    endpoint: &SocketAddr,
+    method: &'static str,
+    request: R,
+    expected_status: &str,
+    authorization: Option<&str>,
+) -> TestResult<GrpcWebResponse<M>>
+where
+    M: Message + Default,
+    R: Message,
+{
+    let body = grpc_frame(request);
+    let response = http_request(
+        endpoint,
+        build_grpc_web_request(endpoint, method, &body, authorization),
+    )?;
+    decode_grpc_web_response(endpoint, method, response, expected_status)
+}
+
+fn decode_grpc_web_response<M>(
+    _endpoint: &SocketAddr,
+    method: &'static str,
+    response: HttpResponse,
+    expected_status: &str,
+) -> TestResult<GrpcWebResponse<M>>
+where
+    M: Message + Default,
+{
     if response.status != 200 {
         return Err(format!("{method} returned HTTP {}", response.status).into());
     }
@@ -266,7 +354,12 @@ where
     Ok(decoded)
 }
 
-fn build_grpc_web_request(endpoint: &SocketAddr, method: &'static str, body: &[u8]) -> Vec<u8> {
+fn build_grpc_web_request(
+    endpoint: &SocketAddr,
+    method: &'static str,
+    body: &[u8],
+    authorization: Option<&str>,
+) -> Vec<u8> {
     let mut request = format!(
         concat!(
             "POST {} HTTP/1.1\r\n",
@@ -276,11 +369,9 @@ fn build_grpc_web_request(endpoint: &SocketAddr, method: &'static str, body: &[u
             "Accept: application/grpc-web+proto\r\n",
             "X-Grpc-Web: 1\r\n",
             "X-User-Agent: grpc-web-javascript/0.1\r\n",
-            "Authorization: Bearer operator-token\r\n",
             "X-Sleepypods-Operator: kind-e2e\r\n",
             "Connection: close\r\n",
             "Content-Length: {}\r\n",
-            "\r\n",
         ),
         operator_path(method),
         endpoint,
@@ -288,6 +379,10 @@ fn build_grpc_web_request(endpoint: &SocketAddr, method: &'static str, body: &[u
         body.len()
     )
     .into_bytes();
+    if let Some(authorization) = authorization {
+        request.extend_from_slice(format!("Authorization: {authorization}\r\n").as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
     request.extend_from_slice(body);
     request
 }

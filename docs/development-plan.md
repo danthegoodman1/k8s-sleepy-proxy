@@ -1202,39 +1202,39 @@ Scope:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Add an auth layer for native gRPC control-plane services. | Operator, proxy, and sidecar services must reject unauthenticated requests before business logic runs. |
-| Incomplete | Add matching auth behavior for gRPC-Web operator APIs. | Browser/V8 clients must be able to send `Authorization` through CORS, and failures must map to structured gRPC-Web errors. |
-| Incomplete | Separate operator and runtime caller policy. | Operator clients may create/delete resources; frontline and sidecar clients may only use runtime RPCs such as subscribe, wake, and report-idle. |
-| Incomplete | Support a simple first auth provider. | Start with static bearer tokens or shared secrets from config/env so local and kind tests remain easy. |
-| Incomplete | Leave room for stronger providers. | The auth interface should allow later mTLS/workload-identity/JWT providers without changing API handlers. |
-| Incomplete | Fail closed when auth is configured. | Missing, malformed, or wrong credentials must return `Unauthenticated` or `PermissionDenied` and must not mutate store state. |
-| Incomplete | Keep explicit development/test mode. | Any no-auth mode must be an intentional config choice suitable only for local development and tests. |
-| Incomplete | Emit structured observability for auth decisions. | Log/metric fields should distinguish missing credentials, invalid credentials, wrong role, and accepted calls without logging secrets. |
-| Incomplete | Document deployment responsibility and examples. | Operator docs must explain direct control-plane exposure, gateway/service-mesh placement, secret rotation expectations, and runtime API separation. |
+| Complete | Add an auth layer for native gRPC control-plane services. | `control-plane::auth` defines role-aware interceptors and `runtime.rs` wraps operator, proxy, and sidecar tonic services before handlers run. Covered by `cargo test -p control-plane --test api_transport auth --quiet`, `cargo test -p control-plane --test proxy_api_transport auth --quiet`, and `cargo test -p control-plane --test sidecar_api_transport auth --quiet`. |
+| Complete | Add matching auth behavior for gRPC-Web operator APIs. | The gRPC-Web router wraps the operator service with the same role interceptor, keeps `Authorization` CORS support, and returns grpc-web status trailers for auth failures. Covered by `cargo test -p control-plane --test api_transport auth --quiet` and `./scripts/test-kind-e2e-grpc-web.sh`. |
+| Complete | Separate operator and runtime caller policy. | `CallerRole` has distinct operator, proxy, and sidecar roles; service interceptors require exactly the matching role. Wrong-role calls return `PermissionDenied`. |
+| Complete | Support a simple first auth provider. | Static bearer-token config uses `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=static-bearer-token` plus distinct operator, proxy, and sidecar token env vars. Frontlines attach proxy/operator tokens from their env, and the control plane injects the sidecar token into rendered pods from runtime auth config instead of WorkloadClass/API state. |
+| Complete | Leave room for stronger providers. | Business handlers depend only on service-level interceptors and the `AuthProvider` trait, leaving future mTLS/workload-identity/JWT providers outside handler code. |
+| Complete | Fail closed when auth is configured. | Static auth requires all role credentials at startup; missing, malformed, invalid, and wrong-role credentials map to stable `Unauthenticated` or `PermissionDenied` status before store/materializer calls. |
+| Complete | Keep explicit development/test mode. | Runtime config now requires `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE`; `no-auth` is an explicit mode used by local/test scripts, not a fallback for malformed static auth. |
+| Complete | Emit structured observability for auth decisions. | `proxy-core` includes `control_plane.auth.decision` and auth decision/reason/role/service fields; auth tests assert accepted, missing, invalid, and wrong-role events without credential material. |
+| Complete | Document deployment responsibility and examples. | `docs/operator-guide.md` and `docs/operator-runbook.md` document static auth env, no-auth local-only use, runtime role separation, rotation expectations, and network-boundary responsibility. |
 
 Sub-phases:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | 13A: Auth domain model, config, and provider trait. | Define caller roles, credentials, failure mapping, no-auth dev mode, and a static-token provider. |
-| Incomplete | 13B: Native gRPC server integration. | Apply auth to operator, proxy, and sidecar services before handlers run. |
-| Incomplete | 13C: gRPC-Web integration. | Preserve CORS support for `Authorization`, return structured gRPC-Web auth failures, and keep unary operator parity. |
-| Incomplete | 13D: Authorization checks by service and method. | Runtime callers cannot call operator APIs; operator credentials cannot accidentally bypass runtime-only constraints unless explicitly configured. |
-| Incomplete | 13E: Tests and kind gates. | Unit/component tests cover success/failure paths; kind E2E proves configured auth for operator, frontline, and sidecar control-plane calls. |
-| Incomplete | 13F: Operator documentation and runbook updates. | Document configuration, rotation, failure diagnosis, and recommended network boundaries. |
+| Complete | 13A: Auth domain model, config, and provider trait. | `auth.rs` defines roles, redacted bearer tokens, `AuthProvider`, static-token provider, failure mapping, explicit no-auth mode, and focused provider/config tests. |
+| Complete | 13B: Native gRPC server integration. | Native router wraps all three generated services with role-specific `tonic` interceptors before business handlers. |
+| Complete | 13C: gRPC-Web integration. | Operator gRPC-Web uses the same operator-role interceptor and accepts browser-shaped `Authorization` requests through CORS. |
+| Complete | 13D: Authorization checks by service and method. | Operator, proxy, and sidecar credentials are scoped to their services; wrong-role tests cover operator-to-runtime and runtime-to-operator denial. |
+| Complete | 13E: Tests and kind gates. | Unit/component/native/gRPC-Web tests pass, frontline HTTP-01 transport coverage proves the operator token interceptor is used, plus `./scripts/test-kind-e2e-stateless.sh` and `./scripts/test-kind-e2e-grpc-web.sh` with static auth enabled. |
+| Complete | 13F: Operator documentation and runbook updates. | Operator guide and runbook now describe configuration, rotation, failure diagnosis, auth observability, and recommended network boundaries. |
 
 Done criteria:
 
 | Status | Item | Evidence / gap |
 | --- | --- | --- |
-| Incomplete | Native gRPC operator APIs reject unauthenticated and unauthorized requests before store mutation. | Needs API transport tests and store mutation assertions. |
-| Incomplete | Native gRPC proxy and sidecar APIs reject unauthenticated and unauthorized requests before wake/sleep/subscribe logic runs. | Needs proxy/sidecar transport tests. |
-| Incomplete | gRPC-Web operator requests support authenticated browser-shaped calls. | Needs CORS preflight and unary request tests with accepted/rejected credentials. |
-| Incomplete | Auth failures use stable `Unauthenticated` or `PermissionDenied` status codes. | Tests must assert status codes and no secret leakage in messages/logs. |
-| Incomplete | Static-token config supports distinct operator, proxy, and sidecar credentials. | Needs config parsing tests and runtime startup tests. |
-| Incomplete | No-auth mode is explicit and documented as local-development only. | Production examples must configure auth. |
-| Incomplete | Observability records accepted, rejected, and unauthorized calls without recording credential material. | Needs structured log/metric tests. |
-| Incomplete | kind E2E proves auth-enabled control plane works with deployed frontend and sidecar. | Build/load production images, configure secrets, prove valid runtime clients work and invalid credentials fail. |
+| Complete | Native gRPC operator APIs reject unauthenticated and unauthorized requests before store mutation. | `api_transport` auth tests assert missing/wrong-role credentials fail and leave store mutation counters unchanged; valid operator credentials still work. |
+| Complete | Native gRPC proxy and sidecar APIs reject unauthenticated and unauthorized requests before wake/sleep/subscribe logic runs. | `proxy_api_transport` and `sidecar_api_transport` auth tests assert missing/wrong-role credentials fail before wake/subscribe/report-idle side effects; valid proxy/sidecar credentials still work. |
+| Complete | gRPC-Web operator requests support authenticated browser-shaped calls. | gRPC-Web transport and kind tests cover CORS/preflight, valid `Authorization`, missing/invalid credentials, structured grpc-web status, and no mutation on failure. |
+| Complete | Auth failures use stable `Unauthenticated` or `PermissionDenied` status codes. | Provider/interceptor and transport tests assert `Unauthenticated` for missing/malformed/invalid credentials and `PermissionDenied` for wrong-role credentials, with no secret values in status text or auth logs. |
+| Complete | Static-token config supports distinct operator, proxy, and sidecar credentials. | `RuntimeConfig` tests cover no-auth, static auth parsing, missing credentials, malformed credentials, duplicate credentials, and missing auth mode fail-closed behavior. |
+| Complete | No-auth mode is explicit and documented as local-development only. | Runtime startup requires `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE`; scripts that intentionally run without auth set `no-auth`, while auth E2E scripts use static tokens. |
+| Complete | Observability records accepted, rejected, and unauthorized calls without recording credential material. | `auth.rs` and `proxy-core` tests cover accepted, missing, invalid, and wrong-role decisions and assert credential strings are absent from captured events. |
+| Complete | kind E2E proves auth-enabled control plane works with deployed frontend and sidecar. | `./scripts/test-kind-e2e-stateless.sh` passed with production images, static auth, authenticated frontline/sidecar runtime calls, runtime-injected sidecar token env, and invalid credential probes; `./scripts/test-kind-e2e-grpc-web.sh` passed for deployed gRPC-Web operator auth. |
 
 ## Stretch
 

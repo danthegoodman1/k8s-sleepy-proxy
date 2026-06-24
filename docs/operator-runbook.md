@@ -63,6 +63,7 @@ Event names:
 - `runtime.materialization.failure`
 - `runtime.idle_report.event`
 - `runtime.http01.event`
+- `control_plane.auth.decision`
 
 Lifecycle field keys:
 
@@ -76,6 +77,11 @@ Lifecycle field keys:
 - `error.reason`
 - `active.count`
 - `duration.ms`
+- `auth.decision`
+- `auth.reason`
+- `auth.caller.role`
+- `auth.required.role`
+- `grpc.service`
 
 Use IDs and generations for correlation, but do not turn high-cardinality IDs
 into metric labels.
@@ -117,6 +123,10 @@ Build dashboards from the exact names above:
   `docs/proxy-hot-path-budgets.md` scripts, especially p99 added latency,
   request-rate/throughput ratios, hot-cache zero-control-plane-call assertions,
   and benchmark regression checker output.
+- Control-plane auth: `control_plane.auth.decision` by `grpc.service`,
+  `auth.required.role`, `auth.reason`, and `auth.caller.role`. Reasons are
+  `accepted`, `missing`, `malformed`, `invalid`, and `wrong_role`; token values
+  are not emitted.
 
 ## Symptom Runbooks
 
@@ -238,6 +248,20 @@ Proxy `Subscribe` disconnects:
 4. Verify route invalidations are received after reconnect by changing a test
    route and watching for cache miss/re-resolve.
 
+Control-plane API returns `Unauthenticated` or `PermissionDenied`:
+
+1. Search `event.name=control_plane.auth.decision` and group by
+   `grpc.service`, `auth.required.role`, `auth.reason`, and
+   `auth.caller.role`.
+2. `auth.reason=missing`, `malformed`, or `invalid` maps to
+   `Unauthenticated`; check that the caller sends `Authorization: Bearer ...`
+   and that its configured token matches the control-plane static token for
+   that role.
+3. `auth.reason=wrong_role` maps to `PermissionDenied`; verify operator,
+   frontline/proxy, and sidecar credentials are not swapped.
+4. Do not look for token values in logs. They are intentionally redacted and
+   should be rotated through the deployment secret source instead.
+
 Image or container startup failures:
 
 1. Run `./scripts/smoke-images.sh` for production image startup, non-root,
@@ -245,6 +269,8 @@ Image or container startup failures:
 2. Inspect pod events for image pull, missing env, missing certificate files,
    or service-account permission errors.
 3. For sidecars, verify rendered env includes app port, instance ID/generation,
-   control-plane endpoint, idle policy, and `SLEEPYPODS_SIDECAR_MODE`.
+   control-plane endpoint, idle policy, runtime-injected
+   `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled, and
+   `SLEEPYPODS_SIDECAR_MODE`.
 4. For workload startup, check app container readiness before blaming the
    sidecar or frontline.

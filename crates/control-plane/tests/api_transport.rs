@@ -29,11 +29,12 @@ use control_plane::api::{
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
 use control_plane::{
-    BackendEndpoint, BackendGeneration, ControlPlaneStore, CreateInstanceResult, Generation,
-    InstanceId, InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientError,
-    KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
-    KubernetesMaterializerClient, MaterializationId, MaterializationRecord, MaterializationState,
-    MaterializationTarget, RenderedObjectRef, StoreError, StoreFuture, StoreResult,
+    AuthConfig, BackendEndpoint, BackendGeneration, CallerRole, ControlPlaneAuth,
+    ControlPlaneStore, CreateInstanceResult, Generation, InstanceId, InstanceRecord,
+    InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
+    KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
+    MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
+    RenderedObjectRef, StaticBearerTokens, StoreError, StoreFuture, StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -60,6 +61,29 @@ fn store_operator_grpc_service(
         store,
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         target(),
+    )
+}
+
+fn auth_config() -> AuthConfig {
+    AuthConfig::static_bearer_tokens(
+        StaticBearerTokens::new("operator-token", "proxy-token", "sidecar-token")
+            .expect("auth tokens are valid"),
+    )
+}
+
+fn control_plane_auth() -> ControlPlaneAuth {
+    ControlPlaneAuth::from_config(auth_config(), Default::default())
+}
+
+fn authenticated_operator_service(
+    store: Arc<dyn ControlPlaneStore>,
+) -> tonic::service::interceptor::InterceptedService<
+    control_plane::api::server::StoreBackedOperatorGrpcService<FakeKubernetesClient>,
+    control_plane::ControlPlaneAuthInterceptor,
+> {
+    tonic::service::interceptor::InterceptedService::new(
+        store_operator_grpc_service(store),
+        control_plane_auth().interceptor(OPERATOR_SERVICE_NAME, CallerRole::Operator),
     )
 }
 
@@ -1063,6 +1087,85 @@ async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
 }
 
 #[tokio::test]
+async fn native_grpc_operator_auth_rejects_missing_and_wrong_role_before_store_mutation() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "auth-delete-instance",
+        DomainInstanceState::Cold,
+        0,
+    ));
+    let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
+
+    let missing_response = authenticated_operator_service(Arc::clone(&store_for_service))
+        .oneshot(grpc_operator_unary_request(
+            DeleteInstanceRequest {
+                instance_id: "auth-delete-instance".to_owned(),
+            },
+            "DeleteInstance",
+            "application/grpc",
+            Version::HTTP_2,
+        ))
+        .await
+        .expect("auth rejection is a gRPC response");
+    let (headers, trailers, body) = collect_grpc_response_parts(missing_response).await;
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "16");
+    assert!(store.instance_exists("auth-delete-instance"));
+    assert_eq!(store.delete_requests(), Vec::new());
+
+    let wrong_role_response = authenticated_operator_service(store_for_service)
+        .oneshot(with_authorization(
+            grpc_operator_unary_request(
+                DeleteInstanceRequest {
+                    instance_id: "auth-delete-instance".to_owned(),
+                },
+                "DeleteInstance",
+                "application/grpc",
+                Version::HTTP_2,
+            ),
+            "Bearer proxy-token",
+        ))
+        .await
+        .expect("wrong-role rejection is a gRPC response");
+    let (headers, trailers, body) = collect_grpc_response_parts(wrong_role_response).await;
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "7");
+    assert!(store.instance_exists("auth-delete-instance"));
+    assert_eq!(store.delete_requests(), Vec::new());
+}
+
+#[tokio::test]
+async fn native_grpc_operator_auth_accepts_valid_operator_credentials() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "auth-valid-instance",
+        DomainInstanceState::Cold,
+        0,
+    ));
+    let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
+
+    let response = authenticated_operator_service(store_for_service)
+        .oneshot(with_authorization(
+            grpc_operator_unary_request(
+                DeleteInstanceRequest {
+                    instance_id: "auth-valid-instance".to_owned(),
+                },
+                "DeleteInstance",
+                "application/grpc",
+                Version::HTTP_2,
+            ),
+            "Bearer operator-token",
+        ))
+        .await
+        .expect("valid credentials dispatch to handler");
+    let (headers, trailers, body) = collect_grpc_response_parts(response).await;
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
+
+    let deleted = decode_grpc_message::<DeleteInstanceResponse>(body.as_ref());
+    assert!(deleted.deleted);
+    assert!(!store.instance_exists("auth-valid-instance"));
+    assert_eq!(store.delete_requests().len(), 1);
+}
+
+#[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
     let response = store_operator_grpc_service(Arc::new(FakeInstanceStore::default()))
         .oneshot(grpc_create_route_binding_request(
@@ -1600,6 +1703,88 @@ async fn grpc_web_store_backed_errors_return_structured_status() {
 }
 
 #[tokio::test]
+async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failures_without_mutation(
+) {
+    let store = Arc::new(FakeInstanceStore::default());
+    let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
+
+    let valid_response = operator_grpc_web_cors_layer()
+        .layer(
+            tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(Arc::clone(
+                &store_for_service,
+            ))),
+        )
+        .oneshot(grpc_web_operator_request(
+            "CreateInstance",
+            CreateInstanceRequest {
+                idempotency_key: "grpc-web-auth-valid".to_owned(),
+                instance_id: "grpc-web-auth-valid".to_owned(),
+                workload_class: Some(WorkloadClassVersionRef {
+                    class_id: "class-auth".to_owned(),
+                    version: 1,
+                }),
+                values: Default::default(),
+            },
+        ))
+        .await
+        .expect("valid gRPC-Web auth response");
+    let (headers, trailers, body) = collect_grpc_response_parts(valid_response).await;
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
+    assert!(store.instance_exists("grpc-web-auth-valid"));
+
+    let mut missing_request = grpc_web_operator_request(
+        "CreateInstance",
+        CreateInstanceRequest {
+            idempotency_key: "grpc-web-auth-missing".to_owned(),
+            instance_id: "grpc-web-auth-missing".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-auth".to_owned(),
+                version: 1,
+            }),
+            values: Default::default(),
+        },
+    );
+    missing_request.headers_mut().remove(header::AUTHORIZATION);
+    let missing_response = operator_grpc_web_cors_layer()
+        .layer(
+            tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(Arc::clone(
+                &store_for_service,
+            ))),
+        )
+        .oneshot(missing_request)
+        .await
+        .expect("missing auth maps to gRPC-Web response");
+    let (headers, trailers, body) = collect_grpc_response_parts(missing_response).await;
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "16");
+    assert!(!store.instance_exists("grpc-web-auth-missing"));
+
+    let wrong_response = operator_grpc_web_cors_layer()
+        .layer(
+            tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(store_for_service)),
+        )
+        .oneshot(with_authorization(
+            grpc_web_operator_request(
+                "CreateInstance",
+                CreateInstanceRequest {
+                    idempotency_key: "grpc-web-auth-wrong".to_owned(),
+                    instance_id: "grpc-web-auth-wrong".to_owned(),
+                    workload_class: Some(WorkloadClassVersionRef {
+                        class_id: "class-auth".to_owned(),
+                        version: 1,
+                    }),
+                    values: Default::default(),
+                },
+            ),
+            "Bearer proxy-token",
+        ))
+        .await
+        .expect("wrong role maps to gRPC-Web response");
+    let (headers, trailers, body) = collect_grpc_response_parts(wrong_response).await;
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "7");
+    assert!(!store.instance_exists("grpc-web-auth-wrong"));
+}
+
+#[tokio::test]
 async fn native_grpc_and_grpc_web_requests_dispatch_to_same_placeholder_method() {
     let native_response = operator_grpc_service()
         .oneshot(grpc_request("application/grpc", Version::HTTP_2))
@@ -1796,6 +1981,13 @@ fn grpc_web_operator_request<M: Message>(method: &'static str, request: M) -> Re
     request
 }
 
+fn with_authorization(mut request: Request<Body>, value: &'static str) -> Request<Body> {
+    request
+        .headers_mut()
+        .insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+    request
+}
+
 fn grpc_web_preflight_request(method: &'static str) -> Request<Body> {
     Request::builder()
         .version(Version::HTTP_11)
@@ -1888,6 +2080,23 @@ fn grpc_header_value(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .or_else(|| grpc_web_trailer_value(body, name))
+}
+
+async fn collect_grpc_response_parts<B>(
+    response: http::Response<B>,
+) -> (HeaderMap, Option<HeaderMap>, Bytes)
+where
+    B: tonic::codegen::Body<Data = Bytes>,
+    B::Error: std::fmt::Debug,
+{
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body should collect");
+    let trailers = collected.trailers().cloned();
+    (headers, trailers, collected.to_bytes())
 }
 
 fn grpc_web_trailer_value(bytes: &[u8], name: &str) -> Option<String> {

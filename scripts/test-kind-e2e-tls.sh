@@ -343,6 +343,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
+              value: no-auth
             - name: SLEEPYPODS_STORE_PROVIDER
               value: postgres
             - name: SLEEPYPODS_POSTGRES_URL

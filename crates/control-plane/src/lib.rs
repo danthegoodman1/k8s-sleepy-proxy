@@ -1,6 +1,7 @@
 //! Domain model and persistence contract for the SleepyPods control plane.
 
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod http01;
 mod idle;
@@ -24,6 +25,11 @@ pub fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+pub use auth::{
+    AuthConfig, AuthFailureReason, AuthProvider, BearerToken, CallerRole, ControlPlaneAuth,
+    ControlPlaneAuthInterceptor, InvalidBearerToken, InvalidStaticBearerTokens,
+    OptionalBearerTokenInterceptor, StaticBearerAuthProvider, StaticBearerTokens,
+};
 pub use config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
 pub use http01::{
     DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,

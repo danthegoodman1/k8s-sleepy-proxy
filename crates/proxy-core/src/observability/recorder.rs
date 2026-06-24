@@ -14,6 +14,7 @@ pub const EVENT_WAKE: &str = "runtime.wake.event";
 pub const EVENT_MATERIALIZATION_FAILURE: &str = "runtime.materialization.failure";
 pub const EVENT_IDLE_REPORT: &str = "runtime.idle_report.event";
 pub const EVENT_HTTP01: &str = "runtime.http01.event";
+pub const EVENT_CONTROL_PLANE_AUTH: &str = "control_plane.auth.decision";
 
 pub const FIELD_INSTANCE_ID: &str = "instance.id";
 pub const FIELD_ROUTE_ID: &str = "route.id";
@@ -28,6 +29,11 @@ pub const FIELD_DURATION_MS: &str = "duration.ms";
 pub const FIELD_EXCLUSIVITY_ACTION: &str = "exclusivity.action";
 pub const FIELD_EXCLUSIVITY_KEY_NAME: &str = "exclusivity.key.name";
 pub const FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID: &str = "exclusivity.owner.instance.id";
+pub const FIELD_AUTH_DECISION: &str = "auth.decision";
+pub const FIELD_AUTH_REASON: &str = "auth.reason";
+pub const FIELD_AUTH_CALLER_ROLE: &str = "auth.caller.role";
+pub const FIELD_AUTH_REQUIRED_ROLE: &str = "auth.required.role";
+pub const FIELD_GRPC_SERVICE: &str = "grpc.service";
 
 pub const LIFECYCLE_FIELDS: &[&str] = &[
     FIELD_INSTANCE_ID,
@@ -43,6 +49,11 @@ pub const LIFECYCLE_FIELDS: &[&str] = &[
     FIELD_EXCLUSIVITY_ACTION,
     FIELD_EXCLUSIVITY_KEY_NAME,
     FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID,
+    FIELD_AUTH_DECISION,
+    FIELD_AUTH_REASON,
+    FIELD_AUTH_CALLER_ROLE,
+    FIELD_AUTH_REQUIRED_ROLE,
+    FIELD_GRPC_SERVICE,
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -201,6 +212,26 @@ impl LogField {
     pub fn exclusivity_owner_instance_id(value: impl ToString) -> Self {
         Self::new(FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID, value)
     }
+
+    pub fn auth_decision(value: impl ToString) -> Self {
+        Self::new(FIELD_AUTH_DECISION, value)
+    }
+
+    pub fn auth_reason(value: impl ToString) -> Self {
+        Self::new(FIELD_AUTH_REASON, value)
+    }
+
+    pub fn auth_caller_role(value: impl ToString) -> Self {
+        Self::new(FIELD_AUTH_CALLER_ROLE, value)
+    }
+
+    pub fn auth_required_role(value: impl ToString) -> Self {
+        Self::new(FIELD_AUTH_REQUIRED_ROLE, value)
+    }
+
+    pub fn grpc_service(value: impl ToString) -> Self {
+        Self::new(FIELD_GRPC_SERVICE, value)
+    }
 }
 
 impl ObservabilityRecorder {
@@ -334,6 +365,16 @@ mod tests {
             "cluster.id",
             "namespace",
             "error.reason",
+            "active.count",
+            "duration.ms",
+            "exclusivity.action",
+            "exclusivity.key.name",
+            "exclusivity.owner.instance.id",
+            "auth.decision",
+            "auth.reason",
+            "auth.caller.role",
+            "auth.required.role",
+            "grpc.service",
         ] {
             assert!(LIFECYCLE_FIELDS.contains(&field));
         }

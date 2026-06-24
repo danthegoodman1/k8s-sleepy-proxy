@@ -10,6 +10,10 @@ image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-kind-e2e-grpc-web}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 grpc_web_port="${SLEEPYPODS_KIND_E2E_GRPC_WEB_PORT:-19652}"
+operator_token="${SLEEPYPODS_KIND_E2E_OPERATOR_TOKEN:-operator-token}"
+proxy_token="${SLEEPYPODS_KIND_E2E_PROXY_TOKEN:-proxy-token}"
+sidecar_token="${SLEEPYPODS_KIND_E2E_SIDECAR_TOKEN:-sidecar-token}"
+invalid_token="${SLEEPYPODS_KIND_E2E_INVALID_TOKEN:-invalid-token}"
 kubeconfig="$(mktemp)"
 grpc_web_pf_log="$(mktemp)"
 created_cluster=0
@@ -282,6 +286,14 @@ spec:
               value: 0.0.0.0:50051
             - name: SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR
               value: 0.0.0.0:50052
+            - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
+              value: static-bearer-token
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
+              value: ${operator_token}
+            - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
+              value: ${proxy_token}
+            - name: SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN
+              value: ${sidecar_token}
             - name: SLEEPYPODS_STORE_PROVIDER
               value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
@@ -322,6 +334,8 @@ echo "==> Running grpc-web kind E2E driver"
 KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_KIND_E2E_GRPC_WEB=1 \
   SLEEPYPODS_E2E_GRPC_WEB_ENDPOINT="127.0.0.1:${grpc_web_port}" \
+  SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \
+  SLEEPYPODS_E2E_INVALID_TOKEN="${invalid_token}" \
   cargo test -p control-plane --test kind_e2e_grpc_web -- --ignored --nocapture
 
 echo "grpc-web deployed control-plane kind E2E completed"

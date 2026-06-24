@@ -32,10 +32,18 @@ const ENV_IDLE_TIMEOUT_MS: &str = "SLEEPYPODS_IDLE_TIMEOUT_MS";
 const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
 const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const ENV_SIDECAR_MODE: &str = "SLEEPYPODS_SIDECAR_MODE";
+const ENV_CONTROL_PLANE_SIDECAR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN";
 const ANNOTATION_BACKEND_SCHEME: &str = "sleepypods.io/backend-scheme";
 
 pub fn render_manifests(
     request: RenderManifestRequest<'_>,
+) -> Result<RenderedManifest, ManifestRenderError> {
+    render_manifests_with_options(request, super::RenderManifestOptions::default())
+}
+
+pub(crate) fn render_manifests_with_options(
+    request: RenderManifestRequest<'_>,
+    options: super::RenderManifestOptions<'_>,
 ) -> Result<RenderedManifest, ManifestRenderError> {
     validate_namespace(request.namespace)?;
 
@@ -150,6 +158,7 @@ pub fn render_manifests(
                     &sidecar,
                     request.namespace,
                     request.sleep_policy,
+                    options,
                 )?,
             ],
             volumes: rendered_volumes
@@ -454,51 +463,58 @@ fn render_sidecar_container(
     config: &SidecarRenderConfig,
     namespace: &str,
     sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
+    options: super::RenderManifestOptions<'_>,
 ) -> Result<Container, ManifestRenderError> {
     let mut env = vec![
-            EnvVar {
-                name: ENV_LISTEN_PORT.to_owned(),
-                value: config.listen_port.to_string(),
-            },
-            EnvVar {
-                name: ENV_SIDECAR_LISTEN_ADDR.to_owned(),
-                value: format!("0.0.0.0:{}", config.listen_port),
-            },
-            EnvVar {
-                name: ENV_APP_PORT.to_owned(),
-                value: config.app_port.to_string(),
-            },
-            EnvVar {
-                name: ENV_INSTANCE_ID.to_owned(),
-                value: instance.id.to_string(),
-            },
-            EnvVar {
-                name: ENV_INSTANCE_GENERATION.to_owned(),
-                value: instance.generation.to_string(),
-            },
-            EnvVar {
-                name: ENV_CONTROL_PLANE_ENDPOINT.to_owned(),
-                value: format!(
-                    "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
-                ),
-            },
-            EnvVar {
-                name: ENV_IDLE_TIMEOUT_MS.to_owned(),
-                value: sleep_policy.idle_timeout_ms.to_string(),
-            },
-            EnvVar {
-                name: ENV_IDLE_RETRY_BACKOFF_MS.to_owned(),
-                value: sleep_policy.idle_retry_backoff_ms.to_string(),
-            },
-            EnvVar {
-                name: ENV_DRAIN_GRACE_TIMEOUT_MS.to_owned(),
-                value: sleep_policy.drain_grace_timeout_ms.to_string(),
-            },
-        ];
+        EnvVar {
+            name: ENV_LISTEN_PORT.to_owned(),
+            value: config.listen_port.to_string(),
+        },
+        EnvVar {
+            name: ENV_SIDECAR_LISTEN_ADDR.to_owned(),
+            value: format!("0.0.0.0:{}", config.listen_port),
+        },
+        EnvVar {
+            name: ENV_APP_PORT.to_owned(),
+            value: config.app_port.to_string(),
+        },
+        EnvVar {
+            name: ENV_INSTANCE_ID.to_owned(),
+            value: instance.id.to_string(),
+        },
+        EnvVar {
+            name: ENV_INSTANCE_GENERATION.to_owned(),
+            value: instance.generation.to_string(),
+        },
+        EnvVar {
+            name: ENV_CONTROL_PLANE_ENDPOINT.to_owned(),
+            value: format!(
+                "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
+            ),
+        },
+        EnvVar {
+            name: ENV_IDLE_TIMEOUT_MS.to_owned(),
+            value: sleep_policy.idle_timeout_ms.to_string(),
+        },
+        EnvVar {
+            name: ENV_IDLE_RETRY_BACKOFF_MS.to_owned(),
+            value: sleep_policy.idle_retry_backoff_ms.to_string(),
+        },
+        EnvVar {
+            name: ENV_DRAIN_GRACE_TIMEOUT_MS.to_owned(),
+            value: sleep_policy.drain_grace_timeout_ms.to_string(),
+        },
+    ];
     if let Some(mode) = &config.mode {
         env.push(EnvVar {
             name: ENV_SIDECAR_MODE.to_owned(),
             value: mode.clone(),
+        });
+    }
+    if let Some(token) = options.sidecar_control_plane_token {
+        env.push(EnvVar {
+            name: ENV_CONTROL_PLANE_SIDECAR_TOKEN.to_owned(),
+            value: token.as_secret_str().to_owned(),
         });
     }
 

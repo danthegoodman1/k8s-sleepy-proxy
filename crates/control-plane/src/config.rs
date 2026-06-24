@@ -1,10 +1,14 @@
 use std::{error::Error, fmt, str::FromStr};
 
-use crate::ids::{EmptyStringError, NonEmptyString};
+use crate::{
+    auth::AuthConfig,
+    ids::{EmptyStringError, NonEmptyString},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlPlaneConfig {
     pub store: StoreProviderConfig,
+    pub auth: AuthConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,8 +32,8 @@ pub struct UnknownStoreProvider {
 }
 
 impl ControlPlaneConfig {
-    pub fn new(store: StoreProviderConfig) -> Self {
-        Self { store }
+    pub fn new(store: StoreProviderConfig, auth: AuthConfig) -> Self {
+        Self { store, auth }
     }
 }
 
@@ -98,7 +102,7 @@ impl Error for UnknownStoreProvider {}
 mod tests {
     use std::str::FromStr;
 
-    use super::{PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
+    use super::{AuthConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
 
     #[test]
     fn parses_postgres_provider_name_case_insensitively() {
@@ -128,5 +132,16 @@ mod tests {
         );
 
         assert_eq!(config.provider_name(), StoreProviderName::Postgres);
+    }
+
+    #[test]
+    fn control_plane_config_requires_explicit_auth_config() {
+        let store = StoreProviderConfig::Postgres(
+            PostgresStoreConfig::new("postgres://example").expect("valid URL"),
+        );
+        let config = super::ControlPlaneConfig::new(store.clone(), AuthConfig::NoAuth);
+
+        assert_eq!(config.store, store);
+        assert_eq!(config.auth, AuthConfig::NoAuth);
     }
 }

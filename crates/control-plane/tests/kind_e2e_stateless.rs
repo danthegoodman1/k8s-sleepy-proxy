@@ -6,14 +6,20 @@ use std::{
     time::Duration,
 };
 
-use control_plane::api::pb::{
-    operator_control_plane_client::OperatorControlPlaneClient, route_identity, template_text_part,
-    ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
-    CreateWorkloadClassVersionRequest, GetInstanceRequest, HttpRouteIdentity, Instance,
-    InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueSchema,
+use control_plane::{
+    api::pb::{
+        operator_control_plane_client::OperatorControlPlaneClient,
+        proxy_control_plane_client::ProxyControlPlaneClient, route_identity,
+        sidecar_control_plane_client::SidecarControlPlaneClient, template_text_part,
+        ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
+        CreateWorkloadClassVersionRequest, GetInstanceRequest, HttpRouteIdentity, Instance,
+        InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute,
+        ProxyWakeInstanceRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+        ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate, TemplateText, TemplateTextPart,
+        WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+        WorkloadValueSchema,
+    },
+    BearerToken, OptionalBearerTokenInterceptor,
 };
 use k8s_openapi::{
     api::{
@@ -27,7 +33,11 @@ use kube::{
     Api, Client, Error as KubeError,
 };
 use tokio::time::{sleep, Instant};
-use tonic::transport::{Channel, Endpoint};
+use tonic::{
+    service::interceptor::InterceptedService,
+    transport::{Channel, Endpoint},
+    Code,
+};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -53,8 +63,9 @@ async fn stateless_http_lifecycle_through_deployed_platform() -> TestResult<()> 
 
     let config = E2eConfig::from_env()?;
     let kube = Client::try_default().await?;
-    let mut operator = connect_operator(&config.operator_endpoint).await?;
+    let mut operator = connect_operator(&config.operator_endpoint, &config.operator_token).await?;
 
+    assert_invalid_control_plane_credentials_fail(&config).await?;
     create_operator_resources(&mut operator, &config).await?;
     let created = wait_for_instance_state(
         &mut operator,
@@ -128,6 +139,9 @@ struct E2eConfig {
     frontline_addr: SocketAddr,
     app_image: String,
     sidecar_image: String,
+    operator_token: String,
+    sidecar_token: String,
+    invalid_token: String,
 }
 
 #[derive(Debug)]
@@ -156,11 +170,22 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods/stateless-app:kind-e2e-stateless".to_owned()),
             sidecar_image: env::var("SLEEPYPODS_E2E_SIDECAR_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/sidecar:kind-e2e-stateless".to_owned()),
+            operator_token: env::var("SLEEPYPODS_E2E_OPERATOR_TOKEN")
+                .unwrap_or_else(|_| "operator-token".to_owned()),
+            sidecar_token: env::var("SLEEPYPODS_E2E_SIDECAR_TOKEN")
+                .unwrap_or_else(|_| "sidecar-token".to_owned()),
+            invalid_token: env::var("SLEEPYPODS_E2E_INVALID_TOKEN")
+                .unwrap_or_else(|_| "invalid-token".to_owned()),
         })
     }
 }
 
-async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClient<Channel>> {
+type AuthenticatedChannel = InterceptedService<Channel, OptionalBearerTokenInterceptor>;
+
+async fn connect_operator(
+    endpoint: &str,
+    token: &str,
+) -> TestResult<OperatorControlPlaneClient<AuthenticatedChannel>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let channel = Endpoint::from_shared(endpoint.to_owned())?
@@ -169,7 +194,12 @@ async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClie
             .connect()
             .await;
         match channel {
-            Ok(channel) => return Ok(OperatorControlPlaneClient::new(channel)),
+            Ok(channel) => {
+                return Ok(OperatorControlPlaneClient::with_interceptor(
+                    channel,
+                    token_interceptor(token)?,
+                ));
+            }
             Err(error) if Instant::now() < deadline => {
                 eprintln!("waiting for operator gRPC endpoint {endpoint}: {error}");
                 sleep(Duration::from_secs(1)).await;
@@ -179,8 +209,63 @@ async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClie
     }
 }
 
+fn token_interceptor(token: &str) -> TestResult<OptionalBearerTokenInterceptor> {
+    let token = BearerToken::new("kind_e2e_token", token.to_owned())?;
+    Ok(OptionalBearerTokenInterceptor::new(Some(&token))?)
+}
+
+async fn assert_invalid_control_plane_credentials_fail(config: &E2eConfig) -> TestResult<()> {
+    let channel = Endpoint::from_shared(config.operator_endpoint.clone())?
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(10))
+        .connect()
+        .await?;
+
+    let mut operator = OperatorControlPlaneClient::with_interceptor(
+        channel.clone(),
+        token_interceptor(&config.invalid_token)?,
+    );
+    let operator_error = operator
+        .get_instance(GetInstanceRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+        })
+        .await
+        .expect_err("invalid operator credentials must fail");
+    assert_eq!(operator_error.code(), Code::Unauthenticated);
+
+    let mut proxy = ProxyControlPlaneClient::with_interceptor(
+        channel.clone(),
+        token_interceptor(&config.invalid_token)?,
+    );
+    let proxy_error = proxy
+        .wake_instance(ProxyWakeInstanceRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+            expected_generation: 0,
+            backend_generation: None,
+        })
+        .await
+        .expect_err("invalid proxy credentials must fail");
+    assert_eq!(proxy_error.code(), Code::Unauthenticated);
+
+    let mut sidecar = SidecarControlPlaneClient::with_interceptor(
+        channel,
+        token_interceptor(&config.invalid_token)?,
+    );
+    let sidecar_error = sidecar
+        .report_idle(SidecarReportIdleRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+            expected_generation: 0,
+            active_count: 0,
+        })
+        .await
+        .expect_err("invalid sidecar credentials must fail");
+    assert_eq!(sidecar_error.code(), Code::Unauthenticated);
+
+    Ok(())
+}
+
 async fn create_operator_resources(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut OperatorControlPlaneClient<AuthenticatedChannel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
     operator
@@ -239,7 +324,7 @@ async fn create_operator_resources(
 }
 
 async fn wait_for_instance_state(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut OperatorControlPlaneClient<AuthenticatedChannel>,
     expected: PbInstanceState,
     timeout: Duration,
 ) -> TestResult<Instance> {
@@ -398,6 +483,11 @@ async fn assert_materialized_deployment_and_service(
             "http://sleepypods-control-plane.{}.svc.cluster.local:50051",
             config.namespace
         ),
+    )?;
+    assert_env(
+        sidecar,
+        "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN",
+        &config.sidecar_token,
     )?;
 
     let service = services.get(RENDERED_WORKLOAD_NAME).await?;

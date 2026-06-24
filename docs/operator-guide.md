@@ -51,6 +51,37 @@ The V1 operator service is unary-only:
 `WakeInstance`, `Subscribe`, and `ReportIdle` are runtime services for proxies
 and sidecars. They are not operator or gRPC-Web APIs.
 
+Control-plane authentication is caller authentication at this API boundary. It
+does not authenticate application end users and it does not replace network
+policy, gateway, or service-mesh placement for direct control-plane exposure.
+Native gRPC operator, proxy, and sidecar services and the gRPC-Web operator
+listener use the same role policy:
+
+- Operator credentials call `OperatorControlPlane`.
+- Proxy credentials call `ProxyControlPlane/WakeInstance` and
+  `ProxyControlPlane/Subscribe`.
+- Sidecar credentials call `SidecarControlPlane/ReportIdle`.
+
+The first provider is static bearer tokens. Configure it with
+`SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=static-bearer-token` plus distinct
+`SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`,
+`SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, and
+`SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` values. Frontlines need
+`SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN` for wake/subscribe traffic and
+`SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN` when HTTP-01 challenge serving is
+enabled. The control plane injects `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN`
+into rendered sidecars from runtime config; operators do not put this token in
+WorkloadClass templates. Browser/gRPC-Web and native operator clients send
+`Authorization: Bearer <operator-token>`.
+
+`SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` is for local development and tests
+only. It is explicit; omitting the auth mode or configuring malformed, missing,
+or duplicate static tokens fails startup instead of silently disabling auth.
+Rotate static tokens by updating the control-plane token set and rolling
+callers with the corresponding new role token. During rotation, keep exposure
+behind trusted network boundaries because static bearer tokens are shared
+secrets.
+
 ## Common Tasks
 
 Create a workload class version:
@@ -229,17 +260,21 @@ Important environment variables:
 | --- | --- |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR` |
 | control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR` optional |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` for local tests, or `static-bearer-token` for configured auth |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
 | control plane | `SLEEPYPODS_STORE_PROVIDER=postgres` |
 | control plane | `SLEEPYPODS_POSTGRES_URL` |
 | control plane | `SLEEPYPODS_CLUSTER_ID`, `SLEEPYPODS_NAMESPACE` |
 | frontline | `SLEEPYPODS_FRONTLINE_LISTEN_ADDR` |
 | frontline | `SLEEPYPODS_CONTROL_PLANE_ENDPOINT` |
+| frontline | `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN` when control-plane static auth is enabled |
+| frontline | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN` when HTTP-01 challenge serving is enabled under static auth |
 | frontline | `SLEEPYPODS_ROUTE_CACHE_CAPACITY` optional, default `1024` |
 | frontline | `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS` optional, default `30000` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` as `sni|cert|key;...` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
-| sidecar | rendered by the control plane: listen address, app port, instance ID, generation, control-plane endpoint, idle policy, and `SLEEPYPODS_SIDECAR_MODE` |
+| sidecar | rendered by the control plane: listen address, app port, instance ID, generation, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
 
 Kubernetes permissions must allow the control plane service account to
 server-side apply and delete rendered Deployments, StatefulSets, Services, PVs,

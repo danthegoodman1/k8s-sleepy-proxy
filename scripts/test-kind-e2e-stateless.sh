@@ -12,6 +12,10 @@ app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/stateless-app:${imag
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19051}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19080}"
+operator_token="${SLEEPYPODS_KIND_E2E_OPERATOR_TOKEN:-operator-token}"
+proxy_token="${SLEEPYPODS_KIND_E2E_PROXY_TOKEN:-proxy-token}"
+sidecar_token="${SLEEPYPODS_KIND_E2E_SIDECAR_TOKEN:-sidecar-token}"
+invalid_token="${SLEEPYPODS_KIND_E2E_INVALID_TOKEN:-invalid-token}"
 kubeconfig="$(mktemp)"
 created_cluster=0
 control_plane_pf=""
@@ -238,6 +242,14 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
+              value: static-bearer-token
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
+              value: ${operator_token}
+            - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
+              value: ${proxy_token}
+            - name: SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN
+              value: ${sidecar_token}
             - name: SLEEPYPODS_STORE_PROVIDER
               value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
@@ -297,6 +309,10 @@ spec:
               value: 0.0.0.0:8080
             - name: SLEEPYPODS_CONTROL_PLANE_ENDPOINT
               value: http://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
+              value: ${proxy_token}
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
+              value: ${operator_token}
 ---
 apiVersion: v1
 kind: Service
@@ -333,6 +349,10 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
+  SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \
+  SLEEPYPODS_E2E_PROXY_TOKEN="${proxy_token}" \
+  SLEEPYPODS_E2E_SIDECAR_TOKEN="${sidecar_token}" \
+  SLEEPYPODS_E2E_INVALID_TOKEN="${invalid_token}" \
   cargo test -p control-plane --test kind_e2e_stateless -- --ignored --nocapture
 
 echo "stateless full-platform kind E2E completed"
