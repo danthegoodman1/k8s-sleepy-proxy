@@ -9,6 +9,9 @@ helper_image="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HELPER_IMAGE:-${image_prefix}/fr
 requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS:-200}"
 concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY:-8}"
 min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO:-0.10}"
+grpc_requests="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS:-${requests}}"
+grpc_concurrency="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY:-${concurrency}}"
+grpc_min_ratio="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO:-${min_ratio}}"
 route_host="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST:-app.example.test}"
 route_path="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH:-/smoke}"
 backend_container_port="${SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT:-18080}"
@@ -77,10 +80,13 @@ require_command docker
 
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS "${requests}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY "${concurrency}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS "${grpc_requests}"
+require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY "${grpc_concurrency}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_BACKEND_PORT "${backend_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_FRONTLINE_PORT "${frontline_container_port}"
 require_positive_integer SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONTROL_PLANE_PORT "${control_plane_container_port}"
 require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO "${min_ratio}"
+require_decimal SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO "${grpc_min_ratio}"
 require_header_value SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST "${route_host}"
 require_route_path SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH "${route_path}"
 
@@ -90,9 +96,11 @@ helper_name="${run_id}-helper"
 frontline_name="${run_id}-frontline"
 direct_output_file="$(mktemp)"
 frontline_output_file="$(mktemp)"
+grpc_direct_output_file="$(mktemp)"
+grpc_frontline_output_file="$(mktemp)"
 
 cleanup() {
-  rm -f "${direct_output_file}" "${frontline_output_file}"
+  rm -f "${direct_output_file}" "${frontline_output_file}" "${grpc_direct_output_file}" "${grpc_frontline_output_file}"
   docker rm -f "${frontline_name}" "${helper_name}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -119,10 +127,11 @@ published_port() {
 wait_for_url() {
   local label="$1"
   local url="$2"
+  local protocol="${3:-http1}"
   local attempt
 
   for attempt in $(seq 1 80); do
-    if "${client_bin}" client --label "${label}" --url "${url}" --host "${route_host}" --requests 1 --concurrency 1 >/dev/null 2>&1; then
+    if "${client_bin}" client --label "${label}" --url "${url}" --host "${route_host}" --requests 1 --concurrency 1 --protocol "${protocol}" >/dev/null 2>&1; then
       return 0
     fi
 
@@ -150,6 +159,9 @@ run_load() {
   local label="$1"
   local url="$2"
   local output_file="$3"
+  local request_count="${4:-${requests}}"
+  local concurrency_count="${5:-${concurrency}}"
+  local protocol="${6:-http1}"
   local output
   local status
 
@@ -158,8 +170,9 @@ run_load() {
     --label "${label}" \
     --url "${url}" \
     --host "${route_host}" \
-    --requests "${requests}" \
-    --concurrency "${concurrency}" 2>&1)"
+    --requests "${request_count}" \
+    --concurrency "${concurrency_count}" \
+    --protocol "${protocol}" 2>&1)"
   status=$?
   set -e
 
@@ -170,6 +183,44 @@ run_load() {
     dump_logs
     exit "${status}"
   fi
+}
+
+assert_ratio_at_least() {
+  local label="$1"
+  local direct="$2"
+  local proxied="$3"
+  local min="$4"
+  local ratio
+  local ratio_status
+
+  set +e
+  ratio="$(awk -v direct="${direct}" -v proxied="${proxied}" -v min="${min}" 'BEGIN {
+    if (direct <= 0) {
+      print "nan"
+      exit 2
+    }
+    ratio = proxied / direct
+    printf "%.3f", ratio
+    if (ratio < min) {
+      exit 1
+    }
+  }')"
+  ratio_status=$?
+  set -e
+
+  if [[ "${ratio_status}" -eq 2 ]]; then
+    echo "direct ${label} RPS was not positive; cannot compare frontline smoke load" >&2
+    dump_logs
+    exit 1
+  fi
+
+  if [[ "${ratio_status}" -ne 0 ]]; then
+    echo "frontline/direct ${label} RPS ratio ${ratio} is below conservative smoke threshold ${min}" >&2
+    dump_logs
+    exit 1
+  fi
+
+  echo "frontline/direct_${label}_rps_ratio=${ratio} min=${min}"
 }
 
 extract_metric() {
@@ -254,7 +305,7 @@ direct_url="http://127.0.0.1:${direct_port}${route_path}"
 frontline_url="http://127.0.0.1:${frontline_port}${route_path}"
 stats_url="http://127.0.0.1:${direct_port}/__sleepypods_load_smoke_stats"
 
-wait_for_url direct "${direct_url}"
+wait_for_url direct "${direct_url}" http1
 
 echo "Starting ${frontline_image}"
 docker run -d \
@@ -266,17 +317,17 @@ docker run -d \
   --env "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS=5000" \
   "${frontline_image}" >/dev/null
 
-wait_for_url frontline "${frontline_url}"
+wait_for_url frontline "${frontline_url}" http1
 echo "Frontline route cache warmed for host ${route_host} path ${route_path}"
 
 echo "Running direct-backend smoke load"
-run_load direct "${direct_url}" "${direct_output_file}"
+run_load direct "${direct_url}" "${direct_output_file}" "${requests}" "${concurrency}" http1
 
 subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
 echo "SubscribeRoute calls before measured frontline phase=${subscribe_route_calls_before}"
 
 echo "Running frontline smoke load"
-run_load frontline "${frontline_url}" "${frontline_output_file}"
+run_load frontline "${frontline_url}" "${frontline_output_file}" "${requests}" "${concurrency}" http1
 
 subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
 
@@ -290,33 +341,34 @@ direct_result="$(cat "${direct_output_file}")"
 frontline_result="$(cat "${frontline_output_file}")"
 direct_rps="$(extract_metric "${direct_result}" rps)"
 frontline_rps="$(extract_metric "${frontline_result}" rps)"
+assert_ratio_at_least "http1" "${direct_rps}" "${frontline_rps}" "${min_ratio}"
 
-set +e
-ratio="$(awk -v direct="${direct_rps}" -v frontline="${frontline_rps}" -v min="${min_ratio}" 'BEGIN {
-  if (direct <= 0) {
-    print "nan"
-    exit 2
-  }
-  ratio = frontline / direct
-  printf "%.3f", ratio
-  if (ratio < min) {
-    exit 1
-  }
-}')"
-ratio_status=$?
-set -e
+echo "hot_cache_http1_subscribe_route_calls=0 subscribe_route_calls_before=${subscribe_route_calls_before} subscribe_route_calls_after=${subscribe_route_calls_after}"
 
-if [[ "${ratio_status}" -eq 2 ]]; then
-  echo "direct RPS was not positive; cannot compare frontline smoke load" >&2
+echo "Warming h2c gRPC-shaped hot-cache route"
+wait_for_url frontline "${frontline_url}" h2c-grpc
+
+echo "Running direct-backend h2c gRPC-shaped smoke load"
+run_load direct-grpc "${direct_url}" "${grpc_direct_output_file}" "${grpc_requests}" "${grpc_concurrency}" h2c-grpc
+
+grpc_subscribe_route_calls_before="$(read_subscribe_route_calls "${stats_url}")"
+echo "SubscribeRoute calls before measured h2c gRPC-shaped frontline phase=${grpc_subscribe_route_calls_before}"
+
+echo "Running frontline h2c gRPC-shaped smoke load"
+run_load frontline-grpc "${frontline_url}" "${grpc_frontline_output_file}" "${grpc_requests}" "${grpc_concurrency}" h2c-grpc
+
+grpc_subscribe_route_calls_after="$(read_subscribe_route_calls "${stats_url}")"
+
+if [[ "${grpc_subscribe_route_calls_after}" != "${grpc_subscribe_route_calls_before}" ]]; then
+  echo "hot-cache h2c gRPC-shaped frontline load made additional SubscribeRoute calls: before=${grpc_subscribe_route_calls_before} after=${grpc_subscribe_route_calls_after}" >&2
   dump_logs
   exit 1
 fi
 
-if [[ "${ratio_status}" -ne 0 ]]; then
-  echo "frontline/direct RPS ratio ${ratio} is below conservative smoke threshold ${min_ratio}" >&2
-  dump_logs
-  exit 1
-fi
+grpc_direct_result="$(cat "${grpc_direct_output_file}")"
+grpc_frontline_result="$(cat "${grpc_frontline_output_file}")"
+grpc_direct_rps="$(extract_metric "${grpc_direct_result}" rps)"
+grpc_frontline_rps="$(extract_metric "${grpc_frontline_result}" rps)"
+assert_ratio_at_least "h2c_grpc" "${grpc_direct_rps}" "${grpc_frontline_rps}" "${grpc_min_ratio}"
 
-echo "frontline/direct_rps_ratio=${ratio} min=${min_ratio}"
-echo "hot_cache_subscribe_route_calls=0 subscribe_route_calls_before=${subscribe_route_calls_before} subscribe_route_calls_after=${subscribe_route_calls_after}"
+echo "hot_cache_h2c_grpc_subscribe_route_calls=0 subscribe_route_calls_before=${grpc_subscribe_route_calls_before} subscribe_route_calls_after=${grpc_subscribe_route_calls_after}"

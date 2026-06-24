@@ -117,10 +117,10 @@ image. It does not cover Kubernetes, the real control plane, frontline routing,
 TLS/SNI, HTTP/2, h2c, gRPC, WebSockets, protocol-specific streaming behavior,
 tail latency, or stable large-stream throughput budgets.
 
-## Production Image Frontline HTTP Load Smoke
+## Production Image Frontline HTTP and h2c gRPC-Shaped Load Smoke
 
 Milestone 7E also has a narrow production-image smoke for the frontline
-HTTP/1.1 hot-cache path:
+HTTP/1.1 and h2c gRPC-shaped hot-cache paths:
 
 ```sh
 ./scripts/smoke-frontline-load.sh
@@ -136,34 +136,49 @@ so both the control-plane endpoint and backend are reached through loopback
 while the load client connects to published `127.0.0.1:<port>` sockets and sends
 the known Host header.
 
-Before measuring the frontline path, the script waits for one successful
-frontline request. That request validates lazy route resolution through
-`SubscribeRoute` and warms the route cache; the measured frontline phase then
-uses the cached ready route. The helper exposes a small stats endpoint for the
-fake control plane, and the script fails if the measured hot-cache frontline
-phase increments `subscribe_route_calls`. The client sends the same request
-count directly to the backend and through frontline, reporting request count,
-failures, elapsed milliseconds, and rough RPS for both paths. The smoke fails on
-correctness errors, startup or process failures, missing tools or images,
-additional hot-cache `SubscribeRoute` calls, and a conservative frontline/direct
-RPS ratio below `SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO` (default `0.10`). As
-with the sidecar smoke, this ratio only catches extreme obvious regressions;
-local Docker RPS is not a stable latency budget.
+Before measuring the HTTP/1.1 frontline path, the script waits for one
+successful frontline request. That request validates lazy route resolution
+through `SubscribeRoute` and warms the route cache; the measured frontline phase
+then uses the cached ready route. The helper exposes a small stats endpoint for
+the fake control plane, and the script fails if the measured hot-cache
+frontline phase increments `subscribe_route_calls`.
+
+After the HTTP/1.1 phase, the script also warms and measures a prior-knowledge
+h2c POST with `content-type: application/grpc`, a fixed gRPC-framed request
+body asserted by the helper, a fixed gRPC-framed response body, and
+`grpc-status: 0` as an HTTP/2 response trailer. The helper backend accepts both
+HTTP/1.1 and h2c, so the h2c phase uses the same direct-backend baseline and the
+same production frontline image. The h2c phase also fails if measured hot-cache
+requests make additional `SubscribeRoute` calls.
+
+The client sends the same request count directly to the backend and through
+frontline for each protocol phase, reporting request count, failures, elapsed
+milliseconds, and rough RPS. The smoke fails on correctness errors, startup or
+process failures, missing tools or images, additional hot-cache `SubscribeRoute`
+calls, and conservative frontline/direct RPS ratios below
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_MIN_RATIO` and
+`SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_MIN_RATIO` (both default `0.10`). As with
+the sidecar smoke, these ratios only catch extreme obvious regressions; local
+Docker RPS is not a stable latency budget.
 
 Useful knobs:
 
 ```sh
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_REQUESTS=500 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_CONCURRENCY=16 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_REQUESTS=500 \
+SLEEPYPODS_FRONTLINE_LOAD_SMOKE_GRPC_CONCURRENCY=16 \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_HOST=app.example.test \
 SLEEPYPODS_FRONTLINE_LOAD_SMOKE_PATH=/smoke \
 ./scripts/smoke-frontline-load.sh
 ```
 
-This smoke only covers the frontline HTTP/1.1 cached ready-route forwarding
-path. It does not cover Kubernetes, the real control plane, TLS/SNI, HTTP/2,
-h2c, gRPC, TCP, WebSockets, streaming throughput, cold wake latency, route-cache
-invalidation behavior, or tail latency.
+This smoke only covers frontline HTTP/1.1 and prior-knowledge h2c
+gRPC-shaped cached ready-route forwarding against a fixed fake-control-plane
+route. It does not cover Kubernetes, the real control plane, TLS/SNI, negotiated
+HTTP/2 over TLS, real generated gRPC clients, TCP, WebSockets, streaming
+throughput, cold wake latency, route-cache invalidation behavior, or tail
+latency.
 
 ## Budget Principles
 

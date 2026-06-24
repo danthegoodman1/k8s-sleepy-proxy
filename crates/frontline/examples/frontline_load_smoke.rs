@@ -20,10 +20,16 @@ use control_plane::{
     },
     RouteHost,
 };
-use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
-use http_body_util::Full;
-use hyper::{server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use http::{
+    header::CONTENT_TYPE, HeaderMap, HeaderValue, Request as HttpRequest, Response as HttpResponse,
+    StatusCode, Version,
+};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::{body::Incoming, client::conn::http2 as client_http2, service::service_fn};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -35,8 +41,10 @@ use tonic::{
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
+type BackendBody = BoxBody<Bytes, BoxError>;
 
 const BACKEND_BODY: &[u8] = b"frontline-load-smoke-ok\n";
+const GRPC_BODY: &[u8] = b"\0\0\0\0\x05hello";
 const DEFAULT_ROUTE_HOST: &str = "app.example.test";
 const DEFAULT_ROUTE_PATH: &str = "/smoke";
 const STATS_PATH: &str = "/__sleepypods_load_smoke_stats";
@@ -149,10 +157,10 @@ async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), B
             let service = service_fn(move |request| {
                 let stats = stats.clone();
 
-                async move { Ok::<_, Infallible>(backend_response(request, &stats)) }
+                async move { Ok::<_, Infallible>(backend_response(request, &stats).await) }
             });
 
-            if let Err(error) = http1::Builder::new()
+            if let Err(error) = auto::Builder::new(TokioExecutor::new())
                 .serve_connection(TokioIo::new(stream), service)
                 .await
             {
@@ -162,9 +170,24 @@ async fn serve_backend(listener: TcpListener, stats: SmokeStats) -> Result<(), B
     }
 }
 
-fn backend_response<B>(request: HttpRequest<B>, stats: &SmokeStats) -> HttpResponse<Full<Bytes>> {
+async fn backend_response<B>(
+    request: HttpRequest<B>,
+    stats: &SmokeStats,
+) -> HttpResponse<BackendBody>
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: fmt::Display,
+{
     if request.uri().path() == STATS_PATH {
         return stats_response(stats);
+    }
+
+    if request.headers().get(CONTENT_TYPE).is_some_and(|value| {
+        value
+            .to_str()
+            .is_ok_and(|value| value.eq_ignore_ascii_case("application/grpc"))
+    }) {
+        return grpc_response(request).await;
     }
 
     HttpResponse::builder()
@@ -172,11 +195,58 @@ fn backend_response<B>(request: HttpRequest<B>, stats: &SmokeStats) -> HttpRespo
         .header("content-type", "text/plain")
         .header("content-length", BACKEND_BODY.len().to_string())
         .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from_static(BACKEND_BODY)))
+        .body(boxed_body(Bytes::from_static(BACKEND_BODY)))
         .expect("fixed load-smoke response builds")
 }
 
-fn stats_response(stats: &SmokeStats) -> HttpResponse<Full<Bytes>> {
+async fn grpc_response<B>(request: HttpRequest<B>) -> HttpResponse<BackendBody>
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: fmt::Display,
+{
+    let collected = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            return bad_request_response(format!(
+                "failed to read gRPC-shaped request body: {error}"
+            ));
+        }
+    };
+
+    if collected.as_ref() != GRPC_BODY {
+        return bad_request_response(format!(
+            "unexpected gRPC-shaped request body length {}",
+            collected.len()
+        ));
+    }
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    trailers.insert("grpc-message", HeaderValue::from_static("ok"));
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/grpc")
+        .header("cache-control", "no-store")
+        .body(
+            Full::new(Bytes::from_static(GRPC_BODY))
+                .map_err(|never| match never {})
+                .with_trailers(std::future::ready(Some(Ok::<_, BoxError>(trailers))))
+                .boxed(),
+        )
+        .expect("fixed load-smoke gRPC-shaped response builds")
+}
+
+fn bad_request_response(message: String) -> HttpResponse<BackendBody> {
+    HttpResponse::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "text/plain")
+        .header("cache-control", "no-store")
+        .body(boxed_body(Bytes::from(message)))
+        .expect("fixed load-smoke bad request response builds")
+}
+
+fn stats_response(stats: &SmokeStats) -> HttpResponse<BackendBody> {
     let snapshot = stats.snapshot();
     let body = format!("subscribe_route_calls={}\n", snapshot.subscribe_route_calls);
 
@@ -185,8 +255,12 @@ fn stats_response(stats: &SmokeStats) -> HttpResponse<Full<Bytes>> {
         .header("content-type", "text/plain")
         .header("content-length", body.len().to_string())
         .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from(body)))
+        .body(boxed_body(Bytes::from(body)))
         .expect("fixed load-smoke stats response builds")
+}
+
+fn boxed_body(bytes: Bytes) -> BackendBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -409,6 +483,7 @@ struct ClientConfig {
     host_header: String,
     requests: u64,
     concurrency: u64,
+    protocol: ClientProtocol,
 }
 
 impl ClientConfig {
@@ -418,6 +493,7 @@ impl ClientConfig {
         let mut host_header = None;
         let mut requests = 100;
         let mut concurrency = 4;
+        let mut protocol = ClientProtocol::Http1;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -433,9 +509,12 @@ impl ClientConfig {
                     concurrency =
                         parse_positive_u64("--concurrency", &next_arg(&mut args, "--concurrency")?)?
                 }
+                "--protocol" => {
+                    protocol = ClientProtocol::parse(&next_arg(&mut args, "--protocol")?)?
+                }
                 _ => {
                     return Err(InvalidArgs(format!(
-                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, or --concurrency"
+                        "unknown client argument {arg:?}; expected --label, --url, --host, --requests, --concurrency, or --protocol"
                     )));
                 }
             }
@@ -452,7 +531,26 @@ impl ClientConfig {
             host_header,
             requests,
             concurrency,
+            protocol,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientProtocol {
+    Http1,
+    H2cGrpc,
+}
+
+impl ClientProtocol {
+    fn parse(value: &str) -> Result<Self, InvalidArgs> {
+        match value {
+            "http1" => Ok(Self::Http1),
+            "h2c-grpc" => Ok(Self::H2cGrpc),
+            _ => Err(InvalidArgs(format!(
+                "--protocol must be http1 or h2c-grpc, got {value:?}"
+            ))),
+        }
     }
 }
 
@@ -525,7 +623,16 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     break;
                 }
 
-                if let Err(error) = send_smoke_request(&target, &host_header, request_id).await {
+                let result = match config.protocol {
+                    ClientProtocol::Http1 => {
+                        send_smoke_request(&target, &host_header, request_id).await
+                    }
+                    ClientProtocol::H2cGrpc => {
+                        send_h2c_grpc_request(&target, &host_header, request_id).await
+                    }
+                };
+
+                if let Err(error) = result {
                     failures.fetch_add(1, Ordering::Relaxed);
 
                     if request_id < 5 {
@@ -582,6 +689,103 @@ async fn send_smoke_request(
         .map_err(|_| timeout_error("read response"))??;
 
     validate_response(&response)?;
+    Ok(())
+}
+
+async fn send_h2c_grpc_request(
+    target: &HttpTarget,
+    host_header: &str,
+    request_id: u64,
+) -> Result<(), BoxError> {
+    let stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
+        .await
+        .map_err(|_| timeout_error("h2c connect"))??;
+    let (mut sender, connection) = timeout(
+        REQUEST_TIMEOUT,
+        client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+    )
+    .await
+    .map_err(|_| timeout_error("h2c handshake"))??;
+    let connection_task = tokio::spawn(async move { connection.await });
+    let request = HttpRequest::builder()
+        .method("POST")
+        .uri(format!(
+            "http://{}{}",
+            host_header,
+            target.request_path(request_id)
+        ))
+        .version(Version::HTTP_2)
+        .header(CONTENT_TYPE, "application/grpc")
+        .body(Full::new(Bytes::from_static(GRPC_BODY)))?;
+    let response = timeout(REQUEST_TIMEOUT, sender.send_request(request))
+        .await
+        .map_err(|_| timeout_error("h2c send request"))??;
+
+    validate_h2c_grpc_response(response).await?;
+    drop(sender);
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    Ok(())
+}
+
+async fn validate_h2c_grpc_response(
+    response: HttpResponse<Incoming>,
+) -> Result<(), ResponseValidationError> {
+    if response.version() != Version::HTTP_2 {
+        return Err(ResponseValidationError::UnexpectedVersion(
+            response.version(),
+        ));
+    }
+
+    if response.status() != StatusCode::OK {
+        return Err(ResponseValidationError::UnexpectedStatus(format!(
+            "{:?} {}",
+            response.version(),
+            response.status()
+        )));
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .ok_or(ResponseValidationError::MissingHeader("content-type"))?;
+    if content_type != "application/grpc" {
+        return Err(ResponseValidationError::UnexpectedHeader {
+            name: "content-type",
+            value: format!("{content_type:?}"),
+        });
+    }
+
+    if let Some(grpc_status) = response.headers().get("grpc-status") {
+        return Err(ResponseValidationError::UnexpectedHeader {
+            name: "grpc-status",
+            value: format!("initial header {grpc_status:?}"),
+        });
+    }
+
+    let collected = timeout(REQUEST_TIMEOUT, response.into_body().collect())
+        .await
+        .map_err(|_| ResponseValidationError::BodyRead("timed out reading body".to_owned()))?
+        .map_err(|error| ResponseValidationError::BodyRead(error.to_string()))?;
+    let trailers = collected
+        .trailers()
+        .ok_or(ResponseValidationError::MissingTrailers)?;
+    let grpc_status = trailers
+        .get("grpc-status")
+        .ok_or(ResponseValidationError::MissingHeader("grpc-status"))?;
+    if grpc_status != "0" {
+        return Err(ResponseValidationError::UnexpectedHeader {
+            name: "grpc-status",
+            value: format!("{grpc_status:?}"),
+        });
+    }
+
+    let body = collected.to_bytes();
+    if body.as_ref() != GRPC_BODY {
+        return Err(ResponseValidationError::UnexpectedBody { len: body.len() });
+    }
+
     Ok(())
 }
 
@@ -690,22 +894,36 @@ impl Error for ClientFailures {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResponseValidationError {
     MissingHeaders,
+    MissingHeader(&'static str),
+    MissingTrailers,
     NonUtf8Headers,
     MissingStatus,
+    UnexpectedVersion(Version),
     UnexpectedStatus(String),
+    UnexpectedHeader { name: &'static str, value: String },
     UnexpectedBody { len: usize },
+    BodyRead(String),
 }
 
 impl fmt::Display for ResponseValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingHeaders => write!(f, "HTTP response headers are missing"),
+            Self::MissingHeader(name) => write!(f, "HTTP response header {name} is missing"),
+            Self::MissingTrailers => write!(f, "HTTP response trailers are missing"),
             Self::NonUtf8Headers => write!(f, "HTTP response headers are not UTF-8"),
             Self::MissingStatus => write!(f, "HTTP response status line is missing"),
+            Self::UnexpectedVersion(version) => {
+                write!(f, "unexpected HTTP response version {version:?}")
+            }
             Self::UnexpectedStatus(status) => write!(f, "unexpected HTTP status line {status:?}"),
+            Self::UnexpectedHeader { name, value } => {
+                write!(f, "unexpected HTTP response header {name}: {value}")
+            }
             Self::UnexpectedBody { len } => {
                 write!(f, "unexpected HTTP response body length {len}")
             }
+            Self::BodyRead(error) => write!(f, "failed to read HTTP response body: {error}"),
         }
     }
 }
@@ -715,12 +933,13 @@ impl Error for ResponseValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_response, path_prefix_matches, validate_response, ClientConfig,
-        FakeProxyControlPlane, HttpTarget, SmokeStats, BACKEND_BODY, STATS_PATH,
+        backend_response, path_prefix_matches, validate_response, ClientConfig, ClientProtocol,
+        FakeProxyControlPlane, HttpTarget, SmokeStats, BACKEND_BODY, GRPC_BODY, STATS_PATH,
     };
+    use bytes::Bytes;
     use control_plane::api::pb;
-    use http::Request as HttpRequest;
-    use http_body_util::BodyExt;
+    use http::{header::CONTENT_TYPE, Request as HttpRequest};
+    use http_body_util::{BodyExt, Full};
 
     #[test]
     fn parses_http_target_with_path_and_query() {
@@ -771,6 +990,25 @@ mod tests {
         .expect_err("zero request count is rejected");
 
         assert_eq!(error.0, "--requests must be greater than zero");
+    }
+
+    #[test]
+    fn client_config_parses_h2c_grpc_protocol() {
+        let config = ClientConfig::from_args(
+            [
+                "--url",
+                "http://127.0.0.1:18080/",
+                "--host",
+                "app.example.test",
+                "--protocol",
+                "h2c-grpc",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("h2c gRPC-shaped client config parses");
+
+        assert_eq!(config.protocol, ClientProtocol::H2cGrpc);
     }
 
     #[test]
@@ -844,10 +1082,11 @@ mod tests {
         let response = backend_response(
             HttpRequest::builder()
                 .uri(STATS_PATH)
-                .body(())
+                .body(Full::new(Bytes::new()))
                 .expect("stats request builds"),
             &stats,
-        );
+        )
+        .await;
         let body = response
             .into_body()
             .collect()
@@ -856,6 +1095,37 @@ mod tests {
             .to_bytes();
 
         assert_eq!(body.as_ref(), b"subscribe_route_calls=2\n");
+    }
+
+    #[tokio::test]
+    async fn backend_returns_grpc_shaped_response_for_grpc_requests() {
+        let stats = SmokeStats::default();
+
+        let response = backend_response(
+            HttpRequest::builder()
+                .uri("/smoke")
+                .header(CONTENT_TYPE, "application/grpc")
+                .body(Full::new(Bytes::from_static(GRPC_BODY)))
+                .expect("gRPC-shaped request builds"),
+            &stats,
+        )
+        .await;
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content-type"),
+            "application/grpc"
+        );
+        assert!(response.headers().get("grpc-status").is_none());
+
+        let collected = response
+            .into_body()
+            .collect()
+            .await
+            .expect("gRPC-shaped body reads");
+        let trailers = collected.trailers().expect("gRPC-shaped trailers");
+        assert_eq!(trailers.get("grpc-status").expect("status"), "0");
+
+        let body = collected.to_bytes();
+        assert_eq!(body.as_ref(), GRPC_BODY);
     }
 
     #[test]
