@@ -8,7 +8,7 @@ use kube::{
     api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams},
     Client, Error as KubeError,
 };
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, timeout, Instant};
 
 use crate::{
     manifest::KubernetesObject,
@@ -33,6 +33,7 @@ pub struct KubeMaterializerClient {
 pub struct KubeMaterializerClientConfig {
     pub field_manager: String,
     pub backend_scheme: String,
+    pub delete_timeout: Duration,
     pub pvc_bound_timeout: Duration,
     pub readiness_timeout: Duration,
     pub poll_interval: Duration,
@@ -106,7 +107,18 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             let api = self.dynamic_api(object)?;
-            match api.delete(&object.name, &DeleteParams::default()).await {
+            let delete = timeout(
+                self.config.delete_timeout,
+                api.delete(&object.name, &DeleteParams::default()),
+            )
+            .await
+            .map_err(|_| {
+                KubernetesClientError::transient(format!(
+                    "timed out deleting Kubernetes object {} {} {}/{}",
+                    object.api_version, object.kind, object.namespace, object.name
+                ))
+            })?;
+            match delete {
                 Ok(_) => Ok(()),
                 Err(error) if is_not_found(&error) => Ok(()),
                 Err(error) => Err(kube_error(error)),
@@ -183,6 +195,7 @@ impl Default for KubeMaterializerClientConfig {
         Self {
             field_manager: DEFAULT_FIELD_MANAGER.to_owned(),
             backend_scheme: "http".to_owned(),
+            delete_timeout: Duration::from_secs(10),
             pvc_bound_timeout: Duration::from_secs(120),
             readiness_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_secs(2),
@@ -200,6 +213,11 @@ impl KubeMaterializerClientConfig {
         if !is_valid_uri_scheme(&self.backend_scheme) {
             return Err(InvalidKubeMaterializerClientConfig {
                 field: "backend_scheme",
+            });
+        }
+        if self.delete_timeout.is_zero() {
+            return Err(InvalidKubeMaterializerClientConfig {
+                field: "delete_timeout",
             });
         }
         if self.pvc_bound_timeout.is_zero() {

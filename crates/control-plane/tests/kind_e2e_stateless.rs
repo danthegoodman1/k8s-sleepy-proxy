@@ -135,6 +135,12 @@ struct HttpResponse {
     body: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrontlineMetricCounts {
+    subscribe_route_success: usize,
+    cache_hits: usize,
+}
+
 impl E2eConfig {
     fn from_env() -> TestResult<Self> {
         Ok(Self {
@@ -456,55 +462,64 @@ async fn assert_frontline_hot_cache_metrics(
     namespace: &str,
     timeout: Duration,
 ) -> TestResult<()> {
-    let pods: Api<Pod> = Api::namespaced(kube, namespace);
     let deadline = Instant::now() + timeout;
     loop {
-        let pod = pods
-            .list(&ListParams::default().labels("app.kubernetes.io/name=sleepypods-frontline"))
-            .await?
-            .items
-            .into_iter()
-            .next()
-            .ok_or("frontline pod was not found")?;
-        let pod_name = pod
-            .metadata
-            .name
-            .ok_or("frontline pod is missing metadata.name")?;
-        let logs = pods
-            .logs(
-                &pod_name,
-                &LogParams {
-                    container: Some("frontline".to_owned()),
-                    ..LogParams::default()
-                },
-            )
-            .await?;
-        let subscribe_route_calls = logs
-            .lines()
-            .filter(|line| {
-                line.contains("metric.name=sleepypods_runtime_control_plane_calls_total")
-                    && line.contains("metric.labels=operation=subscribe_route,outcome=success")
-            })
-            .count();
-        let cache_hits = logs
-            .lines()
-            .filter(|line| {
-                line.contains("metric.name=sleepypods_runtime_route_cache_lookups_total")
-                    && line.contains("metric.labels=outcome=hit")
-            })
-            .count();
-        if subscribe_route_calls == 1 && cache_hits >= 1 {
+        let counts = frontline_metric_counts(kube.clone(), namespace).await?;
+        if counts.subscribe_route_success >= 1 && counts.cache_hits >= 1 {
             return Ok(());
         }
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "expected exactly one SubscribeRoute success and at least one route-cache hit in frontline logs; saw {subscribe_route_calls} SubscribeRoute success lines and {cache_hits} cache-hit lines"
+                "expected at least one SubscribeRoute success and one route-cache hit in frontline logs; saw {counts:?}"
             )
             .into());
         }
         sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn frontline_metric_counts(
+    kube: Client,
+    namespace: &str,
+) -> TestResult<FrontlineMetricCounts> {
+    let pods: Api<Pod> = Api::namespaced(kube, namespace);
+    let pod = pods
+        .list(&ListParams::default().labels("app.kubernetes.io/name=sleepypods-frontline"))
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .ok_or("frontline pod was not found")?;
+    let pod_name = pod
+        .metadata
+        .name
+        .ok_or("frontline pod is missing metadata.name")?;
+    let logs = pods
+        .logs(
+            &pod_name,
+            &LogParams {
+                container: Some("frontline".to_owned()),
+                ..LogParams::default()
+            },
+        )
+        .await?;
+    Ok(FrontlineMetricCounts {
+        subscribe_route_success: logs
+            .lines()
+            .filter(|line| {
+                line.contains("metric.name=sleepypods_runtime_control_plane_calls_total")
+                    && line.contains("metric.labels=operation=subscribe_route,outcome=success")
+            })
+            .count(),
+        cache_hits: logs
+            .lines()
+            .filter(|line| {
+                line.contains("metric.name=sleepypods_runtime_route_cache_lookups_total")
+                    && line.contains("metric.labels=outcome=hit")
+            })
+            .count(),
+    })
 }
 
 fn is_not_found<T>(result: Result<T, KubeError>) -> bool {

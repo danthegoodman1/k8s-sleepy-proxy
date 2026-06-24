@@ -191,7 +191,7 @@ where
         &self,
         objects: &[RenderedObjectRef],
     ) -> Result<(), MaterializerError> {
-        for object in objects.iter().rev() {
+        for object in delete_order(objects) {
             self.client.delete_object(object).await.map_err(|source| {
                 MaterializerError::Delete {
                     object: object.clone(),
@@ -204,7 +204,7 @@ where
     }
 
     async fn delete_rendered_objects_best_effort(&self, objects: &[RenderedObjectRef]) {
-        for object in objects.iter().rev() {
+        for object in delete_order(objects) {
             let _ = self.client.delete_object(object).await;
         }
     }
@@ -347,6 +347,24 @@ fn ordered_objects(manifest: &RenderedManifest) -> Vec<&RenderedManifestObject> 
     let mut objects = manifest.objects.iter().collect::<Vec<_>>();
     objects.sort_by_key(|object| object.apply_order);
     objects
+}
+
+fn delete_order(objects: &[RenderedObjectRef]) -> Vec<&RenderedObjectRef> {
+    objects
+        .iter()
+        .rev()
+        .filter(|object| !is_workload_ref(object))
+        .chain(
+            objects
+                .iter()
+                .rev()
+                .filter(|object| is_workload_ref(object)),
+        )
+        .collect()
+}
+
+fn is_workload_ref(object: &RenderedObjectRef) -> bool {
+    matches!(object.kind.as_str(), "Deployment" | "StatefulSet")
 }
 
 impl KubernetesClientError {
@@ -671,9 +689,9 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
+                FakeOperation::Delete(service_ref),
                 FakeOperation::Delete(workload_ref.clone()),
                 FakeOperation::Delete(workload_ref),
-                FakeOperation::Delete(service_ref),
             ]
         );
     }
@@ -1084,7 +1102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletes_rendered_refs_in_reverse_order() {
+    async fn deletes_rendered_refs_with_workloads_last() {
         let client = FakeKubernetesClient::default();
         let materializer = KubernetesMaterializer::new(client.clone());
         let refs = KubernetesMaterializer::new(FakeKubernetesClient::default())
@@ -1100,7 +1118,6 @@ mod tests {
         assert_eq!(
             client.operations(),
             vec![
-                FakeOperation::Delete(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
                 FakeOperation::Delete(object_ref("v1", "Service", "data", "db-acme")),
                 FakeOperation::Delete(object_ref(
                     "v1",
@@ -1109,6 +1126,7 @@ mod tests {
                     "pvc-acme"
                 )),
                 FakeOperation::Delete(object_ref("v1", "PersistentVolume", "", "pv-acme")),
+                FakeOperation::Delete(object_ref("apps/v1", "StatefulSet", "data", "db-acme")),
             ]
         );
     }
@@ -1155,10 +1173,7 @@ mod tests {
         );
         assert_eq!(
             client.operations(),
-            vec![
-                FakeOperation::Delete(workload_ref),
-                FakeOperation::Delete(service_ref),
-            ]
+            vec![FakeOperation::Delete(service_ref)]
         );
     }
 

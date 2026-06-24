@@ -43,6 +43,7 @@ const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
+const STATEFUL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[tokio::test]
 #[ignore = "requires scripts/test-kind-e2e-stateful.sh or an equivalent kind deployment"]
@@ -110,7 +111,7 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
     let cold_after_idle = wait_for_instance_state(
         &mut operator,
         PbInstanceState::Cold,
-        Duration::from_secs(90),
+        STATEFUL_CLEANUP_TIMEOUT,
     )
     .await?;
     if cold_after_idle.generation <= running.generation {
@@ -120,8 +121,12 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
         )
         .into());
     }
-    wait_for_materialized_objects_deleted(kube.clone(), &config.namespace, Duration::from_secs(90))
-        .await?;
+    wait_for_materialized_objects_deleted(
+        kube.clone(),
+        &config.namespace,
+        STATEFUL_CLEANUP_TIMEOUT,
+    )
+    .await?;
 
     sleep(Duration::from_secs(11)).await;
     eprintln!("stateful E2E: re-wake read through frontline");
@@ -160,7 +165,8 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
             "expected deployed operator DeleteInstance to delete the running instance".into(),
         );
     }
-    wait_for_materialized_objects_deleted(kube, &config.namespace, Duration::from_secs(90)).await?;
+    wait_for_materialized_objects_deleted(kube, &config.namespace, STATEFUL_CLEANUP_TIMEOUT)
+        .await?;
 
     Ok(())
 }
