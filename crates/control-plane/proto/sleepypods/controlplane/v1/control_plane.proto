@@ -540,6 +540,7 @@ message ForceDeleteMaterializationResponse {
   bool found = 1;
   string materialization_id = 2;
   repeated RenderedObjectRef observed_refs = 3;
+  repeated ProjectionObservation projection_observations = 4;
 }
 
 message RenderedObjectRef {
@@ -568,4 +569,5 @@ message ForceReleaseExclusivityKeyRequest {
 
 message ForceReleaseExclusivityKeyResponse {
   uint64 updated_materializations = 1;
+  repeated ProjectionObservation projection_observations = 2;
 }

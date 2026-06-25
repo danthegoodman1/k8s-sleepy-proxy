@@ -180,6 +180,7 @@ pub struct ForceReleaseExclusivityKeyRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForceReleaseExclusivityKeyResult {
     pub updated_materializations: usize,
+    pub affected_materializations: Vec<MaterializationRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

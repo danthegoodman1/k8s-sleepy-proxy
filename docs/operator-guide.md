@@ -222,9 +222,11 @@ an explicit force operation.
 materialization. It loads the row by materialization id, returns current state,
 lease metadata, recorded object refs, and live projection observations, and
 triggers one synchronous reconciliation attempt when the row is `Pending` or
-`Deleting`. Projection observations classify each recorded ref as missing,
-owned, unowned, deleting, apply-rejected, delete-blocked, inspect-failed, ready,
-or unready with bounded reason/finalizer details.
+`Deleting`. Recorded-ref projection observations classify each ref as missing,
+owned, unowned, deleting, delete-blocked, or inspect-failed with bounded
+reason/finalizer details. Ready-row inspection is metadata-only in V1: it does
+not prove EndpointSlice/readiness drift or rendered-hash mutation drift because
+the current desired manifest is not reconstructed for recorded refs.
 
 SleepyPods stamps applied Kubernetes objects with `managed-by=sleepypods`,
 materialization id, instance id, instance generation, and a deterministic
@@ -240,15 +242,18 @@ persistent permission or discovery issue.
 
 `ForceDeleteMaterialization` is an emergency cleanup tool for a materialization
 whose Kubernetes cleanup has already been inspected. The response includes the
-recorded object refs that were present before the row was cleared; it does not
-yet include fresh projection observations. Use it only after Kubernetes objects
-are gone or are known safe to abandon.
+recorded object refs that were present before the row was cleared plus
+best-effort projection observations for those refs. Observation does not mutate
+Kubernetes objects. Use it only after Kubernetes objects are gone or are known
+safe to abandon.
 
 `ForceReleaseExclusivityKey` removes a rendered key from matching active
 materializations without deleting the materialization. It requires the exact
-target, key name, key value, operator, and reason. This is a last-resort escape
-hatch; using it while external singleton resources still exist can allow two
-instances to attach the same resource.
+target, key name, key value, operator, and reason. The response includes
+best-effort projection observations for materializations that held the released
+key when the operation ran. This is a last-resort escape hatch; using it while
+external singleton resources still exist can allow two instances to attach the
+same resource.
 
 Delete an instance or route:
 

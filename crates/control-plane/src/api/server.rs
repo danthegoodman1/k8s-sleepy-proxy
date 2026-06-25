@@ -129,6 +129,17 @@ where
                 .collect(),
         }
     }
+
+    async fn projection_observations_for_materializations(
+        &self,
+        materializations: &[MaterializationRecord],
+    ) -> Vec<pb::ProjectionObservation> {
+        let mut observations = Vec::new();
+        for materialization in materializations {
+            observations.extend(self.projection_observations(materialization).await);
+        }
+        observations
+    }
 }
 
 pub type OperatorGrpcService = OperatorControlPlaneServer<OperatorApiPlaceholder>;
@@ -610,11 +621,16 @@ where
                     .collect()
             })
             .unwrap_or_default();
+        let projection_observations = match materialization.as_ref() {
+            Some(materialization) => self.projection_observations(materialization).await,
+            None => Vec::new(),
+        };
 
         Ok(Response::new(pb::ForceDeleteMaterializationResponse {
             found: materialization.is_some(),
             materialization_id,
             observed_refs,
+            projection_observations,
         }))
     }
 
@@ -629,9 +645,13 @@ where
             )?)
             .await
             .map_err(store_error_to_status)?;
+        let projection_observations = self
+            .projection_observations_for_materializations(&result.affected_materializations)
+            .await;
 
         Ok(Response::new(pb::ForceReleaseExclusivityKeyResponse {
             updated_materializations: result.updated_materializations as u64,
+            projection_observations,
         }))
     }
 }

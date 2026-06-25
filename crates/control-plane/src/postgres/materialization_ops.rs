@@ -760,6 +760,33 @@ pub(crate) async fn force_release_exclusivity_key(
     let namespace = request.target.namespace();
     let key_name = request.key_name.as_str();
     let key_value = request.key_value.as_str();
+    let affected_rows = transaction
+        .query(
+            "
+            SELECT materialization_id, instance_id, instance_generation, cluster_id,
+                namespace, state, backend_uri, backend_generation, rendered_objects,
+                exclusivity_keys, reconcile_owner,
+                reconcile_lease_expires_at_unix_millis, reconcile_attempt
+            FROM materializations
+            WHERE cluster_id = $1
+                AND namespace = $2
+                AND state <> 'deleted'
+                AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(exclusivity_keys) AS key
+                    WHERE key ->> 'name' = $3
+                        AND key ->> 'value' = $4
+                )
+            FOR UPDATE
+            ",
+            &[&cluster_id, &namespace, &key_name, &key_value],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let affected_materializations = affected_rows
+        .iter()
+        .map(materialization_from_row)
+        .collect::<StoreResult<Vec<_>>>()?;
     let updated = transaction
         .execute(
             "
@@ -793,6 +820,7 @@ pub(crate) async fn force_release_exclusivity_key(
         updated_materializations: usize::try_from(updated).map_err(|_| {
             StoreError::internal("force-release updated row count did not fit usize")
         })?,
+        affected_materializations,
     })
 }
 

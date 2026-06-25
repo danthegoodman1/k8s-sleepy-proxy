@@ -2161,6 +2161,11 @@ async fn exercise_materialization_reconciliation_leases(
         ))
         .await?;
     assert_eq!(force_result.updated_materializations, 1);
+    assert_eq!(force_result.affected_materializations.len(), 1);
+    assert_eq!(
+        force_result.affected_materializations[0].exclusivity_keys,
+        vec![RenderedExclusivityKey::new("disk", "force-disk")]
+    );
 
     let released = store
         .load_active_materialization(LoadActiveMaterializationRequest::new(

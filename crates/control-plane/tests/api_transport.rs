@@ -40,7 +40,8 @@ use control_plane::{
     InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
-    RenderedObjectRef, StaticBearerTokens, StoreError, StoreFuture, StoreResult,
+    RenderedExclusivityKey, RenderedObjectRef, StaticBearerTokens, StoreError, StoreFuture,
+    StoreResult,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -701,6 +702,87 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
 }
 
 #[tokio::test]
+async fn force_delete_materialization_returns_projection_observations_without_kubernetes_delete() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let materialization = materialization(
+        "instance-force-delete-observe",
+        9,
+        target(),
+        MaterializationState::Deleting,
+    );
+    let materialization_id = materialization.id.as_str().to_owned();
+    store.seed_materialization(materialization.clone());
+    let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
+    let service =
+        StoreBackedOperatorApi::new(store, operator_materializer(client.clone()), target());
+
+    let force_deleted = service
+        .force_delete_materialization(tonic::Request::new(ForceDeleteMaterializationRequest {
+            materialization_id,
+            operator: "operator-a".to_owned(),
+            reason: "manual cleanup already inspected".to_owned(),
+        }))
+        .await
+        .expect("force-delete materialization succeeds")
+        .into_inner();
+
+    assert!(force_deleted.found);
+    assert_eq!(force_deleted.observed_refs.len(), 2);
+    assert_eq!(force_deleted.projection_observations.len(), 2);
+    assert!(force_deleted
+        .projection_observations
+        .iter()
+        .all(|observation| observation.state == "present_owned"));
+    assert!(
+        client.deleted().is_empty(),
+        "force-delete response observation must not delete Kubernetes objects"
+    );
+}
+
+#[tokio::test]
+async fn force_release_exclusivity_key_returns_scoped_inspect_failed_projection_observation() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let mut materialization = materialization(
+        "instance-force-release-inspect-fails",
+        4,
+        target(),
+        MaterializationState::Ready,
+    );
+    materialization.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "disk-a")];
+    store.seed_materialization(materialization);
+    let client = FakeKubernetesClient::default();
+    client.fail_inspect();
+    let service = StoreBackedOperatorApi::new(store, operator_materializer(client), target());
+
+    let force_release = service
+        .force_release_exclusivity_key(tonic::Request::new(ForceReleaseExclusivityKeyRequest {
+            cluster_id: "cluster-a".to_owned(),
+            namespace: "apps".to_owned(),
+            key_name: "disk".to_owned(),
+            key_value: "disk-a".to_owned(),
+            operator: "operator-a".to_owned(),
+            reason: "singleton verified externally".to_owned(),
+        }))
+        .await
+        .expect("force-release exclusivity key succeeds")
+        .into_inner();
+
+    assert_eq!(force_release.updated_materializations, 1);
+    assert_eq!(force_release.projection_observations.len(), 1);
+    let observation = &force_release.projection_observations[0];
+    assert_eq!(observation.state, "inspect_failed");
+    assert_eq!(observation.reason, "inspect_failed");
+    assert_eq!(
+        observation
+            .r#ref
+            .as_ref()
+            .map(|object| object.name.as_str()),
+        Some("instance-force-release-inspect-fails-svc")
+    );
+}
+
+#[tokio::test]
 async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     let store = Arc::new(FakeInstanceStore::default());
     let service = store_operator_api(store.clone());
@@ -961,7 +1043,21 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     assert!(force_deleted.found);
     assert_eq!(force_deleted.materialization_id, force_materialization_id);
     assert_eq!(force_deleted.observed_refs.len(), 2);
+    assert_eq!(force_deleted.projection_observations.len(), 2);
+    assert!(force_deleted
+        .projection_observations
+        .iter()
+        .all(|observation| observation.state == "missing"));
 
+    let mut force_release_materialization = materialization(
+        "instance-force-release",
+        1,
+        target(),
+        MaterializationState::Ready,
+    );
+    force_release_materialization.exclusivity_keys =
+        vec![RenderedExclusivityKey::new("disk", "disk-a")];
+    store.seed_materialization(force_release_materialization);
     let force_release = service
         .force_release_exclusivity_key(tonic::Request::new(ForceReleaseExclusivityKeyRequest {
             cluster_id: "cluster-a".to_owned(),
@@ -975,6 +1071,11 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .expect("force-release exclusivity key succeeds")
         .into_inner();
     assert_eq!(force_release.updated_materializations, 1);
+    assert_eq!(force_release.projection_observations.len(), 2);
+    assert!(force_release
+        .projection_observations
+        .iter()
+        .all(|observation| observation.state == "missing"));
 }
 
 #[tokio::test]
@@ -3234,11 +3335,36 @@ impl ControlPlaneStore for FakeInstanceStore {
 
     fn force_release_exclusivity_key<'a>(
         &'a self,
-        _request: control_plane::ForceReleaseExclusivityKeyRequest,
+        request: control_plane::ForceReleaseExclusivityKeyRequest,
     ) -> StoreFuture<'a, StoreResult<control_plane::ForceReleaseExclusivityKeyResult>> {
-        Box::pin(async {
+        Box::pin(async move {
+            let mut materialization = self
+                .materialization
+                .lock()
+                .expect("fake store lock is available");
+            let affected = materialization
+                .as_ref()
+                .filter(|record| {
+                    record.target == request.target
+                        && record.state != MaterializationState::Deleted
+                        && record.exclusivity_keys.iter().any(|key| {
+                            key.name == request.key_name && key.value == request.key_value
+                        })
+                })
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !affected.is_empty() {
+                let record = materialization
+                    .as_mut()
+                    .expect("affected materialization exists");
+                record.exclusivity_keys.retain(|key| {
+                    !(key.name == request.key_name && key.value == request.key_value)
+                });
+            }
             Ok(control_plane::ForceReleaseExclusivityKeyResult {
-                updated_materializations: 1,
+                updated_materializations: affected.len(),
+                affected_materializations: affected,
             })
         })
     }

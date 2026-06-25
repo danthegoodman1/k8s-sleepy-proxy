@@ -1410,9 +1410,12 @@ Scope:
 - Make `Deleting` reconciliation use projection observations to delete only
   owned objects, tolerate missing owned refs, stay non-terminal while owned
   objects are blocked by finalizers, and finalize only after cleanup is proven.
-- Keep `Ready` drift conservative in V1: inspect and report missing, unowned,
-  unready, or mutated objects, but do not automatically replace live backends
-  until a later policy explicitly opts into repair.
+- Keep `Ready` drift conservative in V1: inspect and report recorded-ref
+  metadata drift such as missing, unowned, deleting, finalizer-blocked, or
+  inspect-failed refs, but do not automatically replace live backends until a
+  later policy explicitly opts into repair. Non-blocking readiness/EndpointSlice
+  drift and rendered-hash drift for Ready rows require later manifest/hash
+  reconstruction work.
 - Surface operator-readable drift and finalizer state through
   `ReconcileMaterialization` and runbook guidance without exposing high
   cardinality labels in metrics.
@@ -1442,9 +1445,9 @@ Status update (2026-06-24):
 | Complete | 16A: Projection model and ownership stamp definitions. | Added `projection.rs` with `ProjectionPlan`, `ProjectionReconciler`, bounded `ProjectionObservation`, deterministic rendered hashes, and ownership stamps for materialization id, instance id, instance generation, rendered hash, and `managed-by=sleepypods`. |
 | Partial | 16B: Kubernetes inspection implementation. | `KubeMaterializerClient` can inspect live metadata/deletion/finalizers for Deployment, StatefulSet, Service, PVC, and PV refs through the shared projection layer. Non-blocking readiness/EndpointSlice inspection for Ready drift is still deferred. |
 | Partial | 16C-16E: Apply/delete/readiness paths routed through projection. | Wake and Pending reconciliation now call projection apply, which inspects and rejects unowned/stale refs before server-side apply. Operator delete, sidecar idle cleanup, wake terminal cleanup, Deleting reconciliation, and stale Pending cleanup route through owned-only projection delete. Deleting reconciliation tolerates missing refs, blocks on unowned refs and finalizer/deletion-in-progress observations, and finalizes only when cleanup is proven. Wake readiness still uses the materializer readiness wait directly and Ready drift remains report-only. |
-| Partial | 16F: Ready drift inspect/report behavior. | `ReconcileMaterialization` now returns projection observations for recorded refs, including Ready rows when inspected by operators. Automatic Ready repair remains out of scope; rendered-hash mutation drift for Ready rows still needs current-manifest reconstruction or persisted expected hashes. |
-| Partial | 16G: Operator API/runbook updates. | Added `projection_observations` to `ReconcileMaterializationResponse`, including `inspect_failed` observations when Kubernetes inspection itself fails, and updated operator guide/runbook guidance for missing refs, unowned refs, inspect failures, and finalizer-blocked owned deletes. Force-delete/force-release responses still return recorded refs only. |
-| Partial | 16H: Tests. | Added focused projection unit tests, wake regression coverage for unowned live refs before apply, reconciler tests for pending unowned/stale stamps plus deleting missing, owned, unowned, delete-error, lease-loss, and finalizer-blocked paths, and API/sidecar transport coverage for owned-only cleanup and inspect-failed observations. Real kind drift/finalizer injection remains to be added. |
+| Partial | 16F: Ready drift inspect/report behavior. | `ReconcileMaterialization` now returns projection observations for recorded refs, including Ready rows when inspected by operators. This reports missing refs, ownership/generation/materialization-id drift, deletion/finalizer state, and `inspect_failed`; automatic Ready repair, non-blocking readiness/EndpointSlice drift, and rendered-hash mutation drift for Ready rows remain deferred. |
+| Partial | 16G: Operator API/runbook updates. | Added `projection_observations` to `ReconcileMaterializationResponse`, `ForceDeleteMaterializationResponse`, and `ForceReleaseExclusivityKeyResponse`, including bounded `inspect_failed` observations when Kubernetes inspection itself fails for a scoped materialization/ref. Updated operator guide/runbook guidance for missing refs, unowned refs, inspect failures, finalizer-blocked owned deletes, and force-operation observation limits. |
+| Partial | 16H: Tests. | Added focused projection unit tests, wake regression coverage for unowned live refs before apply, reconciler tests for pending unowned/stale stamps plus deleting missing, owned, unowned, delete-error, lease-loss, and finalizer-blocked paths, and API/sidecar transport coverage for owned-only cleanup, inspect-failed observations, and force-operation projection observations. Real kind drift/finalizer injection remains to be added. |
 
 Done when:
 

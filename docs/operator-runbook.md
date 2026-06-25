@@ -202,8 +202,10 @@ Workload exclusivity key conflict:
 5. If cleanup was externally verified but the database row remains non-terminal,
    use `ForceDeleteMaterialization` with the materialization id, operator, and
    reason. If only the lock must be released, use `ForceReleaseExclusivityKey`
-   with the exact target, key name, and key value. Treat key release as unsafe
-   unless the singleton resource cannot still be attached by the old instance.
+   with the exact target, key name, and key value. Both force responses include
+   best-effort projection observations for scoped refs, but treat key release as
+   unsafe unless the singleton resource cannot still be attached by the old
+   instance.
 
 Non-terminal materialization is stuck:
 
@@ -223,9 +225,10 @@ Non-terminal materialization is stuck:
 5. Treat `delete_blocked` with finalizers as non-terminal. Fix or intentionally
    remove the Kubernetes finalizer through the owning controller or a manual
    Kubernetes operation, then let reconciliation retry.
-6. Treat `inspect_failed` as non-terminal. Fix Kubernetes API connectivity,
-   RBAC, discovery, or namespace access first; the control plane has not proven
-   whether that ref is missing, owned, unowned, or finalizer-blocked.
+6. Treat `inspect_failed` as non-terminal, including when it appears in a force
+   operation response. Fix Kubernetes API connectivity, RBAC, discovery, or
+   namespace access first; the control plane has not proven whether that ref is
+   missing, owned, unowned, or finalizer-blocked.
 7. If an operator has manually removed every recorded ref and verified no
    singleton resource can be attached by the old workload, call
    `ForceDeleteMaterialization`. Record a specific reason.
