@@ -1383,6 +1383,92 @@ Done criteria:
 | Complete | Kubernetes API/materializer failures are visible without duplicating Kubernetes resource metrics. | Reconciler tests assert apply/readiness success and delete error metrics; descriptors restrict Kubernetes controller metrics to `operation` and `outcome`. |
 | Complete | The metric surface remains intentionally small. | Operator guide and runbook updates explicitly exclude CPU, memory, restarts, pod scheduling, network, filesystem, instance ids, hostnames, route ids, SNI values, pod names, request paths, error strings, tokens, and volume handles from SleepyPods-owned Prometheus metrics. |
 
+## Milestone 16: Kubernetes Projection Drift and Finalizer Safety
+
+Centralize Kubernetes drift, ownership, finalizer, and stuck-deletion handling
+behind one shared projection layer. The control-plane state machine remains the
+policy owner, but all Kubernetes object observation, ownership proof,
+apply/delete idempotency, readiness inspection, and finalizer reporting should
+flow through one abstraction instead of being scattered across wake, sleep,
+delete, and reconciliation paths.
+
+Scope:
+
+- Introduce a shared `ProjectionPlan`/`ProjectionReconciler` style abstraction
+  for rendered objects, recorded refs, ownership stamps, apply, delete,
+  readiness, and inspect operations.
+- Add explicit ownership stamps to every rendered object, including
+  materialization id, instance id, generation, rendered hash, and
+  `managed-by=sleepypods`.
+- Add a structured observation model for each recorded object ref:
+  `Missing`, `PresentOwned`, `PresentUnowned`, `DeletingOwned`,
+  `DeletingUnowned`, `Ready`, `Unready`, `ApplyRejected`, and `DeleteBlocked`
+  with bounded reason/finalizer details.
+- Make `Pending` reconciliation use projection observations to re-apply missing
+  or partial owned objects, stop on unowned conflicts, and complete only after
+  readiness is observed for the current generation.
+- Make `Deleting` reconciliation use projection observations to delete only
+  owned objects, tolerate missing owned refs, stay non-terminal while owned
+  objects are blocked by finalizers, and finalize only after cleanup is proven.
+- Keep `Ready` drift conservative in V1: inspect and report missing, unowned,
+  unready, or mutated objects, but do not automatically replace live backends
+  until a later policy explicitly opts into repair.
+- Surface operator-readable drift and finalizer state through
+  `ReconcileMaterialization` and runbook guidance without exposing high
+  cardinality labels in metrics.
+- Preserve the existing safety posture for singleton resources: exclusivity keys
+  remain held while cleanup is uncertain, including finalizer-blocked deletes
+  and ownership conflicts.
+
+Sub-phases:
+
+- 16A: Projection model and ownership stamp definitions.
+- 16B: Kubernetes inspection implementation for Deployment, StatefulSet,
+  Service, PVC, and PV refs.
+- 16C: Apply/delete/readiness paths routed through the shared projection layer.
+- 16D: Pending reconciliation policy using projection observations.
+- 16E: Deleting reconciliation policy using projection observations and
+  finalizer-blocked delete reporting.
+- 16F: Ready drift inspect/report behavior without automatic live repair.
+- 16G: Operator API/runbook updates for unowned objects, finalizers, stuck
+  deletes, and safe force operations.
+- 16H: Extensive fake-Kubernetes, real-API, and kind tests for drift/finalizer
+  edge cases.
+
+Done when:
+
+- Unit tests cover ownership-stamp rendering for every Kubernetes object type
+  and reject missing, malformed, stale, or mismatched stamps.
+- Projection observation tests cover missing refs, owned present refs, unowned
+  name collisions, generation mismatches, rendered-hash mismatches, deletion
+  timestamps, finalizer lists, readiness false, absent endpoints, and unsupported
+  object kinds.
+- Pending reconciliation tests cover no objects applied, partially applied
+  PV/PVC/Service/workload refs, manually deleted owned refs, unowned name
+  collisions, stale generation objects, readiness flapping, and Kubernetes API
+  read/apply failures.
+- Deleting reconciliation tests cover already-missing refs, partial deletion,
+  finalizer-blocked PVC/PV/workload refs, unowned same-name objects, Kubernetes
+  delete errors, repeated retry, lease loss during delete, and finalization only
+  after every owned ref is gone or proven safe.
+- Ready drift tests cover manual workload deletion, Service selector mutation,
+  endpoint loss, pod unready state, PVC/PV mutation, unowned object replacement,
+  and prove V1 reports drift without automatically swapping or repairing the
+  backend.
+- Force-operation tests prove `ForceDeleteMaterialization` and
+  `ForceReleaseExclusivityKey` surface the latest projection observation and
+  require audited operator and reason fields before bypassing normal safety.
+- Metrics/log tests expose low-cardinality drift/finalizer outcomes without
+  labels containing instance ids, object names, route ids, hostnames, volume
+  handles, finalizer names, or raw error strings.
+- kind E2E tests inject manual deletion, label/annotation ownership drift,
+  finalizer-blocked PVC/PV deletion, unowned same-name replacement, and Ready
+  drift against production images and prove the reconciler either repairs,
+  waits, reports, or blocks exactly according to the materialization state.
+- The runbook tells operators how to distinguish safe missing-object cleanup
+  from unsafe unowned-object conflicts and when force-release can allow duplicate
+  singleton attachment.
+
 ## Stretch
 
 The original goal is complete when the plan reaches this line. Do not start
@@ -1423,6 +1509,58 @@ Done when:
   backpressure, reconnect failure, and app-level resume/session token handling.
 - Operator docs clearly state that SleepySockets is not transparent generic
   WebSocket sleep and requires an app protocol that tolerates upstream reconnect.
+
+### Stretch Phase 2: Operator CLI
+
+Plan and build a small operator-facing CLI for day-to-day SleepyPods
+management. The CLI should wrap the stable control-plane API rather than
+introducing a second resource model or writing directly to Kubernetes or the
+database.
+
+Scope:
+
+- Pick a CLI name, command shape, config file format, authentication inputs, and
+  output conventions before implementation starts.
+- Support native gRPC first, with room for gRPC-Web or HTTP-compatible transport
+  later if browser/V8 environments need to reuse the same command model.
+- Provide commands for workload class versions, instances, route bindings,
+  HTTP-01 challenges, materialization inspection, one-shot reconciliation, and
+  force operations.
+- Support concise human output by default and stable JSON output for automation
+  and agents.
+- Add dry-run and validation commands for `WorkloadClass` templates, instance
+  values, route identities, and rendered Kubernetes object summaries before
+  operators create resources.
+- Keep dangerous operations explicit: force-delete and force-release commands
+  must require operator identity, reason text, target identifiers, and a
+  deliberate confirmation bypass for non-interactive automation.
+- Make errors operator-readable while preserving structured status codes and
+  machine-readable details in JSON mode.
+- Document example workflows for creating a workload class, creating an
+  instance, adding a route/custom domain, inspecting wake/sleep state,
+  resolving a stuck materialization, and deleting an instance.
+
+Done when:
+
+- A CLI design document describes command names, flags, config precedence,
+  authentication, output formats, exit codes, and dangerous-operation
+  confirmation behavior.
+- CLI unit tests cover argument parsing, config precedence, redacted auth
+  display, JSON output stability, and error formatting.
+- CLI integration tests run against a fake or in-process control-plane service
+  and cover create/get/delete flows for workload classes, instances, route
+  bindings, and HTTP-01 challenges.
+- CLI recovery tests cover `ReconcileMaterialization`,
+  `ForceDeleteMaterialization`, and `ForceReleaseExclusivityKey`, including
+  required audit fields and non-interactive confirmation flags.
+- CLI validation tests prove invalid templates, invalid instance values,
+  duplicate route identities, unsafe force inputs, and malformed server
+  endpoints fail before any unintended write.
+- At least one kind E2E path uses the CLI against deployed production
+  control-plane images for a full create route, cold wake, sleep, inspect, and
+  delete workflow.
+- Operator documentation uses CLI examples as the primary user-facing workflow
+  while still linking to protobuf/API details for integration authors.
 
 ## Deferred
 
