@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -22,10 +23,11 @@ use control_plane::api::{
     RouteSubscriptionBroker, StoreBackedOperatorApi, StoreBackedProxyApi,
     StoreBackedProxyGrpcService, OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
 };
+use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
-    AuthConfig, BackendEndpoint, BackendGeneration, CachePolicy, CallerRole, CompleteWakeResult,
-    ControlPlaneAuth, ControlPlaneStore, CreateInstanceResult, Generation, InstanceId,
-    InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientError,
+    rendered_object_ref, AuthConfig, BackendEndpoint, BackendGeneration, CachePolicy, CallerRole,
+    CompleteWakeResult, ControlPlaneAuth, ControlPlaneStore, CreateInstanceResult, Generation,
+    InstanceId, InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientError,
     KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
     KubernetesMaterializerClient, MaterializationId, MaterializationRecord, MaterializationState,
     MaterializationTarget, PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost,
@@ -146,6 +148,34 @@ async fn proxy_wake_cold_instance_returns_ready_backend() {
     );
     assert_eq!(ready.backend_generation, 44);
     assert_eq!(client.applied_objects_len(), 2);
+}
+
+#[tokio::test]
+async fn proxy_wake_unowned_live_ref_blocks_apply() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_instance(domain_instance(
+        "instance-unowned",
+        DomainInstanceState::Cold,
+        1,
+    ));
+    store.seed_workload_class(domain_workload_class());
+    let client = FakeKubernetesClient::default();
+    client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-instance"));
+    let service = proxy_api(store, client.clone());
+
+    let error = service
+        .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
+            instance_id: "instance-unowned".to_owned(),
+            expected_generation: 1,
+            backend_generation: None,
+        }))
+        .await
+        .expect_err("unowned live ref blocks proxy wake");
+
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("projection failed"));
+    assert!(error.message().contains("ownership conflict"));
+    assert_eq!(client.applied_objects_len(), 0);
 }
 
 #[tokio::test]
@@ -1676,6 +1706,7 @@ enum FakeRouteResolution {
 #[derive(Clone, Debug, Default)]
 struct FakeKubernetesClient {
     applied_objects: Arc<Mutex<Vec<control_plane::KubernetesObject>>>,
+    live_objects: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
     fail_readiness: bool,
 }
 
@@ -1683,6 +1714,7 @@ impl FakeKubernetesClient {
     fn failing_readiness() -> Self {
         Self {
             applied_objects: Arc::new(Mutex::new(Vec::new())),
+            live_objects: Arc::new(Mutex::new(BTreeMap::new())),
             fail_readiness: true,
         }
     }
@@ -1693,6 +1725,28 @@ impl FakeKubernetesClient {
             .expect("fake kubernetes lock is available")
             .len()
     }
+
+    fn set_unowned_live_object(&self, object: RenderedObjectRef) {
+        self.live_objects
+            .lock()
+            .expect("fake kubernetes lock is available")
+            .insert(
+                object_key(&object),
+                ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    deleting: false,
+                    finalizers: Vec::new(),
+                }),
+            );
+    }
+}
+
+fn object_key(object: &RenderedObjectRef) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        object.api_version, object.kind, object.namespace, object.name
+    )
 }
 
 impl ControlPlaneStore for FakeWakeStore {
@@ -2024,6 +2078,16 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         object: &'a control_plane::KubernetesObject,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
+            let object_ref = rendered_object_ref(object);
+            self.live_objects
+                .lock()
+                .expect("fake kubernetes lock is available")
+                .insert(
+                    object_key(&object_ref),
+                    ProjectionObjectInspection::Present(LiveObjectMetadata::from_rendered_object(
+                        object,
+                    )),
+                );
             self.applied_objects
                 .lock()
                 .expect("fake kubernetes lock is available")
@@ -2034,9 +2098,15 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
 
     fn delete_object<'a>(
         &'a self,
-        _object: &'a RenderedObjectRef,
+        object: &'a RenderedObjectRef,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.live_objects
+                .lock()
+                .expect("fake kubernetes lock is available")
+                .remove(&object_key(object));
+            Ok(())
+        })
     }
 
     fn wait_for_pvc_bound<'a>(
@@ -2058,6 +2128,21 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
 
             BackendEndpoint::new("http://svc-acme-instance.apps.svc.cluster.local:80")
                 .map_err(|error| KubernetesClientError::new(error.to_string()))
+        })
+    }
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        Box::pin(async move {
+            Ok(self
+                .live_objects
+                .lock()
+                .expect("fake kubernetes lock is available")
+                .get(&object_key(object))
+                .cloned()
+                .unwrap_or(ProjectionObjectInspection::Missing))
         })
     }
 }
@@ -2147,6 +2232,15 @@ fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> Ins
         values: control_plane::InstanceValues::new(),
         state,
         generation: Generation::new(generation),
+    }
+}
+
+fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
+    RenderedObjectRef {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
     }
 }
 

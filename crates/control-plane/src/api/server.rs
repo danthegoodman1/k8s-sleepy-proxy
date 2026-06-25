@@ -31,6 +31,7 @@ use crate::{
         MaterializationTarget, RenderedObjectRef,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
+    projection::{ProjectionObservation, ProjectionPlan, ProjectionReconciler},
     reconciler::{MaterializationReconciler, MaterializationReconcilerConfig},
     route as domain_route,
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
@@ -100,6 +101,32 @@ impl<C> StoreBackedOperatorApi<C> {
             materializer,
             target,
             route_events,
+        }
+    }
+}
+
+impl<C> StoreBackedOperatorApi<C>
+where
+    C: KubernetesMaterializerClient,
+{
+    async fn projection_observations(
+        &self,
+        materialization: &MaterializationRecord,
+    ) -> Vec<pb::ProjectionObservation> {
+        let plan = ProjectionPlan::from_recorded_refs(materialization);
+        match ProjectionReconciler::new(&self.materializer)
+            .inspect(&plan)
+            .await
+        {
+            Ok(observations) => observations
+                .iter()
+                .map(projection_observation_to_proto)
+                .collect(),
+            Err(error) => error
+                .observations()
+                .iter()
+                .map(projection_observation_to_proto)
+                .collect(),
         }
     }
 }
@@ -526,6 +553,7 @@ where
                 lease_expires_at_unix_millis: 0,
                 lease_attempt: 0,
                 observed_refs: Vec::new(),
+                projection_observations: Vec::new(),
             }));
         };
 
@@ -552,9 +580,12 @@ where
             .await
             .map_err(store_error_to_status)?
             .unwrap_or(before);
+        let projection_observations = self.projection_observations(&after).await;
 
         Ok(Response::new(reconcile_materialization_response(
-            &after, attempted,
+            &after,
+            attempted,
+            projection_observations,
         )))
     }
 
@@ -855,6 +886,7 @@ fn force_release_exclusivity_key_request_from_proto(
 fn reconcile_materialization_response(
     materialization: &MaterializationRecord,
     attempted: bool,
+    projection_observations: Vec<pb::ProjectionObservation>,
 ) -> pb::ReconcileMaterializationResponse {
     let lease = materialization.reconciliation_lease.as_ref();
     pb::ReconcileMaterializationResponse {
@@ -872,6 +904,7 @@ fn reconcile_materialization_response(
             .iter()
             .map(rendered_object_ref_to_proto)
             .collect(),
+        projection_observations,
     }
 }
 
@@ -1054,6 +1087,18 @@ fn rendered_object_ref_to_proto(object: &RenderedObjectRef) -> pb::RenderedObjec
     }
 }
 
+fn projection_observation_to_proto(
+    observation: &ProjectionObservation,
+) -> pb::ProjectionObservation {
+    pb::ProjectionObservation {
+        r#ref: Some(rendered_object_ref_to_proto(&observation.object_ref)),
+        state: observation.state.as_str().to_owned(),
+        reason: observation.reason.clone().unwrap_or_default(),
+        finalizers: observation.finalizers.clone(),
+        backend_uri: observation.backend_uri.clone().unwrap_or_default(),
+    }
+}
+
 fn unix_millis_from_system_time(value: SystemTime) -> Result<i64, Status> {
     match value.duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis())
@@ -1092,7 +1137,7 @@ fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
 
 fn delete_instance_error_to_status(error: domain_instance::DeleteInstanceError) -> Status {
     match error {
-        domain_instance::DeleteInstanceError::Materializer {
+        domain_instance::DeleteInstanceError::Projection {
             instance_id,
             source,
         } => Status::unavailable(format!(

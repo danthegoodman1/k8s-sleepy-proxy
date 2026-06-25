@@ -577,6 +577,10 @@ fn proxy_wake_error_response(
             "materialization failed for instance {}: {source}",
             instance.id.as_str()
         ))),
+        WakeInstanceError::Projection { instance, source } => Err(Status::unavailable(format!(
+            "projection failed for instance {}: {source}",
+            instance.id.as_str()
+        ))),
         WakeInstanceError::Store(error) => Err(store_error_to_status(error)),
     }
 }

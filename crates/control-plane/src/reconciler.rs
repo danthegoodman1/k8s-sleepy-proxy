@@ -29,10 +29,11 @@ use crate::{
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
         FinalizeSleepRequest, ListMaterializationReconciliationCandidatesRequest,
         MaterializationRecord, MaterializationState,
-        ReleaseMaterializationReconciliationLeaseRequest, RenderedObjectRef,
+        ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
+    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
@@ -59,6 +60,7 @@ pub struct MaterializationReconciler<C> {
 pub enum MaterializationReconcileError {
     Store(StoreError),
     Materializer(MaterializerError),
+    Projection(ProjectionError),
     Render(String),
     StaleDesiredRefs,
     LeaseLost,
@@ -237,18 +239,31 @@ where
         let manifest = self
             .render_current_manifest(&instance, &materialization)
             .await?;
-        let desired_refs = self
-            .materializer
-            .rendered_object_refs(&manifest)
+        let projection_plan = ProjectionPlan::from_manifest(&materialization, &manifest)
             .map_err(MaterializationReconcileError::Materializer)?;
+        let desired_refs = projection_plan.object_refs();
         if desired_refs != materialization.rendered_objects {
             return Err(MaterializationReconcileError::StaleDesiredRefs);
         }
 
-        self.apply_manifest_observed(&manifest).await?;
+        self.apply_projection_observed(&projection_plan).await?;
         let backend = self
-            .wait_for_readiness_observed(&materialization.rendered_objects)
+            .wait_for_projection_readiness_observed(&projection_plan)
             .await?;
+        let observations = self.inspect_projection_observed(&projection_plan).await?;
+        ProjectionReconciler::new(&self.materializer)
+            .reject_unowned(&observations)
+            .map_err(MaterializationReconcileError::Projection)?;
+        if observations.iter().any(|observation| {
+            !matches!(
+                observation.state,
+                crate::projection::ProjectionObservationState::PresentOwned
+            )
+        }) {
+            return Err(MaterializationReconcileError::Projection(
+                ProjectionError::Incomplete { observations },
+            ));
+        }
         self.renew_or_lose(&materialization).await?;
 
         let mut complete = CompleteWakeRequest::new(
@@ -275,8 +290,8 @@ where
         &self,
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        self.delete_rendered_objects_observed(&materialization.rendered_objects)
-            .await?;
+        let projection_plan = ProjectionPlan::from_recorded_refs(&materialization);
+        self.delete_projection_observed(&projection_plan).await?;
         self.renew_or_lose(&materialization).await?;
 
         let Some(instance) = self
@@ -306,8 +321,8 @@ where
         &self,
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        self.delete_rendered_objects_observed(&materialization.rendered_objects)
-            .await?;
+        let projection_plan = ProjectionPlan::from_recorded_refs(&materialization);
+        self.delete_projection_observed(&projection_plan).await?;
         self.renew_or_lose(&materialization).await?;
         self.mark_deleted(materialization).await
     }
@@ -360,51 +375,62 @@ where
         }
     }
 
-    async fn apply_manifest_observed(
+    async fn inspect_projection_observed(
         &self,
-        manifest: &crate::manifest::RenderedManifest,
+        plan: &ProjectionPlan,
+    ) -> Result<Vec<crate::projection::ProjectionObservation>, MaterializationReconcileError> {
+        ProjectionReconciler::new(&self.materializer)
+            .inspect(plan)
+            .await
+            .map_err(MaterializationReconcileError::Projection)
+    }
+
+    async fn apply_projection_observed(
+        &self,
+        plan: &ProjectionPlan,
     ) -> Result<(), MaterializationReconcileError> {
         let started = Instant::now();
-        let result = self.materializer.apply_manifest(manifest).await;
+        let result = ProjectionReconciler::new(&self.materializer)
+            .apply(plan)
+            .await;
         self.record_kubernetes_operation(
             Operation::Apply,
             outcome_for_result(&result),
             started.elapsed(),
         );
-        result
-            .map(|_| ())
-            .map_err(MaterializationReconcileError::Materializer)
+        result.map_err(MaterializationReconcileError::Projection)
     }
 
-    async fn wait_for_readiness_observed(
+    async fn wait_for_projection_readiness_observed(
         &self,
-        rendered_objects: &[RenderedObjectRef],
+        plan: &ProjectionPlan,
     ) -> Result<BackendEndpoint, MaterializationReconcileError> {
         let started = Instant::now();
-        let result = self.materializer.wait_for_readiness(rendered_objects).await;
+        let result = ProjectionReconciler::new(&self.materializer)
+            .wait_for_readiness(plan)
+            .await;
         self.record_kubernetes_operation(
             Operation::Readiness,
             outcome_for_result(&result),
             started.elapsed(),
         );
-        result.map_err(MaterializationReconcileError::Materializer)
+        result.map_err(MaterializationReconcileError::Projection)
     }
 
-    async fn delete_rendered_objects_observed(
+    async fn delete_projection_observed(
         &self,
-        rendered_objects: &[RenderedObjectRef],
+        plan: &ProjectionPlan,
     ) -> Result<(), MaterializationReconcileError> {
         let started = Instant::now();
-        let result = self
-            .materializer
-            .delete_rendered_objects(rendered_objects)
+        let result = ProjectionReconciler::new(&self.materializer)
+            .delete_owned(plan)
             .await;
         self.record_kubernetes_operation(
             Operation::Delete,
             outcome_for_result(&result),
             started.elapsed(),
         );
-        result.map_err(MaterializationReconcileError::Materializer)
+        result.map_err(MaterializationReconcileError::Projection)
     }
 
     async fn load_instance(
@@ -576,6 +602,7 @@ impl fmt::Display for MaterializationReconcileError {
         match self {
             Self::Store(error) => write!(f, "store: {error}"),
             Self::Materializer(error) => write!(f, "materializer: {error}"),
+            Self::Projection(error) => write!(f, "projection: {error}"),
             Self::Render(error) => write!(f, "render: {error}"),
             Self::StaleDesiredRefs => {
                 f.write_str("rendered object refs no longer match persisted refs")
@@ -608,7 +635,7 @@ fn stable_owner_hash(owner: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{Arc, Mutex},
     };
 
@@ -625,6 +652,7 @@ mod tests {
             MaterializationReconciliationLease, MaterializationTarget, RenderedObjectRef,
         },
         materializer::{KubernetesClientError, KubernetesClientFuture, KubernetesClientResult},
+        projection::{LiveObjectMetadata, ProjectionObjectInspection},
         store::{StoreFuture, StoreResult},
         workload::{
             RenderedExclusivityKey, WorkloadClassVersion, WorkloadClassVersionRef,
@@ -638,11 +666,14 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_reconciliation_deletes_refs_and_finalizes_with_current_lease() {
+        let materialization = deleting_materialization("mat-delete-ok");
         let store = Arc::new(FakeReconcileStore::new(
-            deleting_materialization("mat-delete-ok"),
+            materialization.clone(),
             draining_instance("instance-reconcile"),
         ));
-        let materializer = KubernetesMaterializer::new(FakeKubernetesClient::default());
+        let materializer = KubernetesMaterializer::new(
+            FakeKubernetesClient::default().with_live_owned_refs(&materialization),
+        );
         let reconciler = reconciler(store.clone(), materializer);
 
         reconciler.run_once().await;
@@ -653,12 +684,14 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_reconciliation_keeps_keys_when_cleanup_fails() {
+        let materialization = deleting_materialization("mat-delete-fail");
         let store = Arc::new(FakeReconcileStore::new(
-            deleting_materialization("mat-delete-fail"),
+            materialization.clone(),
             draining_instance("instance-reconcile"),
         ));
         let materializer = KubernetesMaterializer::new(
             FakeKubernetesClient::default()
+                .with_live_owned_refs(&materialization)
                 .with_delete_error(KubernetesClientError::transient("api unavailable")),
         );
         let reconciler = reconciler(store.clone(), materializer);
@@ -711,12 +744,14 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_reconciliation_records_kubernetes_delete_error_metric() {
+        let materialization = deleting_materialization("mat-delete-error-metrics");
         let store = Arc::new(FakeReconcileStore::new(
-            deleting_materialization("mat-delete-error-metrics"),
+            materialization.clone(),
             draining_instance("instance-reconcile"),
         ));
         let materializer = KubernetesMaterializer::new(
             FakeKubernetesClient::default()
+                .with_live_owned_refs(&materialization)
                 .with_delete_error(KubernetesClientError::transient("api unavailable")),
         );
         let sink = InMemoryObservability::default();
@@ -795,14 +830,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_reconciliation_stops_on_unowned_live_ref() {
+        let instance = waking_instance("instance-reconcile");
+        let materialization = pending_materialization("mat-pending-unowned", &instance);
+        let client = FakeKubernetesClient::default()
+            .with_live_unowned_ref(materialization.rendered_objects[0].clone());
+        let store = Arc::new(FakeReconcileStore::new(materialization, instance));
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(client.apply_calls(), 0);
+        assert_eq!(store.complete_calls(), 0);
+        assert_eq!(store.materialization_state(), MaterializationState::Pending);
+        assert_eq!(store.release_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_stops_on_stale_live_stamp() {
+        let instance = waking_instance("instance-reconcile");
+        let materialization = pending_materialization("mat-pending-stale-stamp", &instance);
+        let client = FakeKubernetesClient::default();
+        let mut stale = live_owned_metadata(&materialization);
+        stale.labels.insert(
+            crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
+            "6".to_owned(),
+        );
+        client.set_live(
+            materialization.rendered_objects[0].clone(),
+            ProjectionObjectInspection::Present(stale),
+        );
+        let store = Arc::new(FakeReconcileStore::new(materialization, instance));
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(client.apply_calls(), 0);
+        assert_eq!(store.complete_calls(), 0);
+        assert_eq!(store.materialization_state(), MaterializationState::Pending);
+        assert_eq!(store.release_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn pending_stale_generation_deletes_refs_and_marks_deleted_after_cleanup() {
         let materialization =
             pending_materialization("mat-pending-stale", &waking_instance("instance-reconcile"));
         let store = Arc::new(FakeReconcileStore::new(
-            materialization,
+            materialization.clone(),
             running_instance("instance-reconcile", 8),
         ));
-        let client = FakeKubernetesClient::default();
+        let client = FakeKubernetesClient::default().with_live_owned_refs(&materialization);
         let materializer = KubernetesMaterializer::new(client.clone());
         let reconciler = reconciler(store.clone(), materializer);
 
@@ -827,9 +906,58 @@ mod tests {
 
         reconciler.run_once().await;
 
-        assert_eq!(client.delete_calls(), 2);
+        assert_eq!(client.delete_calls(), 0);
         assert_eq!(store.finalize_calls(), 1);
         assert_eq!(store.materialization_state(), MaterializationState::Deleted);
+    }
+
+    #[tokio::test]
+    async fn deleting_reconciliation_blocks_on_unowned_live_ref() {
+        let materialization = deleting_materialization("mat-delete-unowned");
+        let client = FakeKubernetesClient::default()
+            .with_live_unowned_ref(materialization.rendered_objects[0].clone());
+        let store = Arc::new(FakeReconcileStore::new(
+            materialization,
+            draining_instance("instance-reconcile"),
+        ));
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(client.delete_calls(), 0);
+        assert_eq!(store.finalize_calls(), 0);
+        assert_eq!(
+            store.materialization_state(),
+            MaterializationState::Deleting
+        );
+        assert_eq!(store.release_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_reconciliation_blocks_on_owned_finalizer() {
+        let materialization = deleting_materialization("mat-delete-finalizer");
+        let client = FakeKubernetesClient::default().with_live_deleting_owned_ref(
+            &materialization,
+            materialization.rendered_objects[0].clone(),
+            vec!["example.com/cleanup".to_owned()],
+        );
+        let store = Arc::new(FakeReconcileStore::new(
+            materialization,
+            draining_instance("instance-reconcile"),
+        ));
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(client.delete_calls(), 0);
+        assert_eq!(store.finalize_calls(), 0);
+        assert_eq!(
+            store.materialization_state(),
+            MaterializationState::Deleting
+        );
+        assert_eq!(store.release_calls(), 1);
     }
 
     #[tokio::test]
@@ -1308,6 +1436,7 @@ mod tests {
         deleted: Arc<Mutex<Vec<RenderedObjectRef>>>,
         wait_readiness_calls: Arc<Mutex<usize>>,
         delete_errors: Arc<Mutex<VecDeque<KubernetesClientError>>>,
+        live: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
     }
 
     impl FakeKubernetesClient {
@@ -1317,6 +1446,51 @@ mod tests {
                 .expect("delete errors lock")
                 .push_back(error);
             self
+        }
+
+        fn with_live_owned_refs(self, materialization: &MaterializationRecord) -> Self {
+            for object_ref in &materialization.rendered_objects {
+                self.set_live(
+                    object_ref.clone(),
+                    ProjectionObjectInspection::Present(live_owned_metadata(materialization)),
+                );
+            }
+            self
+        }
+
+        fn with_live_unowned_ref(self, object_ref: RenderedObjectRef) -> Self {
+            self.set_live(
+                object_ref,
+                ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    deleting: false,
+                    finalizers: Vec::new(),
+                }),
+            );
+            self
+        }
+
+        fn with_live_deleting_owned_ref(
+            self,
+            materialization: &MaterializationRecord,
+            object_ref: RenderedObjectRef,
+            finalizers: Vec<String>,
+        ) -> Self {
+            self.set_live(
+                object_ref,
+                ProjectionObjectInspection::Present(
+                    live_owned_metadata(materialization).deleting(finalizers),
+                ),
+            );
+            self
+        }
+
+        fn set_live(&self, object_ref: RenderedObjectRef, inspection: ProjectionObjectInspection) {
+            self.live
+                .lock()
+                .expect("live lock")
+                .insert(object_key(&object_ref), inspection);
         }
 
         fn apply_calls(&self) -> usize {
@@ -1341,10 +1515,17 @@ mod tests {
             object: &'a crate::manifest::KubernetesObject,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
+                let object_ref = crate::materializer::rendered_object_ref(object);
                 self.applied
                     .lock()
                     .expect("applied lock")
                     .push(object.clone());
+                self.live.lock().expect("live lock").insert(
+                    object_key(&object_ref),
+                    ProjectionObjectInspection::Present(LiveObjectMetadata::from_rendered_object(
+                        object,
+                    )),
+                );
                 Ok(())
             })
         }
@@ -1366,6 +1547,10 @@ mod tests {
                             .lock()
                             .expect("deleted lock")
                             .push(object.clone());
+                        self.live
+                            .lock()
+                            .expect("live lock")
+                            .remove(&object_key(&object));
                         Ok(())
                     }
                 }
@@ -1393,5 +1578,53 @@ mod tests {
                     .map_err(|error| KubernetesClientError::new(error.to_string()))
             })
         }
+
+        fn inspect_object<'a>(
+            &'a self,
+            object: &'a RenderedObjectRef,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>>
+        {
+            Box::pin(async move {
+                Ok(self
+                    .live
+                    .lock()
+                    .expect("live lock")
+                    .get(&object_key(object))
+                    .cloned()
+                    .unwrap_or(ProjectionObjectInspection::Missing))
+            })
+        }
+    }
+
+    fn live_owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata {
+        LiveObjectMetadata {
+            labels: BTreeMap::from([
+                (
+                    crate::projection::LABEL_MANAGED_BY.to_owned(),
+                    crate::projection::LABEL_MANAGED_BY_VALUE.to_owned(),
+                ),
+                (
+                    crate::manifest::LABEL_INSTANCE_ID.to_owned(),
+                    materialization.instance_id.as_str().to_owned(),
+                ),
+                (
+                    crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
+                    materialization.instance_generation.to_string(),
+                ),
+            ]),
+            annotations: BTreeMap::from([(
+                crate::projection::ANNOTATION_MATERIALIZATION_ID.to_owned(),
+                materialization.id.as_str().to_owned(),
+            )]),
+            deleting: false,
+            finalizers: Vec::new(),
+        }
+    }
+
+    fn object_key(object_ref: &RenderedObjectRef) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            object_ref.api_version, object_ref.kind, object_ref.namespace, object_ref.name
+        )
     }
 }

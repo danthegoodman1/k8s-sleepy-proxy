@@ -220,13 +220,29 @@ an explicit force operation.
 
 `ReconcileMaterialization` is the first operator action for a stuck
 materialization. It loads the row by materialization id, returns current state,
-lease metadata, and recorded object refs, and triggers one synchronous
-reconciliation attempt when the row is `Pending` or `Deleting`.
+lease metadata, recorded object refs, and live projection observations, and
+triggers one synchronous reconciliation attempt when the row is `Pending` or
+`Deleting`. Projection observations classify each recorded ref as missing,
+owned, unowned, deleting, apply-rejected, delete-blocked, inspect-failed, ready,
+or unready with bounded reason/finalizer details.
+
+SleepyPods stamps applied Kubernetes objects with `managed-by=sleepypods`,
+materialization id, instance id, instance generation, and a deterministic
+rendered hash. Reconciliation treats missing refs as safe to re-apply during
+`Pending` and safe to tolerate during `Deleting`, but it does not mutate or
+delete live refs whose stamps do not prove ownership by the current
+materialization.
+
+An `inspect_failed` observation means the control plane could not read that
+Kubernetes ref, so cleanup or wake safety is not proven. Treat it as a
+retryable Kubernetes/API-access problem unless the bounded reason indicates a
+persistent permission or discovery issue.
 
 `ForceDeleteMaterialization` is an emergency cleanup tool for a materialization
 whose Kubernetes cleanup has already been inspected. The response includes the
-recorded object refs that were present before the row was cleared. Use it only
-after Kubernetes objects are gone or are known safe to abandon.
+recorded object refs that were present before the row was cleared; it does not
+yet include fresh projection observations. Use it only after Kubernetes objects
+are gone or are known safe to abandon.
 
 `ForceReleaseExclusivityKey` removes a rendered key from matching active
 materializations without deleting the materialization. It requires the exact

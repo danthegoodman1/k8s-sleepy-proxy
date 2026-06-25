@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use crate::{
     ids::{Generation, IdempotencyKey, InstanceId},
     materialization::{LoadActiveMaterializationRequest, MaterializationTarget},
-    materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
+    materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
+    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     route::{RouteBindingRecord, RouteBindingSpec},
     sleep_policy::SleepPolicyError,
     store::{ControlPlaneStore, StoreError},
@@ -214,9 +215,9 @@ pub enum CreateInstanceValidationError {
 
 #[derive(Debug)]
 pub enum DeleteInstanceError {
-    Materializer {
+    Projection {
         instance_id: InstanceId,
-        source: MaterializerError,
+        source: ProjectionError,
     },
     Store(StoreError),
 }
@@ -240,10 +241,11 @@ where
         .map_err(DeleteInstanceError::Store)?;
 
     if let Some(materialization) = materialization.as_ref() {
-        materializer
-            .delete_rendered_objects(&materialization.rendered_objects)
+        let plan = ProjectionPlan::from_recorded_refs(materialization);
+        ProjectionReconciler::new(materializer)
+            .delete_owned(&plan)
             .await
-            .map_err(|source| DeleteInstanceError::Materializer {
+            .map_err(|source| DeleteInstanceError::Projection {
                 instance_id: request.instance_id.clone(),
                 source,
             })?;
@@ -281,12 +283,12 @@ impl From<SleepPolicyError> for CreateInstanceValidationError {
 impl fmt::Display for DeleteInstanceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Materializer {
+            Self::Projection {
                 instance_id,
                 source,
             } => write!(
                 f,
-                "Kubernetes cleanup failed for instance {}: {source}",
+                "Kubernetes projection cleanup failed for instance {}: {source}",
                 instance_id.as_str()
             ),
             Self::Store(error) => error.fmt(f),
@@ -297,7 +299,7 @@ impl fmt::Display for DeleteInstanceError {
 impl Error for DeleteInstanceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Materializer { source, .. } => Some(source),
+            Self::Projection { source, .. } => Some(source),
             Self::Store(error) => Some(error),
         }
     }

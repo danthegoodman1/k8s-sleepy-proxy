@@ -14,6 +14,7 @@ use crate::{
         ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
     },
     materialization::{BackendEndpoint, RenderedObjectRef},
+    projection::ProjectionObjectInspection,
     retry::RetryPolicy,
 };
 
@@ -41,6 +42,18 @@ pub trait KubernetesMaterializerClient: Send + Sync {
         &'a self,
         objects: &'a [RenderedObjectRef],
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>>;
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        let _ = object;
+        Box::pin(async {
+            Err(KubernetesClientError::new(
+                "Kubernetes object inspection is not implemented by this client",
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -222,15 +235,23 @@ where
         objects: &[RenderedObjectRef],
     ) -> Result<(), MaterializerError> {
         for object in delete_order(objects) {
-            self.client.delete_object(object).await.map_err(|source| {
-                MaterializerError::Delete {
-                    object: object.clone(),
-                    source,
-                }
-            })?;
+            self.delete_rendered_object(object).await?;
         }
 
         Ok(())
+    }
+
+    pub async fn delete_rendered_object(
+        &self,
+        object: &RenderedObjectRef,
+    ) -> Result<(), MaterializerError> {
+        self.client
+            .delete_object(object)
+            .await
+            .map_err(|source| MaterializerError::Delete {
+                object: object.clone(),
+                source,
+            })
     }
 
     async fn delete_rendered_objects_best_effort(&self, objects: &[RenderedObjectRef]) {
@@ -393,6 +414,22 @@ where
                 .await
         })
     }
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        let inner = &self.inner;
+        let policy = self.policy;
+        Box::pin(async move {
+            policy
+                .retry_if(
+                    || inner.inspect_object(object),
+                    KubernetesClientError::is_retryable,
+                )
+                .await
+        })
+    }
 }
 
 pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
@@ -434,7 +471,7 @@ fn ordered_objects(manifest: &RenderedManifest) -> Vec<&RenderedManifestObject> 
     objects
 }
 
-fn delete_order(objects: &[RenderedObjectRef]) -> Vec<&RenderedObjectRef> {
+pub(crate) fn delete_order(objects: &[RenderedObjectRef]) -> Vec<&RenderedObjectRef> {
     objects
         .iter()
         .rev()

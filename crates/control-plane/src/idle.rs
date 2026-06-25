@@ -6,7 +6,8 @@ use crate::{
         LoadActiveMaterializationRequest, MaterializationRecord, MaterializationState,
         MaterializationTarget,
     },
-    materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
+    materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
+    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     store::{ControlPlaneStore, StoreError},
 };
 
@@ -51,9 +52,9 @@ pub enum ReportIdleError {
         expected: Generation,
         actual: Generation,
     },
-    Materializer {
+    Projection {
         instance: InstanceRecord,
-        source: MaterializerError,
+        source: ProjectionError,
     },
     Store(StoreError),
 }
@@ -256,10 +257,11 @@ where
     C: KubernetesMaterializerClient,
 {
     if let Some(materialization) = materialization.as_ref() {
-        materializer
-            .delete_rendered_objects(&materialization.rendered_objects)
+        let plan = ProjectionPlan::from_recorded_refs(materialization);
+        ProjectionReconciler::new(materializer)
+            .delete_owned(&plan)
             .await
-            .map_err(|source| ReportIdleError::Materializer {
+            .map_err(|source| ReportIdleError::Projection {
                 instance: instance.clone(),
                 source,
             })?;

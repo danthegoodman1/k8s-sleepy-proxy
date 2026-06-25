@@ -210,14 +210,23 @@ Non-terminal materialization is stuck:
 1. Search `runtime.materialization.reconciliation` for `operation=claim`,
    `operation=reconcile`, `operation=lease_lost`, and `outcome=error`.
 2. Call `ReconcileMaterialization` with the materialization id. The response
-   reports current state, lease metadata, and recorded refs, and attempts one
-   reconciliation pass for `Pending` or `Deleting` rows.
-3. Check Kubernetes refs reported by the materialization. Missing refs during
-   delete are safe only when every recorded ref is gone or cleanup is otherwise
-   proven unnecessary.
-4. If a finalizer or Kubernetes outage blocks delete, do not force-release the
-   key. Fix the Kubernetes blocker and let reconciliation retry.
-5. If an operator has manually removed every recorded ref and verified no
+   reports current state, lease metadata, recorded refs, and projection
+   observations, and attempts one reconciliation pass for `Pending` or
+   `Deleting` rows.
+3. Treat `missing` observations during `Deleting` as safe cleanup progress. A
+   materialization can finalize only after every recorded ref is missing or
+   otherwise proven safe by the projection layer.
+4. Treat `present_unowned` and `deleting_unowned` as unsafe conflicts. Do not
+   force-release exclusivity keys or delete the object through SleepyPods; first
+   identify why the live object no longer carries the current SleepyPods
+   materialization stamps.
+5. Treat `delete_blocked` with finalizers as non-terminal. Fix or intentionally
+   remove the Kubernetes finalizer through the owning controller or a manual
+   Kubernetes operation, then let reconciliation retry.
+6. Treat `inspect_failed` as non-terminal. Fix Kubernetes API connectivity,
+   RBAC, discovery, or namespace access first; the control plane has not proven
+   whether that ref is missing, owned, unowned, or finalizer-blocked.
+7. If an operator has manually removed every recorded ref and verified no
    singleton resource can be attached by the old workload, call
    `ForceDeleteMaterialization`. Record a specific reason.
 
@@ -258,9 +267,14 @@ Delete cleanup is stuck or objects leak:
    `error.reason`.
 3. Check Kubernetes delete permissions for StatefulSet, Deployment, Service,
    PVC, and PV objects and whether finalizers block deletion.
-4. Compare leaked objects' SleepyPods labels with the recorded materialization
-   generation before manual cleanup.
-5. After manual cleanup, prefer waiting for materialization reconciliation to
+4. Compare leaked objects' SleepyPods labels and annotations with
+   `ReconcileMaterialization` projection observations. Current-owned objects
+   carry `managed-by=sleepypods`, materialization id, instance id, instance
+   generation, and rendered-hash stamps.
+5. If observations show an unowned same-name object, do not ask SleepyPods to
+   delete it. Resolve the name collision or manually remove the object only
+   after confirming its real owner.
+6. After manual cleanup, prefer waiting for materialization reconciliation to
    finalize. Use `ForceDeleteMaterialization` only when cleanup has been proven
    and reconciliation cannot make progress.
 

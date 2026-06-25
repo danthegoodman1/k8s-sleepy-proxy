@@ -527,6 +527,7 @@ message ReconcileMaterializationResponse {
   int64 lease_expires_at_unix_millis = 6;
   uint64 lease_attempt = 7;
   repeated RenderedObjectRef observed_refs = 8;
+  repeated ProjectionObservation projection_observations = 9;
 }
 
 message ForceDeleteMaterializationRequest {
@@ -546,6 +547,14 @@ message RenderedObjectRef {
   string kind = 2;
   string namespace = 3;
   string name = 4;
+}
+
+message ProjectionObservation {
+  RenderedObjectRef ref = 1;
+  string state = 2;
+  string reason = 3;
+  repeated string finalizers = 4;
+  string backend_uri = 5;
 }
 
 message ForceReleaseExclusivityKeyRequest {

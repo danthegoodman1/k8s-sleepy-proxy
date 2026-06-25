@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod materialization;
 pub mod materializer;
 pub mod postgres;
+pub mod projection;
 pub mod reconciler;
 pub mod retry;
 pub mod route;

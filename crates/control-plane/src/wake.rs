@@ -23,9 +23,9 @@ use crate::{
         CompleteWakeRequest, CompleteWakeResult, FinalizeSleepRequest,
         LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
         MaterializationState, MaterializationTarget, RecordMaterializationRequest,
-        RenderedObjectRef,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
+    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     sleep_policy::SleepPolicyError,
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
@@ -90,6 +90,10 @@ pub enum WakeInstanceError {
     Materializer {
         instance: InstanceRecord,
         source: MaterializerError,
+    },
+    Projection {
+        instance: InstanceRecord,
+        source: ProjectionError,
     },
 }
 
@@ -342,12 +346,30 @@ where
     );
     pending.rendered_objects = rendered_objects.clone();
     pending.exclusivity_keys = exclusivity_keys.clone();
-    if let Err(error) = store.record_materialization(pending).await {
-        return Err(fail_waking_with_store_error(store, &waking, error).await);
-    }
+    let pending_materialization = match store.record_materialization(pending).await {
+        Ok(materialization) => materialization,
+        Err(error) => {
+            return Err(fail_waking_with_store_error(store, &waking, error).await);
+        }
+    };
+    let projection_plan = match ProjectionPlan::from_manifest(&pending_materialization, &manifest) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Materializer {
+                    instance: waking.clone(),
+                    source: error,
+                },
+            )
+            .await);
+        }
+    };
 
-    if let Err(error) = materializer.apply_manifest(&manifest).await {
-        let no_objects_applied = materializer_error_has_no_applied_objects(&error);
+    let projection_reconciler = ProjectionReconciler::new(materializer);
+    if let Err(error) = projection_reconciler.apply(&projection_plan).await {
+        let no_objects_applied = projection_error_has_no_applied_objects(&error);
         if no_objects_applied {
             release_pending_materialization_after_no_apply_failure(
                 store,
@@ -360,7 +382,7 @@ where
         return Err(fail_waking(
             store,
             &waking,
-            WakeInstanceError::Materializer {
+            WakeInstanceError::Projection {
                 instance: waking.clone(),
                 source: error,
             },
@@ -368,7 +390,8 @@ where
         .await);
     }
 
-    let backend = match materializer.wait_for_readiness(&rendered_objects).await {
+    let projected_refs = projection_plan.object_refs();
+    let backend = match materializer.wait_for_readiness(&projected_refs).await {
         Ok(backend) => backend,
         Err(error) => {
             let original = fail_waking(
@@ -383,15 +406,13 @@ where
             cleanup_rendered_objects_if_instance_missing_or_terminal(
                 store,
                 materializer,
-                &waking.id,
-                &rendered_objects,
+                &pending_materialization,
             )
             .await;
             return Err(original);
         }
     };
 
-    let complete_instance_id = request.instance_id.clone();
     let mut complete = CompleteWakeRequest::new(
         request.instance_id,
         waking.generation,
@@ -408,8 +429,7 @@ where
             cleanup_rendered_objects_if_instance_missing_or_terminal(
                 store,
                 materializer,
-                &complete_instance_id,
-                &rendered_objects,
+                &pending_materialization,
             )
             .await;
             Err(map_store_error(error))
@@ -420,14 +440,13 @@ where
 async fn cleanup_rendered_objects_if_instance_missing_or_terminal<S, C>(
     store: &S,
     materializer: &KubernetesMaterializer<C>,
-    instance_id: &InstanceId,
-    rendered_objects: &[RenderedObjectRef],
+    materialization: &MaterializationRecord,
 ) where
     S: ControlPlaneStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     let should_cleanup = match store
-        .get_instance(GetInstanceRequest::new(instance_id.clone()))
+        .get_instance(GetInstanceRequest::new(materialization.instance_id.clone()))
         .await
     {
         Ok(None) => true,
@@ -439,7 +458,10 @@ async fn cleanup_rendered_objects_if_instance_missing_or_terminal<S, C>(
     };
 
     if should_cleanup {
-        let _ = materializer.delete_rendered_objects(rendered_objects).await;
+        let plan = ProjectionPlan::from_recorded_refs(materialization);
+        let _ = ProjectionReconciler::new(materializer)
+            .delete_owned(&plan)
+            .await;
     }
 }
 
@@ -448,6 +470,13 @@ fn materializer_error_has_no_applied_objects(error: &MaterializerError) -> bool 
         error.applied_objects_before_failure(),
         Some(applied_objects) if applied_objects.is_empty()
     )
+}
+
+fn projection_error_has_no_applied_objects(error: &ProjectionError) -> bool {
+    match error {
+        ProjectionError::Apply { source, .. } => materializer_error_has_no_applied_objects(source),
+        _ => false,
+    }
 }
 
 async fn release_pending_materialization_after_no_apply_failure<S>(
@@ -482,10 +511,11 @@ where
     S: ControlPlaneStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
-    materializer
-        .delete_rendered_objects(&materialization.rendered_objects)
+    let plan = ProjectionPlan::from_recorded_refs(&materialization);
+    ProjectionReconciler::new(materializer)
+        .delete_owned(&plan)
         .await
-        .map_err(|source| WakeInstanceError::Materializer {
+        .map_err(|source| WakeInstanceError::Projection {
             instance: instance.clone(),
             source,
         })?;
@@ -539,7 +569,16 @@ fn record_wake_observation(
     }
     observability.record_log(LifecycleLogEvent::new(EVENT_WAKE, fields));
 
-    if let Err(WakeInstanceError::Materializer { source, instance }) = result {
+    let materialization_failure = match result {
+        Err(WakeInstanceError::Materializer { source, instance }) => {
+            Some((instance, source.to_string()))
+        }
+        Err(WakeInstanceError::Projection { source, instance }) => {
+            Some((instance, source.to_string()))
+        }
+        _ => None,
+    };
+    if let Some((instance, source)) = materialization_failure {
         observability.record_metric(MetricObservation::new(
             RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
             vec![
@@ -553,7 +592,7 @@ fn record_wake_observation(
             vec![
                 LogField::instance_id(instance.id.as_str()),
                 LogField::generation(instance.generation.get()),
-                LogField::error_reason(source.to_string()),
+                LogField::error_reason(source),
             ],
         ));
     }
@@ -571,6 +610,7 @@ fn wake_error_reason(error: &WakeInstanceError) -> &'static str {
         WakeInstanceError::Render { .. } => "render",
         WakeInstanceError::SleepPolicy { .. } => "sleep_policy",
         WakeInstanceError::Materializer { .. } => "materializer",
+        WakeInstanceError::Projection { .. } => "projection",
     }
 }
 
@@ -639,7 +679,7 @@ impl WakeInstanceResult {
     }
 
     #[cfg(test)]
-    pub fn rendered_objects(&self) -> &[RenderedObjectRef] {
+    pub fn rendered_objects(&self) -> &[crate::materialization::RenderedObjectRef] {
         match self {
             Self::Completed { result } => &result.materialization.rendered_objects,
             Self::AlreadyRunning {
@@ -711,6 +751,7 @@ fn failure_message(error: &WakeInstanceError) -> String {
         WakeInstanceError::Materializer { source, .. } => {
             format!("materialization failed: {source}")
         }
+        WakeInstanceError::Projection { source, .. } => format!("projection failed: {source}"),
         WakeInstanceError::Store(error) => format!("store operation failed: {error}"),
         WakeInstanceError::NotFound => "instance not found".to_owned(),
         WakeInstanceError::GenerationConflict { expected, actual } => {
@@ -755,6 +796,7 @@ impl fmt::Display for WakeInstanceError {
             Self::Materializer { source, .. } => {
                 write!(f, "wake materializer failed: {source}")
             }
+            Self::Projection { source, .. } => write!(f, "wake projection failed: {source}"),
         }
     }
 }
@@ -766,6 +808,7 @@ impl Error for WakeInstanceError {
             Self::Render { source, .. } => Some(source),
             Self::SleepPolicy { source, .. } => Some(source),
             Self::Materializer { source, .. } => Some(source),
+            Self::Projection { source, .. } => Some(source),
             Self::NotFound
             | Self::GenerationConflict { .. }
             | Self::Unavailable { .. }

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
@@ -8,6 +11,10 @@ use control_plane::api::{
     },
     sidecar_grpc_service_with_store, StoreBackedSidecarApi, StoreBackedSidecarGrpcService,
     OPERATOR_UNARY_METHODS, SIDECAR_SERVICE_NAME,
+};
+use control_plane::projection::{
+    LiveObjectMetadata, ProjectionObjectInspection, ANNOTATION_MATERIALIZATION_ID,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
 };
 use control_plane::{
     AuthConfig, BackendEndpoint, BeginSleepRequest, BeginSleepResult, CallerRole, ControlPlaneAuth,
@@ -88,8 +95,10 @@ async fn report_idle_running_instance_transitions_to_draining() {
         DomainInstanceState::Running,
         7,
     ));
-    store.seed_materialization(ready_materialization("instance-running", 7));
+    let materialization = ready_materialization("instance-running", 7);
+    store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
     let service = sidecar_api(store.clone(), client.clone());
 
     let response = service
@@ -141,8 +150,10 @@ async fn report_idle_from_rendered_waking_generation_sleeps_current_running_inst
         DomainInstanceState::Running,
         8,
     ));
-    store.seed_materialization(ready_materialization("instance-rendered-generation", 8));
+    let materialization = ready_materialization("instance-rendered-generation", 8);
+    store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
     let service = sidecar_api(store.clone(), client.clone());
 
     let response = service
@@ -185,8 +196,10 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
         DomainInstanceState::Running,
         7,
     ));
-    store.seed_materialization(ready_materialization("instance-delete-retry", 7));
+    let materialization = ready_materialization("instance-delete-retry", 7);
+    store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::failing_deletes(1);
+    client.seed_materialization(&materialization);
     let service = sidecar_api(store.clone(), client.clone());
     let request = SidecarReportIdleRequest {
         instance_id: "instance-delete-retry".to_owned(),
@@ -218,6 +231,7 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
     );
 
     let retry_client = FakeKubernetesClient::default();
+    retry_client.seed_materialization(&materialization);
     let retry_service = sidecar_api(store.clone(), retry_client.clone());
     let response = retry_service
         .report_idle(tonic::Request::new(request))
@@ -243,6 +257,43 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
             "instance-delete-retry"
         )]
     );
+}
+
+#[tokio::test]
+async fn report_idle_unowned_live_ref_blocks_cleanup_without_delete() {
+    let store = Arc::new(FakeSidecarStore::default());
+    store.seed_instance(domain_instance(
+        "instance-unowned",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_materialization(ready_materialization("instance-unowned", 7));
+    let client = FakeKubernetesClient::default();
+    client.seed_unowned_object(object_ref(
+        "apps/v1",
+        "Deployment",
+        "apps",
+        "instance-unowned",
+    ));
+    let service = sidecar_api(store.clone(), client.clone());
+
+    let error = service
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            instance_id: "instance-unowned".to_owned(),
+            expected_generation: 7,
+            active_count: 0,
+        }))
+        .await
+        .expect_err("unowned Kubernetes ref blocks idle cleanup");
+
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("ownership conflict"));
+    assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
+    assert_eq!(store.instance().state, DomainInstanceState::Draining);
+    let materialization = store
+        .materialization()
+        .expect("materialization remains after failed cleanup");
+    assert_eq!(materialization.state, MaterializationState::Deleting);
 }
 
 #[tokio::test]
@@ -508,25 +559,27 @@ async fn native_grpc_sidecar_auth_accepts_valid_report_idle_credentials() {
         DomainInstanceState::Running,
         7,
     ));
-    store.seed_materialization(ready_materialization("instance-auth-valid-idle", 7));
+    let materialization = ready_materialization("instance-auth-valid-idle", 7);
+    store.seed_materialization(materialization.clone());
+    let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
     let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
 
-    let response =
-        authenticated_sidecar_service(store_for_service, FakeKubernetesClient::default())
-            .oneshot(with_authorization(
-                grpc_sidecar_report_idle_request(
-                    SidecarReportIdleRequest {
-                        instance_id: "instance-auth-valid-idle".to_owned(),
-                        expected_generation: 7,
-                        active_count: 0,
-                    },
-                    "application/grpc",
-                    Version::HTTP_2,
-                ),
-                "Bearer sidecar-token",
-            ))
-            .await
-            .expect("valid sidecar credentials dispatch report idle");
+    let response = authenticated_sidecar_service(store_for_service, client)
+        .oneshot(with_authorization(
+            grpc_sidecar_report_idle_request(
+                SidecarReportIdleRequest {
+                    instance_id: "instance-auth-valid-idle".to_owned(),
+                    expected_generation: 7,
+                    active_count: 0,
+                },
+                "application/grpc",
+                Version::HTTP_2,
+            ),
+            "Bearer sidecar-token",
+        ))
+        .await
+        .expect("valid sidecar credentials dispatch report idle");
     let headers = response.headers().clone();
     let collected = response
         .into_body()
@@ -664,6 +717,7 @@ enum FakeStoreError {
 struct FakeKubernetesClient {
     deleted_objects: Arc<Mutex<Vec<RenderedObjectRef>>>,
     failing_deletes: Arc<Mutex<usize>>,
+    live_objects: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
 }
 
 impl FakeKubernetesClient {
@@ -671,7 +725,36 @@ impl FakeKubernetesClient {
         Self {
             deleted_objects: Arc::new(Mutex::new(Vec::new())),
             failing_deletes: Arc::new(Mutex::new(count)),
+            live_objects: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    fn seed_materialization(&self, materialization: &MaterializationRecord) {
+        let mut live_objects = self
+            .live_objects
+            .lock()
+            .expect("fake kubernetes lock is available");
+        for object in &materialization.rendered_objects {
+            live_objects.insert(
+                object_key(object),
+                ProjectionObjectInspection::Present(owned_metadata(materialization)),
+            );
+        }
+    }
+
+    fn seed_unowned_object(&self, object: RenderedObjectRef) {
+        self.live_objects
+            .lock()
+            .expect("fake kubernetes lock is available")
+            .insert(
+                object_key(&object),
+                ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    deleting: false,
+                    finalizers: Vec::new(),
+                }),
+            );
     }
 
     fn deleted_objects(&self) -> Vec<RenderedObjectRef> {
@@ -707,6 +790,10 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
             }
             drop(failing_deletes);
 
+            self.live_objects
+                .lock()
+                .expect("fake kubernetes lock is available")
+                .remove(&object_key(object));
             self.deleted_objects
                 .lock()
                 .expect("fake kubernetes lock is available")
@@ -730,6 +817,21 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         Box::pin(async {
             BackendEndpoint::new("http://example")
                 .map_err(|error| control_plane::KubernetesClientError::new(error.to_string()))
+        })
+    }
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        Box::pin(async move {
+            Ok(self
+                .live_objects
+                .lock()
+                .expect("fake kubernetes lock is available")
+                .get(&object_key(object))
+                .cloned()
+                .unwrap_or(ProjectionObjectInspection::Missing))
         })
     }
 }
@@ -1138,5 +1240,37 @@ fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> Ren
         kind: kind.to_owned(),
         namespace: namespace.to_owned(),
         name: name.to_owned(),
+    }
+}
+
+fn object_key(object: &RenderedObjectRef) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        object.api_version, object.kind, object.namespace, object.name
+    )
+}
+
+fn owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata {
+    LiveObjectMetadata {
+        labels: BTreeMap::from([
+            (
+                LABEL_MANAGED_BY.to_owned(),
+                LABEL_MANAGED_BY_VALUE.to_owned(),
+            ),
+            (
+                "sleepypods.io/instance-id".to_owned(),
+                materialization.instance_id.as_str().to_owned(),
+            ),
+            (
+                "sleepypods.io/instance-generation".to_owned(),
+                materialization.instance_generation.to_string(),
+            ),
+        ]),
+        annotations: BTreeMap::from([(
+            ANNOTATION_MATERIALIZATION_ID.to_owned(),
+            materialization.id.as_str().to_owned(),
+        )]),
+        deleting: false,
+        finalizers: Vec::new(),
     }
 }

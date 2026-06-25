@@ -17,6 +17,7 @@ use crate::{
         rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
         KubernetesMaterializerClient,
     },
+    projection::{LiveObjectMetadata, ProjectionObjectInspection},
 };
 
 const DEFAULT_FIELD_MANAGER: &str = "sleepypods-control-plane";
@@ -185,6 +186,25 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
                     ),
                 )
                 .await?;
+            }
+        })
+    }
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        Box::pin(async move {
+            let api = self.dynamic_api(object)?;
+            match api.get(&object.name).await {
+                Ok(live) => Ok(ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: live.metadata.labels.unwrap_or_default(),
+                    annotations: live.metadata.annotations.unwrap_or_default(),
+                    deleting: live.metadata.deletion_timestamp.is_some(),
+                    finalizers: live.metadata.finalizers.unwrap_or_default(),
+                })),
+                Err(error) if is_not_found(&error) => Ok(ProjectionObjectInspection::Missing),
+                Err(error) => Err(kube_error(error)),
             }
         })
     }

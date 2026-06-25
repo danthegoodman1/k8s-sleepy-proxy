@@ -30,6 +30,10 @@ use control_plane::api::{
     },
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
+use control_plane::projection::{
+    LiveObjectMetadata, ProjectionObjectInspection, ANNOTATION_MATERIALIZATION_ID,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+};
 use control_plane::{
     AuthConfig, BackendEndpoint, BackendGeneration, CallerRole, ControlPlaneAuth,
     ControlPlaneStore, CreateInstanceResult, Generation, InstanceId, InstanceRecord,
@@ -156,6 +160,38 @@ fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> Ren
         kind: kind.to_owned(),
         namespace: namespace.to_owned(),
         name: name.to_owned(),
+    }
+}
+
+fn object_key(object: &RenderedObjectRef) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        object.api_version, object.kind, object.namespace, object.name
+    )
+}
+
+fn owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata {
+    LiveObjectMetadata {
+        labels: BTreeMap::from([
+            (
+                LABEL_MANAGED_BY.to_owned(),
+                LABEL_MANAGED_BY_VALUE.to_owned(),
+            ),
+            (
+                "sleepypods.io/instance-id".to_owned(),
+                materialization.instance_id.as_str().to_owned(),
+            ),
+            (
+                "sleepypods.io/instance-generation".to_owned(),
+                materialization.instance_generation.to_string(),
+            ),
+        ]),
+        annotations: BTreeMap::from([(
+            ANNOTATION_MATERIALIZATION_ID.to_owned(),
+            materialization.id.as_str().to_owned(),
+        )]),
+        deleting: false,
+        finalizers: Vec::new(),
     }
 }
 
@@ -340,8 +376,10 @@ async fn operator_delete_cleans_active_materialization_before_store_delete() {
         DomainInstanceState::Running,
         7,
     ));
-    store.seed_materialization(ready_materialization("instance-delete-active", 7));
+    let materialization = ready_materialization("instance-delete-active", 7);
+    store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
     let service = StoreBackedOperatorApi::new(
         store.clone(),
         operator_materializer(client.clone()),
@@ -448,8 +486,10 @@ async fn operator_delete_cleans_stale_generation_active_materialization_for_targ
         DomainInstanceState::Running,
         9,
     ));
-    store.seed_materialization(ready_materialization("instance-delete-stale-generation", 8));
+    let materialization = ready_materialization("instance-delete-stale-generation", 8);
+    store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
     let service = StoreBackedOperatorApi::new(
         store.clone(),
         operator_materializer(client.clone()),
@@ -494,8 +534,10 @@ async fn operator_delete_kubernetes_failure_preserves_store_state_for_retry() {
         DomainInstanceState::Running,
         5,
     ));
-    store.seed_materialization(ready_materialization("instance-delete-fails", 5));
+    let materialization = ready_materialization("instance-delete-fails", 5);
+    store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
     client.fail_delete(object_ref(
         "v1",
         "Service",
@@ -531,6 +573,43 @@ async fn operator_delete_kubernetes_failure_preserves_store_state_for_retry() {
 }
 
 #[tokio::test]
+async fn operator_delete_unowned_live_ref_blocks_cleanup_without_delete() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-unowned",
+        DomainInstanceState::Running,
+        5,
+    ));
+    let materialization = ready_materialization("instance-delete-unowned", 5);
+    store.seed_materialization(materialization);
+    let client = FakeKubernetesClient::default();
+    client.seed_unowned_object(object_ref(
+        "v1",
+        "Service",
+        "apps",
+        "instance-delete-unowned-svc",
+    ));
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let error = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "instance-delete-unowned".to_owned(),
+        }))
+        .await
+        .expect_err("unowned Kubernetes ref blocks delete cleanup");
+
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("ownership conflict"));
+    assert!(store.instance_exists("instance-delete-unowned"));
+    assert_eq!(store.delete_requests(), Vec::new());
+    assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
+}
+
+#[tokio::test]
 async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
     let store = Arc::new(FakeInstanceStore::default());
     store.seed_instance(domain_instance(
@@ -538,8 +617,10 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
         DomainInstanceState::Running,
         8,
     ));
-    store.seed_materialization(ready_materialization("instance-delete-retry", 8));
+    let materialization = ready_materialization("instance-delete-retry", 8);
+    store.seed_materialization(materialization.clone());
     let failing_client = FakeKubernetesClient::default();
+    failing_client.seed_materialization(&materialization);
     failing_client.fail_delete(object_ref(
         "v1",
         "Service",
@@ -559,6 +640,7 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
         .expect_err("first cleanup attempt fails");
 
     let retry_client = FakeKubernetesClient::default();
+    retry_client.seed_materialization(&materialization);
     let retry_service = StoreBackedOperatorApi::new(
         store.clone(),
         operator_materializer(retry_client.clone()),
@@ -581,6 +663,40 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
             object_ref("v1", "Service", "apps", "instance-delete-retry-svc"),
             object_ref("apps/v1", "Deployment", "apps", "instance-delete-retry"),
         ]
+    );
+}
+
+#[tokio::test]
+async fn reconcile_materialization_surfaces_inspect_failed_projection_observation() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let materialization = ready_materialization("instance-reconcile-inspect-fails", 8);
+    let materialization_id = materialization.id.as_str().to_owned();
+    store.seed_materialization(materialization.clone());
+    let client = FakeKubernetesClient::default();
+    client.fail_inspect();
+    let service = StoreBackedOperatorApi::new(store, operator_materializer(client), target());
+
+    let reconciled = service
+        .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            materialization_id,
+        }))
+        .await
+        .expect("reconcile materialization response surfaces inspect error")
+        .into_inner();
+
+    assert!(reconciled.found);
+    assert!(!reconciled.attempted);
+    assert_eq!(reconciled.state, "Ready");
+    assert_eq!(reconciled.projection_observations.len(), 1);
+    let observation = &reconciled.projection_observations[0];
+    assert_eq!(observation.state, "inspect_failed");
+    assert_eq!(observation.reason, "inspect_failed");
+    assert_eq!(
+        observation
+            .r#ref
+            .as_ref()
+            .map(|object| object.name.as_str()),
+        Some("instance-reconcile-inspect-fails-svc")
     );
 }
 
@@ -812,6 +928,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     assert_eq!(reconciled.materialization_id, reconcile_materialization_id);
     assert_eq!(reconciled.state, "Deleted");
     assert_eq!(reconciled.observed_refs.len(), 0);
+    assert_eq!(reconciled.projection_observations.len(), 0);
     let claim_owners = store.reconciliation_claim_owners();
     assert_eq!(claim_owners.len(), 1);
     assert_ne!(claim_owners[0], "operator-reconcile");
@@ -2567,14 +2684,51 @@ impl FakeInstanceStore {
 struct FakeKubernetesClient {
     deleted: Arc<Mutex<Vec<RenderedObjectRef>>>,
     fail_delete: Arc<Mutex<Option<RenderedObjectRef>>>,
+    fail_inspect: Arc<Mutex<bool>>,
+    live_objects: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
 }
 
 impl FakeKubernetesClient {
+    fn seed_materialization(&self, materialization: &MaterializationRecord) {
+        let mut live_objects = self
+            .live_objects
+            .lock()
+            .expect("fake client lock is available");
+        for object in &materialization.rendered_objects {
+            live_objects.insert(
+                object_key(object),
+                ProjectionObjectInspection::Present(owned_metadata(materialization)),
+            );
+        }
+    }
+
+    fn seed_unowned_object(&self, object: RenderedObjectRef) {
+        self.live_objects
+            .lock()
+            .expect("fake client lock is available")
+            .insert(
+                object_key(&object),
+                ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    deleting: false,
+                    finalizers: Vec::new(),
+                }),
+            );
+    }
+
     fn fail_delete(&self, object: RenderedObjectRef) {
         *self
             .fail_delete
             .lock()
             .expect("fake client lock is available") = Some(object);
+    }
+
+    fn fail_inspect(&self) {
+        *self
+            .fail_inspect
+            .lock()
+            .expect("fake client lock is available") = true;
     }
 
     fn deleted(&self) -> Vec<RenderedObjectRef> {
@@ -2598,10 +2752,6 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         object: &'a RenderedObjectRef,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            self.deleted
-                .lock()
-                .expect("fake client lock is available")
-                .push(object.clone());
             if self
                 .fail_delete
                 .lock()
@@ -2609,9 +2759,21 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .as_ref()
                 == Some(object)
             {
+                self.deleted
+                    .lock()
+                    .expect("fake client lock is available")
+                    .push(object.clone());
                 return Err(KubernetesClientError::new("delete failed"));
             }
 
+            self.live_objects
+                .lock()
+                .expect("fake client lock is available")
+                .remove(&object_key(object));
+            self.deleted
+                .lock()
+                .expect("fake client lock is available")
+                .push(object.clone());
             Ok(())
         })
     }
@@ -2632,6 +2794,28 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
             BackendEndpoint::new("http://example").map_err(|error| {
                 KubernetesClientError::new(format!("invalid backend endpoint: {error}"))
             })
+        })
+    }
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        Box::pin(async move {
+            if *self
+                .fail_inspect
+                .lock()
+                .expect("fake client lock is available")
+            {
+                return Err(KubernetesClientError::new("inspect failed"));
+            }
+            Ok(self
+                .live_objects
+                .lock()
+                .expect("fake client lock is available")
+                .get(&object_key(object))
+                .cloned()
+                .unwrap_or(ProjectionObjectInspection::Missing))
         })
     }
 }

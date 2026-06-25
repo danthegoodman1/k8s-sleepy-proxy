@@ -139,7 +139,7 @@ fn report_idle_error_response(
                 ),
             })
         }
-        ReportIdleError::Materializer { instance, source } => Err(Status::unavailable(format!(
+        ReportIdleError::Projection { instance, source } => Err(Status::unavailable(format!(
             "sleep cleanup failed for instance {}: {source}",
             instance.id.as_str()
         ))),

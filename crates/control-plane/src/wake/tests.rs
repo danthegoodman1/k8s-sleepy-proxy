@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use proxy_core::observability::{
     metrics::{RUNTIME_MATERIALIZATION_FAILURES_TOTAL_NAME, RUNTIME_WAKE_LATENCY_SECONDS_NAME},
@@ -29,10 +32,15 @@ use crate::{
         BackendEndpoint, BeginSleepRequest, BeginSleepResult, FinalizeSleepRequest,
         FinalizeSleepResult, LoadActiveMaterializationRequest, LoadReadyMaterializationRequest,
         MaterializationRecord, MaterializationState, RecordMaterializationRequest,
+        RenderedObjectRef,
     },
     materializer::{
         KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
         KubernetesMaterializer,
+    },
+    projection::{
+        LiveObjectMetadata, ProjectionObjectInspection, ANNOTATION_MATERIALIZATION_ID,
+        LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
@@ -118,6 +126,7 @@ struct FakeKubernetesState {
     fail_apply: Option<RenderedObjectRef>,
     fail_readiness: bool,
     first_apply_store_events: Option<Vec<StoreEvent>>,
+    live_objects: BTreeMap<String, ProjectionObjectInspection>,
 }
 
 impl Default for FakeKubernetesState {
@@ -132,6 +141,7 @@ impl Default for FakeKubernetesState {
             fail_apply: None,
             fail_readiness: false,
             first_apply_store_events: None,
+            live_objects: BTreeMap::new(),
         }
     }
 }
@@ -447,7 +457,7 @@ async fn first_apply_failure_after_exclusivity_acquire_releases_pending_key() {
     .await
     .expect_err("first Kubernetes apply failure fails wake");
 
-    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
     assert!(client.applied_objects().is_empty());
     assert!(client.deleted_objects().is_empty());
     assert!(client.readiness_calls().is_empty());
@@ -503,7 +513,7 @@ async fn first_apply_failure_after_exclusivity_acquire_releases_pending_key() {
                 expected: Generation::new(2),
                 next_state: InstanceState::Failed,
                 reason: StateTransitionReason::FailureReported(
-                    "materialization failed: failed to apply PersistentVolume /pv-acme-instance: apply failed".to_owned()
+                    "projection failed: projection apply rejected: failed to apply PersistentVolume /pv-acme-instance: apply failed".to_owned()
                 ),
             },
             StoreEvent::LoadActiveMaterialization {
@@ -512,6 +522,96 @@ async fn first_apply_failure_after_exclusivity_acquire_releases_pending_key() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn unowned_live_ref_blocks_wake_before_apply_and_keeps_pending_materialization() {
+    let instance = instance("instance-a", InstanceState::Cold, 1);
+    let store = FakeStore::new(instance, Some(workload_class()));
+    let client = FakeKubernetesClient::default();
+    client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-instance"));
+    let materializer = KubernetesMaterializer::new(client.clone());
+    let sink = InMemoryObservability::default();
+
+    let error = wake_instance_with_observability(
+        &store,
+        &materializer,
+        WakeInstanceRequest::new(
+            instance_id("instance-a"),
+            Generation::new(1),
+            target("cluster-a", "apps"),
+        ),
+        sink.recorder(),
+    )
+    .await
+    .expect_err("unowned live object blocks wake");
+
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
+    assert!(client.applied_objects().is_empty());
+    assert!(client.deleted_objects().is_empty());
+    assert!(client.pvc_bound_calls().is_empty());
+    assert!(client.readiness_calls().is_empty());
+
+    let failed = store.instance();
+    assert_eq!(failed.state, InstanceState::Failed);
+    assert_eq!(failed.generation, Generation::new(3));
+
+    let materialization = store
+        .materialization()
+        .expect("blocked wake keeps pending materialization for inspection");
+    assert_eq!(materialization.state, MaterializationState::Pending);
+    assert_eq!(
+        materialization.rendered_objects,
+        vec![
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
+        ]
+    );
+    assert_eq!(
+        store.events(),
+        vec![
+            StoreEvent::Cas {
+                expected: Generation::new(1),
+                next_state: InstanceState::Waking,
+                reason: StateTransitionReason::WakeRequested,
+            },
+            StoreEvent::RecordMaterialization {
+                instance_generation: Generation::new(2),
+                state: MaterializationState::Pending,
+                backend_generation: BackendGeneration::new(2),
+                rendered_objects: vec![
+                    object_ref("v1", "Service", "apps", "svc-acme-instance"),
+                    object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
+                ],
+            },
+            StoreEvent::Cas {
+                expected: Generation::new(2),
+                next_state: InstanceState::Failed,
+                reason: StateTransitionReason::FailureReported(
+                    "projection failed: projection ownership conflict across 1 object(s)"
+                        .to_owned(),
+                ),
+            },
+        ]
+    );
+
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Log(log)
+            if log.name() == EVENT_WAKE
+                && log.field_value(FIELD_INSTANCE_ID) == Some("instance-a")
+                && log.field_value(FIELD_ERROR_REASON) == Some("projection")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ObservabilityEvent::Log(log)
+            if log.name() == EVENT_MATERIALIZATION_FAILURE
+                && log.field_value(FIELD_INSTANCE_ID) == Some("instance-a")
+                && log
+                    .field_value(FIELD_ERROR_REASON)
+                    .is_some_and(|reason| reason.contains("ownership conflict"))
+    )));
 }
 
 #[tokio::test]
@@ -540,7 +640,7 @@ async fn apply_failure_after_objects_may_exist_keeps_exclusivity_key_held() {
     .await
     .expect_err("later Kubernetes apply failure fails wake");
 
-    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
     assert_eq!(client.applied_objects().len(), 2);
     assert_eq!(
         client.deleted_objects(),
@@ -1135,7 +1235,7 @@ async fn pvc_bound_failure_keeps_pending_stateful_refs_for_delete_or_retry() {
     .await
     .expect_err("pvc wait failure fails wake");
 
-    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
     assert_eq!(store.instance().state, InstanceState::Failed);
     assert_eq!(store.instance().generation, Generation::new(8));
     let rendered_objects = vec![
@@ -1576,14 +1676,16 @@ async fn draining_with_deleting_materialization_waits_for_sleep_cleanup() {
         Some(workload_class()),
     );
     let rendered_objects = vec![object_ref("apps/v1", "Deployment", "apps", "instance-a")];
-    store.set_materialization(materialization(
+    let deleting_materialization = materialization(
         "instance-a",
         12,
         target("cluster-a", "apps"),
         MaterializationState::Deleting,
         None,
-    ));
+    );
+    store.set_materialization(deleting_materialization.clone());
     let client = FakeKubernetesClient::default();
+    client.set_owned_live_object(&deleting_materialization, rendered_objects[0].clone());
     let materializer = KubernetesMaterializer::new(client.clone());
 
     let result = wake_instance(
@@ -2157,6 +2259,58 @@ impl FakeKubernetesClient {
             .expect("fake kubernetes lock not poisoned")
             .fail_readiness = true;
     }
+
+    fn set_unowned_live_object(&self, object: RenderedObjectRef) {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .live_objects
+            .insert(
+                object_key(&object),
+                ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    deleting: false,
+                    finalizers: Vec::new(),
+                }),
+            );
+    }
+
+    fn set_owned_live_object(
+        &self,
+        materialization: &MaterializationRecord,
+        object: RenderedObjectRef,
+    ) {
+        self.inner
+            .lock()
+            .expect("fake kubernetes lock not poisoned")
+            .live_objects
+            .insert(
+                object_key(&object),
+                ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    labels: BTreeMap::from([
+                        (
+                            LABEL_MANAGED_BY.to_owned(),
+                            LABEL_MANAGED_BY_VALUE.to_owned(),
+                        ),
+                        (
+                            "sleepypods.io/instance-id".to_owned(),
+                            materialization.instance_id.as_str().to_owned(),
+                        ),
+                        (
+                            "sleepypods.io/instance-generation".to_owned(),
+                            materialization.instance_generation.to_string(),
+                        ),
+                    ]),
+                    annotations: BTreeMap::from([(
+                        ANNOTATION_MATERIALIZATION_ID.to_owned(),
+                        materialization.id.as_str().to_owned(),
+                    )]),
+                    deleting: false,
+                    finalizers: Vec::new(),
+                }),
+            );
+    }
 }
 
 impl KubernetesMaterializerClient for FakeKubernetesClient {
@@ -2190,6 +2344,12 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 return Err(KubernetesClientError::new("apply failed"));
             }
             inner.applied_objects.push(object.clone());
+            inner.live_objects.insert(
+                object_key(&object_ref),
+                ProjectionObjectInspection::Present(LiveObjectMetadata::from_rendered_object(
+                    object,
+                )),
+            );
             Ok(())
         })
     }
@@ -2199,12 +2359,29 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         object: &'a RenderedObjectRef,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            self.inner
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("fake kubernetes lock not poisoned");
+            inner.live_objects.remove(&object_key(object));
+            inner.deleted_objects.push(object.clone());
+            Ok(())
+        })
+    }
+
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
+        Box::pin(async move {
+            Ok(self
+                .inner
                 .lock()
                 .expect("fake kubernetes lock not poisoned")
-                .deleted_objects
-                .push(object.clone());
-            Ok(())
+                .live_objects
+                .get(&object_key(object))
+                .cloned()
+                .unwrap_or(ProjectionObjectInspection::Missing))
         })
     }
 
@@ -2436,6 +2613,13 @@ fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> Ren
         namespace: namespace.to_owned(),
         name: name.to_owned(),
     }
+}
+
+fn object_key(object: &RenderedObjectRef) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        object.api_version, object.kind, object.namespace, object.name
+    )
 }
 
 fn ready_materialization(
