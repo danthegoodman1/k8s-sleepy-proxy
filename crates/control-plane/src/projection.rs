@@ -48,6 +48,19 @@ pub enum ProjectionObjectInspection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectionReadinessInspection {
+    NotObserved,
+    Ready(BackendEndpoint),
+    Unready { reason: String },
+}
+
+impl Default for ProjectionReadinessInspection {
+    fn default() -> Self {
+        Self::NotObserved
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveObjectMetadata {
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
@@ -408,6 +421,40 @@ where
                     source,
                 })?;
             observations.push(classify_object(object, inspection));
+        }
+        Ok(observations)
+    }
+
+    pub async fn inspect_with_readiness(
+        &self,
+        plan: &ProjectionPlan,
+    ) -> Result<Vec<ProjectionObservation>, ProjectionError> {
+        let mut observations = self.inspect(plan).await?;
+        match self
+            .materializer
+            .client()
+            .inspect_readiness(&plan.object_refs())
+            .await
+        {
+            Ok(ProjectionReadinessInspection::NotObserved) => {}
+            Ok(ProjectionReadinessInspection::Ready(backend)) => {
+                observations.push(ProjectionObservation::ready(
+                    readiness_observation_ref(plan),
+                    &backend,
+                ));
+            }
+            Ok(ProjectionReadinessInspection::Unready { reason }) => {
+                observations.push(ProjectionObservation::unready(
+                    readiness_observation_ref(plan),
+                    reason,
+                ));
+            }
+            Err(_) => {
+                observations.push(ProjectionObservation::unready(
+                    readiness_observation_ref(plan),
+                    "readiness_inspect_failed",
+                ));
+            }
         }
         Ok(observations)
     }
@@ -1050,9 +1097,73 @@ mod tests {
         assert!(client.applied_objects().is_empty());
     }
 
+    #[tokio::test]
+    async fn projection_inspect_with_readiness_appends_ready_observation() {
+        let materialization = materialization_record();
+        let plan =
+            ProjectionPlan::from_manifest(&materialization, &manifest()).expect("projection plan");
+        let live = LiveObjectMetadata::from_rendered_object(
+            &plan.manifest().expect("manifest").objects[0].object,
+        );
+        let backend =
+            BackendEndpoint::new("http://svc.apps.svc.cluster.local:80").expect("backend endpoint");
+        let client = FakeProjectionClient::new(ProjectionObjectInspection::Present(live))
+            .with_readiness(ProjectionReadinessInspection::Ready(backend.clone()));
+        let materializer = KubernetesMaterializer::new(client);
+
+        let metadata_only = ProjectionReconciler::new(&materializer)
+            .inspect(&plan)
+            .await
+            .expect("metadata inspection succeeds");
+        let with_readiness = ProjectionReconciler::new(&materializer)
+            .inspect_with_readiness(&plan)
+            .await
+            .expect("readiness inspection succeeds");
+
+        assert_eq!(metadata_only.len(), plan.object_plans().len());
+        assert_eq!(with_readiness.len(), plan.object_plans().len() + 1);
+        let observation = with_readiness.last().expect("readiness observation");
+        assert_eq!(observation.state, ProjectionObservationState::Ready);
+        assert_eq!(
+            observation.object_ref,
+            readiness_observation_ref(&plan),
+            "readiness observation is anchored to the Service ref"
+        );
+        assert_eq!(observation.backend_uri.as_deref(), Some(backend.uri()));
+    }
+
+    #[tokio::test]
+    async fn projection_inspect_with_readiness_appends_bounded_unready_observation() {
+        let materialization = materialization_record();
+        let plan =
+            ProjectionPlan::from_manifest(&materialization, &manifest()).expect("projection plan");
+        let live = LiveObjectMetadata::from_rendered_object(
+            &plan.manifest().expect("manifest").objects[0].object,
+        );
+        let client = FakeProjectionClient::new(ProjectionObjectInspection::Present(live))
+            .with_readiness(ProjectionReadinessInspection::Unready {
+                reason: "x".repeat(MAX_DETAIL_LEN + 32),
+            });
+        let materializer = KubernetesMaterializer::new(client);
+
+        let observations = ProjectionReconciler::new(&materializer)
+            .inspect_with_readiness(&plan)
+            .await
+            .expect("readiness inspection succeeds");
+
+        let observation = observations.last().expect("readiness observation");
+        assert_eq!(observation.state, ProjectionObservationState::Unready);
+        assert_eq!(
+            observation.reason.as_ref().expect("unready reason").len(),
+            MAX_DETAIL_LEN
+        );
+        assert_eq!(observation.backend_uri, None);
+    }
+
     #[derive(Clone)]
     struct FakeProjectionClient {
         inspection: ProjectionObjectInspection,
+        readiness: ProjectionReadinessInspection,
         applied_objects: Arc<Mutex<Vec<RenderedObjectRef>>>,
     }
 
@@ -1060,8 +1171,14 @@ mod tests {
         fn new(inspection: ProjectionObjectInspection) -> Self {
             Self {
                 inspection,
+                readiness: ProjectionReadinessInspection::NotObserved,
                 applied_objects: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_readiness(mut self, readiness: ProjectionReadinessInspection) -> Self {
+            self.readiness = readiness;
+            self
         }
 
         fn applied_objects(&self) -> Vec<RenderedObjectRef> {
@@ -1118,6 +1235,14 @@ mod tests {
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>>
         {
             Box::pin(async move { Ok(self.inspection.clone()) })
+        }
+
+        fn inspect_readiness<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>>
+        {
+            Box::pin(async move { Ok(self.readiness.clone()) })
         }
     }
 

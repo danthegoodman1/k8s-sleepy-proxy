@@ -31,8 +31,8 @@ use control_plane::api::{
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
 use control_plane::projection::{
-    LiveObjectMetadata, ProjectionObjectInspection, ANNOTATION_MATERIALIZATION_ID,
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LiveObjectMetadata, ProjectionObjectInspection, ProjectionReadinessInspection,
+    ANNOTATION_MATERIALIZATION_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
 };
 use control_plane::{
     AuthConfig, BackendEndpoint, BackendGeneration, CallerRole, ControlPlaneAuth,
@@ -698,6 +698,163 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
             .as_ref()
             .map(|object| object.name.as_str()),
         Some("instance-reconcile-inspect-fails-svc")
+    );
+}
+
+#[tokio::test]
+async fn reconcile_materialization_reports_ready_readiness_without_repairing_ready_row() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let materialization = ready_materialization("instance-reconcile-ready-observed", 8);
+    let materialization_id = materialization.id.as_str().to_owned();
+    store.seed_materialization(materialization.clone());
+    let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
+    client.set_readiness(ProjectionReadinessInspection::Ready(
+        BackendEndpoint::new(
+            "http://instance-reconcile-ready-observed-svc.apps.svc.cluster.local:80",
+        )
+        .expect("backend endpoint"),
+    ));
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let reconciled = service
+        .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            materialization_id,
+        }))
+        .await
+        .expect("reconcile materialization response includes readiness observation")
+        .into_inner();
+
+    assert!(reconciled.found);
+    assert!(!reconciled.attempted);
+    assert_eq!(reconciled.state, "Ready");
+    assert_eq!(reconciled.projection_observations.len(), 3);
+    let observation = reconciled
+        .projection_observations
+        .iter()
+        .find(|observation| observation.state == "ready")
+        .expect("ready projection observation returned");
+    assert_eq!(
+        observation
+            .r#ref
+            .as_ref()
+            .map(|object| object.kind.as_str()),
+        Some("Service")
+    );
+    assert_eq!(
+        observation.backend_uri,
+        "http://instance-reconcile-ready-observed-svc.apps.svc.cluster.local:80"
+    );
+    assert!(client.deleted().is_empty());
+    assert_eq!(
+        store
+            .materialization()
+            .expect("materialization remains present")
+            .state,
+        MaterializationState::Ready
+    );
+}
+
+#[tokio::test]
+async fn reconcile_materialization_reports_unready_readiness_without_repairing_ready_row() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let materialization = ready_materialization("instance-reconcile-unready-observed", 8);
+    let materialization_id = materialization.id.as_str().to_owned();
+    store.seed_materialization(materialization.clone());
+    let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
+    client.set_readiness(ProjectionReadinessInspection::Unready {
+        reason: "no_ready_endpoints".to_owned(),
+    });
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let reconciled = service
+        .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            materialization_id,
+        }))
+        .await
+        .expect("reconcile materialization response includes unready observation")
+        .into_inner();
+
+    assert!(reconciled.found);
+    assert!(!reconciled.attempted);
+    assert_eq!(reconciled.state, "Ready");
+    let observation = reconciled
+        .projection_observations
+        .iter()
+        .find(|observation| observation.state == "unready")
+        .expect("unready projection observation returned");
+    assert_eq!(observation.reason, "no_ready_endpoints");
+    assert!(observation.backend_uri.is_empty());
+    assert!(client.deleted().is_empty());
+    assert_eq!(
+        store
+            .materialization()
+            .expect("materialization remains present")
+            .state,
+        MaterializationState::Ready
+    );
+}
+
+#[tokio::test]
+async fn reconcile_materialization_reports_ready_metadata_drift_and_finalizers_without_repair() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let materialization = ready_materialization("instance-reconcile-ready-drift", 8);
+    let materialization_id = materialization.id.as_str().to_owned();
+    store.seed_materialization(materialization.clone());
+    let client = FakeKubernetesClient::default();
+    client.seed_materialization(&materialization);
+    client.seed_unowned_object(materialization.rendered_objects[0].clone());
+    client.seed_deleting_owned_object(
+        &materialization,
+        materialization.rendered_objects[1].clone(),
+        vec!["example.com/cleanup".to_owned()],
+    );
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(client.clone()),
+        target(),
+    );
+
+    let reconciled = service
+        .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            materialization_id,
+        }))
+        .await
+        .expect("reconcile materialization reports Ready metadata drift")
+        .into_inner();
+
+    assert!(reconciled.found);
+    assert!(!reconciled.attempted);
+    assert_eq!(reconciled.state, "Ready");
+    assert_eq!(reconciled.projection_observations.len(), 2);
+    let unowned = reconciled
+        .projection_observations
+        .iter()
+        .find(|observation| observation.state == "present_unowned")
+        .expect("unowned replacement is reported");
+    assert_eq!(unowned.reason, "managed_by_mismatch");
+    let deleting = reconciled
+        .projection_observations
+        .iter()
+        .find(|observation| observation.state == "deleting_owned")
+        .expect("deleting owned object is reported");
+    assert_eq!(deleting.finalizers, vec!["example.com/cleanup"]);
+    assert!(client.deleted().is_empty());
+    assert_eq!(
+        store
+            .materialization()
+            .expect("materialization remains present")
+            .state,
+        MaterializationState::Ready
     );
 }
 
@@ -2786,6 +2943,7 @@ struct FakeKubernetesClient {
     deleted: Arc<Mutex<Vec<RenderedObjectRef>>>,
     fail_delete: Arc<Mutex<Option<RenderedObjectRef>>>,
     fail_inspect: Arc<Mutex<bool>>,
+    readiness: Arc<Mutex<ProjectionReadinessInspection>>,
     live_objects: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
 }
 
@@ -2818,6 +2976,23 @@ impl FakeKubernetesClient {
             );
     }
 
+    fn seed_deleting_owned_object(
+        &self,
+        materialization: &MaterializationRecord,
+        object: RenderedObjectRef,
+        finalizers: Vec<String>,
+    ) {
+        self.live_objects
+            .lock()
+            .expect("fake client lock is available")
+            .insert(
+                object_key(&object),
+                ProjectionObjectInspection::Present(
+                    owned_metadata(materialization).deleting(finalizers),
+                ),
+            );
+    }
+
     fn fail_delete(&self, object: RenderedObjectRef) {
         *self
             .fail_delete
@@ -2830,6 +3005,13 @@ impl FakeKubernetesClient {
             .fail_inspect
             .lock()
             .expect("fake client lock is available") = true;
+    }
+
+    fn set_readiness(&self, readiness: ProjectionReadinessInspection) {
+        *self
+            .readiness
+            .lock()
+            .expect("fake client lock is available") = readiness;
     }
 
     fn deleted(&self) -> Vec<RenderedObjectRef> {
@@ -2917,6 +3099,19 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .get(&object_key(object))
                 .cloned()
                 .unwrap_or(ProjectionObjectInspection::Missing))
+        })
+    }
+
+    fn inspect_readiness<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>> {
+        Box::pin(async move {
+            Ok(self
+                .readiness
+                .lock()
+                .expect("fake client lock is available")
+                .clone())
         })
     }
 }

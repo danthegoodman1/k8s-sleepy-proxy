@@ -14,7 +14,7 @@ use crate::{
         ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
     },
     materialization::{BackendEndpoint, RenderedObjectRef},
-    projection::ProjectionObjectInspection,
+    projection::{ProjectionObjectInspection, ProjectionReadinessInspection},
     retry::RetryPolicy,
 };
 
@@ -53,6 +53,14 @@ pub trait KubernetesMaterializerClient: Send + Sync {
                 "Kubernetes object inspection is not implemented by this client",
             ))
         })
+    }
+
+    fn inspect_readiness<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>> {
+        let _ = objects;
+        Box::pin(async { Ok(ProjectionReadinessInspection::NotObserved) })
     }
 }
 
@@ -430,6 +438,22 @@ where
                 .await
         })
     }
+
+    fn inspect_readiness<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>> {
+        let inner = &self.inner;
+        let policy = self.policy;
+        Box::pin(async move {
+            policy
+                .retry_if(
+                    || inner.inspect_readiness(objects),
+                    KubernetesClientError::is_retryable,
+                )
+                .await
+        })
+    }
 }
 
 pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
@@ -776,6 +800,7 @@ mod tests {
             ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
             VolumeTemplate, WorkloadKind, WorkloadTemplate,
         },
+        projection::ProjectionReadinessInspection,
         sleep_policy::ResolvedSleepPolicy,
         workload::WorkloadClassVersionRef,
     };
@@ -798,6 +823,7 @@ mod tests {
         applied_objects: Vec<KubernetesObject>,
         queued_failures: VecDeque<(FakeOperation, KubernetesClientError)>,
         readiness_backend: Option<BackendEndpoint>,
+        readiness_inspection: Option<ProjectionReadinessInspection>,
         fail_pvc_wait: Option<(String, String)>,
         fail_delete: Option<RenderedObjectRef>,
         fail_apply: Option<RenderedObjectRef>,
@@ -809,6 +835,7 @@ mod tests {
         Apply(RenderedObjectRef),
         WaitPvcBound { namespace: String, name: String },
         WaitReadiness(Vec<RenderedObjectRef>),
+        InspectReadiness(Vec<RenderedObjectRef>),
         Delete(RenderedObjectRef),
     }
 
@@ -966,6 +993,40 @@ mod tests {
                 FakeOperation::WaitReadiness(refs),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn retrying_materializer_client_preserves_readiness_inspection() {
+        let refs = vec![
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
+        ];
+        let cases = [
+            ProjectionReadinessInspection::Ready(backend_endpoint(
+                "http://svc-acme-instance.apps.svc.cluster.local:80",
+            )),
+            ProjectionReadinessInspection::Unready {
+                reason: "no_ready_endpoints".to_owned(),
+            },
+            ProjectionReadinessInspection::NotObserved,
+        ];
+
+        for expected in cases {
+            let client = FakeKubernetesClient::default();
+            client.set_readiness_inspection(expected.clone());
+            let retrying = retrying_client(client.clone());
+
+            let observed = retrying
+                .inspect_readiness(&refs)
+                .await
+                .expect("readiness inspection forwards through retrying client");
+
+            assert_eq!(observed, expected);
+            assert_eq!(
+                client.operations(),
+                vec![FakeOperation::InspectReadiness(refs.clone())]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1687,6 +1748,28 @@ mod tests {
                 }
             })
         }
+
+        fn inspect_readiness<'a>(
+            &'a self,
+            objects: &'a [RenderedObjectRef],
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>>
+        {
+            let objects = objects.to_vec();
+            let client = self.clone();
+            Box::pin(async move {
+                let mut inner = client.inner.lock().expect("fake client lock not poisoned");
+                let operation = FakeOperation::InspectReadiness(objects);
+                inner.operations.push(operation.clone());
+                if let Some(error) = take_queued_failure(&mut inner, &operation) {
+                    return Err(error);
+                }
+
+                Ok(inner
+                    .readiness_inspection
+                    .clone()
+                    .unwrap_or(ProjectionReadinessInspection::NotObserved))
+            })
+        }
     }
 
     impl FakeKubernetesClient {
@@ -1732,6 +1815,13 @@ mod tests {
                 .lock()
                 .expect("fake client lock not poisoned")
                 .readiness_backend = Some(backend);
+        }
+
+        fn set_readiness_inspection(&self, inspection: ProjectionReadinessInspection) {
+            self.inner
+                .lock()
+                .expect("fake client lock not poisoned")
+                .readiness_inspection = Some(inspection);
         }
 
         fn fail_readiness(&self) {

@@ -17,7 +17,7 @@ use crate::{
         rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
         KubernetesMaterializerClient,
     },
-    projection::{LiveObjectMetadata, ProjectionObjectInspection},
+    projection::{LiveObjectMetadata, ProjectionObjectInspection, ProjectionReadinessInspection},
 };
 
 const DEFAULT_FIELD_MANAGER: &str = "sleepypods-control-plane";
@@ -208,6 +208,39 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
             }
         })
     }
+
+    fn inspect_readiness<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>> {
+        Box::pin(async move {
+            let service_ref = match rendered_service_ref(objects) {
+                Ok(service_ref) => service_ref,
+                Err(_) => return Ok(ProjectionReadinessInspection::NotObserved),
+            };
+            let services: Api<Service> =
+                Api::namespaced(self.client.clone(), &service_ref.namespace);
+            let service = match services.get(&service_ref.name).await {
+                Ok(service) => service,
+                Err(error) if is_not_found(&error) => {
+                    return Ok(ProjectionReadinessInspection::Unready {
+                        reason: "service_missing".to_owned(),
+                    });
+                }
+                Err(error) => return Err(kube_error(error)),
+            };
+
+            let endpoint_slices: Api<EndpointSlice> =
+                Api::namespaced(self.client.clone(), &service_ref.namespace);
+            let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
+            let slices = endpoint_slices
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map_err(kube_error)?;
+
+            readiness_inspection_for_service(&service, &slices.items, &self.config)
+        })
+    }
 }
 
 impl Default for KubeMaterializerClientConfig {
@@ -369,6 +402,28 @@ fn endpoint_slice_has_ready_endpoint(slice: &EndpointSlice) -> bool {
     })
 }
 
+fn readiness_inspection_for_service(
+    service: &Service,
+    slices: &[EndpointSlice],
+    config: &KubeMaterializerClientConfig,
+) -> KubernetesClientResult<ProjectionReadinessInspection> {
+    let backend = match backend_endpoint_for_service(service, config) {
+        Ok(backend) => backend,
+        Err(_) => {
+            return Ok(ProjectionReadinessInspection::Unready {
+                reason: "backend_endpoint_invalid".to_owned(),
+            });
+        }
+    };
+    if slices.iter().any(endpoint_slice_has_ready_endpoint) {
+        Ok(ProjectionReadinessInspection::Ready(backend))
+    } else {
+        Ok(ProjectionReadinessInspection::Unready {
+            reason: "no_ready_endpoints".to_owned(),
+        })
+    }
+}
+
 fn is_valid_uri_scheme(scheme: &str) -> bool {
     let mut chars = scheme.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
@@ -467,12 +522,15 @@ mod tests {
     };
     use kube::{core::Status, Error as KubeError};
 
-    use crate::materialization::RenderedObjectRef;
+    use crate::{
+        materialization::{BackendEndpoint, RenderedObjectRef},
+        projection::ProjectionReadinessInspection,
+    };
 
     use super::{
         api_resource_for_ref, backend_endpoint_for_service, endpoint_slice_has_ready_endpoint,
-        is_not_found, is_valid_uri_scheme, kube_error, rendered_service_ref,
-        KubeMaterializerClientConfig,
+        is_not_found, is_valid_uri_scheme, kube_error, readiness_inspection_for_service,
+        rendered_service_ref, KubeMaterializerClientConfig,
     };
 
     #[test]
@@ -584,6 +642,61 @@ mod tests {
         assert!(!endpoint_slice_has_ready_endpoint(&endpoint_slice([Some(
             false
         )])));
+    }
+
+    #[test]
+    fn readiness_inspection_reports_ready_endpoint_without_polling() {
+        let service = service("api", "apps", [80]);
+        let config = KubeMaterializerClientConfig::default();
+
+        let inspection =
+            readiness_inspection_for_service(&service, &[endpoint_slice([Some(true)])], &config)
+                .expect("readiness inspection succeeds");
+
+        assert_eq!(
+            inspection,
+            ProjectionReadinessInspection::Ready(
+                BackendEndpoint::new("http://api.apps.svc.cluster.local:80")
+                    .expect("backend endpoint")
+            )
+        );
+    }
+
+    #[test]
+    fn readiness_inspection_reports_absent_ready_endpoints() {
+        let service = service("api", "apps", [80]);
+        let config = KubeMaterializerClientConfig::default();
+
+        let inspection = readiness_inspection_for_service(
+            &service,
+            &[endpoint_slice([Some(false)]), endpoint_slice([])],
+            &config,
+        )
+        .expect("readiness inspection succeeds");
+
+        assert_eq!(
+            inspection,
+            ProjectionReadinessInspection::Unready {
+                reason: "no_ready_endpoints".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_inspection_reports_invalid_service_backend_as_unready() {
+        let service = service("api", "apps", [0]);
+        let config = KubeMaterializerClientConfig::default();
+
+        let inspection =
+            readiness_inspection_for_service(&service, &[endpoint_slice([Some(true)])], &config)
+                .expect("readiness inspection remains report-only");
+
+        assert_eq!(
+            inspection,
+            ProjectionReadinessInspection::Unready {
+                reason: "backend_endpoint_invalid".to_owned()
+            }
+        );
     }
 
     #[test]

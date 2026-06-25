@@ -115,7 +115,7 @@ where
     ) -> Vec<pb::ProjectionObservation> {
         let plan = ProjectionPlan::from_recorded_refs(materialization);
         match ProjectionReconciler::new(&self.materializer)
-            .inspect(&plan)
+            .inspect_with_readiness(&plan)
             .await
         {
             Ok(observations) => observations
