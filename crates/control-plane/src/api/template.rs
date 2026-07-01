@@ -19,6 +19,11 @@ pub(super) fn manifest_template_from_proto(
             .into_iter()
             .map(volume_template_from_proto)
             .collect::<Result<_, _>>()?,
+        raw_objects: template
+            .raw_objects
+            .into_iter()
+            .map(raw_manifest_template_from_proto)
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -167,6 +172,31 @@ fn volume_source_template_from_proto(
                     .into_iter()
                     .map(|(key, value)| Ok((key, template_text_from_proto(value)?)))
                     .collect::<Result<_, Status>>()?,
+                controller_publish_secret_ref: csi_secret_ref_from_proto(
+                    csi.controller_publish_secret_ref,
+                    "template.volumes.source.csi.controller_publish_secret_ref.name",
+                    "template.volumes.source.csi.controller_publish_secret_ref.namespace",
+                )?,
+                node_stage_secret_ref: csi_secret_ref_from_proto(
+                    csi.node_stage_secret_ref,
+                    "template.volumes.source.csi.node_stage_secret_ref.name",
+                    "template.volumes.source.csi.node_stage_secret_ref.namespace",
+                )?,
+                node_publish_secret_ref: csi_secret_ref_from_proto(
+                    csi.node_publish_secret_ref,
+                    "template.volumes.source.csi.node_publish_secret_ref.name",
+                    "template.volumes.source.csi.node_publish_secret_ref.namespace",
+                )?,
+                controller_expand_secret_ref: csi_secret_ref_from_proto(
+                    csi.controller_expand_secret_ref,
+                    "template.volumes.source.csi.controller_expand_secret_ref.name",
+                    "template.volumes.source.csi.controller_expand_secret_ref.namespace",
+                )?,
+                node_expand_secret_ref: csi_secret_ref_from_proto(
+                    csi.node_expand_secret_ref,
+                    "template.volumes.source.csi.node_expand_secret_ref.name",
+                    "template.volumes.source.csi.node_expand_secret_ref.namespace",
+                )?,
             })
         }
         pb::persistent_volume_source_template::Kind::HostPath(host_path) => {
@@ -180,6 +210,30 @@ fn volume_source_template_from_proto(
             })
         }
     }
+}
+
+fn csi_secret_ref_from_proto(
+    ref_: Option<pb::CsiSecretRefTemplate>,
+    name_field: &'static str,
+    namespace_field: &'static str,
+) -> Result<Option<domain_manifest::CsiSecretRefTemplate>, Status> {
+    let Some(ref_) = ref_ else {
+        return Ok(None);
+    };
+    Ok(Some(domain_manifest::CsiSecretRefTemplate {
+        name: required_template_field(ref_.name, name_field).and_then(template_text_from_proto)?,
+        namespace: required_template_field(ref_.namespace, namespace_field)
+            .and_then(template_text_from_proto)?,
+    }))
+}
+
+fn raw_manifest_template_from_proto(
+    template: pb::RawKubernetesManifestTemplate,
+) -> Result<domain_manifest::RawKubernetesManifestTemplate, Status> {
+    Ok(domain_manifest::RawKubernetesManifestTemplate {
+        manifest: required_template_field(template.manifest, "template.raw_objects.manifest")
+            .and_then(template_text_from_proto)?,
+    })
 }
 
 pub(super) fn template_text_from_proto(
@@ -297,6 +351,11 @@ pub(super) fn manifest_template_to_proto(
             .into_iter()
             .map(volume_template_to_proto)
             .collect(),
+        raw_objects: template
+            .raw_objects
+            .into_iter()
+            .map(raw_manifest_template_to_proto)
+            .collect(),
     }
 }
 
@@ -402,6 +461,11 @@ fn volume_source_template_to_proto(
             fs_type,
             read_only,
             volume_attributes,
+            controller_publish_secret_ref,
+            node_stage_secret_ref,
+            node_publish_secret_ref,
+            controller_expand_secret_ref,
+            node_expand_secret_ref,
         } => pb::persistent_volume_source_template::Kind::Csi(pb::CsiVolumeSourceTemplate {
             driver: Some(template_text_to_proto(driver)),
             volume_handle: Some(template_text_to_proto(volume_handle)),
@@ -411,6 +475,12 @@ fn volume_source_template_to_proto(
                 .into_iter()
                 .map(|(key, value)| (key, template_text_to_proto(value)))
                 .collect(),
+            controller_publish_secret_ref: controller_publish_secret_ref
+                .map(csi_secret_ref_to_proto),
+            node_stage_secret_ref: node_stage_secret_ref.map(csi_secret_ref_to_proto),
+            node_publish_secret_ref: node_publish_secret_ref.map(csi_secret_ref_to_proto),
+            controller_expand_secret_ref: controller_expand_secret_ref.map(csi_secret_ref_to_proto),
+            node_expand_secret_ref: node_expand_secret_ref.map(csi_secret_ref_to_proto),
         }),
         domain_manifest::PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
             pb::persistent_volume_source_template::Kind::HostPath(
@@ -423,6 +493,23 @@ fn volume_source_template_to_proto(
     };
 
     pb::PersistentVolumeSourceTemplate { kind: Some(kind) }
+}
+
+fn csi_secret_ref_to_proto(
+    ref_: domain_manifest::CsiSecretRefTemplate,
+) -> pb::CsiSecretRefTemplate {
+    pb::CsiSecretRefTemplate {
+        name: Some(template_text_to_proto(ref_.name)),
+        namespace: Some(template_text_to_proto(ref_.namespace)),
+    }
+}
+
+fn raw_manifest_template_to_proto(
+    template: domain_manifest::RawKubernetesManifestTemplate,
+) -> pb::RawKubernetesManifestTemplate {
+    pb::RawKubernetesManifestTemplate {
+        manifest: Some(template_text_to_proto(template.manifest)),
+    }
 }
 
 pub(super) fn template_text_to_proto(text: domain_manifest::TemplateText) -> pb::TemplateText {

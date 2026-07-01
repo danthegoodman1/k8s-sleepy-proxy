@@ -12,21 +12,22 @@ use control_plane::api::{
         operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
         persistent_volume_source_template, route_identity, template_text_part,
         ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
-        CreateWorkloadClassVersionRequest, CsiVolumeSourceTemplate, DeleteHttp01ChallengeRequest,
-        DeleteHttp01ChallengeResponse, DeleteInstanceRequest, DeleteInstanceResponse,
-        DeleteRouteBindingRequest, DeleteRouteBindingResponse, EnvVarTemplate,
-        ExpireHttp01ChallengesRequest, ForceDeleteMaterializationRequest,
+        CreateWorkloadClassVersionRequest, CsiSecretRefTemplate, CsiVolumeSourceTemplate,
+        DeleteHttp01ChallengeRequest, DeleteHttp01ChallengeResponse, DeleteInstanceRequest,
+        DeleteInstanceResponse, DeleteRouteBindingRequest, DeleteRouteBindingResponse,
+        EnvVarTemplate, ExpireHttp01ChallengesRequest, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, GetInstanceRequest, GetRouteBindingRequest,
         GetWorkloadClassVersionRequest, HostPathVolumeSourceTemplate, Http01Challenge,
         Http01ChallengeKey, HttpRouteIdentity, IdleTimeoutOverridePolicy, Instance, InstanceState,
         ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
         PersistentVolumeSourceTemplate, ProtocolRoute, PutHttp01ChallengeRequest,
-        ReconcileMaterializationRequest, ReconcileMaterializationResponse,
-        ResolveHttp01ChallengeRequest, ResolveHttp01ChallengeResponse, RouteBinding, RouteHost,
-        RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-        SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersion,
-        WorkloadClassVersionRef, WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy,
-        WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+        RawKubernetesManifestTemplate, ReconcileMaterializationRequest,
+        ReconcileMaterializationResponse, ResolveHttp01ChallengeRequest,
+        ResolveHttp01ChallengeResponse, RouteBinding, RouteHost, RouteHostKind, RouteIdentity,
+        ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText,
+        TemplateTextPart, VolumeTemplate, WorkloadClassVersion, WorkloadClassVersionRef,
+        WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+        WorkloadValueFieldRule, WorkloadValueSchema,
     },
     OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
 };
@@ -1282,6 +1283,116 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
 }
 
 #[tokio::test]
+async fn store_backed_workload_class_api_round_trips_csi_secret_refs() {
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let template = stateful_manifest_template_proto();
+
+    let created = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-csi-secret-ref-class".to_owned(),
+            class_id: "csi-secret-ref-class".to_owned(),
+            version: 1,
+            default_values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template.clone()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
+        }))
+        .await
+        .expect("create workload class with CSI secret ref template succeeds")
+        .into_inner();
+
+    assert_eq!(created.template, Some(template.clone()));
+
+    let loaded = service
+        .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "csi-secret-ref-class".to_owned(),
+                version: 1,
+            }),
+        }))
+        .await
+        .expect("get workload class with CSI secret ref template succeeds")
+        .into_inner();
+
+    assert_eq!(loaded, created);
+    let source = loaded.template.as_ref().expect("template returned").volumes[0]
+        .source
+        .as_ref()
+        .and_then(|source| source.kind.as_ref())
+        .expect("volume source returned");
+    let persistent_volume_source_template::Kind::Csi(csi) = source else {
+        panic!("expected CSI source");
+    };
+    assert_eq!(
+        csi.node_publish_secret_ref
+            .as_ref()
+            .and_then(|ref_| ref_.namespace.as_ref()),
+        Some(&literal_text("storage-secrets"))
+    );
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_round_trips_raw_manifest_templates() {
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let mut template = stateful_manifest_template_proto();
+    template.raw_objects = vec![RawKubernetesManifestTemplate {
+        manifest: Some(TemplateText {
+            parts: vec![
+                TemplateTextPart {
+                    kind: Some(template_text_part::Kind::Literal(
+                        "apiVersion: v1\nkind: Service\nmetadata:\n  name: raw-".to_owned(),
+                    )),
+                },
+                TemplateTextPart {
+                    kind: Some(template_text_part::Kind::InstanceValue("tenant".to_owned())),
+                },
+            ],
+        }),
+    }];
+
+    let created = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-raw-manifest-class".to_owned(),
+            class_id: "raw-manifest-class".to_owned(),
+            version: 1,
+            default_values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template.clone()),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
+        }))
+        .await
+        .expect("create workload class with raw manifest template succeeds")
+        .into_inner();
+
+    assert_eq!(created.template, Some(template.clone()));
+
+    let loaded = service
+        .get_workload_class_version(tonic::Request::new(GetWorkloadClassVersionRequest {
+            reference: Some(WorkloadClassVersionRef {
+                class_id: "raw-manifest-class".to_owned(),
+                version: 1,
+            }),
+        }))
+        .await
+        .expect("get workload class with raw manifest template succeeds")
+        .into_inner();
+
+    assert_eq!(loaded, created);
+    assert_eq!(
+        loaded
+            .template
+            .as_ref()
+            .expect("template returned")
+            .raw_objects,
+        template.raw_objects
+    );
+}
+
+#[tokio::test]
 async fn store_backed_workload_class_api_round_trips_exclusivity_keys() {
     let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
     let key = WorkloadExclusivityKey {
@@ -1495,6 +1606,71 @@ async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
 
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(error.message().contains("template text parts"));
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_rejects_incomplete_csi_secret_ref() {
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let mut template = stateful_manifest_template_proto();
+    let source = template.volumes[0]
+        .source
+        .as_mut()
+        .and_then(|source| source.kind.as_mut())
+        .expect("CSI source exists");
+    let persistent_volume_source_template::Kind::Csi(csi) = source else {
+        panic!("expected CSI source");
+    };
+    csi.node_publish_secret_ref = Some(CsiSecretRefTemplate {
+        name: None,
+        namespace: Some(literal_text("storage-secrets")),
+    });
+
+    let error = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-incomplete-csi-secret-ref-class".to_owned(),
+            class_id: "incomplete-csi-secret-ref-class".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
+        }))
+        .await
+        .expect_err("incomplete CSI secret ref is rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error
+        .message()
+        .contains("template.volumes.source.csi.node_publish_secret_ref.name is required"));
+}
+
+#[tokio::test]
+async fn store_backed_workload_class_api_rejects_incomplete_raw_manifest_template() {
+    let service = store_operator_api(Arc::new(FakeInstanceStore::default()));
+    let mut template = stateful_manifest_template_proto();
+    template.raw_objects = vec![RawKubernetesManifestTemplate { manifest: None }];
+
+    let error = service
+        .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
+            idempotency_key: "create-incomplete-raw-manifest-class".to_owned(),
+            class_id: "incomplete-raw-manifest-class".to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: None,
+            template_generation: 1,
+            template: Some(template),
+            sleep_policy: Some(sleep_policy_proto()),
+            exclusivity_keys: vec![],
+        }))
+        .await
+        .expect_err("incomplete raw manifest template is rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error
+        .message()
+        .contains("template.raw_objects.manifest is required"));
 }
 
 #[tokio::test]
@@ -2656,10 +2832,19 @@ fn stateful_manifest_template_proto() -> ManifestTemplate {
                         read_only: false,
                         volume_attributes: [("tenant".to_owned(), instance_value_text("tenant"))]
                             .into(),
+                        controller_publish_secret_ref: None,
+                        node_stage_secret_ref: None,
+                        node_publish_secret_ref: Some(CsiSecretRefTemplate {
+                            name: Some(composed_text("secret-", "tenant")),
+                            namespace: Some(literal_text("storage-secrets")),
+                        }),
+                        controller_expand_secret_ref: None,
+                        node_expand_secret_ref: None,
                     },
                 )),
             }),
         }],
+        raw_objects: vec![],
     }
 }
 

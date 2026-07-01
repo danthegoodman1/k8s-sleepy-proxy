@@ -4,18 +4,21 @@ use serde_json::json;
 
 use super::{
     render_manifests, render_manifests_with_options, ApplyOrder, ContainerPortTemplate,
-    ContainerTemplate, CsiPersistentVolumeSource, EnvVar, EnvVarTemplate,
-    HostPathPersistentVolumeSource, KubernetesObject, ManifestRenderError, ManifestTemplate,
-    PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSource,
-    PersistentVolumeSourceTemplate, RenderManifestOptions, RenderManifestRequest,
-    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
-    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION,
+    ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference, EnvVar,
+    EnvVarTemplate, HostPathPersistentVolumeSource, KubernetesObject, ManifestRenderError,
+    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSource, PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate,
+    RenderManifestOptions, RenderManifestRequest, ServicePortTemplate, ServiceTemplate,
+    SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,
+    WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
+    LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
+use crate::materializer::{rendered_object_ref, rendered_object_refs};
 use crate::{
     auth::BearerToken,
     ids::{Generation, InstanceId, WorkloadClassId},
     instance::{InstanceRecord, InstanceState, InstanceValues},
+    materialization::RenderedObjectRef,
     sleep_policy::ResolvedSleepPolicy,
     workload::WorkloadClassVersionRef,
 };
@@ -65,6 +68,7 @@ fn manifest_templates_survive_json_round_trips() {
     for template in [
         deployment_template(),
         stateful_template(),
+        archil_static_csi_template(),
         host_path_stateful_template(),
     ] {
         let encoded = serde_json::to_value(&template).expect("manifest template encodes");
@@ -505,6 +509,11 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
             fs_type: Some("ext4".to_owned()),
             read_only: false,
             volume_attributes: BTreeMap::from([("tenant".to_owned(), "acme".to_owned())]),
+            controller_publish_secret_ref: None,
+            node_stage_secret_ref: None,
+            node_publish_secret_ref: None,
+            controller_expand_secret_ref: None,
+            node_expand_secret_ref: None,
         })
     );
 
@@ -559,6 +568,622 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     assert!(stateful_set.spec.template.spec.containers[1]
         .volume_mounts
         .is_empty());
+}
+
+#[test]
+fn renders_valid_raw_pv_pvc_service_and_stateful_set() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![
+        raw_manifest(
+            r#"
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: raw-pv-acme
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    namespace: apps
+    name: raw-pvc-acme
+  hostPath:
+    path: /tmp/raw-acme
+"#,
+        ),
+        raw_manifest(
+            r#"
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: raw-pvc-acme
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+  volumeName: raw-pv-acme
+"#,
+        ),
+        RawKubernetesManifestTemplate {
+            manifest: TemplateText::from_parts([
+                TemplateTextPart::literal(
+                    r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc-"#,
+                ),
+                TemplateTextPart::instance_value("tenant"),
+                TemplateTextPart::literal(
+                    r#"
+  finalizers:
+    - raw.example.com/protect
+spec:
+  type: ClusterIP
+  selector:
+    app: raw
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+"#,
+                ),
+            ]),
+        },
+        raw_manifest(
+            r#"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raw-db-acme
+spec:
+  podManagementPolicy: Parallel
+  serviceName: raw-svc-acme
+  selector:
+    matchLabels:
+      app: raw
+  template:
+    metadata:
+      name: raw-pod-template
+      labels:
+        app: raw
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+"#,
+        ),
+    ];
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("raw objects render");
+
+    assert_eq!(
+        rendered
+            .objects
+            .iter()
+            .map(|object| (object.apply_order, rendered_object_ref(&object.object)))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ApplyOrder::PersistentVolume,
+                object_ref("v1", "PersistentVolume", "", "raw-pv-acme")
+            ),
+            (
+                ApplyOrder::PersistentVolumeClaim,
+                object_ref("v1", "PersistentVolumeClaim", "apps", "raw-pvc-acme")
+            ),
+            (
+                ApplyOrder::Service,
+                object_ref("v1", "Service", "apps", "svc-acme-instance")
+            ),
+            (
+                ApplyOrder::Service,
+                object_ref("v1", "Service", "apps", "raw-svc-acme")
+            ),
+            (
+                ApplyOrder::Workload,
+                object_ref("apps/v1", "Deployment", "apps", "app-acme-instance")
+            ),
+            (
+                ApplyOrder::Workload,
+                object_ref("apps/v1", "StatefulSet", "apps", "raw-db-acme")
+            ),
+        ]
+    );
+
+    let raw_service = rendered
+        .objects
+        .iter()
+        .find(|object| object_name(&object.object) == "raw-svc-acme")
+        .expect("raw service rendered")
+        .to_kubernetes_json();
+    assert_eq!(
+        raw_service["metadata"]["labels"][LABEL_INSTANCE_ID],
+        json!("instance-a")
+    );
+    assert_eq!(
+        raw_service["metadata"]["labels"][LABEL_WORKLOAD_NAME],
+        json!("app-acme-instance")
+    );
+    assert_eq!(raw_service["spec"]["type"], json!("ClusterIP"));
+    assert_eq!(
+        raw_service["metadata"]["finalizers"],
+        json!(["raw.example.com/protect"])
+    );
+
+    let raw_stateful_set = rendered
+        .objects
+        .iter()
+        .find(|object| object_name(&object.object) == "raw-db-acme")
+        .expect("raw stateful set rendered")
+        .to_kubernetes_json();
+    assert_eq!(
+        raw_stateful_set["metadata"]["labels"][LABEL_INSTANCE_GENERATION],
+        json!("7")
+    );
+    assert_eq!(
+        raw_stateful_set["spec"]["template"]["metadata"]["labels"][LABEL_INSTANCE_ID],
+        json!("instance-a")
+    );
+    assert_eq!(
+        raw_stateful_set["spec"]["template"]["metadata"]["name"],
+        json!("raw-pod-template")
+    );
+    assert_eq!(
+        raw_stateful_set["spec"]["podManagementPolicy"],
+        json!("Parallel")
+    );
+}
+
+#[test]
+fn rejects_raw_manifest_with_disallowed_kind() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: raw-job
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("disallowed kind is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.kind",
+        "not in the V1 allow-list",
+    );
+}
+
+#[test]
+fn rejects_invalid_raw_manifest_yaml() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest("apiVersion: [")];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("invalid YAML is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest",
+        "manifest must be valid YAML or JSON",
+    );
+}
+
+#[test]
+fn rejects_raw_manifest_missing_name() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata: {}
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("missing name is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.metadata.name",
+        "name must be a non-empty string",
+    );
+}
+
+#[test]
+fn rejects_raw_manifest_non_string_namespace() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  namespace: 123
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("non-string namespace is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.metadata.namespace",
+        "namespace must be a string",
+    );
+}
+
+#[test]
+fn rejects_raw_persistent_volume_with_namespace_key() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: raw-pv
+  namespace: apps
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("PersistentVolume namespace is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.metadata.namespace",
+        "PersistentVolume must be cluster-scoped with no namespace",
+    );
+}
+
+#[test]
+fn rejects_duplicate_raw_and_typed_rendered_object_refs() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-acme-instance
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("duplicate ref is rejected");
+
+    assert_invalid_field(
+        error,
+        "template",
+        "duplicate rendered Kubernetes object ref v1 Service apps/svc-acme-instance",
+    );
+}
+
+#[test]
+fn rejects_conflicting_raw_sleepypods_labels() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  labels:
+    sleepypods.io/instance-id: other-instance
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("conflicting ownership label is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.metadata.labels",
+        "sleepypods.io/instance-id must be \"instance-a\"",
+    );
+}
+
+#[test]
+fn rejects_non_string_raw_sleepypods_labels() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  labels:
+    sleepypods.io/instance-id: 7
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .expect_err("non-string ownership label is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.metadata.labels",
+        "sleepypods.io/instance-id must be \"instance-a\", got non-string value",
+    );
+}
+
+#[test]
+fn rejects_non_string_raw_sleepypods_annotations() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  annotations:
+    sleepypods.io/template-generation: [3]
+"#,
+    )];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect_err("non-string template annotation is rejected");
+
+    assert_invalid_field(
+        error,
+        "raw_objects.manifest.metadata.annotations",
+        "sleepypods.io/template-generation must be \"3\", got non-string value",
+    );
+}
+
+#[test]
+fn raw_rendered_object_refs_are_available_without_applying() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+"#,
+    )];
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("raw object renders");
+
+    let refs = rendered_object_refs(&rendered).expect("refs derive before apply");
+
+    assert_eq!(
+        refs,
+        vec![
+            object_ref("v1", "Service", "apps", "svc-acme-instance"),
+            object_ref("v1", "Service", "apps", "raw-svc"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),
+        ]
+    );
+}
+
+#[test]
+fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &archil_static_csi_template(),
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret", "archil-node-secret"),
+                ("secret_namespace", "storage-secrets"),
+            ]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect("Archil-style CSI workload renders");
+
+    let pv = match &rendered.objects[0].object {
+        KubernetesObject::PersistentVolume(pv) => pv,
+        other => panic!("expected PersistentVolume, got {}", other.kind()),
+    };
+    assert_eq!(
+        pv.spec.persistent_volume_reclaim_policy,
+        PersistentVolumeReclaimPolicy::Retain
+    );
+    assert_eq!(pv.spec.claim_ref.namespace, "data");
+    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-postgres");
+    assert_eq!(
+        pv.spec.source,
+        PersistentVolumeSource::Csi(CsiPersistentVolumeSource {
+            driver: "csi.archil.com".to_owned(),
+            volume_handle: "archil-volume-123".to_owned(),
+            fs_type: None,
+            read_only: false,
+            volume_attributes: BTreeMap::from([("region".to_owned(), "us-west-2".to_owned())]),
+            controller_publish_secret_ref: None,
+            node_stage_secret_ref: None,
+            node_publish_secret_ref: Some(CsiSecretReference {
+                name: "archil-node-secret".to_owned(),
+                namespace: "storage-secrets".to_owned(),
+            }),
+            controller_expand_secret_ref: None,
+            node_expand_secret_ref: None,
+        })
+    );
+
+    let objects = rendered.to_kubernetes_json_values();
+    assert_eq!(
+        objects[0]["spec"]["csi"]["nodePublishSecretRef"],
+        json!({
+            "name": "archil-node-secret",
+            "namespace": "storage-secrets",
+        })
+    );
+    assert_eq!(
+        objects[0]["spec"]["csi"]["volumeAttributes"]["region"],
+        json!("us-west-2")
+    );
+    assert_eq!(objects[1]["spec"]["volumeName"], json!("pv-acme-postgres"));
+}
+
+#[test]
+fn renders_all_csi_secret_refs_to_kubernetes_keys() {
+    let mut template = archil_static_csi_template();
+    let PersistentVolumeSourceTemplate::Csi {
+        controller_publish_secret_ref,
+        node_stage_secret_ref,
+        node_publish_secret_ref,
+        controller_expand_secret_ref,
+        node_expand_secret_ref,
+        ..
+    } = &mut template.volumes[0].source
+    else {
+        panic!("expected CSI source");
+    };
+    *controller_publish_secret_ref = Some(csi_secret_ref("controller-publish-secret"));
+    *node_stage_secret_ref = Some(csi_secret_ref("node-stage-secret"));
+    *node_publish_secret_ref = Some(csi_secret_ref("node-publish-secret"));
+    *controller_expand_secret_ref = Some(csi_secret_ref("controller-expand-secret"));
+    *node_expand_secret_ref = Some(csi_secret_ref("node-expand-secret"));
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+            ]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect("CSI workload with all secret refs renders");
+
+    let pv = match &rendered.objects[0].object {
+        KubernetesObject::PersistentVolume(pv) => pv,
+        other => panic!("expected PersistentVolume, got {}", other.kind()),
+    };
+    let PersistentVolumeSource::Csi(csi) = &pv.spec.source else {
+        panic!("expected CSI source");
+    };
+
+    let expected = [
+        (
+            "controllerPublishSecretRef",
+            "controller-publish-secret",
+            csi.controller_publish_secret_ref.as_ref(),
+        ),
+        (
+            "nodeStageSecretRef",
+            "node-stage-secret",
+            csi.node_stage_secret_ref.as_ref(),
+        ),
+        (
+            "nodePublishSecretRef",
+            "node-publish-secret",
+            csi.node_publish_secret_ref.as_ref(),
+        ),
+        (
+            "controllerExpandSecretRef",
+            "controller-expand-secret",
+            csi.controller_expand_secret_ref.as_ref(),
+        ),
+        (
+            "nodeExpandSecretRef",
+            "node-expand-secret",
+            csi.node_expand_secret_ref.as_ref(),
+        ),
+    ];
+    let objects = rendered.to_kubernetes_json_values();
+    let csi_json = &objects[0]["spec"]["csi"];
+
+    for (key, name, rendered_ref) in expected {
+        assert_eq!(
+            rendered_ref.map(|ref_| (ref_.name.as_str(), ref_.namespace.as_str())),
+            Some((name, "storage-secrets")),
+            "{key}"
+        );
+        assert_eq!(
+            csi_json[key],
+            json!({
+                "name": name,
+                "namespace": "storage-secrets",
+            }),
+            "{key}"
+        );
+    }
 }
 
 #[test]
@@ -1133,6 +1758,114 @@ fn rejects_empty_csi_volume_handle() {
 }
 
 #[test]
+fn rejects_invalid_csi_secret_ref_templates() {
+    let cases = [
+        (
+            "missing name",
+            vec![
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret_namespace", "storage-secrets"),
+            ],
+            ManifestRenderError::MissingInstanceValue {
+                field: "secret".to_owned(),
+            },
+        ),
+        (
+            "empty name",
+            vec![
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret", "   "),
+                ("secret_namespace", "storage-secrets"),
+            ],
+            ManifestRenderError::InvalidField {
+                field: "volume.source.csi.node_publish_secret_ref.name",
+                message: "rendered value must not be empty".to_owned(),
+            },
+        ),
+        (
+            "invalid name",
+            vec![
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret", "Archil_Secret"),
+                ("secret_namespace", "storage-secrets"),
+            ],
+            ManifestRenderError::InvalidName {
+                field: "volume.source.csi.node_publish_secret_ref.name",
+                value: "Archil_Secret".to_owned(),
+            },
+        ),
+        (
+            "missing namespace",
+            vec![
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret", "archil-node-secret"),
+            ],
+            ManifestRenderError::MissingInstanceValue {
+                field: "secret_namespace".to_owned(),
+            },
+        ),
+        (
+            "empty namespace",
+            vec![
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret", "archil-node-secret"),
+                ("secret_namespace", "   "),
+            ],
+            ManifestRenderError::InvalidField {
+                field: "volume.source.csi.node_publish_secret_ref.namespace",
+                message: "rendered value must not be empty".to_owned(),
+            },
+        ),
+        (
+            "invalid namespace",
+            vec![
+                ("tenant", "acme"),
+                ("volume", "archil-volume-123"),
+                ("region", "us-west-2"),
+                ("secret", "archil-node-secret"),
+                ("secret_namespace", "storage_secrets"),
+            ],
+            ManifestRenderError::InvalidName {
+                field: "volume.source.csi.node_publish_secret_ref.namespace",
+                value: "storage_secrets".to_owned(),
+            },
+        ),
+    ];
+
+    for (name, value_pairs, expected) in cases {
+        let template = archil_static_csi_template();
+        let values: InstanceValues = value_pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+
+        let result = render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("postgres-a", 2, values),
+            sleep_policy: sleep_policy(),
+            namespace: "data",
+            template_generation: None,
+        });
+        let error = match result {
+            Ok(_) => panic!("{name} should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, expected, "{name}");
+    }
+}
+
+#[test]
 fn rejects_relative_host_path_persistent_volume_source() {
     let mut template = host_path_stateful_template();
     template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {
@@ -1187,6 +1920,7 @@ fn deployment_template() -> ManifestTemplate {
         }),
         sidecar: sidecar_template(),
         volumes: Vec::new(),
+        raw_objects: Vec::new(),
     }
 }
 
@@ -1233,8 +1967,44 @@ fn stateful_template() -> ManifestTemplate {
                     "tenant".to_owned(),
                     TemplateText::instance_value("tenant"),
                 )]),
+                controller_publish_secret_ref: None,
+                node_stage_secret_ref: None,
+                node_publish_secret_ref: None,
+                controller_expand_secret_ref: None,
+                node_expand_secret_ref: None,
             },
         }],
+        raw_objects: Vec::new(),
+    }
+}
+
+fn archil_static_csi_template() -> ManifestTemplate {
+    let mut template = stateful_template();
+    template.volumes[0].source = PersistentVolumeSourceTemplate::Csi {
+        driver: TemplateText::literal("csi.archil.com"),
+        volume_handle: TemplateText::instance_value("volume"),
+        fs_type: None,
+        read_only: false,
+        volume_attributes: BTreeMap::from([(
+            "region".to_owned(),
+            TemplateText::instance_value("region"),
+        )]),
+        controller_publish_secret_ref: None,
+        node_stage_secret_ref: None,
+        node_publish_secret_ref: Some(CsiSecretRefTemplate {
+            name: TemplateText::instance_value("secret"),
+            namespace: TemplateText::instance_value("secret_namespace"),
+        }),
+        controller_expand_secret_ref: None,
+        node_expand_secret_ref: None,
+    };
+    template
+}
+
+fn csi_secret_ref(name: &str) -> CsiSecretRefTemplate {
+    CsiSecretRefTemplate {
+        name: TemplateText::literal(name),
+        namespace: TemplateText::literal("storage-secrets"),
     }
 }
 
@@ -1291,6 +2061,7 @@ fn object_name(object: &KubernetesObject) -> &str {
         KubernetesObject::Service(object) => &object.metadata.name,
         KubernetesObject::PersistentVolume(object) => &object.metadata.name,
         KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.name,
+        KubernetesObject::Raw(object) => &object.metadata.name,
     }
 }
 
@@ -1299,6 +2070,21 @@ fn composed(prefix: &str, field: &str) -> TemplateText {
         TemplateTextPart::literal(prefix),
         TemplateTextPart::instance_value(field),
     ])
+}
+
+fn raw_manifest(manifest: &str) -> RawKubernetesManifestTemplate {
+    RawKubernetesManifestTemplate {
+        manifest: TemplateText::literal(manifest),
+    }
+}
+
+fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
+    RenderedObjectRef {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
+    }
 }
 
 fn instance(id: &str, generation: u64, values: InstanceValues) -> InstanceRecord {

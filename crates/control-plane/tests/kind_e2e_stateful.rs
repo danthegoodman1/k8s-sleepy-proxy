@@ -1517,6 +1517,7 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                 )),
             }),
         }],
+        raw_objects: vec![],
     }
 }
 

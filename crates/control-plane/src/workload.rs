@@ -468,6 +468,7 @@ mod tests {
                 },
                 service: None,
                 volumes: vec![],
+                raw_objects: vec![],
             },
             default_values: InstanceValues::new(),
             value_schema: WorkloadValueSchema::new(true),

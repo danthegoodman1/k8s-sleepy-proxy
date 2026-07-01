@@ -1,11 +1,11 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    Container, ContainerPort, CsiPersistentVolumeSource, Deployment, EnvVar,
+    Container, ContainerPort, CsiPersistentVolumeSource, CsiSecretReference, Deployment, EnvVar,
     HostPathPersistentVolumeSource, KubernetesObject, ObjectMeta, PersistentVolume,
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderedManifest,
-    RenderedManifestObject, Service, ServicePort, StatefulSet, VolumeMount,
+    PersistentVolumeSource, PodTemplateMetadata, PodTemplateSpec, PodVolume, RawKubernetesObject,
+    RenderedManifest, RenderedManifestObject, Service, ServicePort, StatefulSet, VolumeMount,
 };
 
 impl RenderedManifest {
@@ -24,10 +24,11 @@ impl RenderedManifestObject {
 }
 
 impl KubernetesObject {
-    pub fn api_version(&self) -> &'static str {
+    pub fn api_version(&self) -> &str {
         match self {
             Self::Deployment(_) | Self::StatefulSet(_) => "apps/v1",
             Self::Service(_) | Self::PersistentVolume(_) | Self::PersistentVolumeClaim(_) => "v1",
+            Self::Raw(object) => object.api_version.as_str(),
         }
     }
 
@@ -38,6 +39,7 @@ impl KubernetesObject {
             Self::Service(object) => service_to_value(object),
             Self::PersistentVolume(object) => persistent_volume_to_value(object),
             Self::PersistentVolumeClaim(object) => persistent_volume_claim_to_value(object),
+            Self::Raw(object) => raw_object_to_value(object),
         }
     }
 }
@@ -175,6 +177,42 @@ fn metadata_to_value(metadata: &ObjectMeta) -> Value {
     Value::Object(value)
 }
 
+fn raw_object_to_value(object: &RawKubernetesObject) -> Value {
+    let mut value = object.value.clone();
+    value["apiVersion"] = json!(object.api_version);
+    value["kind"] = json!(object.kind);
+    patch_raw_metadata(&mut value["metadata"], &object.metadata);
+    if let Some(metadata) = &object.pod_template_metadata {
+        patch_raw_pod_template_metadata(&mut value["spec"]["template"]["metadata"], metadata);
+    }
+    value
+}
+
+fn patch_raw_metadata(value: &mut Value, metadata: &ObjectMeta) {
+    let object = ensure_object(value);
+    object.insert("name".to_owned(), json!(metadata.name));
+    if let Some(namespace) = metadata.namespace.as_deref() {
+        object.insert("namespace".to_owned(), json!(namespace));
+    } else {
+        object.remove("namespace");
+    }
+    object.insert("labels".to_owned(), json!(metadata.labels));
+    object.insert("annotations".to_owned(), json!(metadata.annotations));
+}
+
+fn patch_raw_pod_template_metadata(value: &mut Value, metadata: &PodTemplateMetadata) {
+    let object = ensure_object(value);
+    object.insert("labels".to_owned(), json!(metadata.labels));
+    object.insert("annotations".to_owned(), json!(metadata.annotations));
+}
+
+fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    value.as_object_mut().expect("value was set to an object")
+}
+
 fn pod_template_to_value(template: &PodTemplateSpec) -> Value {
     json!({
         "metadata": pod_template_metadata_to_value(&template.metadata),
@@ -250,7 +288,48 @@ fn csi_source_to_value(source: &CsiPersistentVolumeSource) -> Value {
         "volumeAttributes".to_owned(),
         json!(source.volume_attributes),
     );
+    insert_optional_secret_ref(
+        &mut value,
+        "controllerPublishSecretRef",
+        source.controller_publish_secret_ref.as_ref(),
+    );
+    insert_optional_secret_ref(
+        &mut value,
+        "nodeStageSecretRef",
+        source.node_stage_secret_ref.as_ref(),
+    );
+    insert_optional_secret_ref(
+        &mut value,
+        "nodePublishSecretRef",
+        source.node_publish_secret_ref.as_ref(),
+    );
+    insert_optional_secret_ref(
+        &mut value,
+        "controllerExpandSecretRef",
+        source.controller_expand_secret_ref.as_ref(),
+    );
+    insert_optional_secret_ref(
+        &mut value,
+        "nodeExpandSecretRef",
+        source.node_expand_secret_ref.as_ref(),
+    );
     Value::Object(value)
+}
+
+fn insert_optional_secret_ref(
+    object: &mut Map<String, Value>,
+    key: &str,
+    value: Option<&CsiSecretReference>,
+) {
+    if let Some(value) = value {
+        object.insert(
+            key.to_owned(),
+            json!({
+                "name": value.name,
+                "namespace": value.namespace,
+            }),
+        );
+    }
 }
 
 fn host_path_source_to_value(source: &HostPathPersistentVolumeSource) -> Value {

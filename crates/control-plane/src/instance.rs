@@ -670,6 +670,7 @@ mod tests {
                 }],
             }),
             volumes: Vec::new(),
+            raw_objects: Vec::new(),
         }
     }
 

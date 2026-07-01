@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{Map, Value};
 
 use crate::{
     instance::InstanceRecord,
@@ -6,17 +8,19 @@ use crate::{
 };
 
 use super::{
-    ApplyOrder, Container, ContainerPort, ContainerTemplate, CsiPersistentVolumeSource, Deployment,
-    DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector,
-    ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
-    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
-    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
-    PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderManifestRequest, RenderedManifest,
-    RenderedManifestObject, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate,
-    StatefulSet, StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements,
-    VolumeTemplate, WorkloadKind, ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
-    LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    ApplyOrder, Container, ContainerPort, ContainerTemplate, CsiPersistentVolumeSource,
+    CsiSecretRefTemplate, CsiSecretReference, Deployment, DeploymentSpec, EnvVar,
+    HostPathPersistentVolumeSource, KubernetesObject, LabelSelector, ManifestRenderError,
+    ManifestTemplate, ObjectMeta, PersistentVolume, PersistentVolumeAccessMode,
+    PersistentVolumeClaim, PersistentVolumeClaimRef, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy, PersistentVolumeSource,
+    PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec, PodTemplateMetadata,
+    PodTemplateSpec, PodVolume, RawKubernetesManifestTemplate, RawKubernetesObject,
+    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Service, ServicePort,
+    ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec, TemplateText,
+    VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
+    ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
 const SIDECAR_PORT_NAME: &str = "sleepypods";
@@ -182,8 +186,8 @@ pub(crate) fn render_manifests_with_options(
                     metadata: ObjectMeta {
                         name: workload_name,
                         namespace: Some(request.namespace.to_owned()),
-                        labels: metadata_labels,
-                        annotations,
+                        labels: metadata_labels.clone(),
+                        annotations: annotations.clone(),
                     },
                     spec: DeploymentSpec {
                         replicas,
@@ -213,8 +217,8 @@ pub(crate) fn render_manifests_with_options(
                     metadata: ObjectMeta {
                         name: workload_name,
                         namespace: Some(request.namespace.to_owned()),
-                        labels: metadata_labels,
-                        annotations,
+                        labels: metadata_labels.clone(),
+                        annotations: annotations.clone(),
                     },
                     spec: StatefulSetSpec {
                         replicas,
@@ -229,11 +233,349 @@ pub(crate) fn render_manifests_with_options(
         }
     }
 
+    for raw in &request.template.raw_objects {
+        objects.push(render_raw_object(
+            raw,
+            request.instance,
+            request.namespace,
+            &metadata_labels,
+            &annotations,
+        )?);
+    }
+
+    objects.sort_by_key(|object| object.apply_order);
+    validate_unique_rendered_refs(&objects)?;
+
     Ok(RenderedManifest {
         instance_generation: request.instance.generation,
         template_generation: request.template_generation,
         objects,
     })
+}
+
+fn render_raw_object(
+    template: &RawKubernetesManifestTemplate,
+    instance: &InstanceRecord,
+    namespace: &str,
+    metadata_labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+) -> Result<RenderedManifestObject, ManifestRenderError> {
+    let rendered = render_non_empty("raw_objects.manifest", &template.manifest, instance)?;
+    let mut value: Value =
+        serde_yaml::from_str(&rendered).map_err(|error| ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest",
+            message: format!("manifest must be valid YAML or JSON: {error}"),
+        })?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest",
+            message: "manifest must render to one Kubernetes object".to_owned(),
+        })?;
+
+    let api_version = required_string_field(object, "apiVersion", "raw_objects.manifest")?;
+    let kind = required_string_field(object, "kind", "raw_objects.manifest")?;
+    let apply_order = raw_apply_order(&api_version, &kind)?;
+    let namespaced = raw_kind_is_namespaced(&kind);
+
+    let metadata = object
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.metadata",
+            message: "metadata must be an object".to_owned(),
+        })?;
+    let name = required_string_field(metadata, "name", "raw_objects.manifest.metadata.name")?;
+    validate_dns_label("raw_objects.manifest.metadata.name", &name)?;
+
+    let effective_namespace = raw_effective_namespace(metadata, namespace, namespaced)?;
+    if namespaced {
+        metadata.insert(
+            "namespace".to_owned(),
+            Value::String(effective_namespace.clone()),
+        );
+    } else {
+        metadata.remove("namespace");
+    }
+
+    merge_required_string_map(
+        metadata,
+        "labels",
+        metadata_labels,
+        "raw_objects.manifest.metadata.labels",
+    )?;
+    merge_required_string_map(
+        metadata,
+        "annotations",
+        annotations,
+        "raw_objects.manifest.metadata.annotations",
+    )?;
+    let object_metadata = ObjectMeta {
+        name,
+        namespace: namespaced.then_some(effective_namespace),
+        labels: string_map(metadata, "labels", "raw_objects.manifest.metadata.labels")?,
+        annotations: string_map(
+            metadata,
+            "annotations",
+            "raw_objects.manifest.metadata.annotations",
+        )?,
+    };
+
+    let pod_template_metadata = if matches!(kind.as_str(), "Deployment" | "StatefulSet") {
+        Some(raw_pod_template_metadata(
+            &mut value,
+            metadata_labels,
+            annotations,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(RenderedManifestObject {
+        apply_order,
+        object: KubernetesObject::Raw(RawKubernetesObject {
+            api_version,
+            kind,
+            metadata: object_metadata,
+            pod_template_metadata,
+            value,
+        }),
+    })
+}
+
+fn required_string_field(
+    object: &Map<String, Value>,
+    key: &str,
+    field: &'static str,
+) -> Result<String, ManifestRenderError> {
+    match object.get(key).and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
+        _ => Err(ManifestRenderError::InvalidField {
+            field,
+            message: format!("{key} must be a non-empty string"),
+        }),
+    }
+}
+
+fn raw_apply_order(api_version: &str, kind: &str) -> Result<ApplyOrder, ManifestRenderError> {
+    match (api_version, kind) {
+        ("v1", "PersistentVolume") => Ok(ApplyOrder::PersistentVolume),
+        ("v1", "PersistentVolumeClaim") => Ok(ApplyOrder::PersistentVolumeClaim),
+        ("v1", "Service") => Ok(ApplyOrder::Service),
+        ("apps/v1", "Deployment") | ("apps/v1", "StatefulSet") => Ok(ApplyOrder::Workload),
+        _ => Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.kind",
+            message: format!("raw object {api_version} {kind} is not in the V1 allow-list"),
+        }),
+    }
+}
+
+fn raw_kind_is_namespaced(kind: &str) -> bool {
+    !matches!(kind, "PersistentVolume")
+}
+
+fn raw_effective_namespace(
+    metadata: &Map<String, Value>,
+    namespace: &str,
+    namespaced: bool,
+) -> Result<String, ManifestRenderError> {
+    if !namespaced {
+        if metadata.contains_key("namespace") {
+            return Err(ManifestRenderError::InvalidField {
+                field: "raw_objects.manifest.metadata.namespace",
+                message: "PersistentVolume must be cluster-scoped with no namespace".to_owned(),
+            });
+        }
+        return Ok(String::new());
+    }
+
+    let Some(raw_namespace) = metadata.get("namespace") else {
+        return Ok(namespace.to_owned());
+    };
+    let Some(effective) = raw_namespace.as_str() else {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.metadata.namespace",
+            message: "namespace must be a string".to_owned(),
+        });
+    };
+    if effective.is_empty() {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.metadata.namespace",
+            message: "namespace must be a non-empty string".to_owned(),
+        });
+    }
+    validate_dns_label("raw_objects.manifest.metadata.namespace", effective)?;
+    if effective != namespace {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.metadata.namespace",
+            message: format!("namespace must be omitted or match target namespace {namespace:?}"),
+        });
+    }
+    Ok(effective.to_owned())
+}
+
+fn raw_pod_template_metadata(
+    value: &mut Value,
+    metadata_labels: &BTreeMap<String, String>,
+    annotations: &BTreeMap<String, String>,
+) -> Result<PodTemplateMetadata, ManifestRenderError> {
+    let object = value
+        .as_object_mut()
+        .expect("raw Kubernetes object already validated as object");
+    let spec = object
+        .entry("spec")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.spec",
+            message: "spec must be an object".to_owned(),
+        })?;
+    let template = spec
+        .entry("template")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.spec.template",
+            message: "workload template must be an object".to_owned(),
+        })?;
+    let metadata = template
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.spec.template.metadata",
+            message: "workload template metadata must be an object".to_owned(),
+        })?;
+
+    merge_required_string_map(
+        metadata,
+        "labels",
+        metadata_labels,
+        "raw_objects.manifest.spec.template.metadata.labels",
+    )?;
+    merge_required_string_map(
+        metadata,
+        "annotations",
+        annotations,
+        "raw_objects.manifest.spec.template.metadata.annotations",
+    )?;
+
+    Ok(PodTemplateMetadata {
+        labels: string_map(
+            metadata,
+            "labels",
+            "raw_objects.manifest.spec.template.metadata.labels",
+        )?,
+        annotations: string_map(
+            metadata,
+            "annotations",
+            "raw_objects.manifest.spec.template.metadata.annotations",
+        )?,
+    })
+}
+
+fn merge_required_string_map(
+    metadata: &mut Map<String, Value>,
+    key: &'static str,
+    required: &BTreeMap<String, String>,
+    field: &'static str,
+) -> Result<(), ManifestRenderError> {
+    let map = metadata
+        .entry(key)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field,
+            message: format!("{key} must be an object"),
+        })?;
+    for (label, value) in required {
+        match map.get(label) {
+            Some(Value::String(existing)) if existing == value => {}
+            Some(Value::String(existing)) => {
+                return Err(ManifestRenderError::InvalidField {
+                    field,
+                    message: format!(
+                        "{label} must be {value:?}, got conflicting value {existing:?}"
+                    ),
+                });
+            }
+            Some(_) => {
+                return Err(ManifestRenderError::InvalidField {
+                    field,
+                    message: format!("{label} must be {value:?}, got non-string value"),
+                });
+            }
+            None => {
+                map.insert(label.clone(), Value::String(value.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn string_map(
+    metadata: &Map<String, Value>,
+    key: &'static str,
+    field: &'static str,
+) -> Result<BTreeMap<String, String>, ManifestRenderError> {
+    let Some(value) = metadata.get(key) else {
+        return Ok(BTreeMap::new());
+    };
+    let map = value
+        .as_object()
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field,
+            message: format!("{key} must be an object"),
+        })?;
+    map.iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .ok_or_else(|| ManifestRenderError::InvalidField {
+                    field,
+                    message: "all values must be strings".to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn validate_unique_rendered_refs(
+    objects: &[RenderedManifestObject],
+) -> Result<(), ManifestRenderError> {
+    let mut refs = BTreeSet::new();
+    for rendered in objects {
+        let object = &rendered.object;
+        let namespace = match object {
+            KubernetesObject::Deployment(object) => object.metadata.namespace.as_deref(),
+            KubernetesObject::StatefulSet(object) => object.metadata.namespace.as_deref(),
+            KubernetesObject::Service(object) => object.metadata.namespace.as_deref(),
+            KubernetesObject::PersistentVolume(object) => object.metadata.namespace.as_deref(),
+            KubernetesObject::PersistentVolumeClaim(object) => object.metadata.namespace.as_deref(),
+            KubernetesObject::Raw(object) => object.metadata.namespace.as_deref(),
+        }
+        .unwrap_or_default();
+        let key = (
+            object.api_version(),
+            object.kind(),
+            namespace,
+            object.name(),
+        );
+        if !refs.insert(key) {
+            return Err(ManifestRenderError::InvalidField {
+                field: "template",
+                message: format!(
+                    "duplicate rendered Kubernetes object ref {} {} {}/{}",
+                    object.api_version(),
+                    object.kind(),
+                    namespace,
+                    object.name()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 struct RenderedVolume {
@@ -359,6 +701,11 @@ fn render_volume(
             fs_type,
             read_only,
             volume_attributes,
+            controller_publish_secret_ref,
+            node_stage_secret_ref,
+            node_publish_secret_ref,
+            controller_expand_secret_ref,
+            node_expand_secret_ref,
         } => {
             let rendered_attributes = volume_attributes
                 .iter()
@@ -382,6 +729,36 @@ fn render_volume(
                     .transpose()?,
                 read_only: *read_only,
                 volume_attributes: rendered_attributes,
+                controller_publish_secret_ref: render_csi_secret_ref(
+                    "volume.source.csi.controller_publish_secret_ref.name",
+                    "volume.source.csi.controller_publish_secret_ref.namespace",
+                    controller_publish_secret_ref.as_ref(),
+                    instance,
+                )?,
+                node_stage_secret_ref: render_csi_secret_ref(
+                    "volume.source.csi.node_stage_secret_ref.name",
+                    "volume.source.csi.node_stage_secret_ref.namespace",
+                    node_stage_secret_ref.as_ref(),
+                    instance,
+                )?,
+                node_publish_secret_ref: render_csi_secret_ref(
+                    "volume.source.csi.node_publish_secret_ref.name",
+                    "volume.source.csi.node_publish_secret_ref.namespace",
+                    node_publish_secret_ref.as_ref(),
+                    instance,
+                )?,
+                controller_expand_secret_ref: render_csi_secret_ref(
+                    "volume.source.csi.controller_expand_secret_ref.name",
+                    "volume.source.csi.controller_expand_secret_ref.namespace",
+                    controller_expand_secret_ref.as_ref(),
+                    instance,
+                )?,
+                node_expand_secret_ref: render_csi_secret_ref(
+                    "volume.source.csi.node_expand_secret_ref.name",
+                    "volume.source.csi.node_expand_secret_ref.namespace",
+                    node_expand_secret_ref.as_ref(),
+                    instance,
+                )?,
             })
         }
         PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
@@ -415,6 +792,22 @@ fn render_volume(
         storage_class_name,
         source,
     })
+}
+
+fn render_csi_secret_ref(
+    name_field: &'static str,
+    namespace_field: &'static str,
+    template: Option<&CsiSecretRefTemplate>,
+    instance: &InstanceRecord,
+) -> Result<Option<CsiSecretReference>, ManifestRenderError> {
+    let Some(template) = template else {
+        return Ok(None);
+    };
+    let name = render_non_empty(name_field, &template.name, instance)?;
+    let namespace = render_non_empty(namespace_field, &template.namespace, instance)?;
+    validate_dns_label(name_field, &name)?;
+    validate_dns_label(namespace_field, &namespace)?;
+    Ok(Some(CsiSecretReference { name, namespace }))
 }
 
 fn render_app_container(

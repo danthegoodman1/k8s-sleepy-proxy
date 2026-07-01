@@ -749,6 +749,7 @@ fn manifest_template(
             }],
         }),
         volumes: Vec::new(),
+        raw_objects: Vec::new(),
     }
 }
 

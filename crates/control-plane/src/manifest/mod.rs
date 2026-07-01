@@ -11,21 +11,22 @@ mod template;
 mod tests;
 
 pub use objects::{
-    ApplyOrder, Container, ContainerPort, CsiPersistentVolumeSource, Deployment, DeploymentSpec,
-    EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector, ObjectMeta,
-    PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimRef, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, PersistentVolumeSource, PersistentVolumeSpec, PodSpec,
-    PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderedManifest, RenderedManifestObject,
-    Service, ServicePort, ServiceSpec, StatefulSet, StatefulSetSpec, VolumeMount,
-    VolumeResourceRequirements,
+    ApplyOrder, Container, ContainerPort, CsiPersistentVolumeSource, CsiSecretReference,
+    Deployment, DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject,
+    LabelSelector, ObjectMeta, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimRef,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeSource,
+    PersistentVolumeSpec, PodSpec, PodTemplateMetadata, PodTemplateSpec, PodVolume,
+    RawKubernetesObject, RenderedManifest, RenderedManifestObject, Service, ServicePort,
+    ServiceSpec, StatefulSet, StatefulSetSpec, VolumeMount, VolumeResourceRequirements,
 };
 pub use render::render_manifests;
 pub(crate) use render::render_manifests_with_options;
 pub use template::{
-    ContainerPortTemplate, ContainerTemplate, EnvVarTemplate, ManifestTemplate,
-    PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
-    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadKind, WorkloadTemplate,
+    ContainerPortTemplate, ContainerTemplate, CsiSecretRefTemplate, EnvVarTemplate,
+    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,
+    WorkloadTemplate,
 };
 
 pub(crate) const LABEL_INSTANCE_ID: &str = "sleepypods.io/instance-id";

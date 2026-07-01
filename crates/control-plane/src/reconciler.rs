@@ -1180,6 +1180,7 @@ mod tests {
                     mode: None,
                 },
                 volumes: Vec::new(),
+                raw_objects: Vec::new(),
             },
             default_values: InstanceValues::new(),
             value_schema: WorkloadValueSchema::new(true),

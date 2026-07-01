@@ -649,6 +649,7 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
             }],
         }),
         volumes: Vec::new(),
+        raw_objects: Vec::new(),
     }
 }
 

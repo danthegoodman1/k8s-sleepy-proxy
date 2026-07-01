@@ -1407,6 +1407,7 @@ fn manifest_template(app_image: &str, sidecar_image: &str) -> ManifestTemplate {
             }],
         }),
         volumes: Vec::new(),
+        raw_objects: Vec::new(),
     }
 }
 

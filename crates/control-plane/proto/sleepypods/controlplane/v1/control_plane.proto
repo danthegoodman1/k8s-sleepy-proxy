@@ -253,6 +253,11 @@ message ManifestTemplate {
   SidecarTemplate sidecar = 2;
   ServiceTemplate service = 3;
   repeated VolumeTemplate volumes = 4;
+  repeated RawKubernetesManifestTemplate raw_objects = 5;
+}
+
+message RawKubernetesManifestTemplate {
+  TemplateText manifest = 1;
 }
 
 message WorkloadTemplate {
@@ -341,6 +346,16 @@ message CsiVolumeSourceTemplate {
   TemplateText fs_type = 3;
   bool read_only = 4;
   map<string, TemplateText> volume_attributes = 5;
+  CsiSecretRefTemplate controller_publish_secret_ref = 6;
+  CsiSecretRefTemplate node_stage_secret_ref = 7;
+  CsiSecretRefTemplate node_publish_secret_ref = 8;
+  CsiSecretRefTemplate controller_expand_secret_ref = 9;
+  CsiSecretRefTemplate node_expand_secret_ref = 10;
+}
+
+message CsiSecretRefTemplate {
+  TemplateText name = 1;
+  TemplateText namespace = 2;
 }
 
 message HostPathVolumeSourceTemplate {

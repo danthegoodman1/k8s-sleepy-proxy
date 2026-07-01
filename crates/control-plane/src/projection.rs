@@ -887,6 +887,7 @@ fn object_metadata_mut(object: &mut KubernetesObject) -> &mut ObjectMeta {
         KubernetesObject::Service(object) => &mut object.metadata,
         KubernetesObject::PersistentVolume(object) => &mut object.metadata,
         KubernetesObject::PersistentVolumeClaim(object) => &mut object.metadata,
+        KubernetesObject::Raw(object) => &mut object.metadata,
     }
 }
 
@@ -897,6 +898,7 @@ fn pod_template_metadata_mut(object: &mut KubernetesObject) -> Option<&mut PodTe
         KubernetesObject::Service(_)
         | KubernetesObject::PersistentVolume(_)
         | KubernetesObject::PersistentVolumeClaim(_) => None,
+        KubernetesObject::Raw(object) => object.pod_template_metadata.as_mut(),
     }
 }
 
@@ -907,6 +909,7 @@ fn object_labels(object: &KubernetesObject) -> &BTreeMap<String, String> {
         KubernetesObject::Service(object) => &object.metadata.labels,
         KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
         KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
+        KubernetesObject::Raw(object) => &object.metadata.labels,
     }
 }
 
@@ -917,6 +920,7 @@ fn object_annotations(object: &KubernetesObject) -> &BTreeMap<String, String> {
         KubernetesObject::Service(object) => &object.metadata.annotations,
         KubernetesObject::PersistentVolume(object) => &object.metadata.annotations,
         KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.annotations,
+        KubernetesObject::Raw(object) => &object.metadata.annotations,
     }
 }
 
@@ -1253,6 +1257,7 @@ mod tests {
             KubernetesObject::Service(object) => &object.metadata,
             KubernetesObject::PersistentVolume(object) => &object.metadata,
             KubernetesObject::PersistentVolumeClaim(object) => &object.metadata,
+            KubernetesObject::Raw(object) => &object.metadata,
         }
     }
 
@@ -1308,6 +1313,7 @@ mod tests {
                 mode: None,
             },
             volumes: Vec::new(),
+            raw_objects: Vec::new(),
         };
         let instance = InstanceRecord {
             id: InstanceId::new("instance-a").expect("valid instance id"),

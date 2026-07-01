@@ -465,6 +465,10 @@ pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
         KubernetesObject::PersistentVolumeClaim(object) => {
             ("v1", object.metadata.namespace.clone())
         }
+        KubernetesObject::Raw(object) => (
+            object.api_version.as_str(),
+            object.metadata.namespace.clone(),
+        ),
     };
 
     RenderedObjectRef {
@@ -761,6 +765,7 @@ fn object_metadata(
         KubernetesObject::PersistentVolumeClaim(object) => {
             (&object.metadata.labels, &object.metadata.annotations)
         }
+        KubernetesObject::Raw(object) => (&object.metadata.labels, &object.metadata.annotations),
     }
 }
 
@@ -779,6 +784,10 @@ fn pod_template_metadata(
         KubernetesObject::Service(_)
         | KubernetesObject::PersistentVolume(_)
         | KubernetesObject::PersistentVolumeClaim(_) => None,
+        KubernetesObject::Raw(object) => object
+            .pod_template_metadata
+            .as_ref()
+            .map(|metadata| (&metadata.labels, &metadata.annotations)),
     }
 }
 
@@ -1924,6 +1933,7 @@ mod tests {
             }),
             sidecar: sidecar_template(),
             volumes: Vec::new(),
+            raw_objects: Vec::new(),
         }
     }
 
@@ -1967,8 +1977,14 @@ mod tests {
                     fs_type: Some(TemplateText::literal("ext4")),
                     read_only: false,
                     volume_attributes: BTreeMap::new(),
+                    controller_publish_secret_ref: None,
+                    node_stage_secret_ref: None,
+                    node_publish_secret_ref: None,
+                    controller_expand_secret_ref: None,
+                    node_expand_secret_ref: None,
                 },
             }],
+            raw_objects: Vec::new(),
         }
     }
 
@@ -2005,6 +2021,7 @@ mod tests {
             KubernetesObject::Service(object) => &object.metadata.labels,
             KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
             KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
+            KubernetesObject::Raw(object) => &object.metadata.labels,
         }
     }
 

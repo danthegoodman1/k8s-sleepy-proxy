@@ -605,6 +605,7 @@ fn manifest_template() -> ManifestTemplate {
             }],
         }),
         volumes: Vec::new(),
+        raw_objects: Vec::new(),
     }
 }
 

@@ -23,6 +23,8 @@ pub struct ManifestTemplate {
     pub sidecar: SidecarTemplate,
     pub service: Option<ServiceTemplate>,
     pub volumes: Vec<VolumeTemplate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_objects: Vec<RawKubernetesManifestTemplate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +95,11 @@ pub struct VolumeTemplate {
     pub source: PersistentVolumeSourceTemplate,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawKubernetesManifestTemplate {
+    pub manifest: TemplateText,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentVolumeAccessMode {
     ReadWriteOnce,
@@ -114,11 +121,22 @@ pub enum PersistentVolumeSourceTemplate {
         fs_type: Option<TemplateText>,
         read_only: bool,
         volume_attributes: BTreeMap<String, TemplateText>,
+        controller_publish_secret_ref: Option<CsiSecretRefTemplate>,
+        node_stage_secret_ref: Option<CsiSecretRefTemplate>,
+        node_publish_secret_ref: Option<CsiSecretRefTemplate>,
+        controller_expand_secret_ref: Option<CsiSecretRefTemplate>,
+        node_expand_secret_ref: Option<CsiSecretRefTemplate>,
     },
     HostPath {
         path: TemplateText,
         type_: Option<TemplateText>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CsiSecretRefTemplate {
+    pub name: TemplateText,
+    pub namespace: TemplateText,
 }
 
 impl TemplateText {

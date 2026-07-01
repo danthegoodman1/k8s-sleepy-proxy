@@ -2528,6 +2528,7 @@ fn deployment_template() -> ManifestTemplate {
             mode: None,
         },
         volumes: Vec::new(),
+        raw_objects: Vec::new(),
     }
 }
 
@@ -2578,6 +2579,7 @@ fn stateful_template() -> ManifestTemplate {
                 type_: None,
             },
         }],
+        raw_objects: Vec::new(),
     }
 }
 

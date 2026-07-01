@@ -155,6 +155,25 @@ Kubernetes apply. PersistentVolumes are cluster-scoped and are collision-checked
 with an empty namespace; namespaced objects are checked with their rendered
 namespace.
 
+Typed manifest templates are the preferred path for supported Kubernetes
+fields. Operators can use `ManifestTemplate.raw_objects` as an advanced escape
+hatch for unsupported fields that must be preserved exactly in applied
+Kubernetes objects. Each raw object is a YAML or JSON manifest held in
+`RawKubernetesManifestTemplate.manifest`, and that text uses only the same
+limited `TemplateText` instance-value substitution model as typed fields. It is
+not an executable templating engine.
+
+Raw objects are limited in V1 to `Deployment`, `StatefulSet`, `Service`,
+`PersistentVolume`, and `PersistentVolumeClaim`. After substitution, the
+control plane parses the manifest, validates `apiVersion`, `kind`,
+`metadata.name`, and namespace scope, injects the same SleepyPods ownership
+labels and template-generation annotations used by typed objects, and derives
+rendered refs before any Kubernetes apply. Conflicting SleepyPods identity
+labels are rejected. PersistentVolumes must be cluster-scoped; namespaced raw
+objects are applied in the materialization target namespace. Raw refs collide
+with typed refs, so a raw object cannot reuse the same
+apiVersion/kind/namespace/name as a typed-rendered object.
+
 Add a route or custom domain:
 
 ```text
@@ -193,6 +212,12 @@ Attach an existing volume:
 2. Reference those values from a `VolumeTemplate` `source.csi.volume_handle` or
    `source.host_path.path`, plus `pv_name`, `pvc_name`, `capacity`, access
    modes, reclaim policy, and optional storage class.
+   Static CSI volumes can also set typed secret refs on `source.csi`, including
+   `controller_publish_secret_ref`, `node_stage_secret_ref`,
+   `node_publish_secret_ref`, `controller_expand_secret_ref`, and
+   `node_expand_secret_ref`. Each ref has templated `name` and `namespace`
+   fields, so external CSI drivers can receive per-instance secrets such as an
+   Archil-style `node_publish_secret_ref`.
 3. For singleton external resources that must not be attached by two active
    materializations at once, declare a workload-class `exclusivity_keys` entry
    such as `name: "disk"` and `value: "{{ volume_handle }}"`.

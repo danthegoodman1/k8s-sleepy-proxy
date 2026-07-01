@@ -188,6 +188,7 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
                 type_: Some(TemplateText::literal("DirectoryOrCreate")),
             },
         }],
+        raw_objects: Vec::new(),
     };
     let instance = InstanceRecord {
         id: InstanceId::new("kind-materializer")?,

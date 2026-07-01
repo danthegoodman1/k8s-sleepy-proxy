@@ -892,6 +892,7 @@ async fn create_workload_class(
                 sidecar: Some(sidecar_template(sidecar_image)),
                 service: Some(service_template(workload_name)),
                 volumes,
+                raw_objects: vec![],
             }),
             sleep_policy: Some(sleep_policy()),
             exclusivity_keys: vec![],

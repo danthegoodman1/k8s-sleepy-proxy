@@ -2278,6 +2278,7 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
                 mode: None,
             },
             volumes: Vec::new(),
+            raw_objects: Vec::new(),
         },
         default_values: control_plane::InstanceValues::new(),
         value_schema: control_plane::WorkloadValueSchema::new(true),

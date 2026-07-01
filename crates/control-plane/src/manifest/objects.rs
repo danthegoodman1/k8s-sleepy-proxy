@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
 use crate::ids::Generation;
 
 use super::{PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy};
@@ -32,6 +34,7 @@ pub enum KubernetesObject {
     Service(Service),
     PersistentVolume(PersistentVolume),
     PersistentVolumeClaim(PersistentVolumeClaim),
+    Raw(RawKubernetesObject),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +43,15 @@ pub struct ObjectMeta {
     pub namespace: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawKubernetesObject {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: ObjectMeta,
+    pub pod_template_metadata: Option<PodTemplateMetadata>,
+    pub value: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +196,17 @@ pub struct CsiPersistentVolumeSource {
     pub fs_type: Option<String>,
     pub read_only: bool,
     pub volume_attributes: BTreeMap<String, String>,
+    pub controller_publish_secret_ref: Option<CsiSecretReference>,
+    pub node_stage_secret_ref: Option<CsiSecretReference>,
+    pub node_publish_secret_ref: Option<CsiSecretReference>,
+    pub controller_expand_secret_ref: Option<CsiSecretReference>,
+    pub node_expand_secret_ref: Option<CsiSecretReference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsiSecretReference {
+    pub name: String,
+    pub namespace: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,13 +235,14 @@ pub struct VolumeResourceRequirements {
 }
 
 impl KubernetesObject {
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &str {
         match self {
             Self::Deployment(_) => "Deployment",
             Self::StatefulSet(_) => "StatefulSet",
             Self::Service(_) => "Service",
             Self::PersistentVolume(_) => "PersistentVolume",
             Self::PersistentVolumeClaim(_) => "PersistentVolumeClaim",
+            Self::Raw(object) => object.kind.as_str(),
         }
     }
 
@@ -229,6 +253,7 @@ impl KubernetesObject {
             Self::Service(object) => &object.metadata.name,
             Self::PersistentVolume(object) => &object.metadata.name,
             Self::PersistentVolumeClaim(object) => &object.metadata.name,
+            Self::Raw(object) => &object.metadata.name,
         }
     }
 }
