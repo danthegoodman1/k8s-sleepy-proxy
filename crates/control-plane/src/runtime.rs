@@ -892,23 +892,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_backlog_metrics_exclude_ready_and_failed_states() {
+    async fn materialization_operational_metrics_make_stuck_work_alertable_by_state() {
         let sink = PrometheusMetricsSink::new();
         let store: Arc<dyn ControlPlaneStore> = Arc::new(OperationalMetricsStore);
 
         record_materialization_operational_metrics(store, sink.clone()).await;
 
         let rendered = sink.render();
-        assert!(rendered.contains("sleepypods_materializations_nonterminal{state=\"pending\"} 2\n"));
-        assert!(rendered.contains(
-            "sleepypods_materialization_oldest_nonterminal_age_seconds{state=\"deleting\"}"
-        ));
+        assert_state_sample(
+            &rendered,
+            "sleepypods_materializations_nonterminal",
+            "pending",
+            "2",
+        );
+        assert_state_sample(
+            &rendered,
+            "sleepypods_materializations_nonterminal",
+            "deleting",
+            "1",
+        );
+        assert_state_sample(
+            &rendered,
+            "sleepypods_materialization_oldest_nonterminal_age_seconds",
+            "pending",
+            "11",
+        );
+        assert_state_sample(
+            &rendered,
+            "sleepypods_materialization_oldest_nonterminal_age_seconds",
+            "deleting",
+            "7",
+        );
         assert!(!rendered.contains("sleepypods_materializations_nonterminal{state=\"ready\"}"));
         assert!(!rendered.contains(
             "sleepypods_materialization_oldest_nonterminal_age_seconds{state=\"ready\"}"
         ));
-        assert!(rendered.contains("sleepypods_exclusivity_keys_held{state=\"ready\"} 3\n"));
-        assert!(rendered.contains("sleepypods_exclusivity_keys_held{state=\"failed\"} 1\n"));
+        assert_state_sample(
+            &rendered,
+            "sleepypods_exclusivity_keys_held",
+            "pending",
+            "0",
+        );
+        assert_state_sample(
+            &rendered,
+            "sleepypods_exclusivity_keys_held",
+            "deleting",
+            "0",
+        );
+        assert_state_sample(&rendered, "sleepypods_exclusivity_keys_held", "ready", "3");
+        assert_state_sample(&rendered, "sleepypods_exclusivity_keys_held", "failed", "1");
+    }
+
+    fn assert_state_sample(rendered: &str, metric: &str, state: &str, value: &str) {
+        let sample = format!("{metric}{{state=\"{state}\"}} {value}\n");
+        assert!(
+            rendered.contains(&sample),
+            "missing state-only metric sample {sample:?} in rendered output:\n{rendered}"
+        );
     }
 
     fn valid_env() -> Vec<(&'static str, &'static str)> {

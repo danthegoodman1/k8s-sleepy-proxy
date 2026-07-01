@@ -147,7 +147,7 @@ impl Default for FakeKubernetesState {
 }
 
 #[tokio::test]
-async fn successful_wake_cas_renders_applies_and_completes_with_waking_generation() {
+async fn successful_wake_cas_applies_and_completes_with_running_generation_projection() {
     let instance = instance("instance-a", InstanceState::Cold, 1);
     let store = FakeStore::new(instance, Some(workload_class()));
     let client = FakeKubernetesClient::observing_store(store.clone());
@@ -248,7 +248,7 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
             .metadata
             .labels
             .get("sleepypods.io/instance-generation"),
-        Some(&"2".to_owned())
+        Some(&"3".to_owned())
     );
     let sidecar = deployment
         .spec
@@ -258,6 +258,7 @@ async fn successful_wake_cas_renders_applies_and_completes_with_waking_generatio
         .iter()
         .find(|container| container.name == "sleepypods-sidecar")
         .expect("sidecar container was rendered");
+    assert_env(&sidecar.env, "SLEEPYPODS_INSTANCE_GENERATION", "3");
     assert_env(&sidecar.env, "SLEEPYPODS_IDLE_TIMEOUT_MS", "120000");
     assert_env(&sidecar.env, "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", "5000");
     assert_env(&sidecar.env, "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS", "30000");
@@ -1032,7 +1033,7 @@ async fn materializer_failure_marks_waking_generation_failed() {
     .await
     .expect_err("readiness failure fails wake");
 
-    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
     assert_eq!(store.instance().state, InstanceState::Failed);
     assert_eq!(store.instance().generation, Generation::new(8));
     assert_eq!(client.applied_objects().len(), 2);
@@ -1107,10 +1108,7 @@ async fn retry_after_failed_high_backend_generation_does_not_rewind_pending_mate
     .await
     .expect_err("first wake fails after recording high backend generation");
 
-    assert!(matches!(
-        first_error,
-        WakeInstanceError::Materializer { .. }
-    ));
+    assert!(matches!(first_error, WakeInstanceError::Projection { .. }));
     assert_eq!(store.instance().state, InstanceState::Failed);
     assert_eq!(store.instance().generation, Generation::new(3));
     assert_eq!(
@@ -1179,7 +1177,7 @@ async fn retry_after_failed_high_backend_generation_does_not_rewind_pending_mate
                 expected: Generation::new(2),
                 next_state: InstanceState::Failed,
                 reason: StateTransitionReason::FailureReported(
-                    "materialization failed: failed waiting for readiness across 2 rendered Kubernetes objects: not ready"
+                    "projection failed: projection readiness unready: failed waiting for readiness across 2 rendered Kubernetes objects: not ready"
                         .to_owned()
                 ),
             },
@@ -1307,7 +1305,7 @@ async fn materializer_failure_records_wake_and_failure_observability_fields() {
     .await
     .expect_err("readiness failure fails wake");
 
-    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
     let events = sink.events();
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1329,7 +1327,7 @@ async fn materializer_failure_records_wake_and_failure_observability_fields() {
                 && log.field_value(FIELD_INSTANCE_ID) == Some("instance-a")
                 && log.field_value(FIELD_CLUSTER_ID) == Some("cluster-a")
                 && log.field_value(FIELD_NAMESPACE) == Some("apps")
-                && log.field_value(FIELD_ERROR_REASON) == Some("materializer")
+                && log.field_value(FIELD_ERROR_REASON) == Some("projection")
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1550,7 +1548,7 @@ async fn delete_after_pending_before_readiness_failure_cleans_objects_applied_by
     .await
     .expect_err("readiness fails after delete wins the post-pending race");
 
-    assert!(matches!(error, WakeInstanceError::Materializer { .. }));
+    assert!(matches!(error, WakeInstanceError::Projection { .. }));
     let rendered_objects = vec![
         object_ref("v1", "Service", "apps", "svc-acme-instance"),
         object_ref("apps/v1", "Deployment", "apps", "app-acme-instance"),

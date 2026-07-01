@@ -297,6 +297,63 @@ where
         }
     };
 
+    let mut projected_instance = waking.clone();
+    projected_instance.state = InstanceState::Running;
+    projected_instance.generation = waking.generation.next();
+    let projected_manifest = match render_manifests_with_options(
+        RenderManifestRequest {
+            template: &workload_class.template,
+            instance: &projected_instance,
+            sleep_policy,
+            namespace: request.target.namespace(),
+            template_generation: Some(workload_class.template_generation),
+        },
+        RenderManifestOptions {
+            sidecar_control_plane_token: materializer.sidecar_control_plane_token(),
+        },
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Render {
+                    instance: projected_instance,
+                    source: error,
+                },
+            )
+            .await);
+        }
+    };
+    let projected_rendered_objects = match materializer.rendered_object_refs(&projected_manifest) {
+        Ok(rendered_objects) => rendered_objects,
+        Err(error) => {
+            return Err(fail_waking(
+                store,
+                &waking,
+                WakeInstanceError::Materializer {
+                    instance: projected_instance,
+                    source: error,
+                },
+            )
+            .await);
+        }
+    };
+    if projected_rendered_objects != rendered_objects {
+        return Err(fail_waking(
+            store,
+            &waking,
+            WakeInstanceError::Materializer {
+                instance: projected_instance,
+                source: MaterializerError::InvalidManifest {
+                    message: "rendered object refs must remain stable between waking and running generations"
+                        .to_owned(),
+                },
+            },
+        )
+        .await);
+    }
+
     let exclusivity_keys = match workload_class.render_exclusivity_keys(&waking.values) {
         Ok(exclusivity_keys) => exclusivity_keys,
         Err(error) => {
@@ -352,20 +409,23 @@ where
             return Err(fail_waking_with_store_error(store, &waking, error).await);
         }
     };
-    let projection_plan = match ProjectionPlan::from_manifest(&pending_materialization, &manifest) {
-        Ok(plan) => plan,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Materializer {
-                    instance: waking.clone(),
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
+    let mut projected_materialization = pending_materialization.clone();
+    projected_materialization.instance_generation = projected_instance.generation;
+    let projection_plan =
+        match ProjectionPlan::from_manifest(&projected_materialization, &projected_manifest) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(fail_waking(
+                    store,
+                    &waking,
+                    WakeInstanceError::Materializer {
+                        instance: waking.clone(),
+                        source: error,
+                    },
+                )
+                .await);
+            }
+        };
 
     let projection_reconciler = ProjectionReconciler::new(materializer);
     if let Err(error) = projection_reconciler.apply(&projection_plan).await {
@@ -390,14 +450,16 @@ where
         .await);
     }
 
-    let projected_refs = projection_plan.object_refs();
-    let backend = match materializer.wait_for_readiness(&projected_refs).await {
+    let backend = match projection_reconciler
+        .wait_for_readiness(&projection_plan)
+        .await
+    {
         Ok(backend) => backend,
         Err(error) => {
             let original = fail_waking(
                 store,
                 &waking,
-                WakeInstanceError::Materializer {
+                WakeInstanceError::Projection {
                     instance: waking.clone(),
                     source: error,
                 },
@@ -406,7 +468,7 @@ where
             cleanup_rendered_objects_if_instance_missing_or_terminal(
                 store,
                 materializer,
-                &pending_materialization,
+                &projected_materialization,
             )
             .await;
             return Err(original);
@@ -420,7 +482,7 @@ where
         backend,
         backend_generation,
     );
-    complete.rendered_objects = rendered_objects.clone();
+    complete.rendered_objects = projected_rendered_objects;
     complete.exclusivity_keys = exclusivity_keys;
 
     match store.complete_wake(complete).await {
@@ -429,7 +491,7 @@ where
             cleanup_rendered_objects_if_instance_missing_or_terminal(
                 store,
                 materializer,
-                &pending_materialization,
+                &projected_materialization,
             )
             .await;
             Err(map_store_error(error))

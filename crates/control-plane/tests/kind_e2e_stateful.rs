@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     error::Error,
     io::{Read, Write},
@@ -13,23 +13,28 @@ use control_plane::api::pb::{
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteInstanceRequest, GetInstanceRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity,
     Instance, InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute, RouteHost,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProjectionObservation,
+    ProtocolRoute, ReconcileMaterializationRequest, ReconcileMaterializationResponse, RouteHost,
     RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
     TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef,
     WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
     WorkloadValueSchema,
 };
+use control_plane::projection::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
 use k8s_openapi::{
     api::{
         apps::v1::StatefulSet,
-        core::v1::{PersistentVolume, PersistentVolumeClaim, Pod, Service},
+        core::v1::{
+            PersistentVolume, PersistentVolumeClaim, Pod, Service, ServicePort, ServiceSpec,
+        },
     },
     apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::{
-    api::{DeleteParams, ListParams},
+    api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams},
     Api, Client, Error as KubeError,
 };
+use serde_json::json;
 use tokio::time::{sleep, Instant};
 use tonic::{
     transport::{Channel, Endpoint},
@@ -49,10 +54,12 @@ const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-e2e-stat";
 const RENDERED_PV_NAME: &str = "e2e-stateful-pv-e2e-stat";
 const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
+const CLUSTER_ID: &str = "kind-e2e-stateful";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
 const STATEFUL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(180);
 const CONTROL_PLANE_LABEL: &str = "app.kubernetes.io/name=sleepypods-control-plane";
+const PROJECTION_DRIFT_FINALIZER: &str = "sleepypods.io/kind-e2e-projection-drift-blocker";
 const EXCLUSIVE_CLASS_ID: &str = "stateful-exclusive";
 const EXCLUSIVE_OWNER_INSTANCE_ID: &str = "m12ownera";
 const EXCLUSIVE_BLOCKED_INSTANCE_ID: &str = "m12blockb";
@@ -407,8 +414,320 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires scripts/test-kind-e2e-projection-drift.sh or an equivalent kind deployment"]
+async fn projection_drift_and_finalizer_safety_through_deployed_platform() -> TestResult<()> {
+    if env::var("SLEEPYPODS_KIND_E2E_STATEFUL").as_deref() != Ok("1")
+        || env::var("SLEEPYPODS_KIND_E2E_PROJECTION_DRIFT").as_deref() != Ok("1")
+    {
+        eprintln!(
+            "skipping projection drift kind E2E because SLEEPYPODS_KIND_E2E_STATEFUL=1 and SLEEPYPODS_KIND_E2E_PROJECTION_DRIFT=1 are not set"
+        );
+        return Ok(());
+    }
+
+    control_plane::install_rustls_crypto_provider();
+
+    let config = E2eConfig::from_env()?;
+    let kube = Client::try_default().await?;
+    let mut operator = connect_operator(&config.operator_endpoint).await?;
+    let marker = unique_marker()?;
+
+    let result =
+        run_projection_drift_and_finalizer_safety(kube.clone(), &config, &mut operator, marker)
+            .await;
+    let cleanup = cleanup_projection_drift_injections(kube, &config.namespace).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => {
+            Err(format!("projection drift kind E2E cleanup failed: {cleanup_error}").into())
+        }
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "projection drift kind E2E failed: {error}; cleanup also failed: {cleanup_error}"
+        )
+        .into()),
+    }
+}
+
+async fn run_projection_drift_and_finalizer_safety(
+    kube: Client,
+    config: &E2eConfig,
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    marker: String,
+) -> TestResult<()> {
+    assert_single_node_cluster(kube.clone()).await?;
+    create_projection_drift_resources(operator, config).await?;
+    let created =
+        wait_for_instance_state(operator, PbInstanceState::Cold, Duration::from_secs(30)).await?;
+
+    let write_path = format!("/write/{marker}");
+    eprintln!("projection drift E2E: waking stateful backend");
+    let response = wait_for_frontline_response(
+        config,
+        "projection drift wake",
+        &write_path,
+        "wrote:",
+        Duration::from_secs(180),
+    )
+    .await?;
+    assert_response(&response, "projection drift wake", "wrote:")?;
+    let running =
+        wait_for_instance_state(operator, PbInstanceState::Running, Duration::from_secs(30))
+            .await?;
+    if running.generation <= created.generation {
+        return Err(format!(
+            "expected projection drift wake to advance generation beyond {}, got {}",
+            created.generation, running.generation
+        )
+        .into());
+    }
+    assert_materialized_stateful_objects(kube.clone(), config).await?;
+
+    let materialization_id = config.materialization_id(INSTANCE_ID);
+    let baseline = reconcile_materialization(operator, &materialization_id).await?;
+    assert_ready_reconcile_report_only(&baseline, &materialization_id)?;
+    assert_no_unowned_projection_observations(&baseline.projection_observations, "baseline")?;
+    expect_projection_observation(
+        &baseline.projection_observations,
+        "v1",
+        "Service",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "ready",
+    )?;
+
+    eprintln!("projection drift E2E: deleting an owned Service ref");
+    let original_service = service_api(kube.clone(), &config.namespace)
+        .get(RENDERED_WORKLOAD_NAME)
+        .await?;
+    delete_service_if_present(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
+    wait_for_service_absent(
+        kube.clone(),
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let missing = reconcile_materialization(operator, &materialization_id).await?;
+    assert_ready_reconcile_report_only(&missing, &materialization_id)?;
+    assert_no_unowned_projection_observations(&missing.projection_observations, "missing Service")?;
+    expect_projection_observation(
+        &missing.projection_observations,
+        "v1",
+        "Service",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "missing",
+    )?;
+    let unready = expect_projection_observation(
+        &missing.projection_observations,
+        "v1",
+        "Service",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "unready",
+    )?;
+    if unready.reason != "service_missing" {
+        return Err(format!(
+            "expected deleted Service readiness reason service_missing, got {:?}",
+            unready.reason
+        )
+        .into());
+    }
+    sleep(Duration::from_secs(2)).await;
+    assert_service_absent(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
+    assert_instance_generation(
+        operator,
+        INSTANCE_ID,
+        PbInstanceState::Running,
+        running.generation,
+    )
+    .await?;
+
+    eprintln!("projection drift E2E: creating an unowned same-name Service collision");
+    create_unowned_service_collision(kube.clone(), &config.namespace, &original_service).await?;
+    let unowned = reconcile_materialization(operator, &materialization_id).await?;
+    assert_ready_reconcile_report_only(&unowned, &materialization_id)?;
+    let unowned_service = expect_projection_observation(
+        &unowned.projection_observations,
+        "v1",
+        "Service",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "present_unowned",
+    )?;
+    if unowned_service.reason != "managed_by_mismatch" {
+        return Err(format!(
+            "expected unowned Service reason managed_by_mismatch, got {:?}",
+            unowned_service.reason
+        )
+        .into());
+    }
+    assert_unowned_service_present(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
+
+    let delete_error = operator
+        .delete_instance(DeleteInstanceRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+        })
+        .await
+        .expect_err("unowned same-name Service must block normal cleanup");
+    if delete_error.code() != Code::Unavailable
+        || !delete_error.message().contains("ownership conflict")
+    {
+        return Err(format!(
+            "expected DeleteInstance to fail with ownership conflict, got {}: {}",
+            delete_error.code(),
+            delete_error.message()
+        )
+        .into());
+    }
+    assert_unowned_service_present(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
+    assert_instance_generation(
+        operator,
+        INSTANCE_ID,
+        PbInstanceState::Running,
+        running.generation,
+    )
+    .await?;
+
+    eprintln!("projection drift E2E: removing injected unowned Service");
+    delete_service_if_present(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
+    wait_for_service_absent(
+        kube.clone(),
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        Duration::from_secs(30),
+    )
+    .await?;
+    restore_owned_service(kube.clone(), &config.namespace, &original_service).await?;
+    let restored = reconcile_materialization(operator, &materialization_id).await?;
+    assert_ready_reconcile_report_only(&restored, &materialization_id)?;
+    assert_no_unowned_projection_observations(
+        &restored.projection_observations,
+        "restored Service",
+    )?;
+    expect_projection_observation(
+        &restored.projection_observations,
+        "v1",
+        "Service",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "present_owned",
+    )?;
+
+    eprintln!("projection drift E2E: blocking owned StatefulSet deletion with a finalizer");
+    add_stateful_set_finalizer(
+        kube.clone(),
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        PROJECTION_DRIFT_FINALIZER,
+    )
+    .await?;
+    let finalizer_error = operator
+        .delete_instance(DeleteInstanceRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+        })
+        .await
+        .expect_err("owned finalizer must block normal cleanup");
+    if finalizer_error.code() != Code::Unavailable
+        || !finalizer_error.message().contains("cleanup blocked")
+    {
+        return Err(format!(
+            "expected DeleteInstance to fail with cleanup blocked, got {}: {}",
+            finalizer_error.code(),
+            finalizer_error.message()
+        )
+        .into());
+    }
+
+    let blocked = wait_for_reconcile_observation(
+        operator,
+        &materialization_id,
+        "apps/v1",
+        "StatefulSet",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "deleting_owned",
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert_ready_reconcile_report_only(&blocked, &materialization_id)?;
+    let blocked_stateful_set = expect_projection_observation(
+        &blocked.projection_observations,
+        "apps/v1",
+        "StatefulSet",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "deleting_owned",
+    )?;
+    if !blocked_stateful_set
+        .finalizers
+        .iter()
+        .any(|finalizer| finalizer == PROJECTION_DRIFT_FINALIZER)
+    {
+        return Err(format!(
+            "expected deleting StatefulSet observation to include finalizer {PROJECTION_DRIFT_FINALIZER}, got {:?}",
+            blocked_stateful_set.finalizers
+        )
+        .into());
+    }
+
+    eprintln!("projection drift E2E: removing finalizer and completing cleanup");
+    remove_stateful_set_finalizer(
+        kube.clone(),
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        PROJECTION_DRIFT_FINALIZER,
+    )
+    .await?;
+    let deleted = delete_instance_until_cleanup_complete(
+        &config.operator_endpoint,
+        INSTANCE_ID,
+        STATEFUL_CLEANUP_TIMEOUT,
+    )
+    .await?;
+    if !deleted.deleted {
+        return Err("expected final DeleteInstance retry to remove the instance".into());
+    }
+    wait_for_materialized_objects_deleted_for_instance(
+        kube,
+        &config.namespace,
+        INSTANCE_ID,
+        STATEFUL_CLEANUP_TIMEOUT,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn cleanup_projection_drift_injections(kube: Client, namespace: &str) -> TestResult<()> {
+    let mut errors = Vec::new();
+    if let Err(error) = remove_stateful_set_finalizer(
+        kube.clone(),
+        namespace,
+        RENDERED_WORKLOAD_NAME,
+        PROJECTION_DRIFT_FINALIZER,
+    )
+    .await
+    {
+        errors.push(format!("remove StatefulSet finalizer: {error}"));
+    }
+    if let Err(error) = delete_service_if_present(kube, namespace, RENDERED_WORKLOAD_NAME).await {
+        errors.push(format!("delete injected Service: {error}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; ").into())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct E2eConfig {
+    cluster_id: String,
     namespace: String,
     operator_endpoint: String,
     frontline_addr: SocketAddr,
@@ -425,6 +744,8 @@ struct HttpResponse {
 impl E2eConfig {
     fn from_env() -> TestResult<Self> {
         Ok(Self {
+            cluster_id: env::var("SLEEPYPODS_E2E_CLUSTER_ID")
+                .unwrap_or_else(|_| CLUSTER_ID.to_owned()),
             namespace: env::var("SLEEPYPODS_E2E_NAMESPACE")
                 .unwrap_or_else(|_| "sleepypods-e2e-stateful".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
@@ -441,6 +762,10 @@ impl E2eConfig {
 
     fn host_path(&self) -> String {
         format!("/tmp/sleepypods-kind-e2e/{TENANT_VALUE}")
+    }
+
+    fn materialization_id(&self, instance_id: &str) -> String {
+        format!("{instance_id}:{}:{}", self.cluster_id, self.namespace)
     }
 }
 
@@ -544,6 +869,40 @@ async fn delete_instance_with_reconnect(
     }
 }
 
+async fn delete_instance_until_cleanup_complete(
+    endpoint: &str,
+    instance_id: &str,
+    timeout: Duration,
+) -> TestResult<DeleteInstanceOutcome> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut operator = connect_operator(endpoint).await?;
+        match operator
+            .delete_instance(DeleteInstanceRequest {
+                instance_id: instance_id.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => {
+                return Ok(DeleteInstanceOutcome {
+                    deleted: response.into_inner().deleted,
+                });
+            }
+            Err(status)
+                if (retryable_operator_transport_status(&status)
+                    || status.code() == Code::Unavailable)
+                    && Instant::now() < deadline =>
+            {
+                eprintln!(
+                    "retrying DeleteInstance for {instance_id} while cleanup converges: {status}"
+                );
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(status) => return Err(status.into()),
+        }
+    }
+}
+
 fn retryable_operator_transport_status(status: &tonic::Status) -> bool {
     status.code() == Code::Unknown && status.message().contains("transport error")
 }
@@ -552,9 +911,25 @@ async fn create_operator_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
+    create_stateful_operator_resources(operator, config, "kind-e2e-stateful", 15_000).await
+}
+
+async fn create_projection_drift_resources(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    config: &E2eConfig,
+) -> TestResult<()> {
+    create_stateful_operator_resources(operator, config, "kind-e2e-projection-drift", 900_000).await
+}
+
+async fn create_stateful_operator_resources(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    config: &E2eConfig,
+    idempotency_scope: &str,
+    idle_timeout_ms: u64,
+) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-stateful-create-class".to_owned(),
+            idempotency_key: format!("{idempotency_scope}-create-class"),
             class_id: CLASS_ID.to_owned(),
             version: 1,
             default_values: Default::default(),
@@ -565,7 +940,7 @@ async fn create_operator_resources(
             template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
-                idle_timeout_ms: 15_000,
+                idle_timeout_ms,
                 idle_retry_backoff_ms: 500,
                 drain_grace_timeout_ms: 500,
                 idle_timeout_override: None,
@@ -576,7 +951,7 @@ async fn create_operator_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-stateful-create-instance".to_owned(),
+            idempotency_key: format!("{idempotency_scope}-create-instance"),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
@@ -588,7 +963,7 @@ async fn create_operator_resources(
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: "kind-e2e-stateful-create-route".to_owned(),
+            idempotency_key: format!("{idempotency_scope}-create-route"),
             route_binding_id: ROUTE_ID.to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             identity: Some(RouteIdentity {
@@ -752,6 +1127,180 @@ async fn wait_for_named_instance_state(
         }
         sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn assert_instance_generation(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    instance_id: &str,
+    expected_state: PbInstanceState,
+    expected_generation: u64,
+) -> TestResult<()> {
+    let instance = operator
+        .get_instance(GetInstanceRequest {
+            instance_id: instance_id.to_owned(),
+        })
+        .await?
+        .into_inner();
+    let actual_state =
+        PbInstanceState::try_from(instance.state).unwrap_or(PbInstanceState::Unspecified);
+    if actual_state != expected_state || instance.generation != expected_generation {
+        return Err(format!(
+            "expected instance {instance_id} to remain {expected_state:?} generation {expected_generation}, got {actual_state:?} generation {}",
+            instance.generation
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+async fn reconcile_materialization(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    materialization_id: &str,
+) -> TestResult<ReconcileMaterializationResponse> {
+    Ok(operator
+        .reconcile_materialization(ReconcileMaterializationRequest {
+            materialization_id: materialization_id.to_owned(),
+        })
+        .await?
+        .into_inner())
+}
+
+fn assert_ready_reconcile_report_only(
+    response: &ReconcileMaterializationResponse,
+    materialization_id: &str,
+) -> TestResult<()> {
+    if !response.found {
+        return Err(format!("expected materialization {materialization_id} to be found").into());
+    }
+    if response.materialization_id != materialization_id {
+        return Err(format!(
+            "expected materialization id {materialization_id}, got {}",
+            response.materialization_id
+        )
+        .into());
+    }
+    if response.state != "Ready" {
+        return Err(format!(
+            "expected ReconcileMaterialization to report Ready state, got {}",
+            response.state
+        )
+        .into());
+    }
+    if response.attempted {
+        return Err("Ready materialization drift inspection must remain report-only in V1".into());
+    }
+
+    Ok(())
+}
+
+fn expect_projection_observation<'a>(
+    observations: &'a [ProjectionObservation],
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    state: &str,
+) -> TestResult<&'a ProjectionObservation> {
+    observations
+        .iter()
+        .find(|observation| {
+            observation.state == state
+                && observation.r#ref.as_ref().is_some_and(|object_ref| {
+                    object_ref.api_version == api_version
+                        && object_ref.kind == kind
+                        && object_ref.namespace == namespace
+                        && object_ref.name == name
+                })
+        })
+        .ok_or_else(|| {
+            format!(
+                "expected projection observation {api_version} {kind} {namespace}/{name} state {state}; got {}",
+                projection_observation_summary(observations)
+            )
+            .into()
+        })
+}
+
+fn assert_no_unowned_projection_observations(
+    observations: &[ProjectionObservation],
+    context: &str,
+) -> TestResult<()> {
+    let unowned = observations
+        .iter()
+        .filter(|observation| {
+            matches!(
+                observation.state.as_str(),
+                "present_unowned" | "deleting_unowned"
+            )
+        })
+        .collect::<Vec<_>>();
+    if unowned.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected no unowned projection observations for {context}; got {}",
+            projection_observation_summary(observations)
+        )
+        .into())
+    }
+}
+
+async fn wait_for_reconcile_observation(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    materialization_id: &str,
+    api_version: &str,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    state: &str,
+    timeout: Duration,
+) -> TestResult<ReconcileMaterializationResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let response = reconcile_materialization(operator, materialization_id).await?;
+        if expect_projection_observation(
+            &response.projection_observations,
+            api_version,
+            kind,
+            namespace,
+            name,
+            state,
+        )
+        .is_ok()
+        {
+            return Ok(response);
+        }
+
+        if Instant::now() >= deadline {
+            let last_summary = projection_observation_summary(&response.projection_observations);
+            return Err(format!(
+                "timed out waiting for projection observation {api_version} {kind} {namespace}/{name} state {state}; last observations: {last_summary}"
+            )
+            .into());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn projection_observation_summary(observations: &[ProjectionObservation]) -> String {
+    observations
+        .iter()
+        .map(|observation| {
+            let object_ref = observation
+                .r#ref
+                .as_ref()
+                .map(|object_ref| {
+                    format!(
+                        "{} {}/{}",
+                        object_ref.kind, object_ref.namespace, object_ref.name
+                    )
+                })
+                .unwrap_or_else(|| "<missing-ref>".to_owned());
+            format!("{object_ref}:{}:{}", observation.state, observation.reason)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn wait_for_named_instance_state_with_reconnect(
@@ -938,6 +1487,202 @@ async fn assert_materialized_stateful_objects(kube: Client, config: &E2eConfig) 
     assert_service_targets_sidecar(&service)?;
     assert_stateful_pod_mounts_pvc(&pods).await?;
 
+    Ok(())
+}
+
+fn service_api(kube: Client, namespace: &str) -> Api<Service> {
+    Api::namespaced(kube, namespace)
+}
+
+async fn delete_service_if_present(kube: Client, namespace: &str, name: &str) -> TestResult<()> {
+    let services = service_api(kube, namespace);
+    match services.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(error) if kube_error_is_not_found(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn wait_for_service_absent(
+    kube: Client,
+    namespace: &str,
+    name: &str,
+    timeout: Duration,
+) -> TestResult<()> {
+    let services = service_api(kube, namespace);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if is_not_found(services.get(name).await) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("timed out waiting for Service {namespace}/{name} to be absent").into(),
+            );
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn assert_service_absent(kube: Client, namespace: &str, name: &str) -> TestResult<()> {
+    let services = service_api(kube, namespace);
+    match services.get(name).await {
+        Ok(_) => Err(format!("expected Service {namespace}/{name} to remain absent").into()),
+        Err(error) if kube_error_is_not_found(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn create_unowned_service_collision(
+    kube: Client,
+    namespace: &str,
+    original: &Service,
+) -> TestResult<()> {
+    let original_spec = original
+        .spec
+        .as_ref()
+        .ok_or("original Service is missing spec")?;
+    let ports = original_spec
+        .ports
+        .clone()
+        .ok_or("original Service is missing ports")?
+        .into_iter()
+        .map(unowned_service_port)
+        .collect::<Vec<_>>();
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "sleepypods.io/kind-e2e".to_owned(),
+        "projection-drift-unowned".to_owned(),
+    );
+    let service = Service {
+        metadata: ObjectMeta {
+            name: Some(RENDERED_WORKLOAD_NAME.to_owned()),
+            namespace: Some(namespace.to_owned()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            ports: Some(ports),
+            selector: original_spec.selector.clone(),
+            type_: Some("ClusterIP".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    service_api(kube, namespace)
+        .create(&PostParams::default(), &service)
+        .await?;
+    Ok(())
+}
+
+async fn restore_owned_service(
+    kube: Client,
+    namespace: &str,
+    original: &Service,
+) -> TestResult<()> {
+    let original_spec = original
+        .spec
+        .as_ref()
+        .ok_or("original Service is missing spec")?;
+    let service = Service {
+        metadata: ObjectMeta {
+            name: Some(RENDERED_WORKLOAD_NAME.to_owned()),
+            namespace: Some(namespace.to_owned()),
+            labels: original.metadata.labels.clone(),
+            annotations: original.metadata.annotations.clone(),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            ports: original_spec.ports.clone(),
+            selector: original_spec.selector.clone(),
+            type_: Some("ClusterIP".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    service_api(kube, namespace)
+        .create(&PostParams::default(), &service)
+        .await?;
+    Ok(())
+}
+
+fn unowned_service_port(mut port: ServicePort) -> ServicePort {
+    port.node_port = None;
+    port
+}
+
+async fn assert_unowned_service_present(
+    kube: Client,
+    namespace: &str,
+    name: &str,
+) -> TestResult<()> {
+    let service = service_api(kube, namespace).get(name).await?;
+    let labels = service.metadata.labels.unwrap_or_default();
+    if labels.get(LABEL_MANAGED_BY).map(String::as_str) == Some(LABEL_MANAGED_BY_VALUE) {
+        return Err(format!(
+            "Service {namespace}/{name} unexpectedly has SleepyPods ownership label"
+        )
+        .into());
+    }
+    if labels.contains_key("sleepypods.io/instance-id") {
+        return Err(
+            format!("Service {namespace}/{name} unexpectedly has an instance-id label").into(),
+        );
+    }
+    Ok(())
+}
+
+async fn add_stateful_set_finalizer(
+    kube: Client,
+    namespace: &str,
+    name: &str,
+    finalizer: &str,
+) -> TestResult<()> {
+    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube, namespace);
+    let stateful_set = stateful_sets.get(name).await?;
+    let mut finalizers = stateful_set.metadata.finalizers.unwrap_or_default();
+    if !finalizers.iter().any(|value| value == finalizer) {
+        finalizers.push(finalizer.to_owned());
+    }
+    patch_stateful_set_finalizers(&stateful_sets, name, finalizers).await
+}
+
+async fn remove_stateful_set_finalizer(
+    kube: Client,
+    namespace: &str,
+    name: &str,
+    finalizer: &str,
+) -> TestResult<()> {
+    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube, namespace);
+    let stateful_set = match stateful_sets.get(name).await {
+        Ok(stateful_set) => stateful_set,
+        Err(error) if kube_error_is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut finalizers = stateful_set.metadata.finalizers.unwrap_or_default();
+    let original_len = finalizers.len();
+    finalizers.retain(|value| value != finalizer);
+    if finalizers.len() == original_len {
+        return Ok(());
+    }
+    patch_stateful_set_finalizers(&stateful_sets, name, finalizers).await
+}
+
+async fn patch_stateful_set_finalizers(
+    stateful_sets: &Api<StatefulSet>,
+    name: &str,
+    finalizers: Vec<String>,
+) -> TestResult<()> {
+    let patch = Patch::Merge(json!({
+        "metadata": {
+            "finalizers": finalizers,
+        }
+    }));
+    stateful_sets
+        .patch(name, &PatchParams::default(), &patch)
+        .await?;
     Ok(())
 }
 
@@ -1452,6 +2197,10 @@ async fn assert_single_node_cluster(kube: Client) -> TestResult<()> {
 
 fn is_not_found<T>(result: Result<T, KubeError>) -> bool {
     matches!(result, Err(KubeError::Api(status)) if status.is_not_found())
+}
+
+fn kube_error_is_not_found(error: &KubeError) -> bool {
+    matches!(error, KubeError::Api(status) if status.is_not_found())
 }
 
 fn pod_ready(pod: &Pod) -> bool {

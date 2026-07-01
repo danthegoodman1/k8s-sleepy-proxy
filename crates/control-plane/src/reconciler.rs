@@ -236,10 +236,12 @@ where
             ));
         }
 
+        let projected_instance = projected_pending_wake_instance(&instance);
+        let projected_materialization = projected_pending_wake_materialization(&materialization);
         let manifest = self
-            .render_current_manifest(&instance, &materialization)
+            .render_current_manifest(&projected_instance, &materialization)
             .await?;
-        let projection_plan = ProjectionPlan::from_manifest(&materialization, &manifest)
+        let projection_plan = ProjectionPlan::from_manifest(&projected_materialization, &manifest)
             .map_err(MaterializationReconcileError::Materializer)?;
         let desired_refs = projection_plan.object_refs();
         if desired_refs != materialization.rendered_objects {
@@ -321,7 +323,9 @@ where
         &self,
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        let projection_plan = ProjectionPlan::from_recorded_refs(&materialization);
+        let projection_materialization =
+            projected_recorded_ref_materialization_for_cleanup(&materialization);
+        let projection_plan = ProjectionPlan::from_recorded_refs(&projection_materialization);
         self.delete_projection_observed(&projection_plan).await?;
         self.renew_or_lose(&materialization).await?;
         self.mark_deleted(materialization).await
@@ -577,6 +581,31 @@ fn outcome_for_result<T, E>(result: &Result<T, E>) -> Outcome {
     }
 }
 
+fn projected_pending_wake_instance(instance: &InstanceRecord) -> InstanceRecord {
+    let mut projected = instance.clone();
+    projected.state = InstanceState::Running;
+    projected.generation = instance.generation.next();
+    projected
+}
+
+fn projected_pending_wake_materialization(
+    materialization: &MaterializationRecord,
+) -> MaterializationRecord {
+    let mut projected = materialization.clone();
+    projected.instance_generation = materialization.instance_generation.next();
+    projected
+}
+
+fn projected_recorded_ref_materialization_for_cleanup(
+    materialization: &MaterializationRecord,
+) -> MaterializationRecord {
+    if materialization.state == MaterializationState::Pending {
+        projected_pending_wake_materialization(materialization)
+    } else {
+        materialization.clone()
+    }
+}
+
 impl<C> Clone for MaterializationReconciler<C>
 where
     C: Clone,
@@ -780,6 +809,30 @@ mod tests {
         assert_eq!(store.complete_calls(), 1);
         assert_eq!(store.guarded_delete_calls(), 0);
         assert_eq!(store.materialization_state(), MaterializationState::Ready);
+        assert_eq!(store.materialization_generation(), Generation::new(8));
+        assert_eq!(client.apply_calls(), 2);
+        assert_eq!(client.wait_readiness_calls(), 1);
+        assert_eq!(store.release_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_resumes_running_projection_after_apply_before_complete_crash() {
+        let instance = waking_instance("instance-reconcile");
+        let materialization = pending_materialization("mat-pending-applied-crash", &instance);
+        let projected = projected_pending_wake_materialization(&materialization);
+        let projected_instance = projected_pending_wake_instance(&instance);
+        let store = Arc::new(FakeReconcileStore::new(materialization, instance));
+        let client = FakeKubernetesClient::default()
+            .with_live_applied_projection(&projected, &projected_instance);
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(store.complete_calls(), 1);
+        assert_eq!(store.guarded_delete_calls(), 0);
+        assert_eq!(store.materialization_state(), MaterializationState::Ready);
+        assert_eq!(store.materialization_generation(), Generation::new(8));
         assert_eq!(client.apply_calls(), 2);
         assert_eq!(client.wait_readiness_calls(), 1);
         assert_eq!(store.release_calls(), 0);
@@ -881,7 +934,8 @@ mod tests {
             materialization.clone(),
             running_instance("instance-reconcile", 8),
         ));
-        let client = FakeKubernetesClient::default().with_live_owned_refs(&materialization);
+        let projected = projected_pending_wake_materialization(&materialization);
+        let client = FakeKubernetesClient::default().with_live_owned_refs(&projected);
         let materializer = KubernetesMaterializer::new(client.clone());
         let reconciler = reconciler(store.clone(), materializer);
 
@@ -1346,20 +1400,26 @@ mod tests {
 
         fn complete_wake_reconciliation<'a>(
             &'a self,
-            _request: CompleteWakeReconciliationRequest,
+            request: CompleteWakeReconciliationRequest,
         ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
             Box::pin(async move {
                 *self.complete_calls.lock().expect("complete lock") += 1;
+                let running_generation = request.complete.expected_waking_generation.next();
                 let mut materialization =
                     self.materialization.lock().expect("materialization lock");
                 materialization.state = MaterializationState::Ready;
+                materialization.instance_generation = running_generation;
+                materialization.backend_generation = request.complete.backend_generation;
                 materialization.backend = Some(
                     BackendEndpoint::new("http://svc.apps.svc.cluster.local:80")
                         .expect("backend endpoint"),
                 );
+                materialization.rendered_objects = request.complete.rendered_objects;
+                materialization.exclusivity_keys = request.complete.exclusivity_keys;
                 materialization.reconciliation_lease = None;
                 let mut instance = self.instance.clone();
                 instance.state = InstanceState::Running;
+                instance.generation = running_generation;
                 Ok(CompleteWakeResult {
                     instance,
                     materialization: materialization.clone(),
@@ -1454,6 +1514,37 @@ mod tests {
                 self.set_live(
                     object_ref.clone(),
                     ProjectionObjectInspection::Present(live_owned_metadata(materialization)),
+                );
+            }
+            self
+        }
+
+        fn with_live_applied_projection(
+            self,
+            materialization: &MaterializationRecord,
+            instance: &InstanceRecord,
+        ) -> Self {
+            let workload_class = workload_class();
+            let manifest = render_manifests(RenderManifestRequest {
+                template: &workload_class.template,
+                instance,
+                sleep_policy: workload_class
+                    .sleep_policy
+                    .resolve(&instance.values)
+                    .expect("sleep policy resolves"),
+                namespace: materialization.target.namespace(),
+                template_generation: Some(workload_class.template_generation),
+            })
+            .expect("manifest renders");
+            let plan = ProjectionPlan::from_manifest(materialization, &manifest)
+                .expect("projection plan builds");
+            for rendered in &plan.manifest().expect("projection manifest").objects {
+                let object_ref = crate::materializer::rendered_object_ref(&rendered.object);
+                self.set_live(
+                    object_ref,
+                    ProjectionObjectInspection::Present(LiveObjectMetadata::from_rendered_object(
+                        &rendered.object,
+                    )),
                 );
             }
             self
