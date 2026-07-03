@@ -20,6 +20,7 @@ use crate::{
 
 pub type KubernetesClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type KubernetesClientResult<T> = Result<T, KubernetesClientError>;
+type ObjectMetadataMaps<'a> = (&'a BTreeMap<String, String>, &'a BTreeMap<String, String>);
 
 pub trait KubernetesMaterializerClient: Send + Sync {
     fn apply_object<'a>(
@@ -94,12 +95,12 @@ pub enum MaterializerError {
         message: String,
     },
     Apply {
-        object: RenderedObjectRef,
+        object: Box<RenderedObjectRef>,
         applied_objects: Vec<RenderedObjectRef>,
         source: KubernetesClientError,
     },
     Delete {
-        object: RenderedObjectRef,
+        object: Box<RenderedObjectRef>,
         source: KubernetesClientError,
     },
     PvcBoundWait {
@@ -257,7 +258,7 @@ where
             .delete_object(object)
             .await
             .map_err(|source| MaterializerError::Delete {
-                object: object.clone(),
+                object: Box::new(object.clone()),
                 source,
             })
     }
@@ -277,7 +278,7 @@ where
             .apply_object(object)
             .await
             .map_err(|source| MaterializerError::Apply {
-                object: object_ref.clone(),
+                object: Box::new(object_ref.clone()),
                 applied_objects: Vec::new(),
                 source,
             })?;
@@ -746,9 +747,7 @@ fn validate_generation_value(
     })
 }
 
-fn object_metadata(
-    object: &KubernetesObject,
-) -> (&BTreeMap<String, String>, &BTreeMap<String, String>) {
+fn object_metadata(object: &KubernetesObject) -> ObjectMetadataMaps<'_> {
     match object {
         KubernetesObject::Deployment(object) => {
             (&object.metadata.labels, &object.metadata.annotations)
@@ -769,9 +768,7 @@ fn object_metadata(
     }
 }
 
-fn pod_template_metadata(
-    object: &KubernetesObject,
-) -> Option<(&BTreeMap<String, String>, &BTreeMap<String, String>)> {
+fn pod_template_metadata(object: &KubernetesObject) -> Option<ObjectMetadataMaps<'_>> {
     match object {
         KubernetesObject::Deployment(object) => Some((
             &object.spec.template.metadata.labels,
@@ -1056,7 +1053,7 @@ mod tests {
         assert_eq!(
             error,
             MaterializerError::Apply {
-                object: service_ref.clone(),
+                object: Box::new(service_ref.clone()),
                 applied_objects: Vec::new(),
                 source: KubernetesClientError::new("invalid object"),
             }
@@ -1232,7 +1229,7 @@ mod tests {
         assert_eq!(
             error,
             MaterializerError::Apply {
-                object: service_ref.clone(),
+                object: Box::new(service_ref.clone()),
                 applied_objects: Vec::new(),
                 source: KubernetesClientError::new("apply failed"),
             }
@@ -1257,7 +1254,7 @@ mod tests {
         assert_eq!(
             error,
             MaterializerError::Apply {
-                object: service_ref.clone(),
+                object: Box::new(service_ref.clone()),
                 applied_objects: vec![pv_ref.clone(), pvc_ref.clone()],
                 source: KubernetesClientError::new("apply failed"),
             }
@@ -1480,7 +1477,7 @@ mod tests {
         assert_eq!(
             error,
             MaterializerError::Delete {
-                object: service_ref.clone(),
+                object: Box::new(service_ref.clone()),
                 source: KubernetesClientError::new("delete failed"),
             }
         );

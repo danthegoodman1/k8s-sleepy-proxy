@@ -42,7 +42,9 @@ use tokio_tungstenite::{
     accept_hdr_async, connect_async,
     tungstenite::{
         client::IntoClientRequest,
-        handshake::server::{Request as WsRequest, Response as WsResponse},
+        handshake::server::{
+            Callback, ErrorResponse, Request as WsRequest, Response as WsResponse,
+        },
         protocol::CloseFrame,
         Bytes as WsBytes, Message,
     },
@@ -62,6 +64,8 @@ use crate::{
 
 const READY_RESPONSE: &[u8] = b"ready-from-listener-upstream";
 const TLS_REQUEST_BODY: &[u8] = b"tls-listener-request";
+type BlockingSubscribeResponse =
+    oneshot::Receiver<Result<SubscribeControlPlaneOutput, TestRouteError>>;
 
 #[derive(Clone, Debug, Default)]
 struct FakeRouteClient {
@@ -99,9 +103,7 @@ struct FakeHttp01Resolver {
 #[derive(Clone, Debug, Default)]
 struct BlockingRouteClient {
     calls: Arc<Mutex<Vec<RouteClientCall>>>,
-    subscribe_responses: Arc<
-        Mutex<VecDeque<oneshot::Receiver<Result<SubscribeControlPlaneOutput, TestRouteError>>>>,
-    >,
+    subscribe_responses: Arc<Mutex<VecDeque<BlockingSubscribeResponse>>>,
     subscribe_notifications: Arc<Mutex<VecDeque<oneshot::Sender<()>>>>,
 }
 
@@ -740,27 +742,14 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
     let (path_seen_tx, path_seen_rx) = oneshot::channel();
     let upstream_task = tokio::spawn(async move {
         let (stream, _) = upstream_listener.accept().await.expect("upstream accepts");
-        let mut path_seen_tx = Some(path_seen_tx);
-        let mut websocket =
-            accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
-                assert_eq!(
-                    request
-                        .uri()
-                        .path_and_query()
-                        .expect("websocket path query")
-                        .as_str(),
-                    "/socket?room=blue"
-                );
-                assert_frontline_forwarded_headers(request.headers(), "http", "ws.example.com");
-                path_seen_tx
-                    .take()
-                    .expect("path signal unused")
-                    .send(())
-                    .expect("test waits for websocket path");
-                Ok(response)
-            })
-            .await
-            .expect("upstream accepts websocket");
+        let mut websocket = accept_hdr_async(
+            stream,
+            AssertListenerWebSocketRequest {
+                path_seen_tx: Some(path_seen_tx),
+            },
+        )
+        .await
+        .expect("upstream accepts websocket");
 
         let text = websocket
             .next()
@@ -1417,6 +1406,34 @@ fn assert_frontline_forwarded_headers(
         expected_host
     );
     assert!(headers.get("x-forwarded-prefix").is_none());
+}
+
+struct AssertListenerWebSocketRequest {
+    path_seen_tx: Option<oneshot::Sender<()>>,
+}
+
+impl Callback for AssertListenerWebSocketRequest {
+    fn on_request(
+        mut self,
+        request: &WsRequest,
+        response: WsResponse,
+    ) -> Result<WsResponse, ErrorResponse> {
+        assert_eq!(
+            request
+                .uri()
+                .path_and_query()
+                .expect("websocket path query")
+                .as_str(),
+            "/socket?room=blue"
+        );
+        assert_frontline_forwarded_headers(request.headers(), "http", "ws.example.com");
+        self.path_seen_tx
+            .take()
+            .expect("path signal unused")
+            .send(())
+            .expect("test waits for websocket path");
+        Ok(response)
+    }
 }
 
 async fn spawn_h2c_grpc_upstream() -> (SocketAddr, JoinHandle<()>) {

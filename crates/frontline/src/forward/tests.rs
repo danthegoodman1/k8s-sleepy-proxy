@@ -16,7 +16,9 @@ use tokio::{net::TcpListener, sync::oneshot};
 use tokio_tungstenite::{
     accept_hdr_async, connect_async,
     tungstenite::{
-        handshake::server::{Request as WsRequest, Response as WsResponse},
+        handshake::server::{
+            Callback, ErrorResponse, Request as WsRequest, Response as WsResponse,
+        },
         protocol::CloseFrame,
         Bytes as WsBytes, Message,
     },
@@ -322,7 +324,6 @@ async fn frontline_h2c_grpc_shaped_forwarding_preserves_body_and_trailers() {
 }
 
 #[tokio::test]
-#[allow(clippy::result_large_err)]
 async fn frontline_websocket_forwards_ready_backend_bidirectionally_and_closes() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -333,26 +334,14 @@ async fn frontline_websocket_forwards_ready_backend_bidirectionally_and_closes()
 
     let upstream_task = tokio::spawn(async move {
         let (stream, _) = upstream_listener.accept().await.expect("upstream accepts");
-        let mut path_seen_tx = Some(path_seen_tx);
-        let mut websocket =
-            accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
-                assert_eq!(
-                    request
-                        .uri()
-                        .path_and_query()
-                        .expect("ws path query")
-                        .as_str(),
-                    "/socket?room=blue"
-                );
-                path_seen_tx
-                    .take()
-                    .expect("path signal unused")
-                    .send(())
-                    .expect("test waits for websocket path");
-                Ok(response)
-            })
-            .await
-            .expect("upstream accepts websocket");
+        let mut websocket = accept_hdr_async(
+            stream,
+            AssertForwardedWebSocketPath {
+                path_seen_tx: Some(path_seen_tx),
+            },
+        )
+        .await
+        .expect("upstream accepts websocket");
 
         let first = websocket
             .next()
@@ -486,5 +475,32 @@ fn ready_backend(uri: impl Into<String>) -> ReadyBackend {
         instance_generation: Generation::new(7),
         backend: BackendEndpoint::new(uri).expect("backend endpoint"),
         backend_generation: Some(BackendGeneration::new(11)),
+    }
+}
+
+struct AssertForwardedWebSocketPath {
+    path_seen_tx: Option<oneshot::Sender<()>>,
+}
+
+impl Callback for AssertForwardedWebSocketPath {
+    fn on_request(
+        mut self,
+        request: &WsRequest,
+        response: WsResponse,
+    ) -> Result<WsResponse, ErrorResponse> {
+        assert_eq!(
+            request
+                .uri()
+                .path_and_query()
+                .expect("ws path query")
+                .as_str(),
+            "/socket?room=blue"
+        );
+        self.path_seen_tx
+            .take()
+            .expect("path signal unused")
+            .send(())
+            .expect("test waits for websocket path");
+        Ok(response)
     }
 }

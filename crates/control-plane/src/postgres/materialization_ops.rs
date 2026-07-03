@@ -685,13 +685,15 @@ pub(crate) async fn force_delete_materialization(
     let materialization_id = request.materialization_id.as_str();
     insert_operator_audit_event(
         &transaction,
-        "force_delete_materialization",
-        Some(materialization_id),
-        None,
-        None,
-        None,
-        &request.operator,
-        &request.reason,
+        OperatorAuditEvent {
+            operation: "force_delete_materialization",
+            materialization_id: Some(materialization_id),
+            cluster_id: None,
+            namespace: None,
+            key_name: None,
+            operator: &request.operator,
+            reason: &request.reason,
+        },
     )
     .await?;
     let existing = transaction
@@ -747,13 +749,15 @@ pub(crate) async fn force_release_exclusivity_key(
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     insert_operator_audit_event(
         &transaction,
-        "force_release_exclusivity_key",
-        None,
-        Some(request.target.cluster_id()),
-        Some(request.target.namespace()),
-        Some(&request.key_name),
-        &request.operator,
-        &request.reason,
+        OperatorAuditEvent {
+            operation: "force_release_exclusivity_key",
+            materialization_id: None,
+            cluster_id: Some(request.target.cluster_id()),
+            namespace: Some(request.target.namespace()),
+            key_name: Some(&request.key_name),
+            operator: &request.operator,
+            reason: &request.reason,
+        },
     )
     .await?;
     let cluster_id = request.target.cluster_id();
@@ -1042,7 +1046,7 @@ async fn ensure_reconciliation_lease(
         .await
         .map_err(map_postgres_error)?
         .get("now");
-    if expires_at.map_or(true, |expires_at| expires_at <= now) {
+    if expires_at.is_none_or(|expires_at| expires_at <= now) {
         return Err(StoreError::unavailable(
             "materialization reconciliation lease is expired",
         ));
@@ -1077,15 +1081,19 @@ fn validate_operator_audit(operator: &str, reason: &str) -> StoreResult<()> {
     Ok(())
 }
 
+struct OperatorAuditEvent<'a> {
+    operation: &'a str,
+    materialization_id: Option<&'a str>,
+    cluster_id: Option<&'a str>,
+    namespace: Option<&'a str>,
+    key_name: Option<&'a str>,
+    operator: &'a str,
+    reason: &'a str,
+}
+
 async fn insert_operator_audit_event(
     client: &impl GenericClient,
-    operation: &str,
-    materialization_id: Option<&str>,
-    cluster_id: Option<&str>,
-    namespace: Option<&str>,
-    key_name: Option<&str>,
-    operator: &str,
-    reason: &str,
+    event: OperatorAuditEvent<'_>,
 ) -> StoreResult<()> {
     client
         .execute(
@@ -1097,13 +1105,13 @@ async fn insert_operator_audit_event(
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ",
             &[
-                &operation,
-                &materialization_id,
-                &cluster_id,
-                &namespace,
-                &key_name,
-                &operator,
-                &reason,
+                &event.operation,
+                &event.materialization_id,
+                &event.cluster_id,
+                &event.namespace,
+                &event.key_name,
+                &event.operator,
+                &event.reason,
             ],
         )
         .await

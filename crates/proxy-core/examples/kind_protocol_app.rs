@@ -25,7 +25,12 @@ use tokio::{
 };
 use tokio_tungstenite::{
     accept_hdr_async,
-    tungstenite::{handshake::server::Request as WsRequest, Message},
+    tungstenite::{
+        handshake::server::{
+            Callback, ErrorResponse, Request as WsRequest, Response as WsResponse,
+        },
+        Message,
+    },
 };
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -143,15 +148,7 @@ fn grpc_response(
 async fn serve_websocket(stream: PrefixedTcpStream) -> AppResult<()> {
     let instance = instance();
     let mut path = String::new();
-    let mut websocket = accept_hdr_async(stream, |request: &WsRequest, response| {
-        path = request
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_else(|| "/".to_owned());
-        Ok(response)
-    })
-    .await?;
+    let mut websocket = accept_hdr_async(stream, CaptureWebSocketPath { path: &mut path }).await?;
 
     while let Some(message) = websocket.next().await {
         match message? {
@@ -184,6 +181,25 @@ async fn serve_websocket(stream: PrefixedTcpStream) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+struct CaptureWebSocketPath<'a> {
+    path: &'a mut String,
+}
+
+impl Callback for CaptureWebSocketPath<'_> {
+    fn on_request(
+        self,
+        request: &WsRequest,
+        response: WsResponse,
+    ) -> Result<WsResponse, ErrorResponse> {
+        *self.path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned());
+        Ok(response)
+    }
 }
 
 fn boxed_full(body: String) -> AppBody {

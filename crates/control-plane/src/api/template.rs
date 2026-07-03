@@ -176,27 +176,32 @@ fn volume_source_template_from_proto(
                     csi.controller_publish_secret_ref,
                     "template.volumes.source.csi.controller_publish_secret_ref.name",
                     "template.volumes.source.csi.controller_publish_secret_ref.namespace",
-                )?,
+                )?
+                .map(Box::new),
                 node_stage_secret_ref: csi_secret_ref_from_proto(
                     csi.node_stage_secret_ref,
                     "template.volumes.source.csi.node_stage_secret_ref.name",
                     "template.volumes.source.csi.node_stage_secret_ref.namespace",
-                )?,
+                )?
+                .map(Box::new),
                 node_publish_secret_ref: csi_secret_ref_from_proto(
                     csi.node_publish_secret_ref,
                     "template.volumes.source.csi.node_publish_secret_ref.name",
                     "template.volumes.source.csi.node_publish_secret_ref.namespace",
-                )?,
+                )?
+                .map(Box::new),
                 controller_expand_secret_ref: csi_secret_ref_from_proto(
                     csi.controller_expand_secret_ref,
                     "template.volumes.source.csi.controller_expand_secret_ref.name",
                     "template.volumes.source.csi.controller_expand_secret_ref.namespace",
-                )?,
+                )?
+                .map(Box::new),
                 node_expand_secret_ref: csi_secret_ref_from_proto(
                     csi.node_expand_secret_ref,
                     "template.volumes.source.csi.node_expand_secret_ref.name",
                     "template.volumes.source.csi.node_expand_secret_ref.namespace",
-                )?,
+                )?
+                .map(Box::new),
             })
         }
         pb::persistent_volume_source_template::Kind::HostPath(host_path) => {
@@ -476,11 +481,15 @@ fn volume_source_template_to_proto(
                 .map(|(key, value)| (key, template_text_to_proto(value)))
                 .collect(),
             controller_publish_secret_ref: controller_publish_secret_ref
-                .map(csi_secret_ref_to_proto),
-            node_stage_secret_ref: node_stage_secret_ref.map(csi_secret_ref_to_proto),
-            node_publish_secret_ref: node_publish_secret_ref.map(csi_secret_ref_to_proto),
-            controller_expand_secret_ref: controller_expand_secret_ref.map(csi_secret_ref_to_proto),
-            node_expand_secret_ref: node_expand_secret_ref.map(csi_secret_ref_to_proto),
+                .map(|secret| csi_secret_ref_to_proto(*secret)),
+            node_stage_secret_ref: node_stage_secret_ref
+                .map(|secret| csi_secret_ref_to_proto(*secret)),
+            node_publish_secret_ref: node_publish_secret_ref
+                .map(|secret| csi_secret_ref_to_proto(*secret)),
+            controller_expand_secret_ref: controller_expand_secret_ref
+                .map(|secret| csi_secret_ref_to_proto(*secret)),
+            node_expand_secret_ref: node_expand_secret_ref
+                .map(|secret| csi_secret_ref_to_proto(*secret)),
         }),
         domain_manifest::PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
             pb::persistent_volume_source_template::Kind::HostPath(

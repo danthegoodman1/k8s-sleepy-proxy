@@ -76,12 +76,14 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
 
     let response = wait_for_tls_response(
         config.tls_termination_addr,
-        "TLS termination",
-        TERMINATION_HOST,
-        TERMINATION_HOST,
-        "/terminated",
-        TERMINATION_TARGET,
-        "http",
+        TlsResponseExpectation {
+            context: "TLS termination",
+            sni: TERMINATION_HOST,
+            host: TERMINATION_HOST,
+            path: "/terminated",
+            target: TERMINATION_TARGET,
+            mode: "http",
+        },
         Duration::from_secs(180),
     )
     .await?;
@@ -126,12 +128,14 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
 
     let exact = wait_for_tls_response(
         config.tls_passthrough_addr,
-        "exact SNI passthrough",
-        EXACT_SNI_HOST,
-        EXACT_SNI_HOST,
-        "/passthrough/exact",
-        "sni-exact",
-        "tls",
+        TlsResponseExpectation {
+            context: "exact SNI passthrough",
+            sni: EXACT_SNI_HOST,
+            host: EXACT_SNI_HOST,
+            path: "/passthrough/exact",
+            target: "sni-exact",
+            mode: "tls",
+        },
         Duration::from_secs(180),
     )
     .await?;
@@ -139,12 +143,14 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
 
     let wildcard = wait_for_tls_response(
         config.tls_passthrough_addr,
-        "wildcard SNI passthrough",
-        WILDCARD_SNI_CHILD_HOST,
-        WILDCARD_SNI_CHILD_HOST,
-        "/passthrough/wildcard",
-        "sni-wildcard",
-        "tls",
+        TlsResponseExpectation {
+            context: "wildcard SNI passthrough",
+            sni: WILDCARD_SNI_CHILD_HOST,
+            host: WILDCARD_SNI_CHILD_HOST,
+            path: "/passthrough/wildcard",
+            target: "sni-wildcard",
+            mode: "tls",
+        },
         Duration::from_secs(180),
     )
     .await?;
@@ -407,36 +413,47 @@ async fn wait_for_instance_state(
     }
 }
 
+struct TlsResponseExpectation<'a> {
+    context: &'a str,
+    sni: &'a str,
+    host: &'a str,
+    path: &'a str,
+    target: &'a str,
+    mode: &'a str,
+}
+
 async fn wait_for_tls_response(
     addr: SocketAddr,
-    context: &str,
-    sni: &str,
-    host: &str,
-    path: &str,
-    target: &str,
-    mode: &str,
+    expectation: TlsResponseExpectation<'_>,
     timeout: Duration,
 ) -> TestResult<HttpResponse> {
     let deadline = Instant::now() + timeout;
     loop {
-        let last_error = match tls_get(addr, sni, host, path).await {
-            Ok(response)
-                if response.status == 200
-                    && response_body_identifies(&response, target)
-                    && response.body.contains(&format!("mode={mode}\n")) =>
-            {
-                return Ok(response);
-            }
-            Ok(response) => format!(
-                "frontline returned HTTP {} with body {:?}",
-                response.status, response.body
-            ),
-            Err(error) => error.to_string(),
-        };
+        let last_error =
+            match tls_get(addr, expectation.sni, expectation.host, expectation.path).await {
+                Ok(response)
+                    if response.status == 200
+                        && response_body_identifies(&response, expectation.target)
+                        && response
+                            .body
+                            .contains(&format!("mode={}\n", expectation.mode)) =>
+                {
+                    return Ok(response);
+                }
+                Ok(response) => format!(
+                    "frontline returned HTTP {} with body {:?}",
+                    response.status, response.body
+                ),
+                Err(error) => error.to_string(),
+            };
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for {context} response for SNI {sni} host {host} path {path}: {}",
+                "timed out waiting for {} response for SNI {} host {} path {}: {}",
+                expectation.context,
+                expectation.sni,
+                expectation.host,
+                expectation.path,
                 last_error
             )
             .into());

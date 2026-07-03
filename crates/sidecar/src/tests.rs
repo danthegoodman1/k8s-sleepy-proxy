@@ -605,10 +605,11 @@ async fn drain_completes_after_active_http_upstream_disconnects() {
             .expect("upstream accepts sidecar connection");
 
         let mut buffer = [0; 128];
-        stream
+        let bytes_read = stream
             .read(&mut buffer)
             .await
             .expect("upstream reads request bytes");
+        assert!(bytes_read > 0);
         upstream_accepted_tx
             .send(())
             .expect("test waits for upstream accept");

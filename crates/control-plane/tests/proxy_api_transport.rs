@@ -1304,10 +1304,10 @@ async fn proxy_wake_render_failure_returns_transport_error() {
 }
 
 #[tokio::test]
-async fn proxy_wake_materializer_failure_returns_transport_error() {
+async fn proxy_wake_projection_failure_returns_transport_error() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_instance(domain_instance(
-        "instance-materializer-failure",
+        "instance-projection-failure",
         DomainInstanceState::Cold,
         1,
     ));
@@ -1316,15 +1316,15 @@ async fn proxy_wake_materializer_failure_returns_transport_error() {
 
     let error = service
         .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
-            instance_id: "instance-materializer-failure".to_owned(),
+            instance_id: "instance-projection-failure".to_owned(),
             expected_generation: 1,
             backend_generation: None,
         }))
         .await
-        .expect_err("materializer failure is a transport error");
+        .expect_err("projection failure is a transport error");
 
     assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("materialization failed"));
+    assert!(error.message().contains("projection failed"));
 }
 
 #[test]

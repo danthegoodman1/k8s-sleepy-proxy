@@ -459,7 +459,7 @@ where
             ))
             .await
             .map_err(MaterializationReconcileError::Store)?
-            .ok_or_else(|| {
+            .ok_or({
                 MaterializationReconcileError::Store(StoreError::NotFound {
                     resource: "workload class version",
                 })
@@ -617,12 +617,6 @@ where
             config: self.config.clone(),
             observability: self.observability.clone(),
         }
-    }
-}
-
-impl MaterializationReconcileError {
-    fn to_string(&self) -> String {
-        format!("{self}")
     }
 }
 
@@ -1642,7 +1636,7 @@ mod tests {
                         self.live
                             .lock()
                             .expect("live lock")
-                            .remove(&object_key(&object));
+                            .remove(&object_key(object));
                         Ok(())
                     }
                 }

@@ -1507,7 +1507,7 @@ async fn send_h2c_grpc_request(
     )
     .await
     .map_err(|_| timeout_error("h2c handshake"))??;
-    let connection_task = tokio::spawn(async move { connection.await });
+    let connection_task = tokio::spawn(connection);
     let request = HttpRequest::builder()
         .method("POST")
         .uri(format!(
@@ -1565,7 +1565,7 @@ async fn send_h2_tls_grpc_request(
     )
     .await
     .map_err(|_| timeout_error("h2 TLS HTTP/2 handshake"))??;
-    let connection_task = tokio::spawn(async move { connection.await });
+    let connection_task = tokio::spawn(connection);
     let request = HttpRequest::builder()
         .method("POST")
         .uri(format!(

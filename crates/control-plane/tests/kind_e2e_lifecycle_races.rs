@@ -70,65 +70,75 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
 
     create_workload_class(
         &mut operator,
-        NORMAL_CLASS_ID,
-        &config.app_image,
-        &config.sidecar_image,
-        WorkloadKind::Deployment,
-        "lifecycle-normal-app",
-        Vec::new(),
-        "normal",
+        WorkloadClassFixture {
+            class_id: NORMAL_CLASS_ID,
+            app_image: &config.app_image,
+            sidecar_image: &config.sidecar_image,
+            kind: WorkloadKind::Deployment,
+            workload_name: "lifecycle-normal-app",
+            volumes: Vec::new(),
+            idempotency_suffix: "normal",
+        },
     )
     .await?;
     create_workload_class(
         &mut operator,
-        SLEEP_WHILE_WAKING_CLASS_ID,
-        &config.sleep_while_waking_image,
-        &config.sidecar_image,
-        WorkloadKind::Deployment,
-        "lifecycle-sleep-waking-app",
-        Vec::new(),
-        "sleep-waking",
+        WorkloadClassFixture {
+            class_id: SLEEP_WHILE_WAKING_CLASS_ID,
+            app_image: &config.sleep_while_waking_image,
+            sidecar_image: &config.sidecar_image,
+            kind: WorkloadKind::Deployment,
+            workload_name: "lifecycle-sleep-waking-app",
+            volumes: Vec::new(),
+            idempotency_suffix: "sleep-waking",
+        },
     )
     .await?;
     create_workload_class(
         &mut operator,
-        DELETE_WHILE_WAKING_CLASS_ID,
-        &config.delete_while_waking_image,
-        &config.sidecar_image,
-        WorkloadKind::StatefulSet,
-        "lifecycle-delete-waking-app",
-        stateful_volumes(
-            "lifecycle-delete-waking-pv",
-            "lifecycle-delete-waking-pvc",
-            "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-waking",
-        ),
-        "delete-waking",
+        WorkloadClassFixture {
+            class_id: DELETE_WHILE_WAKING_CLASS_ID,
+            app_image: &config.delete_while_waking_image,
+            sidecar_image: &config.sidecar_image,
+            kind: WorkloadKind::StatefulSet,
+            workload_name: "lifecycle-delete-waking-app",
+            volumes: stateful_volumes(
+                "lifecycle-delete-waking-pv",
+                "lifecycle-delete-waking-pvc",
+                "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-waking",
+            ),
+            idempotency_suffix: "delete-waking",
+        },
     )
     .await?;
     create_workload_class(
         &mut operator,
-        DELETE_WHILE_DRAINING_CLASS_ID,
-        &config.app_image,
-        &config.sidecar_image,
-        WorkloadKind::StatefulSet,
-        "lifecycle-delete-draining-app",
-        stateful_volumes(
-            "lifecycle-delete-draining-pv",
-            "lifecycle-delete-draining-pvc",
-            "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-draining",
-        ),
-        "delete-draining",
+        WorkloadClassFixture {
+            class_id: DELETE_WHILE_DRAINING_CLASS_ID,
+            app_image: &config.app_image,
+            sidecar_image: &config.sidecar_image,
+            kind: WorkloadKind::StatefulSet,
+            workload_name: "lifecycle-delete-draining-app",
+            volumes: stateful_volumes(
+                "lifecycle-delete-draining-pv",
+                "lifecycle-delete-draining-pvc",
+                "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-draining",
+            ),
+            idempotency_suffix: "delete-draining",
+        },
     )
     .await?;
     create_workload_class(
         &mut operator,
-        FAILED_RETRY_CLASS_ID,
-        &config.failed_retry_image,
-        &config.sidecar_image,
-        WorkloadKind::Deployment,
-        "lifecycle-failed-retry-app",
-        Vec::new(),
-        "failed-retry",
+        WorkloadClassFixture {
+            class_id: FAILED_RETRY_CLASS_ID,
+            app_image: &config.failed_retry_image,
+            sidecar_image: &config.sidecar_image,
+            kind: WorkloadKind::Deployment,
+            workload_name: "lifecycle-failed-retry-app",
+            volumes: Vec::new(),
+            idempotency_suffix: "failed-retry",
+        },
     )
     .await?;
 
@@ -860,20 +870,24 @@ async fn route_reassignment_invalidates_active_subscription(
     Ok(())
 }
 
+struct WorkloadClassFixture<'a> {
+    class_id: &'a str,
+    app_image: &'a str,
+    sidecar_image: &'a str,
+    kind: WorkloadKind,
+    workload_name: &'a str,
+    volumes: Vec<VolumeTemplate>,
+    idempotency_suffix: &'a str,
+}
+
 async fn create_workload_class(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    class_id: &str,
-    app_image: &str,
-    sidecar_image: &str,
-    kind: WorkloadKind,
-    workload_name: &str,
-    volumes: Vec<VolumeTemplate>,
-    idempotency_suffix: &str,
+    fixture: WorkloadClassFixture<'_>,
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-lifecycle-{idempotency_suffix}-class"),
-            class_id: class_id.to_owned(),
+            idempotency_key: format!("kind-e2e-lifecycle-{}-class", fixture.idempotency_suffix),
+            class_id: fixture.class_id.to_owned(),
             version: 1,
             default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
@@ -888,10 +902,14 @@ async fn create_workload_class(
             }),
             template_generation: 1,
             template: Some(ManifestTemplate {
-                workload: Some(workload_template(kind, workload_name, app_image)),
-                sidecar: Some(sidecar_template(sidecar_image)),
-                service: Some(service_template(workload_name)),
-                volumes,
+                workload: Some(workload_template(
+                    fixture.kind,
+                    fixture.workload_name,
+                    fixture.app_image,
+                )),
+                sidecar: Some(sidecar_template(fixture.sidecar_image)),
+                service: Some(service_template(fixture.workload_name)),
+                volumes: fixture.volumes,
                 raw_objects: vec![],
             }),
             sleep_policy: Some(sleep_policy()),

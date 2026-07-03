@@ -239,7 +239,7 @@ where
             match event {
                 GrpcRouteSubscriptionEvent::Message(message) => {
                     if is_subscription_update(&message) {
-                        events.push(RouteSubscriptionEvent::Update(message));
+                        events.push(RouteSubscriptionEvent::Update(Box::new(message)));
                     } else {
                         return Err(GrpcProxyControlPlaneError::UnexpectedRouteResponse {
                             request_id: response_request_id(&message)

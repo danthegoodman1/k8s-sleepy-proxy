@@ -330,7 +330,7 @@ where
     }
 
     if let Some(metrics_addr) = config.metrics_listen_addr {
-        let prometheus = prometheus.unwrap_or_else(PrometheusMetricsSink::new);
+        let prometheus = prometheus.unwrap_or_default();
         let metrics_shutdown = native_shutdown.clone();
         let store = Arc::clone(&store);
         listeners.spawn(async move {

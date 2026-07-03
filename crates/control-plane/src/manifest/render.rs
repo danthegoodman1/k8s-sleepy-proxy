@@ -78,7 +78,7 @@ pub(crate) fn render_manifests_with_options(
     for rendered in &rendered_volumes {
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::PersistentVolume,
-            object: KubernetesObject::PersistentVolume(PersistentVolume {
+            object: KubernetesObject::PersistentVolume(Box::new(PersistentVolume {
                 metadata: ObjectMeta {
                     name: rendered.pv_name.clone(),
                     namespace: None,
@@ -96,7 +96,7 @@ pub(crate) fn render_manifests_with_options(
                     },
                     source: rendered.source.clone(),
                 },
-            }),
+            })),
         });
     }
     for rendered in &rendered_volumes {
@@ -716,7 +716,7 @@ fn render_volume(
                     ))
                 })
                 .collect::<Result<BTreeMap<_, _>, ManifestRenderError>>()?;
-            PersistentVolumeSource::Csi(CsiPersistentVolumeSource {
+            PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
                 driver: render_non_empty("volume.source.csi.driver", driver, instance)?,
                 volume_handle: render_non_empty(
                     "volume.source.csi.volume_handle",
@@ -732,34 +732,34 @@ fn render_volume(
                 controller_publish_secret_ref: render_csi_secret_ref(
                     "volume.source.csi.controller_publish_secret_ref.name",
                     "volume.source.csi.controller_publish_secret_ref.namespace",
-                    controller_publish_secret_ref.as_ref(),
+                    controller_publish_secret_ref.as_deref(),
                     instance,
                 )?,
                 node_stage_secret_ref: render_csi_secret_ref(
                     "volume.source.csi.node_stage_secret_ref.name",
                     "volume.source.csi.node_stage_secret_ref.namespace",
-                    node_stage_secret_ref.as_ref(),
+                    node_stage_secret_ref.as_deref(),
                     instance,
                 )?,
                 node_publish_secret_ref: render_csi_secret_ref(
                     "volume.source.csi.node_publish_secret_ref.name",
                     "volume.source.csi.node_publish_secret_ref.namespace",
-                    node_publish_secret_ref.as_ref(),
+                    node_publish_secret_ref.as_deref(),
                     instance,
                 )?,
                 controller_expand_secret_ref: render_csi_secret_ref(
                     "volume.source.csi.controller_expand_secret_ref.name",
                     "volume.source.csi.controller_expand_secret_ref.namespace",
-                    controller_expand_secret_ref.as_ref(),
+                    controller_expand_secret_ref.as_deref(),
                     instance,
                 )?,
                 node_expand_secret_ref: render_csi_secret_ref(
                     "volume.source.csi.node_expand_secret_ref.name",
                     "volume.source.csi.node_expand_secret_ref.namespace",
-                    node_expand_secret_ref.as_ref(),
+                    node_expand_secret_ref.as_deref(),
                     instance,
                 )?,
-            })
+            }))
         }
         PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
             let path = render_non_empty("volume.source.host_path.path", path, instance)?;

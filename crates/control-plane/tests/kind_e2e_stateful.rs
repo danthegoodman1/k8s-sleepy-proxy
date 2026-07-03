@@ -645,11 +645,13 @@ async fn run_projection_drift_and_finalizer_safety(
     let blocked = wait_for_reconcile_observation(
         operator,
         &materialization_id,
-        "apps/v1",
-        "StatefulSet",
-        &config.namespace,
-        RENDERED_WORKLOAD_NAME,
-        "deleting_owned",
+        ReconcileObservationExpectation {
+            api_version: "apps/v1",
+            kind: "StatefulSet",
+            namespace: &config.namespace,
+            name: RENDERED_WORKLOAD_NAME,
+            state: "deleting_owned",
+        },
         Duration::from_secs(30),
     )
     .await?;
@@ -1246,14 +1248,18 @@ fn assert_no_unowned_projection_observations(
     }
 }
 
+struct ReconcileObservationExpectation<'a> {
+    api_version: &'a str,
+    kind: &'a str,
+    namespace: &'a str,
+    name: &'a str,
+    state: &'a str,
+}
+
 async fn wait_for_reconcile_observation(
     operator: &mut OperatorControlPlaneClient<Channel>,
     materialization_id: &str,
-    api_version: &str,
-    kind: &str,
-    namespace: &str,
-    name: &str,
-    state: &str,
+    expectation: ReconcileObservationExpectation<'_>,
     timeout: Duration,
 ) -> TestResult<ReconcileMaterializationResponse> {
     let deadline = Instant::now() + timeout;
@@ -1261,11 +1267,11 @@ async fn wait_for_reconcile_observation(
         let response = reconcile_materialization(operator, materialization_id).await?;
         if expect_projection_observation(
             &response.projection_observations,
-            api_version,
-            kind,
-            namespace,
-            name,
-            state,
+            expectation.api_version,
+            expectation.kind,
+            expectation.namespace,
+            expectation.name,
+            expectation.state,
         )
         .is_ok()
         {
@@ -1275,7 +1281,12 @@ async fn wait_for_reconcile_observation(
         if Instant::now() >= deadline {
             let last_summary = projection_observation_summary(&response.projection_observations);
             return Err(format!(
-                "timed out waiting for projection observation {api_version} {kind} {namespace}/{name} state {state}; last observations: {last_summary}"
+                "timed out waiting for projection observation {} {} {}/{} state {}; last observations: {last_summary}",
+                expectation.api_version,
+                expectation.kind,
+                expectation.namespace,
+                expectation.name,
+                expectation.state
             )
             .into());
         }

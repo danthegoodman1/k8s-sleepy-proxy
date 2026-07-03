@@ -45,7 +45,7 @@ pub trait RouteSubscriptionClient {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteSubscriptionEvent {
-    Update(SubscribeControlPlaneOutput),
+    Update(Box<SubscribeControlPlaneOutput>),
     StreamClosed,
 }
 
@@ -322,7 +322,7 @@ where
             match event {
                 RouteSubscriptionEvent::Update(message) => {
                     self.record_subscribe_message(&message);
-                    let outcome = self.state.apply_control_plane_message(message, now);
+                    let outcome = self.state.apply_control_plane_message(*message, now);
                     self.unsubscribe_outcome(&outcome).await?;
                 }
                 RouteSubscriptionEvent::StreamClosed => {

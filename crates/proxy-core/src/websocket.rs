@@ -9,7 +9,10 @@ use tokio_tungstenite::{
         client::IntoClientRequest,
         handshake::{
             client::Request as WsClientRequest,
-            server::{create_response_with_body, Request as WsServerRequest},
+            server::{
+                create_response_with_body, Callback, ErrorResponse, Request as WsServerRequest,
+                Response as WsServerResponse,
+            },
         },
         protocol::Role,
     },
@@ -62,10 +65,12 @@ impl WebSocketProxy {
     {
         let _permit = self.drain.try_acquire()?;
         let mut upstream_headers = HeaderMap::new();
-        let client = accept_hdr_async(client, |request: &WsServerRequest, response| {
-            upstream_headers = forwarded_headers(request.headers());
-            Ok(response)
-        })
+        let client = accept_hdr_async(
+            client,
+            CaptureForwardedHeaders {
+                headers: &mut upstream_headers,
+            },
+        )
         .await
         .map_err(WebSocketProxyError::ClientHandshake)?;
         let upstream_request = upstream_websocket_request(upstream_url, &upstream_headers)
@@ -118,6 +123,21 @@ impl WebSocketProxy {
         proxy_websocket_streams(client, upstream)
             .await
             .map_err(WebSocketProxyError::Proxy)
+    }
+}
+
+struct CaptureForwardedHeaders<'a> {
+    headers: &'a mut HeaderMap,
+}
+
+impl Callback for CaptureForwardedHeaders<'_> {
+    fn on_request(
+        self,
+        request: &WsServerRequest,
+        response: WsServerResponse,
+    ) -> Result<WsServerResponse, ErrorResponse> {
+        *self.headers = forwarded_headers(request.headers());
+        Ok(response)
     }
 }
 

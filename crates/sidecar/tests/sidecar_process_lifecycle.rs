@@ -206,9 +206,7 @@ async fn spawn_control_plane() -> ControlPlaneServer {
 
     let task = tokio::spawn(async move {
         Server::builder()
-            .add_service(SidecarControlPlaneServer::new(
-                FakeSidecarControlPlane::default(),
-            ))
+            .add_service(SidecarControlPlaneServer::new(FakeSidecarControlPlane))
             .serve_with_shutdown(addr, async {
                 let _ = shutdown_rx.await;
             })

@@ -32,7 +32,7 @@ pub enum KubernetesObject {
     Deployment(Deployment),
     StatefulSet(StatefulSet),
     Service(Service),
-    PersistentVolume(PersistentVolume),
+    PersistentVolume(Box<PersistentVolume>),
     PersistentVolumeClaim(PersistentVolumeClaim),
     Raw(RawKubernetesObject),
 }
@@ -185,7 +185,7 @@ pub struct PersistentVolumeClaimRef {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersistentVolumeSource {
-    Csi(CsiPersistentVolumeSource),
+    Csi(Box<CsiPersistentVolumeSource>),
     HostPath(HostPathPersistentVolumeSource),
 }
 

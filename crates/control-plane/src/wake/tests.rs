@@ -1041,7 +1041,7 @@ async fn materializer_failure_marks_waking_generation_failed() {
         store
             .events()
             .into_iter()
-            .map(|event| match event {
+            .filter_map(|event| match event {
                 StoreEvent::Cas {
                     expected,
                     next_state,
@@ -1076,7 +1076,6 @@ async fn materializer_failure_marks_waking_generation_failed() {
                     panic!("cold wake failure must not finalize sleep")
                 }
             })
-            .flatten()
             .collect::<Vec<_>>(),
         vec![
             (Generation::new(6), InstanceState::Waking),

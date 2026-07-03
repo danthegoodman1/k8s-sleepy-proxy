@@ -503,7 +503,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     assert_eq!(pv.spec.claim_ref.name, "pvc-acme-postgres");
     assert_eq!(
         pv.spec.source,
-        PersistentVolumeSource::Csi(CsiPersistentVolumeSource {
+        PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
             driver: "csi.example.com".to_owned(),
             volume_handle: "provider-vol-123".to_owned(),
             fs_type: Some("ext4".to_owned()),
@@ -514,7 +514,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
             node_publish_secret_ref: None,
             controller_expand_secret_ref: None,
             node_expand_secret_ref: None,
-        })
+        }))
     );
 
     let pvc = match &rendered.objects[1].object {
@@ -1062,7 +1062,7 @@ fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
     assert_eq!(pv.spec.claim_ref.name, "pvc-acme-postgres");
     assert_eq!(
         pv.spec.source,
-        PersistentVolumeSource::Csi(CsiPersistentVolumeSource {
+        PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
             driver: "csi.archil.com".to_owned(),
             volume_handle: "archil-volume-123".to_owned(),
             fs_type: None,
@@ -1076,7 +1076,7 @@ fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
             }),
             controller_expand_secret_ref: None,
             node_expand_secret_ref: None,
-        })
+        }))
     );
 
     let objects = rendered.to_kubernetes_json_values();
@@ -1108,11 +1108,11 @@ fn renders_all_csi_secret_refs_to_kubernetes_keys() {
     else {
         panic!("expected CSI source");
     };
-    *controller_publish_secret_ref = Some(csi_secret_ref("controller-publish-secret"));
-    *node_stage_secret_ref = Some(csi_secret_ref("node-stage-secret"));
-    *node_publish_secret_ref = Some(csi_secret_ref("node-publish-secret"));
-    *controller_expand_secret_ref = Some(csi_secret_ref("controller-expand-secret"));
-    *node_expand_secret_ref = Some(csi_secret_ref("node-expand-secret"));
+    *controller_publish_secret_ref = Some(Box::new(csi_secret_ref("controller-publish-secret")));
+    *node_stage_secret_ref = Some(Box::new(csi_secret_ref("node-stage-secret")));
+    *node_publish_secret_ref = Some(Box::new(csi_secret_ref("node-publish-secret")));
+    *controller_expand_secret_ref = Some(Box::new(csi_secret_ref("controller-expand-secret")));
+    *node_expand_secret_ref = Some(Box::new(csi_secret_ref("node-expand-secret")));
 
     let rendered = render_manifests(RenderManifestRequest {
         template: &template,
@@ -1991,10 +1991,10 @@ fn archil_static_csi_template() -> ManifestTemplate {
         )]),
         controller_publish_secret_ref: None,
         node_stage_secret_ref: None,
-        node_publish_secret_ref: Some(CsiSecretRefTemplate {
+        node_publish_secret_ref: Some(Box::new(CsiSecretRefTemplate {
             name: TemplateText::instance_value("secret"),
             namespace: TemplateText::instance_value("secret_namespace"),
-        }),
+        })),
         controller_expand_secret_ref: None,
         node_expand_secret_ref: None,
     };

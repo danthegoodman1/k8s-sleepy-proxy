@@ -882,8 +882,7 @@ async fn restart_control_plane_pod(
         .list(&ListParams::default().labels(CONTROL_PLANE_LABEL))
         .await?
         .into_iter()
-        .find(|pod| pod_ready(pod))
-        .or_else(|| None)
+        .find(pod_ready)
         .ok_or("no control-plane pod found to restart")?;
     let old_name = selected
         .metadata

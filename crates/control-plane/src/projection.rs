@@ -47,17 +47,14 @@ pub enum ProjectionObjectInspection {
     Present(LiveObjectMetadata),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ProjectionReadinessInspection {
+    #[default]
     NotObserved,
     Ready(BackendEndpoint),
-    Unready { reason: String },
-}
-
-impl Default for ProjectionReadinessInspection {
-    fn default() -> Self {
-        Self::NotObserved
-    }
+    Unready {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +91,7 @@ pub enum ProjectionObservationState {
 #[derive(Debug)]
 pub enum ProjectionError {
     Inspect {
-        object_ref: RenderedObjectRef,
+        object_ref: Box<RenderedObjectRef>,
         observations: Vec<ProjectionObservation>,
         source: KubernetesClientError,
     },
@@ -110,15 +107,15 @@ pub enum ProjectionError {
     },
     Apply {
         observations: Vec<ProjectionObservation>,
-        source: MaterializerError,
+        source: Box<MaterializerError>,
     },
     Delete {
         observations: Vec<ProjectionObservation>,
-        source: MaterializerError,
+        source: Box<MaterializerError>,
     },
     Readiness {
         observations: Vec<ProjectionObservation>,
-        source: MaterializerError,
+        source: Box<MaterializerError>,
     },
 }
 
@@ -413,7 +410,7 @@ where
                 .inspect_object(object.object_ref())
                 .await
                 .map_err(|source| ProjectionError::Inspect {
-                    object_ref: object_ref.clone(),
+                    object_ref: Box::new(object_ref.clone()),
                     observations: vec![ProjectionObservation::inspect_failed(
                         object_ref,
                         "inspect_failed",
@@ -490,7 +487,7 @@ where
             .await
             .map_err(|source| ProjectionError::Apply {
                 observations: apply_rejected_observations(plan, &source),
-                source,
+                source: Box::new(source),
             })?;
         Ok(())
     }
@@ -508,7 +505,7 @@ where
                     readiness_observation_ref(plan),
                     "readiness_wait_failed",
                 )],
-                source,
+                source: Box::new(source),
             })
     }
 
@@ -534,7 +531,7 @@ where
                             "delete_request_failed",
                             &[],
                         )],
-                        source,
+                        source: Box::new(source),
                     })?;
             }
         }
@@ -611,7 +608,7 @@ impl Error for ProjectionError {
             Self::Inspect { source, .. } => Some(source),
             Self::Apply { source, .. }
             | Self::Delete { source, .. }
-            | Self::Readiness { source, .. } => Some(source),
+            | Self::Readiness { source, .. } => Some(source.as_ref()),
             Self::MissingManifest
             | Self::OwnershipConflict { .. }
             | Self::Incomplete { .. }
@@ -800,7 +797,7 @@ fn apply_rejected_observations(
 ) -> Vec<ProjectionObservation> {
     match error {
         MaterializerError::Apply { object, .. } => vec![ProjectionObservation::apply_rejected(
-            object.clone(),
+            object.as_ref().clone(),
             "apply_rejected",
         )],
         MaterializerError::PvcBoundWait {
@@ -823,7 +820,7 @@ fn apply_rejected_observations(
             "readiness_wait_failed",
         )],
         MaterializerError::Delete { object, .. } => vec![ProjectionObservation::delete_blocked(
-            object.clone(),
+            object.as_ref().clone(),
             "delete_request_failed",
             &[],
         )],

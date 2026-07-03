@@ -211,10 +211,10 @@ where
         }
     }
 
-    if current.generation == request.expected_generation.next().next() {
-        if current.state == InstanceState::Cold {
-            return Ok(ReportIdleResult::Accepted { instance: current });
-        }
+    if current.generation == request.expected_generation.next().next()
+        && current.state == InstanceState::Cold
+    {
+        return Ok(ReportIdleResult::Accepted { instance: current });
     }
 
     Err(ReportIdleError::GenerationConflict {

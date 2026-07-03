@@ -14,7 +14,9 @@ use tokio_tungstenite::{
     accept_async, accept_hdr_async, connect_async,
     tungstenite::{
         client::IntoClientRequest,
-        handshake::server::{Request as WsRequest, Response as WsResponse},
+        handshake::server::{
+            Callback, ErrorResponse, Request as WsRequest, Response as WsResponse,
+        },
         protocol::{CloseFrame, Role},
         Bytes as WsBytes, Error as TungsteniteError, Message,
     },
@@ -187,53 +189,14 @@ async fn websocket_proxy_preserves_forwarded_headers_in_upstream_handshake() {
             .accept()
             .await
             .expect("upstream accepts proxy connection");
-        let mut headers_seen_tx = Some(headers_seen_tx);
-        let mut websocket =
-            accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("forwarded")
-                        .expect("forwarded header"),
-                    "for=203.0.113.10;proto=https"
-                );
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("x-forwarded-for")
-                        .expect("x-forwarded-for header"),
-                    "203.0.113.11"
-                );
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("x-forwarded-proto")
-                        .expect("x-forwarded-proto header"),
-                    "https"
-                );
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("x-forwarded-host")
-                        .expect("x-forwarded-host header"),
-                    "edge.example.com"
-                );
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("x-forwarded-prefix")
-                        .expect("x-forwarded-prefix header"),
-                    "/edge"
-                );
-                headers_seen_tx
-                    .take()
-                    .expect("headers signal unused")
-                    .send(())
-                    .expect("test waits for headers");
-                Ok(response)
-            })
-            .await
-            .expect("upstream accepts websocket");
+        let mut websocket = accept_hdr_async(
+            stream,
+            AssertForwardedHeaders {
+                headers_seen_tx: Some(headers_seen_tx),
+            },
+        )
+        .await
+        .expect("upstream accepts websocket");
 
         let close = websocket
             .next()
@@ -748,4 +711,58 @@ async fn websocket_proxy_rejects_new_session_after_drain_starts() {
         error,
         WebSocketProxyError::Drain(DrainError::Draining)
     ));
+}
+
+struct AssertForwardedHeaders {
+    headers_seen_tx: Option<oneshot::Sender<()>>,
+}
+
+impl Callback for AssertForwardedHeaders {
+    fn on_request(
+        mut self,
+        request: &WsRequest,
+        response: WsResponse,
+    ) -> Result<WsResponse, ErrorResponse> {
+        assert_eq!(
+            request
+                .headers()
+                .get("forwarded")
+                .expect("forwarded header"),
+            "for=203.0.113.10;proto=https"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .expect("x-forwarded-for header"),
+            "203.0.113.11"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-proto")
+                .expect("x-forwarded-proto header"),
+            "https"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-host")
+                .expect("x-forwarded-host header"),
+            "edge.example.com"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-forwarded-prefix")
+                .expect("x-forwarded-prefix header"),
+            "/edge"
+        );
+        self.headers_seen_tx
+            .take()
+            .expect("headers signal unused")
+            .send(())
+            .expect("test waits for headers");
+        Ok(response)
+    }
 }
