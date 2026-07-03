@@ -72,8 +72,8 @@ Status ledger:
 | Complete | Work | 1A: Fix stale wake-error test assertion | `crates/control-plane/tests/proxy_api_transport.rs` renamed the readiness failure case to `proxy_wake_projection_failure_returns_transport_error` and now asserts `Code::Unavailable` with "projection failed"; `cargo test --workspace` passed. |
 | Complete | Work | 1B: Remove `to_string` shadow; clear clippy warnings | `crates/control-plane/src/reconciler.rs` no longer defines inherent `MaterializationReconcileError::to_string`; `cargo clippy --workspace --all-targets -- -D warnings` passed. |
 | Complete | Work | 1C: CI workflow with fmt/clippy/test/postgres gates | `.github/workflows/ci.yml` runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo test -p control-plane --test postgres_store` with `SLEEPYPODS_POSTGRES_URL` set plus skip-output and nonzero-test-count guards. |
-| Incomplete | Gate | Default branch green under CI | Missing: CI run on remote; `.github/workflows/ci.yml` is present locally. |
-| Incomplete | Test | Postgres conformance runs (not skipped) in CI | Missing: CI run on remote; local `./scripts/test-postgres-store.sh` executed 2 tests, including `postgres_store_conformance_against_real_database`, with no self-skip output. |
+| Complete | Gate | Default branch green under CI | CI run 28637514645 on `north-star` at `3fd1997` passed all steps (fmt, clippy, workspace tests, Postgres store). |
+| Complete | Test | Postgres conformance runs (not skipped) in CI | CI run 28637514645 "Test Postgres store" step logged `running 2 tests` and `test result: ok. 2 passed` with no self-skip output. |
 
 ## Phase 2: Data-Plane Quick Wins
 
