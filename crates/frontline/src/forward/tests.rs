@@ -120,6 +120,7 @@ async fn frontline_http1_forwards_ready_backend_request_and_response() {
         .to_bytes();
     assert_eq!(body, Bytes::from_static(RESPONSE_BODY));
 
+    drop(forwarder);
     upstream_task.await.expect("upstream task completes");
 }
 
@@ -216,6 +217,7 @@ async fn frontline_http2_cleartext_forwards_body_to_h2_upstream() {
         .to_bytes();
     assert_eq!(body, Bytes::from_static(RESPONSE_BODY));
 
+    drop(forwarder);
     upstream_task.await.expect("upstream task completes");
 }
 
@@ -320,6 +322,7 @@ async fn frontline_h2c_grpc_shaped_forwarding_preserves_body_and_trailers() {
     assert_eq!(trailers.get("grpc-status").expect("grpc-status"), "0");
     assert_eq!(trailers.get("grpc-message").expect("grpc-message"), "ok");
 
+    drop(forwarder);
     upstream_task.await.expect("upstream task completes");
 }
 

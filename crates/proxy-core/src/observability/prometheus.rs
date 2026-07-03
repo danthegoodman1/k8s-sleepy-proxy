@@ -15,9 +15,10 @@ use hyper_util::rt::TokioIo;
 use tokio::{net::TcpListener, task::JoinSet};
 
 use super::{
-    metrics::{MetricDescriptor, MetricKind, MetricLabel, ALL_METRICS},
+    metrics::{MetricDescriptor, MetricKind, MetricLabel, ALL_METRICS, RUNTIME_ACTIVE_STREAMS},
     recorder::{MetricObservation, ObservabilityEvent, ObservabilitySink},
 };
+use crate::drain::DrainTracker;
 
 const HISTOGRAM_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -26,6 +27,38 @@ const HISTOGRAM_BUCKETS: &[f64] = &[
 #[derive(Clone, Debug, Default)]
 pub struct PrometheusMetricsSink {
     state: Arc<Mutex<PrometheusState>>,
+}
+
+/// Samples `sleepypods_runtime_active_streams` from a `DrainTracker` at
+/// metrics-collect time, so permit acquire/release stays free of metric
+/// emission on the request path.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeActiveStreamsCollector {
+    drain: Arc<Mutex<Option<DrainTracker>>>,
+}
+
+impl RuntimeActiveStreamsCollector {
+    pub fn attach(&self, drain: DrainTracker) {
+        *self
+            .drain
+            .lock()
+            .expect("active streams collector lock not poisoned") = Some(drain);
+    }
+
+    pub fn collect(&self, sink: PrometheusMetricsSink) {
+        let active = self
+            .drain
+            .lock()
+            .expect("active streams collector lock not poisoned")
+            .as_ref()
+            .map(DrainTracker::active_count)
+            .unwrap_or(0);
+        sink.record_observation(MetricObservation::new(
+            RUNTIME_ACTIVE_STREAMS,
+            Vec::new(),
+            active as f64,
+        ));
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -553,6 +586,47 @@ mod tests {
             ],
             1.0,
         )));
+    }
+
+    // Proves the scrape-time wiring used by the frontline and sidecar bins:
+    // /metrics renders the runtime active-streams gauge from the live
+    // DrainTracker count instead of per-permit metric events.
+    #[tokio::test]
+    async fn metrics_endpoint_samples_runtime_active_streams_via_collector() {
+        let sink = PrometheusMetricsSink::new();
+        let collector = RuntimeActiveStreamsCollector::default();
+        let drain = crate::drain::DrainTracker::new(std::time::Duration::from_secs(5));
+        collector.attach(drain.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("metrics listener binds");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(serve_prometheus_listener_with_collector(
+            listener,
+            sink,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move |sink| {
+                let collector = collector.clone();
+                async move {
+                    collector.collect(sink);
+                }
+            },
+        ));
+
+        let permit = drain.try_acquire().expect("work admitted");
+        let with_active = raw_http_get(addr, "/metrics").await;
+        drop(permit);
+        let after_release = raw_http_get(addr, "/metrics").await;
+        let _ = shutdown_tx.send(());
+        task.await
+            .expect("server task joins")
+            .expect("server exits cleanly");
+
+        assert!(with_active.contains("sleepypods_runtime_active_streams 1\n"));
+        assert!(after_release.contains("sleepypods_runtime_active_streams 0\n"));
     }
 
     #[tokio::test]

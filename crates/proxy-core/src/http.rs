@@ -13,9 +13,10 @@ use http::{
     HeaderMap, HeaderName, HeaderValue, Request, Response, Uri,
 };
 use http_body::{Body, Frame, SizeHint};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use hyper::body::Incoming;
 use hyper_util::{
-    client::legacy::{Client, Error as ClientError},
+    client::legacy::{connect::HttpConnector, Client, Error as ClientError},
     rt::TokioExecutor,
 };
 use pin_project_lite::pin_project;
@@ -23,10 +24,14 @@ use pin_project_lite::pin_project;
 use crate::drain::{DrainError, DrainPermit, DrainTracker};
 
 type BoxError = Box<dyn Error + Send + Sync>;
+type UpstreamBody = UnsyncBoxBody<Bytes, BoxError>;
+type UpstreamClient = Client<HttpConnector, UpstreamBody>;
 
 #[derive(Clone, Debug)]
 pub struct HttpProxy {
     drain: DrainTracker,
+    http1_client: UpstreamClient,
+    http2_client: UpstreamClient,
 }
 
 #[derive(Debug)]
@@ -45,7 +50,18 @@ pub enum ReverseProxyRequestError {
 
 impl HttpProxy {
     pub fn new(drain: DrainTracker) -> Self {
-        Self { drain }
+        let http1_client = Client::builder(TokioExecutor::new()).build(http_connector());
+        let mut http2_builder = Client::builder(TokioExecutor::new());
+        // h2c has no ALPN signal, so HTTP/2 inbound requests use prior knowledge
+        // when dialing a cleartext upstream.
+        http2_builder.http2_only(true);
+        let http2_client = http2_builder.build(http_connector());
+
+        Self {
+            drain,
+            http1_client,
+            http2_client,
+        }
     }
 
     pub fn drain_tracker(&self) -> &DrainTracker {
@@ -64,19 +80,32 @@ impl HttpProxy {
         let permit = self.drain.try_acquire()?;
         let use_http2_upstream = request.version() == http::Version::HTTP_2;
         let request = prepare_reverse_proxy_request(request, upstream_origin)?;
-        let mut builder = Client::builder(TokioExecutor::new());
-        if use_http2_upstream {
-            // h2c has no ALPN signal, so HTTP/2 inbound requests use prior
-            // knowledge when dialing a cleartext upstream.
-            builder.http2_only(true);
-        }
-        let client = builder.build_http();
+        let request = request.map(box_upstream_body);
+        let client = if use_http2_upstream {
+            &self.http2_client
+        } else {
+            &self.http1_client
+        };
         let mut response = client.request(request).await?;
 
         strip_hop_by_hop_headers(response.headers_mut());
 
         Ok(response.map(|body| TrackedBody::new(body, permit)))
     }
+}
+
+fn http_connector() -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    connector
+}
+
+fn box_upstream_body<B>(body: B) -> UpstreamBody
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    body.map_err(|error| error.into()).boxed_unsync()
 }
 
 pub fn prepare_reverse_proxy_request<B>(

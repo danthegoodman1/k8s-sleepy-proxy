@@ -306,6 +306,7 @@ where
     let mut exit_error = None;
 
     loop {
+        reap_completed_tasks(&mut connections);
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
@@ -316,6 +317,7 @@ where
                         break;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let runtime = shared.clone();
                 let connection_shutdown = shutdown.clone();
                 let forwarding_context = FrontlineForwardContext::http(peer_addr.ip());
@@ -370,6 +372,7 @@ where
     let mut exit_error = None;
 
     loop {
+        reap_completed_tasks(&mut connections);
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
@@ -383,6 +386,7 @@ where
                         break;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let runtime = shared.clone();
                 let tls_adapter = tls_adapter.clone();
                 let connection_shutdown = shutdown.clone();
@@ -436,6 +440,7 @@ where
     let mut exit_error = None;
 
     loop {
+        reap_completed_tasks(&mut connections);
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
@@ -449,6 +454,7 @@ where
                         break;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let runtime = shared.clone();
                 let tls_adapter = tls_adapter.clone();
 

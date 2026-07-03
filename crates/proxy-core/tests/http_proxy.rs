@@ -867,10 +867,12 @@ async fn http_proxy_handles_concurrent_http2_streams() {
     let upstream_origin: Uri = format!("http://{upstream_addr}")
         .parse()
         .expect("upstream URI parses");
+    let upstream_connections = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(AtomicUsize::new(0));
     let (seen_tx, mut seen_rx) = watch::channel(0usize);
     let release_responses = Arc::new(Notify::new());
     let upstream_task = tokio::spawn({
+        let upstream_connections = Arc::clone(&upstream_connections);
         let seen = Arc::clone(&seen);
         let seen_tx = seen_tx.clone();
         let release_responses = Arc::clone(&release_responses);
@@ -881,6 +883,7 @@ async fn http_proxy_handles_concurrent_http2_streams() {
                     .accept()
                     .await
                     .expect("upstream accepts h2 proxy connection");
+                upstream_connections.fetch_add(1, Ordering::AcqRel);
                 let seen = Arc::clone(&seen);
                 let seen_tx = seen_tx.clone();
                 let release_responses = Arc::clone(&release_responses);
@@ -975,6 +978,7 @@ async fn http_proxy_handles_concurrent_http2_streams() {
     )
     .await;
     assert_eq!(drain.active_count(), 2);
+    assert_eq!(upstream_connections.load(Ordering::Acquire), 1);
 
     release_responses.notify_waiters();
 

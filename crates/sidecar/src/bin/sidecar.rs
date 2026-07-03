@@ -6,7 +6,7 @@ use control_plane::{
 };
 use proxy_core::{
     observability::{
-        prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
+        prometheus::{serve_prometheus_metrics_with_collector, PrometheusMetricsSink},
         recorder::{CompositeObservabilitySink, ObservabilityRecorder, StderrObservabilitySink},
     },
     Shutdown,
@@ -45,6 +45,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr, prometheus) {
         let metrics_shutdown = shutdown.clone();
         let runtime = env.runtime;
+        let active_streams = runtime.active_streams_collector();
         let runtime_mode = env.runtime_mode;
         tokio::try_join!(
             async {
@@ -58,9 +59,19 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
             },
             async {
-                serve_prometheus_metrics(metrics_addr, prometheus, metrics_shutdown.cancelled())
-                    .await
-                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+                serve_prometheus_metrics_with_collector(
+                    metrics_addr,
+                    prometheus,
+                    metrics_shutdown.cancelled(),
+                    move |sink| {
+                        let active_streams = active_streams.clone();
+                        async move {
+                            active_streams.collect(sink);
+                        }
+                    },
+                )
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
             },
         )?;
     } else {

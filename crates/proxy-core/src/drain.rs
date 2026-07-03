@@ -7,7 +7,7 @@ use std::{
 
 use crate::accounting::{ActiveConnection, ActiveConnectionCounter, IdleActivityWatch};
 use crate::observability::{
-    metrics::{RUNTIME_ACTIVE_STREAMS, RUNTIME_DRAIN_DURATION_SECONDS},
+    metrics::RUNTIME_DRAIN_DURATION_SECONDS,
     recorder::{
         LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
         EVENT_DRAIN_COMPLETED, EVENT_DRAIN_STARTED, EVENT_DRAIN_TIMEOUT,
@@ -40,7 +40,6 @@ struct State {
 #[must_use = "dropping the permit releases the active connection count"]
 pub struct DrainPermit {
     active: ActiveConnection,
-    tracker: DrainTracker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,12 +102,8 @@ impl DrainTracker {
         }
 
         let active = self.inner.active.track();
-        self.record_active_streams();
 
-        Ok(DrainPermit {
-            active,
-            tracker: self.clone(),
-        })
+        Ok(DrainPermit { active })
     }
 
     pub fn start_drain(&self) {
@@ -176,23 +171,12 @@ impl DrainTracker {
     pub fn watch_for_activity_after_idle(&self) -> Option<IdleActivityWatch> {
         self.inner.active.watch_for_activity_after_idle()
     }
-
-    fn record_active_streams(&self) {
-        self.inner
-            .observability
-            .record_metric(MetricObservation::new(
-                RUNTIME_ACTIVE_STREAMS,
-                Vec::new(),
-                self.active_count() as f64,
-            ));
-    }
 }
 
 impl DrainPermit {
     pub fn release(&mut self) {
         if self.active.is_active() {
             self.active.release();
-            self.tracker.record_active_streams();
         }
     }
 }
@@ -201,7 +185,6 @@ impl Drop for DrainPermit {
     fn drop(&mut self) {
         if self.active.is_active() {
             self.active.release();
-            self.tracker.record_active_streams();
         }
     }
 }
@@ -309,12 +292,14 @@ mod tests {
     }
 
     #[test]
-    fn drain_permit_records_active_stream_gauge_on_acquire_and_release() {
+    fn drain_permit_updates_active_count_without_emitting_hot_path_gauge() {
         let sink = InMemoryObservability::default();
         let tracker = DrainTracker::with_observability(Duration::from_secs(5), sink.recorder());
 
         let permit = tracker.try_acquire().expect("work admitted");
+        assert_eq!(tracker.active_count(), 1);
         drop(permit);
+        assert_eq!(tracker.active_count(), 0);
 
         let values = sink
             .events()
@@ -329,6 +314,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(values, vec![1.0, 0.0]);
+        assert!(values.is_empty());
     }
 }

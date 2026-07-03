@@ -5,7 +5,10 @@ use std::{
     future::{pending, Future},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -40,7 +43,7 @@ use tokio_tungstenite::{
 use crate::{
     runtime::{
         detect_protocol, serve_http_listener_with_idle, serve_tcp_listener_with_idle,
-        AcceptedProtocol, SidecarRuntimeConfig, SidecarRuntimeError,
+        AcceptedProtocol, SidecarRuntimeConfig, SidecarRuntimeError, HTTP1_HEADER_READ_TIMEOUT,
     },
     IdleReportConfig, ReportIdleClient, ReportIdleFuture, ReportIdleRequest, ReportIdleResponse,
 };
@@ -108,6 +111,37 @@ async fn http_request_reaches_upstream_and_activity_delays_idle_report() {
 }
 
 #[tokio::test]
+async fn http_keep_alive_reuses_connection_without_holding_idle_permit() {
+    let (upstream_addr, upstream_connections, upstream_task) = spawn_keep_alive_upstream().await;
+    let shutdown = Shutdown::new();
+    let client = FakeReportIdleClient::new();
+    let requests = client.requests();
+    let (runtime_addr, runtime_task) =
+        spawn_runtime(upstream_addr.port(), client, shutdown.clone()).await;
+    let mut stream = TcpStream::connect(runtime_addr)
+        .await
+        .expect("client connects to runtime");
+
+    write_http_request(&mut stream, "/keepalive-one").await;
+    let first = read_http_response(&mut stream, b"keepalive-one").await;
+    assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+    wait_for_recorded_count(&requests, 1).await;
+
+    write_http_request(&mut stream, "/keepalive-two").await;
+    let second = read_http_response(&mut stream, b"keepalive-two").await;
+    assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+    assert_eq!(upstream_connections.load(Ordering::Acquire), 1);
+
+    drop(stream);
+    shutdown.shutdown();
+    runtime_task
+        .await
+        .expect("runtime task joins")
+        .expect("runtime exits");
+    upstream_task.await.expect("upstream task joins");
+}
+
+#[tokio::test]
 async fn idle_report_fires_without_http_activity() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -126,6 +160,85 @@ async fn idle_report_fires_without_http_activity() {
         .await
         .expect("runtime task joins")
         .expect("runtime exits");
+}
+
+// Classification must be limited to the header block: a request body inside
+// the sniffed prefix containing upgrade-looking lines must not flip the
+// connection to WebSocket handling.
+#[tokio::test]
+async fn protocol_detection_ignores_upgrade_lines_in_request_body() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("detector listener binds");
+    let addr = listener.local_addr().expect("detector listener has addr");
+    let request = b"POST /submit HTTP/1.1\r\nhost: localhost\r\ncontent-length: 43\r\n\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n";
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("detector client connects");
+        client
+            .write_all(request)
+            .await
+            .expect("client writes request with upgrade-looking body");
+    });
+    let (server, _) = listener.accept().await.expect("detector accepts client");
+    let shutdown = Shutdown::new();
+
+    let accepted = expect_within(
+        detect_protocol(server, &shutdown),
+        "upgrade-looking body detection",
+    )
+    .await
+    .expect("protocol is detected");
+    assert_eq!(accepted.protocol, AcceptedProtocol::Http1);
+
+    let mut stream = accepted.into_stream();
+    let mut replayed = vec![0; request.len()];
+    stream
+        .read_exact(&mut replayed)
+        .await
+        .expect("buffered request and body replay");
+    assert_eq!(replayed, request);
+    client_task.await.expect("client task completed");
+}
+
+// A pipelined second request in the same sniffed prefix must not contribute
+// headers to classification; only the first request's header block counts.
+#[tokio::test]
+async fn protocol_detection_classifies_from_first_request_headers_when_pipelined() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("detector listener binds");
+    let addr = listener.local_addr().expect("detector listener has addr");
+    let requests = b"GET /first HTTP/1.1\r\nhost: localhost\r\n\r\nGET /socket HTTP/1.1\r\nhost: localhost\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n";
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("detector client connects");
+        client
+            .write_all(requests)
+            .await
+            .expect("client writes pipelined requests");
+    });
+    let (server, _) = listener.accept().await.expect("detector accepts client");
+    let shutdown = Shutdown::new();
+
+    let accepted = expect_within(
+        detect_protocol(server, &shutdown),
+        "pipelined request detection",
+    )
+    .await
+    .expect("protocol is detected");
+    assert_eq!(accepted.protocol, AcceptedProtocol::Http1);
+
+    let mut stream = accepted.into_stream();
+    let mut replayed = vec![0; requests.len()];
+    stream
+        .read_exact(&mut replayed)
+        .await
+        .expect("buffered pipelined requests replay");
+    assert_eq!(replayed, requests);
+    client_task.await.expect("client task completed");
 }
 
 #[tokio::test]
@@ -167,6 +280,76 @@ async fn protocol_detection_handles_segmented_h2c_preface_and_replays_it() {
         .expect("buffered h2 preface replays");
     assert_eq!(replayed, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     client_task.await.expect("client task completed");
+}
+
+#[tokio::test]
+async fn protocol_detection_handles_header_terminator_split_across_reads() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("detector listener binds");
+    let addr = listener.local_addr().expect("detector listener has addr");
+    let request = b"GET /split HTTP/1.1\r\nhost: localhost\r\n\r\n";
+    let client_task = tokio::spawn(async move {
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("detector client connects");
+        client
+            .write_all(&request[..request.len() - 1])
+            .await
+            .expect("client writes partial request");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        client
+            .write_all(&request[request.len() - 1..])
+            .await
+            .expect("client completes request");
+    });
+    let (server, _) = listener.accept().await.expect("detector accepts client");
+    let shutdown = Shutdown::new();
+
+    let accepted = expect_within(
+        detect_protocol(server, &shutdown),
+        "split header terminator detection",
+    )
+    .await
+    .expect("protocol is detected");
+    assert_eq!(accepted.protocol, AcceptedProtocol::Http1);
+
+    let mut stream = accepted.into_stream();
+    let mut replayed = vec![0; request.len()];
+    stream
+        .read_exact(&mut replayed)
+        .await
+        .expect("buffered request replays");
+    assert_eq!(replayed, request);
+    client_task.await.expect("client task completed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn protocol_detection_times_out_waiting_for_header_completion() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("detector listener binds");
+    let addr = listener.local_addr().expect("detector listener has addr");
+    let mut client = TcpStream::connect(addr)
+        .await
+        .expect("detector client connects");
+    let (server, _) = listener.accept().await.expect("detector accepts client");
+    client
+        .write_all(b"GET /slow HTTP/1.1\r\nhost: localhost\r\n")
+        .await
+        .expect("client writes incomplete request");
+    let shutdown = Shutdown::new();
+    let detect_shutdown = shutdown.clone();
+    let detect_task = tokio::spawn(async move { detect_protocol(server, &detect_shutdown).await });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(HTTP1_HEADER_READ_TIMEOUT).await;
+
+    assert!(expect_within(detect_task, "protocol detection timeout")
+        .await
+        .expect("detector task joins")
+        .is_none());
+    drop(client);
 }
 
 #[tokio::test]
@@ -791,6 +974,50 @@ async fn spawn_hanging_upstream(
     });
 
     (addr, task)
+}
+
+async fn spawn_keep_alive_upstream() -> (SocketAddr, Arc<AtomicUsize>, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("upstream listener binds");
+    let addr = listener.local_addr().expect("upstream listener has addr");
+    let connections = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let task_connections = Arc::clone(&connections);
+    let task_requests = Arc::clone(&requests);
+
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("upstream accepts runtime");
+        task_connections.fetch_add(1, Ordering::AcqRel);
+
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |request: Request<Incoming>| {
+                    let requests = Arc::clone(&task_requests);
+                    async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
+                        let body = match request.uri().path() {
+                            "/keepalive-one" => Bytes::from_static(b"keepalive-one"),
+                            "/keepalive-two" => Bytes::from_static(b"keepalive-two"),
+                            path => panic!("unexpected path {path}"),
+                        };
+
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(body))
+                                .expect("upstream response builds"),
+                        )
+                    }
+                }),
+            )
+            .await
+            .expect("upstream serves keep-alive connection");
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+    });
+
+    (addr, connections, task)
 }
 
 async fn spawn_blocked_h2_grpc_upstream(

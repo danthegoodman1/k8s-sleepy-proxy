@@ -99,6 +99,12 @@ pub struct InMemoryObservability {
 struct NoopObservabilitySink;
 #[derive(Debug)]
 pub struct StderrObservabilitySink;
+/// Stderr sink that keeps lifecycle and error events but drops metric samples
+/// and per-request events, so installing stderr observability adds no
+/// formatted writes on the hot forwarding path. Metrics are exported through
+/// the Prometheus sink at scrape time instead.
+#[derive(Debug)]
+pub struct FilteredStderrObservabilitySink;
 #[derive(Clone)]
 pub struct CompositeObservabilitySink {
     sinks: Vec<Arc<dyn ObservabilitySink>>,
@@ -357,6 +363,23 @@ impl ObservabilitySink for StderrObservabilitySink {
     }
 }
 
+impl ObservabilitySink for FilteredStderrObservabilitySink {
+    fn record(&self, event: ObservabilityEvent) {
+        if suppressed_on_stderr(&event) {
+            return;
+        }
+
+        StderrObservabilitySink.record(event);
+    }
+}
+
+fn suppressed_on_stderr(event: &ObservabilityEvent) -> bool {
+    match event {
+        ObservabilityEvent::Metric(_) => true,
+        ObservabilityEvent::Log(log) => log.name() == EVENT_ROUTE_CACHE_LOOKUP,
+    }
+}
+
 impl ObservabilitySink for CompositeObservabilitySink {
     fn record(&self, event: ObservabilityEvent) {
         for sink in &self.sinks {
@@ -368,9 +391,11 @@ impl ObservabilitySink for CompositeObservabilitySink {
 #[cfg(test)]
 mod tests {
     use super::{
-        InMemoryObservability, LifecycleLogEvent, LogField, ObservabilityEvent, FIELD_INSTANCE_ID,
-        LIFECYCLE_FIELDS,
+        suppressed_on_stderr, InMemoryObservability, LifecycleLogEvent, LogField,
+        MetricObservation, ObservabilityEvent, EVENT_DRAIN_STARTED, EVENT_ROUTE_CACHE_LOOKUP,
+        EVENT_WAKE, FIELD_INSTANCE_ID, LIFECYCLE_FIELDS,
     };
+    use crate::observability::metrics::RUNTIME_ACTIVE_STREAMS;
 
     #[test]
     fn lifecycle_log_fields_include_required_identity_context() {
@@ -396,6 +421,25 @@ mod tests {
         ] {
             assert!(LIFECYCLE_FIELDS.contains(&field));
         }
+    }
+
+    // The filtered stderr sink must drop every metric sample and the
+    // per-request route-cache lookup event (both fire per forwarded request)
+    // while letting other lifecycle and error events through.
+    #[test]
+    fn filtered_stderr_sink_suppresses_metrics_and_per_request_events_only() {
+        assert!(suppressed_on_stderr(&ObservabilityEvent::Metric(
+            MetricObservation::new(RUNTIME_ACTIVE_STREAMS, vec![], 1.0)
+        )));
+        assert!(suppressed_on_stderr(&ObservabilityEvent::Log(
+            LifecycleLogEvent::new(EVENT_ROUTE_CACHE_LOOKUP, vec![])
+        )));
+        assert!(!suppressed_on_stderr(&ObservabilityEvent::Log(
+            LifecycleLogEvent::new(EVENT_DRAIN_STARTED, vec![])
+        )));
+        assert!(!suppressed_on_stderr(&ObservabilityEvent::Log(
+            LifecycleLogEvent::new(EVENT_WAKE, vec![])
+        )));
     }
 
     #[test]

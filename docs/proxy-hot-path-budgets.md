@@ -214,19 +214,32 @@ frontline phase increments `subscribe_route_calls`.
 After the HTTP/1.1 phase, the script also warms and measures a prior-knowledge
 h2c POST with `content-type: application/grpc`, a fixed gRPC-framed request
 body asserted by the helper, a fixed gRPC-framed response body, and
-`grpc-status: 0` as an HTTP/2 response trailer. The helper backend accepts both
-HTTP/1.1 and h2c, so the h2c phase uses the same direct-backend baseline and the
-same production frontline image. The h2c phase also fails if measured hot-cache
-requests make additional `SubscribeRoute` calls.
+`grpc-status: 0` as an HTTP/2 response trailer. Each load worker opens one h2c
+connection before the timed window starts and multiplexes all of its measured
+requests over that long-lived channel, matching how generated gRPC clients
+such as tonic and grpc-go hold long-lived multiplexed channels. The helper
+backend accepts both HTTP/1.1 and h2c, so the h2c phase uses the same
+direct-backend baseline and the same production frontline image. The h2c phase
+also fails if measured hot-cache requests make additional `SubscribeRoute`
+calls.
 
 The script then generates a temporary self-signed certificate for the route
 host, mounts it into the production frontline container, enables the production
 TLS-termination listener, and warms/measures the same gRPC-shaped request over
-negotiated HTTP/2-over-TLS. The client trusts only that generated certificate
-and fails unless TLS ALPN negotiates `h2`, so this phase cannot silently fall
-back to h2c. Its same-run direct baseline is the helper's direct h2c backend
-path, so the frontend ratio and p99 gates intentionally include TLS termination
-and proxy overhead rather than comparing against a separate direct TLS backend.
+negotiated HTTP/2-over-TLS. Each load worker completes its TCP, TLS, and
+HTTP/2 setup before the timed window starts and multiplexes measured requests
+over that single negotiated channel. The client trusts only the generated
+certificate and fails unless TLS ALPN negotiates `h2`, so this phase cannot
+silently fall back to h2c. Its same-run direct baseline is the helper's direct
+h2c backend path, so the frontend ratio and p99 gates intentionally include
+TLS termination and proxy overhead rather than comparing against a separate
+direct TLS backend.
+
+The two h2 phases therefore gate steady-state multiplexed request throughput,
+not connection establishment. Per-request connection churn through the proxy
+stays covered by the HTTP/1.1 phase, which sends `Connection: close` on every
+request, and by the real generated gRPC phase, which opens a new tonic channel
+per request.
 
 The smoke also starts a small generated gRPC backend using the existing
 generated `ProxyControlPlane` service and measures generated
@@ -312,9 +325,12 @@ This smoke only covers frontline HTTP/1.1, prior-knowledge h2c gRPC-shaped,
 negotiated HTTP/2 over the production TLS-termination listener, real generated
 gRPC unary forwarding, and WebSocket cached ready-route forwarding and
 byte-streaming plus one fake-control-plane cold wake through the production
-frontline image. It does not cover Kubernetes, the real control plane, SNI
-passthrough, TCP, real Kubernetes cold materialization latency, or route-cache
-invalidation behavior.
+frontline image. The h2c and h2-over-TLS ratio gates measure multiplexed
+request throughput over one long-lived HTTP/2 channel per load worker with
+connection setup outside the timed window; per-connection setup cost is
+exercised by the HTTP/1.1 and generated-gRPC phases instead. The smoke does
+not cover Kubernetes, the real control plane, SNI passthrough, TCP, real
+Kubernetes cold materialization latency, or route-cache invalidation behavior.
 
 ## Production-Image Load Budget Gates
 

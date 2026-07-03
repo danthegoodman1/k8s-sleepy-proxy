@@ -3,6 +3,10 @@ use std::{
     convert::Infallible,
     fmt,
     net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -226,6 +230,7 @@ async fn ready_route_forwards_http_request_to_loopback_upstream() {
     assert!(runtime.coordinator().resolver().client().calls.is_empty());
     assert!(runtime.coordinator().wake_client().calls.is_empty());
 
+    drop(runtime);
     upstream_task.await.expect("upstream task joins");
 }
 
@@ -359,6 +364,7 @@ async fn cold_route_wakes_to_ready_forwards_and_updates_cache() {
     assert_eq!(runtime.coordinator().resolver().client().calls.len(), 1);
     assert_eq!(runtime.coordinator().wake_client().calls.len(), 1);
 
+    drop(runtime);
     upstream_task.await.expect("upstream task joins");
 }
 
@@ -767,29 +773,39 @@ async fn spawn_http_upstream(
         .await
         .expect("upstream binds");
     let addr = listener.local_addr().expect("upstream addr");
+    let remaining = Arc::new(AtomicUsize::new(requests));
     let task = tokio::spawn(async move {
-        for _ in 0..requests {
-            let (stream, _) = listener.accept().await.expect("upstream accepts");
-            http1::Builder::new()
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |mut request: Request<Incoming>| async move {
+        let (stream, _) = listener.accept().await.expect("upstream accepts");
+        let service_remaining = Arc::clone(&remaining);
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |mut request: Request<Incoming>| {
+                    let remaining = Arc::clone(&service_remaining);
+                    async move {
+                        let previous = remaining.fetch_sub(1, Ordering::AcqRel);
+                        assert!(previous > 0, "upstream received too many requests");
                         let _ = request
                             .body_mut()
                             .collect()
                             .await
                             .expect("request body reads");
+                        let mut response = Response::builder().status(status);
+                        if previous == 1 {
+                            response = response.header("connection", "close");
+                        }
+
                         Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(status)
+                            response
                                 .body(Full::new(Bytes::from_static(body)))
                                 .expect("response builds"),
                         )
-                    }),
-                )
-                .await
-                .expect("upstream serves");
-        }
+                    }
+                }),
+            )
+            .await
+            .expect("upstream serves");
+        assert_eq!(remaining.load(Ordering::Acquire), 0);
     });
 
     (addr, task)

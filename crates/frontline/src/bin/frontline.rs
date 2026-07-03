@@ -14,8 +14,13 @@ use frontline::{
 };
 use proxy_core::{
     observability::{
-        prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
-        recorder::{CompositeObservabilitySink, ObservabilityRecorder, StderrObservabilitySink},
+        prometheus::{
+            serve_prometheus_metrics_with_collector, PrometheusMetricsSink,
+            RuntimeActiveStreamsCollector,
+        },
+        recorder::{
+            CompositeObservabilitySink, FilteredStderrObservabilitySink, ObservabilityRecorder,
+        },
     },
     DrainTracker, Shutdown,
 };
@@ -69,6 +74,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         observability.clone(),
     );
     let drain = DrainTracker::with_observability(env.drain_grace_timeout(), observability.clone());
+    let active_streams = RuntimeActiveStreamsCollector::default();
+    active_streams.attach(drain.clone());
     let runtime = FrontlineHttpRuntime::with_http01_resolver_and_observability(
         coordinator,
         http01_resolver,
@@ -100,9 +107,19 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
             },
             async {
-                serve_prometheus_metrics(metrics_addr, prometheus, metrics_shutdown.cancelled())
-                    .await
-                    .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+                serve_prometheus_metrics_with_collector(
+                    metrics_addr,
+                    prometheus,
+                    metrics_shutdown.cancelled(),
+                    move |sink| {
+                        let active_streams = active_streams.clone();
+                        async move {
+                            active_streams.collect(sink);
+                        }
+                    },
+                )
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
             },
         )?;
     } else {
@@ -118,16 +135,21 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+// The filtered stderr sink keeps lifecycle and error events visible while
+// dropping metric samples and the per-request route-cache lookup event, so
+// stderr observability performs no formatted writes on the forward path.
 fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
     if !metrics_enabled {
-        let _ = ObservabilityRecorder::install_stderr_global();
+        let _ = ObservabilityRecorder::install_global(std::sync::Arc::new(
+            FilteredStderrObservabilitySink,
+        ));
         return None;
     }
 
     let prometheus = PrometheusMetricsSink::new();
     let _ = ObservabilityRecorder::install_global(std::sync::Arc::new(
         CompositeObservabilitySink::new(vec![
-            std::sync::Arc::new(StderrObservabilitySink),
+            std::sync::Arc::new(FilteredStderrObservabilitySink),
             std::sync::Arc::new(prometheus.clone()),
         ]),
     ));

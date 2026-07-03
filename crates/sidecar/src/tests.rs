@@ -211,6 +211,7 @@ async fn http_forwarding_preserves_request_response_and_releases_active_count() 
 
     sidecar.wait_for_active_count(0).await;
     assert_eq!(sidecar.active_count(), 0);
+    drop(sidecar);
     upstream_task.await.expect("upstream task completed");
 }
 
@@ -258,6 +259,7 @@ async fn http_active_count_remains_one_while_response_body_is_held() {
     drop(response);
     sidecar.wait_for_active_count(0).await;
     assert_eq!(sidecar.active_count(), 0);
+    drop(sidecar);
     upstream_task.await.expect("upstream task completed");
 }
 
@@ -309,6 +311,7 @@ async fn drain_waits_for_active_http_response_body_then_completes() {
     sidecar.wait_for_active_count(0).await;
 
     assert_eq!(drain_task.await.expect("drain task completed"), Ok(()));
+    drop(sidecar);
     upstream_task.await.expect("upstream task completed");
 }
 

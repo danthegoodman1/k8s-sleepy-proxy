@@ -38,6 +38,7 @@ use rcgen::generate_simple_self_signed;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::{mpsc, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -242,6 +243,7 @@ async fn serve_backend(
 ) -> Result<(), BoxError> {
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let stats = stats.clone();
 
         tokio::spawn(async move {
@@ -1160,7 +1162,8 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
     let failures = Arc::new(AtomicU64::new(0));
     let latencies = LatencyRecorder::new(config.requests);
     let mut tasks = JoinSet::new();
-    let start = Instant::now();
+    let (ready_tx, mut ready_rx) = mpsc::channel(config.concurrency as usize);
+    let (start_tx, start_rx) = watch::channel(false);
 
     for _ in 0..config.concurrency {
         let next_request = Arc::clone(&next_request);
@@ -1173,8 +1176,52 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
         let tls_ca_cert_path = config.tls_ca_cert_path.clone();
         let websocket_stream_bytes = config.websocket_stream_bytes;
         let websocket_stream_chunk_size = config.websocket_stream_chunk_size;
+        let ready_tx = ready_tx.clone();
+        let mut start_rx = start_rx.clone();
 
         tasks.spawn(async move {
+            let tls_connector = match (protocol, tls_ca_cert_path.as_deref()) {
+                (ClientProtocol::H2TlsGrpc, Some(ca_cert_path)) => {
+                    Some(tls_connector(ca_cert_path)?)
+                }
+                (ClientProtocol::H2TlsGrpc, None) => {
+                    return Err(Box::new(InvalidArgs(
+                        "--tls-ca-cert is required for h2-tls-grpc".to_owned(),
+                    )) as BoxError);
+                }
+                _ => None,
+            };
+            let mut h2_grpc = match protocol {
+                ClientProtocol::H2cGrpc => {
+                    Some(H2GrpcClient::connect_h2c(target.clone(), host_header.clone()).await?)
+                }
+                ClientProtocol::H2TlsGrpc => Some(
+                    H2GrpcClient::connect_h2_tls(
+                        target.clone(),
+                        host_header.clone(),
+                        tls_connector
+                            .as_ref()
+                            .expect("h2-tls-grpc connector is initialized"),
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
+            ready_tx.send(()).await.map_err(|_| {
+                Box::new(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "load coordinator dropped readiness channel",
+                )) as BoxError
+            })?;
+            while !*start_rx.borrow() {
+                start_rx.changed().await.map_err(|_| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "load coordinator dropped start channel",
+                    )) as BoxError
+                })?;
+            }
+
             loop {
                 let request_id = next_request.fetch_add(1, Ordering::Relaxed);
 
@@ -1187,23 +1234,13 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     ClientProtocol::Http1 => {
                         send_smoke_request(&target, &host_header, request_id).await
                     }
-                    ClientProtocol::H2cGrpc => {
-                        send_h2c_grpc_request(&target, &host_header, request_id).await
-                    }
-                    ClientProtocol::H2TlsGrpc => match tls_ca_cert_path.as_deref() {
-                        Some(ca_cert_path) => {
-                            send_h2_tls_grpc_request(
-                                &target,
-                                &host_header,
-                                request_id,
-                                ca_cert_path,
-                            )
+                    ClientProtocol::H2cGrpc | ClientProtocol::H2TlsGrpc => {
+                        h2_grpc
+                            .as_mut()
+                            .expect("h2 grpc client is initialized")
+                            .send(request_id)
                             .await
-                        }
-                        None => Err(Box::new(InvalidArgs(
-                            "--tls-ca-cert is required for h2-tls-grpc".to_owned(),
-                        )) as BoxError),
-                    },
+                    }
                     ClientProtocol::GeneratedGrpc => {
                         send_generated_grpc_request(&target, &host_header, request_id).await
                     }
@@ -1230,11 +1267,25 @@ async fn run_client(config: ClientConfig) -> Result<(), BoxError> {
                     }
                 }
             }
+
+            Ok::<(), BoxError>(())
         });
     }
+    drop(ready_tx);
+
+    for _ in 0..config.concurrency {
+        ready_rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("load worker exited before starting"))?;
+    }
+    let start = Instant::now();
+    start_tx
+        .send(true)
+        .map_err(|_| io::Error::other("load workers exited before start"))?;
 
     while let Some(result) = tasks.join_next().await {
-        result?;
+        result??;
     }
 
     let elapsed = start.elapsed();
@@ -1493,99 +1544,115 @@ where
     Ok(())
 }
 
-async fn send_h2c_grpc_request(
-    target: &HttpTarget,
-    host_header: &str,
-    request_id: u64,
-) -> Result<(), BoxError> {
-    let stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
-        .await
-        .map_err(|_| timeout_error("h2c connect"))??;
-    let (mut sender, connection) = timeout(
-        REQUEST_TIMEOUT,
-        client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
-    )
-    .await
-    .map_err(|_| timeout_error("h2c handshake"))??;
-    let connection_task = tokio::spawn(connection);
-    let request = HttpRequest::builder()
-        .method("POST")
-        .uri(format!(
-            "http://{}{}",
-            host_header,
-            target.request_path(request_id)
-        ))
-        .version(Version::HTTP_2)
-        .header(CONTENT_TYPE, "application/grpc")
-        .body(Full::new(Bytes::from_static(GRPC_BODY)))?;
-    let response = timeout(REQUEST_TIMEOUT, sender.send_request(request))
-        .await
-        .map_err(|_| timeout_error("h2c send request"))??;
-
-    validate_h2c_grpc_response(response).await?;
-    drop(sender);
-    connection_task.abort();
-    let _ = connection_task.await;
-
-    Ok(())
+struct H2GrpcClient {
+    target: HttpTarget,
+    host_header: String,
+    scheme: &'static str,
+    sender: client_http2::SendRequest<Full<Bytes>>,
+    connection_task: tokio::task::JoinHandle<()>,
 }
 
-async fn send_h2_tls_grpc_request(
-    target: &HttpTarget,
-    host_header: &str,
-    request_id: u64,
-    ca_cert_path: &Path,
-) -> Result<(), BoxError> {
-    let stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
+impl H2GrpcClient {
+    async fn connect_h2c(target: HttpTarget, host_header: String) -> Result<Self, BoxError> {
+        let stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
+            .await
+            .map_err(|_| timeout_error("h2c connect"))??;
+        let _ = stream.set_nodelay(true);
+        let (sender, connection) = timeout(
+            REQUEST_TIMEOUT,
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+        )
         .await
-        .map_err(|_| timeout_error("h2 TLS connect"))??;
-    let server_name = ServerName::try_from(host_header.to_owned())
-        .map_err(|error| InvalidArgs(format!("--host must be a TLS server name: {error}")))?;
-    let tls = timeout(
-        REQUEST_TIMEOUT,
-        tls_connector(ca_cert_path)?.connect(server_name, stream),
-    )
-    .await
-    .map_err(|_| timeout_error("h2 TLS handshake"))??;
+        .map_err(|_| timeout_error("h2c handshake"))??;
 
-    let negotiated = tls
-        .get_ref()
-        .1
-        .alpn_protocol()
-        .ok_or(ResponseValidationError::MissingAlpnProtocol)?;
-    if negotiated != b"h2" {
-        return Err(Box::new(ResponseValidationError::UnexpectedAlpnProtocol(
-            String::from_utf8_lossy(negotiated).into_owned(),
-        )));
+        Ok(Self::new(target, host_header, "http", sender, connection))
     }
 
-    let (mut sender, connection) = timeout(
-        REQUEST_TIMEOUT,
-        client_http2::handshake(TokioExecutor::new(), TokioIo::new(tls)),
-    )
-    .await
-    .map_err(|_| timeout_error("h2 TLS HTTP/2 handshake"))??;
-    let connection_task = tokio::spawn(connection);
-    let request = HttpRequest::builder()
-        .method("POST")
-        .uri(format!(
-            "https://{}{}",
-            host_header,
-            target.request_path(request_id)
-        ))
-        .version(Version::HTTP_2)
-        .header(CONTENT_TYPE, "application/grpc")
-        .body(Full::new(Bytes::from_static(GRPC_BODY)))?;
-    let response = timeout(REQUEST_TIMEOUT, sender.send_request(request))
+    async fn connect_h2_tls(
+        target: HttpTarget,
+        host_header: String,
+        tls_connector: &TlsConnector,
+    ) -> Result<Self, BoxError> {
+        let stream = timeout(REQUEST_TIMEOUT, TcpStream::connect(target.authority()))
+            .await
+            .map_err(|_| timeout_error("h2 TLS connect"))??;
+        let _ = stream.set_nodelay(true);
+        let server_name = ServerName::try_from(host_header.to_owned())
+            .map_err(|error| InvalidArgs(format!("--host must be a TLS server name: {error}")))?;
+        let tls = timeout(REQUEST_TIMEOUT, tls_connector.connect(server_name, stream))
+            .await
+            .map_err(|_| timeout_error("h2 TLS handshake"))??;
+
+        let negotiated = tls
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .ok_or(ResponseValidationError::MissingAlpnProtocol)?;
+        if negotiated != b"h2" {
+            return Err(Box::new(ResponseValidationError::UnexpectedAlpnProtocol(
+                String::from_utf8_lossy(negotiated).into_owned(),
+            )));
+        }
+
+        let (sender, connection) = timeout(
+            REQUEST_TIMEOUT,
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(tls)),
+        )
         .await
-        .map_err(|_| timeout_error("h2 TLS send request"))??;
+        .map_err(|_| timeout_error("h2 TLS HTTP/2 handshake"))??;
 
-    validate_h2c_grpc_response(response).await?;
-    drop(sender);
-    connection_task.abort();
-    let _ = connection_task.await;
+        Ok(Self::new(target, host_header, "https", sender, connection))
+    }
 
-    Ok(())
+    fn new<IO>(
+        target: HttpTarget,
+        host_header: String,
+        scheme: &'static str,
+        sender: client_http2::SendRequest<Full<Bytes>>,
+        connection: client_http2::Connection<TokioIo<IO>, Full<Bytes>, TokioExecutor>,
+    ) -> Self
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        Self {
+            target,
+            host_header,
+            scheme,
+            sender,
+            connection_task,
+        }
+    }
+
+    async fn send(&mut self, request_id: u64) -> Result<(), BoxError> {
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri(format!(
+                "{}://{}{}",
+                self.scheme,
+                self.host_header,
+                self.target.request_path(request_id)
+            ))
+            .version(Version::HTTP_2)
+            .header(CONTENT_TYPE, "application/grpc")
+            .body(Full::new(Bytes::from_static(GRPC_BODY)))?;
+        let response = timeout(REQUEST_TIMEOUT, self.sender.send_request(request))
+            .await
+            .map_err(|_| timeout_error("h2 send request"))??;
+
+        validate_h2c_grpc_response(response)
+            .await
+            .map_err(|error| Box::new(error) as BoxError)
+    }
+}
+
+impl Drop for H2GrpcClient {
+    fn drop(&mut self) {
+        self.connection_task.abort();
+    }
 }
 
 fn tls_connector(ca_cert_path: &Path) -> Result<TlsConnector, BoxError> {

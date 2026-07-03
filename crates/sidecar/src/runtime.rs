@@ -18,8 +18,8 @@ use hyper::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use proxy_core::{
-    observability::recorder::ObservabilityRecorder, DrainError, DrainTracker, HttpProxyError,
-    Shutdown,
+    observability::{prometheus::RuntimeActiveStreamsCollector, recorder::ObservabilityRecorder},
+    DrainError, DrainTracker, HttpProxyError, Shutdown,
 };
 use sleepypods_types::{Generation, InstanceId};
 use tokio::{
@@ -37,6 +37,8 @@ type BoxError = Box<dyn Error + Send + Sync>;
 type RuntimeBody = UnsyncBoxBody<Bytes, BoxError>;
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_HTTP1_HEADER_BYTES: usize = 64 * 1024;
+const PROTOCOL_SNIFF_CHUNK_BYTES: usize = 4096;
+const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct SidecarRuntimeConfig {
@@ -46,6 +48,7 @@ pub struct SidecarRuntimeConfig {
     generation: Generation,
     idle_report: IdleReportConfig,
     drain_grace_timeout: Duration,
+    active_streams_collector: RuntimeActiveStreamsCollector,
 }
 
 #[derive(Debug)]
@@ -72,6 +75,7 @@ impl SidecarRuntimeConfig {
             generation,
             idle_report,
             drain_grace_timeout,
+            active_streams_collector: RuntimeActiveStreamsCollector::default(),
         })
     }
 
@@ -97,6 +101,10 @@ impl SidecarRuntimeConfig {
 
     pub fn drain_grace_timeout(&self) -> Duration {
         self.drain_grace_timeout
+    }
+
+    pub fn active_streams_collector(&self) -> RuntimeActiveStreamsCollector {
+        self.active_streams_collector.clone()
     }
 }
 
@@ -151,6 +159,7 @@ where
     let observability = ObservabilityRecorder::global();
     let drain =
         DrainTracker::with_observability(config.drain_grace_timeout(), observability.clone());
+    config.active_streams_collector.attach(drain.clone());
     let proxy = SidecarProxy::new(config.proxy().clone(), drain.clone());
     let mut idle = IdleDetector::with_observability(
         config.instance_id().clone(),
@@ -165,6 +174,7 @@ where
     let mut exit_error = None;
 
     loop {
+        reap_completed_connections(&mut connections);
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
@@ -175,6 +185,7 @@ where
                         break;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let proxy = proxy.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
@@ -231,8 +242,7 @@ async fn serve_http1_connection(
         let proxy = proxy.clone();
         async move { Ok::<_, Infallible>(forward_or_error(proxy, request).await) }
     });
-    let mut builder = http1::Builder::new();
-    builder.keep_alive(false);
+    let builder = http1::Builder::new();
     let connection = builder.serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
 
@@ -283,25 +293,21 @@ impl AcceptedStream {
 }
 
 async fn detect_protocol(stream: TcpStream, shutdown: &Shutdown) -> Option<AcceptedStream> {
-    let mut prefix = Vec::with_capacity(HTTP2_PREFACE.len());
+    let (prefix, headers_end) = tokio::time::timeout(
+        HTTP1_HEADER_READ_TIMEOUT,
+        read_protocol_prefix(&stream, shutdown),
+    )
+    .await
+    .ok()??;
 
-    loop {
-        if prefix == HTTP2_PREFACE {
-            return Some(accepted(AcceptedProtocol::Http2, prefix, stream));
-        }
-
-        if !HTTP2_PREFACE.starts_with(&prefix) {
-            break;
-        }
-
-        prefix.push(read_one(&stream, shutdown).await?);
+    if prefix.starts_with(HTTP2_PREFACE) {
+        return Some(accepted(AcceptedProtocol::Http2, prefix, stream));
     }
 
-    while !headers_complete(&prefix) && prefix.len() < MAX_HTTP1_HEADER_BYTES {
-        prefix.push(read_one(&stream, shutdown).await?);
-    }
-
-    let protocol = if is_websocket_upgrade(&prefix) {
+    // Chunked reads can pull request body or pipelined bytes past the header
+    // terminator into the prefix; classification must only see the header
+    // block, while the full prefix is still replayed to the served protocol.
+    let protocol = if is_websocket_upgrade(&prefix[..headers_end]) {
         AcceptedProtocol::WebSocket
     } else {
         AcceptedProtocol::Http1
@@ -310,12 +316,55 @@ async fn detect_protocol(stream: TcpStream, shutdown: &Shutdown) -> Option<Accep
     Some(accepted(protocol, prefix, stream))
 }
 
-async fn read_one(stream: &TcpStream, shutdown: &Shutdown) -> Option<u8> {
+/// Reads until the h2 preface is confirmed, the HTTP/1.1 header terminator
+/// arrives, or the size cap is hit. Returns the buffered prefix and the end
+/// index of the header block within it.
+async fn read_protocol_prefix(stream: &TcpStream, shutdown: &Shutdown) -> Option<(Vec<u8>, usize)> {
+    let mut prefix = Vec::with_capacity(HTTP2_PREFACE.len());
+    let mut h2_possible = true;
+    let mut scan_from = 0;
+
     loop {
-        let mut byte = [0; 1];
-        match stream.try_read(&mut byte) {
+        if h2_possible {
+            if prefix.starts_with(HTTP2_PREFACE) {
+                let end = prefix.len();
+                return Some((prefix, end));
+            }
+
+            if !HTTP2_PREFACE.starts_with(&prefix) {
+                h2_possible = false;
+                scan_from = 0;
+            }
+        }
+
+        if !h2_possible {
+            if let Some(end) = find_headers_end(&prefix, scan_from) {
+                return Some((prefix, end));
+            }
+            if prefix.len() >= MAX_HTTP1_HEADER_BYTES {
+                let end = prefix.len();
+                return Some((prefix, end));
+            }
+            scan_from = prefix.len().saturating_sub(3);
+        }
+
+        read_chunk(stream, shutdown, &mut prefix).await?;
+    }
+}
+
+async fn read_chunk(stream: &TcpStream, shutdown: &Shutdown, buffer: &mut Vec<u8>) -> Option<()> {
+    let mut chunk = [0; PROTOCOL_SNIFF_CHUNK_BYTES];
+    // read_protocol_prefix stops at MAX_HTTP1_HEADER_BYTES before requesting
+    // another chunk, so at least one more byte can always be read here.
+    let read_len = (MAX_HTTP1_HEADER_BYTES - buffer.len()).min(chunk.len());
+
+    loop {
+        match stream.try_read(&mut chunk[..read_len]) {
             Ok(0) => return None,
-            Ok(_) => return Some(byte[0]),
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                return Some(());
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(_error) => return None,
         }
@@ -338,8 +387,16 @@ fn accepted(protocol: AcceptedProtocol, prefix: Vec<u8>, stream: TcpStream) -> A
     }
 }
 
-fn headers_complete(buffer: &[u8]) -> bool {
-    buffer.windows(4).any(|window| window == b"\r\n\r\n")
+fn reap_completed_connections(connections: &mut JoinSet<()>) {
+    while connections.try_join_next().is_some() {}
+}
+
+fn find_headers_end(buffer: &[u8], start: usize) -> Option<usize> {
+    let start = start.min(buffer.len());
+    buffer[start..]
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| start + position + 4)
 }
 
 fn is_websocket_upgrade(buffer: &[u8]) -> bool {
@@ -435,6 +492,7 @@ where
     let observability = ObservabilityRecorder::global();
     let drain =
         DrainTracker::with_observability(config.drain_grace_timeout(), observability.clone());
+    config.active_streams_collector.attach(drain.clone());
     let proxy = SidecarProxy::new(config.proxy().clone(), drain.clone());
     let mut idle = IdleDetector::with_observability(
         config.instance_id().clone(),
@@ -449,6 +507,7 @@ where
     let mut exit_error = None;
 
     loop {
+        reap_completed_connections(&mut connections);
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
@@ -459,6 +518,7 @@ where
                         break;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let proxy = proxy.clone();
                 connections.spawn(async move {
                     let _ = proxy.forward_tcp(stream).await;
