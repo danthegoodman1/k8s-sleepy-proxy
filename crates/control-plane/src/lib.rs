@@ -85,8 +85,9 @@ pub use reconciler::{MaterializationReconciler, MaterializationReconcilerConfig}
 pub use retry::RetryPolicy;
 pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-    PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteDependencyLookup,
-    RouteDependencySet, RouteEntry, RouteHost, RouteHostKind, RouteIdentity, RouteResolution,
+    ListRouteBindingsForInstanceRequest, PathPrefix, ProtocolRoute, RouteBindingRecord,
+    RouteBindingSpec, RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost,
+    RouteHostKind, RouteIdentity, RouteResolution,
 };
 pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,

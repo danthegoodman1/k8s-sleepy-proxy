@@ -18,6 +18,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use proxy_core::{
+    configure_tcp_keepalive,
     observability::{prometheus::RuntimeActiveStreamsCollector, recorder::ObservabilityRecorder},
     DrainError, DrainTracker, HttpProxyError, Shutdown,
 };
@@ -216,6 +217,7 @@ enum AcceptedProtocol {
 }
 
 async fn serve_http_connection(proxy: SidecarProxy, stream: TcpStream, shutdown: Shutdown) {
+    let _ = configure_tcp_keepalive(&stream, proxy_core::TcpProxyConfig::default().tcp_keepalive);
     let Some(accepted) = detect_protocol(stream, &shutdown).await else {
         return;
     };
@@ -519,6 +521,10 @@ where
                     }
                 };
                 let _ = stream.set_nodelay(true);
+                let _ = configure_tcp_keepalive(
+                    &stream,
+                    proxy_core::TcpProxyConfig::default().tcp_keepalive,
+                );
                 let proxy = proxy.clone();
                 connections.spawn(async move {
                     let _ = proxy.forward_tcp(stream).await;

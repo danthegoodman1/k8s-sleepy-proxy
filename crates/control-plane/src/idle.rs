@@ -1,14 +1,12 @@
+use std::time::Duration;
+
 use crate::{
     ids::{Generation, InstanceId},
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
-    materialization::{
-        BeginSleepRequest, BeginSleepResult, FinalizeSleepRequest,
-        LoadActiveMaterializationRequest, MaterializationRecord, MaterializationState,
-        MaterializationTarget,
-    },
+    materialization::{BeginSleepRequest, BeginSleepResult, MaterializationTarget},
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     store::{ControlPlaneStore, StoreError},
+    workload::LoadWorkloadClassVersionRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,13 +46,11 @@ pub enum ReportIdleError {
         active_count: u64,
     },
     NotFound,
+    WorkloadClassNotFound,
+    SleepPolicy(String),
     GenerationConflict {
         expected: Generation,
         actual: Generation,
-    },
-    Projection {
-        instance: InstanceRecord,
-        source: ProjectionError,
     },
     Store(StoreError),
 }
@@ -75,7 +71,7 @@ impl ReportIdleRequest {
 
 pub async fn report_idle<S, C>(
     store: &S,
-    materializer: &KubernetesMaterializer<C>,
+    _materializer: &KubernetesMaterializer<C>,
     target: MaterializationTarget,
     request: ReportIdleRequest,
 ) -> Result<ReportIdleResult, ReportIdleError>
@@ -91,13 +87,11 @@ where
 
     let current = load_instance(store, request.instance_id.clone()).await?;
     if current.generation != request.expected_generation {
-        return generation_mismatch_result(store, materializer, target, &request, current).await;
+        return generation_mismatch_result(store, target, &request, current).await;
     }
 
     match current.state {
-        InstanceState::Running => {
-            finalize_running_sleep(store, materializer, target, request).await
-        }
+        InstanceState::Running => begin_running_sleep(store, target, request, &current).await,
         state => Ok(ReportIdleResult::Unavailable {
             instance: current,
             reason: unavailable_reason_for_state(state),
@@ -105,22 +99,25 @@ where
     }
 }
 
-async fn finalize_running_sleep<S, C>(
+async fn begin_running_sleep<S>(
     store: &S,
-    materializer: &KubernetesMaterializer<C>,
     target: MaterializationTarget,
     request: ReportIdleRequest,
+    current: &InstanceRecord,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
     S: ControlPlaneStore + ?Sized,
-    C: KubernetesMaterializerClient,
 {
+    let drain_grace_timeout = drain_grace_timeout(store, current).await?;
     let begin = match store
-        .begin_sleep(BeginSleepRequest::new(
-            request.instance_id.clone(),
-            request.expected_generation,
-            target.clone(),
-        ))
+        .begin_sleep(
+            BeginSleepRequest::new(
+                request.instance_id.clone(),
+                request.expected_generation,
+                target.clone(),
+            )
+            .with_drain_grace_timeout(drain_grace_timeout),
+        )
         .await
     {
         Ok(begin) => Ok(begin),
@@ -129,14 +126,7 @@ where
             if actual == expected.next() {
                 let current = load_instance(store, request.instance_id.clone()).await?;
                 if current.generation == actual {
-                    return generation_mismatch_result(
-                        store,
-                        materializer,
-                        target,
-                        &request,
-                        current,
-                    )
-                    .await;
+                    return generation_mismatch_result(store, target, &request, current).await;
                 }
             }
 
@@ -145,26 +135,19 @@ where
         Err(error) => Err(ReportIdleError::Store(error)),
     }?;
 
-    cleanup_and_finalize_sleep(
-        store,
-        materializer,
-        target,
-        begin.instance,
-        begin.materialization,
-    )
-    .await
+    Ok(ReportIdleResult::Accepted {
+        instance: begin.instance,
+    })
 }
 
-async fn generation_mismatch_result<S, C>(
+async fn generation_mismatch_result<S>(
     store: &S,
-    materializer: &KubernetesMaterializer<C>,
     target: MaterializationTarget,
     request: &ReportIdleRequest,
     current: InstanceRecord,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
     S: ControlPlaneStore + ?Sized,
-    C: KubernetesMaterializerClient,
 {
     if current.generation == request.expected_generation.next() {
         if current.state == InstanceState::Running {
@@ -173,40 +156,15 @@ where
                 request.instance_id.clone(),
                 current.generation,
                 target.clone(),
+                drain_grace_timeout(store, &current).await?,
             )
             .await?;
-            return cleanup_and_finalize_sleep(
-                store,
-                materializer,
-                target,
-                begin.instance,
-                begin.materialization,
-            )
-            .await;
+            return Ok(ReportIdleResult::Accepted {
+                instance: begin.instance,
+            });
         }
 
         if current.state == InstanceState::Draining {
-            let materialization = store
-                .load_active_materialization(LoadActiveMaterializationRequest::new(
-                    request.instance_id.clone(),
-                    target.clone(),
-                ))
-                .await
-                .map_err(ReportIdleError::Store)?;
-
-            if materialization.as_ref().is_some_and(|materialization| {
-                materialization.state == MaterializationState::Deleting
-            }) {
-                return cleanup_and_finalize_sleep(
-                    store,
-                    materializer,
-                    target,
-                    current,
-                    materialization,
-                )
-                .await;
-            }
-
             return Ok(ReportIdleResult::AlreadyDraining { instance: current });
         }
     }
@@ -228,12 +186,16 @@ async fn begin_sleep_at_generation<S>(
     instance_id: InstanceId,
     generation: Generation,
     target: MaterializationTarget,
+    drain_grace_timeout: Duration,
 ) -> Result<BeginSleepResult, ReportIdleError>
 where
     S: ControlPlaneStore + ?Sized,
 {
     match store
-        .begin_sleep(BeginSleepRequest::new(instance_id, generation, target))
+        .begin_sleep(
+            BeginSleepRequest::new(instance_id, generation, target)
+                .with_drain_grace_timeout(drain_grace_timeout),
+        )
         .await
     {
         Ok(begin) => Ok(begin),
@@ -245,40 +207,25 @@ where
     }
 }
 
-async fn cleanup_and_finalize_sleep<S, C>(
+async fn drain_grace_timeout<S>(
     store: &S,
-    materializer: &KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-    instance: InstanceRecord,
-    materialization: Option<MaterializationRecord>,
-) -> Result<ReportIdleResult, ReportIdleError>
+    instance: &InstanceRecord,
+) -> Result<Duration, ReportIdleError>
 where
     S: ControlPlaneStore + ?Sized,
-    C: KubernetesMaterializerClient,
 {
-    if let Some(materialization) = materialization.as_ref() {
-        let plan = ProjectionPlan::from_recorded_refs(materialization);
-        ProjectionReconciler::new(materializer)
-            .delete_owned(&plan)
-            .await
-            .map_err(|source| ReportIdleError::Projection {
-                instance: instance.clone(),
-                source,
-            })?;
-    }
-
-    let finalized = store
-        .finalize_sleep(FinalizeSleepRequest::new(
-            instance.id,
-            instance.generation,
-            target,
+    let workload_class = store
+        .load_workload_class_version(LoadWorkloadClassVersionRequest::new(
+            instance.workload_class.clone(),
         ))
         .await
-        .map_err(map_finalize_store_error)?;
-
-    Ok(ReportIdleResult::Accepted {
-        instance: finalized.instance,
-    })
+        .map_err(ReportIdleError::Store)?
+        .ok_or(ReportIdleError::WorkloadClassNotFound)?;
+    let sleep_policy = workload_class
+        .sleep_policy
+        .resolve(&instance.values)
+        .map_err(|error| ReportIdleError::SleepPolicy(error.to_string()))?;
+    Ok(Duration::from_millis(sleep_policy.drain_grace_timeout_ms))
 }
 
 async fn load_instance<S>(
@@ -306,15 +253,5 @@ fn unavailable_reason_for_state(state: InstanceState) -> ReportIdleUnavailableRe
         InstanceState::Failed => ReportIdleUnavailableReason::Failed,
         InstanceState::Deleting => ReportIdleUnavailableReason::Deleting,
         InstanceState::Deleted => ReportIdleUnavailableReason::Deleted,
-    }
-}
-
-fn map_finalize_store_error(error: StoreError) -> ReportIdleError {
-    match error {
-        StoreError::NotFound { .. } => ReportIdleError::NotFound,
-        StoreError::GenerationConflict { expected, actual } => {
-            ReportIdleError::GenerationConflict { expected, actual }
-        }
-        other => ReportIdleError::Store(other),
     }
 }

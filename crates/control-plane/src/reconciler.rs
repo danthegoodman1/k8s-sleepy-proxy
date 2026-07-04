@@ -20,6 +20,7 @@ use proxy_core::observability::{
 use tokio::{sync::watch, task::JoinSet, time::sleep};
 
 use crate::{
+    api::RouteSubscriptionBroker,
     ids::InstanceId,
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
     manifest::{render_manifests_with_options, RenderManifestOptions, RenderManifestRequest},
@@ -34,6 +35,7 @@ use crate::{
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
+    route::ListRouteBindingsForInstanceRequest,
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
@@ -54,6 +56,7 @@ pub struct MaterializationReconciler<C> {
     materializer: KubernetesMaterializer<C>,
     config: MaterializationReconcilerConfig,
     observability: ObservabilityRecorder,
+    route_events: RouteSubscriptionBroker,
 }
 
 #[derive(Debug)]
@@ -93,7 +96,13 @@ where
             materializer,
             config,
             observability,
+            route_events: RouteSubscriptionBroker::new(),
         }
+    }
+
+    pub fn with_route_events(mut self, route_events: RouteSubscriptionBroker) -> Self {
+        self.route_events = route_events;
+        self
     }
 
     pub async fn run_until_shutdown(self, mut shutdown: watch::Receiver<bool>) {
@@ -277,15 +286,18 @@ where
         );
         complete.rendered_objects = materialization.rendered_objects.clone();
         complete.exclusivity_keys = materialization.exclusivity_keys.clone();
-        self.store
+        let result = self
+            .store
             .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
                 materialization.id,
                 self.config.owner.clone(),
                 complete,
             ))
             .await
-            .map(|_| ())
-            .map_err(MaterializationReconcileError::Store)
+            .map_err(MaterializationReconcileError::Store)?;
+        self.notify_instance_routes_changed(result.instance.id)
+            .await?;
+        Ok(())
     }
 
     async fn reconcile_deleting(
@@ -302,21 +314,43 @@ where
         else {
             return self.mark_deleted(materialization).await;
         };
+        // begin_sleep leaves the materialization stamped with the Running
+        // generation and moves the instance to Draining at Running + 1, so
+        // the drain this row belongs to is current exactly when the instance
+        // is Draining one generation past the stamp. Anything else means the
+        // instance moved on (re-woke, failed, or is being deleted) and the
+        // row is just cleanup debris.
         if instance.state != InstanceState::Draining
-            || instance.generation != materialization.instance_generation
+            || instance.generation != materialization.instance_generation.next()
         {
             return self.mark_deleted(materialization).await;
         }
 
-        self.store
+        let result = self
+            .store
             .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
                 materialization.id,
                 self.config.owner.clone(),
                 FinalizeSleepRequest::new(instance.id, instance.generation, materialization.target),
             ))
             .await
-            .map(|_| ())
-            .map_err(MaterializationReconcileError::Store)
+            .map_err(MaterializationReconcileError::Store)?;
+        self.notify_instance_routes_changed(result.instance.id)
+            .await?;
+        Ok(())
+    }
+
+    async fn notify_instance_routes_changed(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<(), MaterializationReconcileError> {
+        let route_bindings = self
+            .store
+            .list_route_bindings_for_instance(ListRouteBindingsForInstanceRequest::new(instance_id))
+            .await
+            .map_err(MaterializationReconcileError::Store)?;
+        self.route_events.notify_routes_changed(&route_bindings);
+        Ok(())
     }
 
     async fn delete_refs_and_mark_deleted(
@@ -616,6 +650,7 @@ where
             materializer: self.materializer.clone(),
             config: self.config.clone(),
             observability: self.observability.clone(),
+            route_events: self.route_events.clone(),
         }
     }
 }
@@ -676,6 +711,7 @@ mod tests {
         },
         materializer::{KubernetesClientError, KubernetesClientFuture, KubernetesClientResult},
         projection::{LiveObjectMetadata, ProjectionObjectInspection},
+        route::{ListRouteBindingsForInstanceRequest, RouteBindingRecord},
         store::{StoreFuture, StoreResult},
         workload::{
             RenderedExclusivityKey, WorkloadClassVersion, WorkloadClassVersionRef,
@@ -894,10 +930,13 @@ mod tests {
         assert_eq!(store.release_calls(), 1);
     }
 
+    // Leftovers stamped with an older generation belong to this instance's
+    // failed prior attempt: the pending reconciliation supersedes them in
+    // place and completes the wake instead of stalling forever.
     #[tokio::test]
-    async fn pending_reconciliation_stops_on_stale_live_stamp() {
+    async fn pending_reconciliation_supersedes_older_live_stamp() {
         let instance = waking_instance("instance-reconcile");
-        let materialization = pending_materialization("mat-pending-stale-stamp", &instance);
+        let materialization = pending_materialization("mat-pending-older-stamp", &instance);
         let client = FakeKubernetesClient::default();
         let mut stale = live_owned_metadata(&materialization);
         stale.labels.insert(
@@ -907,6 +946,34 @@ mod tests {
         client.set_live(
             materialization.rendered_objects[0].clone(),
             ProjectionObjectInspection::Present(stale),
+        );
+        let store = Arc::new(FakeReconcileStore::new(materialization, instance));
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(client.apply_calls(), 2);
+        assert_eq!(store.complete_calls(), 1);
+        assert_eq!(store.materialization_state(), MaterializationState::Ready);
+        assert_eq!(store.release_calls(), 0);
+    }
+
+    // Live objects stamped with a NEWER generation belong to a newer owner;
+    // this stale plan must not touch them.
+    #[tokio::test]
+    async fn pending_reconciliation_stops_on_newer_live_stamp() {
+        let instance = waking_instance("instance-reconcile");
+        let materialization = pending_materialization("mat-pending-newer-stamp", &instance);
+        let client = FakeKubernetesClient::default();
+        let mut newer = live_owned_metadata(&materialization);
+        newer.labels.insert(
+            crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
+            "9".to_owned(),
+        );
+        client.set_live(
+            materialization.rendered_objects[0].clone(),
+            ProjectionObjectInspection::Present(newer),
         );
         let store = Arc::new(FakeReconcileStore::new(materialization, instance));
         let materializer = KubernetesMaterializer::new(client.clone());
@@ -1013,6 +1080,27 @@ mod tests {
         let store = Arc::new(FakeReconcileStore::new(
             deleting_materialization("mat-delete-race"),
             running_instance("instance-reconcile", 8),
+        ));
+        let materializer = KubernetesMaterializer::new(FakeKubernetesClient::default());
+        let reconciler = reconciler(store.clone(), materializer);
+
+        reconciler.run_once().await;
+
+        assert_eq!(store.finalize_calls(), 0);
+        assert_eq!(store.guarded_delete_calls(), 1);
+        assert_eq!(store.materialization_state(), MaterializationState::Deleted);
+    }
+
+    // A Draining instance whose generation is more than one past the
+    // materialization stamp belongs to a later sleep cycle, so the stale
+    // deleting row must be discarded without finalizing that newer drain.
+    #[tokio::test]
+    async fn deleting_reconciliation_skips_finalize_for_later_drain_cycle() {
+        let mut later_drain = draining_instance("instance-reconcile");
+        later_drain.generation = Generation::new(12);
+        let store = Arc::new(FakeReconcileStore::new(
+            deleting_materialization("mat-delete-later-drain"),
+            later_drain,
         ));
         let materializer = KubernetesMaterializer::new(FakeKubernetesClient::default());
         let reconciler = reconciler(store.clone(), materializer);
@@ -1154,6 +1242,8 @@ mod tests {
         }
     }
 
+    // Draining sits one generation past the materialization stamp (7),
+    // mirroring begin_sleep's CAS from Running to Draining.
     fn draining_instance(instance_id: &str) -> InstanceRecord {
         InstanceRecord {
             id: InstanceId::new(instance_id).expect("valid instance id"),
@@ -1163,7 +1253,7 @@ mod tests {
             ),
             values: Default::default(),
             state: InstanceState::Draining,
-            generation: Generation::new(7),
+            generation: Generation::new(8),
         }
     }
 
@@ -1341,6 +1431,13 @@ mod tests {
             _request: LoadWorkloadClassVersionRequest,
         ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
             Box::pin(async move { Ok(Some(self.workload_class.clone())) })
+        }
+
+        fn list_route_bindings_for_instance<'a>(
+            &'a self,
+            _request: ListRouteBindingsForInstanceRequest,
+        ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
+            Box::pin(async move { Ok(Vec::new()) })
         }
 
         fn list_materialization_reconciliation_candidates<'a>(

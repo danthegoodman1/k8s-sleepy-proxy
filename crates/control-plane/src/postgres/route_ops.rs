@@ -6,8 +6,8 @@ use crate::{
     materialization::MaterializationRecord,
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteIdentity,
-        RouteResolution,
+        ListRouteBindingsForInstanceRequest, RouteBindingRecord, RouteDependencyLookup,
+        RouteDependencySet, RouteEntry, RouteIdentity, RouteResolution,
     },
     store::{StoreError, StoreResult},
 };
@@ -94,6 +94,27 @@ pub(crate) async fn delete_route_binding(
         .map_err(map_postgres_error)?;
 
     Ok(deleted > 0)
+}
+
+pub(crate) async fn list_route_bindings_for_instance(
+    store: &PostgresStore,
+    request: ListRouteBindingsForInstanceRequest,
+) -> StoreResult<Vec<RouteBindingRecord>> {
+    let client = store.client().await?;
+    let rows = client
+        .query(
+            "
+            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            FROM route_bindings
+            WHERE instance_id = $1
+            ORDER BY route_binding_id
+            ",
+            &[&request.instance_id.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    rows.iter().map(route_binding_from_row).collect()
 }
 
 pub(crate) async fn resolve_route(

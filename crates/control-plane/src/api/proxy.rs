@@ -18,13 +18,13 @@ use crate::{
         LoadReadyMaterializationRequest, MaterializationRecord, MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    route as domain_route,
+    route::{self as domain_route, ListRouteBindingsForInstanceRequest},
     store::{ControlPlaneStore, StoreError},
     wake::{self, WakeInstanceError, WakeInstanceResult, WakeUnavailableReason},
 };
 
 pub const PROXY_SERVICE_NAME: &str = "sleepypods.controlplane.v1.ProxyControlPlane";
-const POSITIVE_ROUTE_CACHE_TTL: Duration = Duration::from_secs(10);
+const POSITIVE_ROUTE_CACHE_TTL: Duration = Duration::from_secs(300);
 const SUBSCRIBE_RESPONSE_BUFFER: usize = 16;
 
 type ProxySubscribeResponseStream = Pin<
@@ -172,6 +172,12 @@ where
         .await;
         let response = match result {
             Ok(WakeInstanceResult::Completed { result }) => {
+                notify_instance_routes_changed(
+                    self.store.as_ref(),
+                    &self.route_events,
+                    result.instance.id.clone(),
+                )
+                .await?;
                 proxy_ready_response(&result.instance, &result.materialization)?
             }
             Ok(WakeInstanceResult::AlreadyRunning {
@@ -186,7 +192,17 @@ where
                     },
                 )),
             },
-            Err(error) => proxy_wake_error_response(instance_id, error)?,
+            Err(error) => {
+                if let Some(instance) = failed_wake_instance(&error) {
+                    notify_instance_routes_changed(
+                        self.store.as_ref(),
+                        &self.route_events,
+                        instance.id.clone(),
+                    )
+                    .await?;
+                }
+                proxy_wake_error_response(instance_id, error)?
+            }
         };
 
         Ok(Response::new(response))
@@ -269,6 +285,34 @@ where
         Ok(Response::new(Box::pin(ReceiverStream::new(
             response_stream,
         ))))
+    }
+}
+
+async fn notify_instance_routes_changed(
+    store: &dyn ControlPlaneStore,
+    route_events: &RouteSubscriptionBroker,
+    instance_id: InstanceId,
+) -> Result<(), Status> {
+    let route_bindings = store
+        .list_route_bindings_for_instance(ListRouteBindingsForInstanceRequest::new(instance_id))
+        .await
+        .map_err(store_error_to_status)?;
+    route_events.notify_routes_changed(&route_bindings);
+    Ok(())
+}
+
+fn failed_wake_instance(error: &WakeInstanceError) -> Option<&crate::instance::InstanceRecord> {
+    match error {
+        WakeInstanceError::WorkloadClassNotFound { instance }
+        | WakeInstanceError::Render { instance, .. }
+        | WakeInstanceError::SleepPolicy { instance, .. }
+        | WakeInstanceError::Materializer { instance, .. }
+        | WakeInstanceError::Projection { instance, .. } => Some(instance),
+        WakeInstanceError::NotFound
+        | WakeInstanceError::GenerationConflict { .. }
+        | WakeInstanceError::Unavailable { .. }
+        | WakeInstanceError::ReadyMaterializationNotFound { .. }
+        | WakeInstanceError::Store(_) => None,
     }
 }
 

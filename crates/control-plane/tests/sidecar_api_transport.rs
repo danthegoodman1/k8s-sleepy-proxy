@@ -113,21 +113,23 @@ async fn report_idle_running_instance_transitions_to_draining() {
 
     let accepted = expect_accepted(response);
     assert_eq!(accepted.instance_id, "instance-running");
-    assert_eq!(accepted.instance_generation, 9);
+    assert_eq!(accepted.instance_generation, 8);
 
     let instance = store.instance();
-    assert_eq!(instance.state, DomainInstanceState::Cold);
-    assert_eq!(instance.generation, Generation::new(9));
+    assert_eq!(instance.state, DomainInstanceState::Draining);
+    assert_eq!(instance.generation, Generation::new(8));
     let transitions = store.transition_requests();
-    assert_eq!(transitions.len(), 2);
+    assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].expected_generation, Generation::new(7));
     assert_eq!(transitions[0].next_state, DomainInstanceState::Draining);
     assert_eq!(transitions[0].reason, StateTransitionReason::IdleReported);
-    assert_eq!(transitions[1].expected_generation, Generation::new(8));
-    assert_eq!(transitions[1].next_state, DomainInstanceState::Cold);
-    assert_eq!(transitions[1].reason, StateTransitionReason::DrainCompleted);
+    assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
+    let materialization = store
+        .materialization()
+        .expect("materialization remains recorded");
+    assert_eq!(materialization.state, MaterializationState::Deleting);
     assert_eq!(
-        client.deleted_objects(),
+        materialization.rendered_objects,
         vec![object_ref(
             "apps/v1",
             "Deployment",
@@ -135,11 +137,6 @@ async fn report_idle_running_instance_transitions_to_draining() {
             "instance-running"
         )]
     );
-    let materialization = store
-        .materialization()
-        .expect("materialization remains recorded");
-    assert_eq!(materialization.state, MaterializationState::Deleted);
-    assert!(materialization.rendered_objects.is_empty());
 }
 
 #[tokio::test]
@@ -168,24 +165,14 @@ async fn report_idle_from_rendered_waking_generation_sleeps_current_running_inst
 
     let accepted = expect_accepted(response);
     assert_eq!(accepted.instance_id, "instance-rendered-generation");
-    assert_eq!(accepted.instance_generation, 10);
-    assert_eq!(store.instance().state, DomainInstanceState::Cold);
-    assert_eq!(store.instance().generation, Generation::new(10));
+    assert_eq!(accepted.instance_generation, 9);
+    assert_eq!(store.instance().state, DomainInstanceState::Draining);
+    assert_eq!(store.instance().generation, Generation::new(9));
     let transitions = store.transition_requests();
-    assert_eq!(transitions.len(), 2);
+    assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].expected_generation, Generation::new(8));
     assert_eq!(transitions[0].next_state, DomainInstanceState::Draining);
-    assert_eq!(transitions[1].expected_generation, Generation::new(9));
-    assert_eq!(transitions[1].next_state, DomainInstanceState::Cold);
-    assert_eq!(
-        client.deleted_objects(),
-        vec![object_ref(
-            "apps/v1",
-            "Deployment",
-            "apps",
-            "instance-rendered-generation"
-        )]
-    );
+    assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
 }
 
 #[tokio::test]
@@ -207,18 +194,20 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
         active_count: 0,
     };
 
-    let error = service
+    let response = service
         .report_idle(tonic::Request::new(request.clone()))
         .await
-        .expect_err("first delete failure is retryable");
+        .expect("idle report does not delete Kubernetes objects")
+        .into_inner();
 
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("sleep cleanup failed"));
+    let accepted = expect_accepted(response);
+    assert_eq!(accepted.instance_id, "instance-delete-retry");
+    assert_eq!(accepted.instance_generation, 8);
     assert_eq!(store.instance().state, DomainInstanceState::Draining);
     assert_eq!(store.instance().generation, Generation::new(8));
     let materialization = store
         .materialization()
-        .expect("materialization remains after failed delete");
+        .expect("materialization remains after idle report");
     assert_eq!(materialization.state, MaterializationState::Deleting);
     assert_eq!(
         materialization.rendered_objects,
@@ -229,34 +218,7 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
             "instance-delete-retry"
         )]
     );
-
-    let retry_client = FakeKubernetesClient::default();
-    retry_client.seed_materialization(&materialization);
-    let retry_service = sidecar_api(store.clone(), retry_client.clone());
-    let response = retry_service
-        .report_idle(tonic::Request::new(request))
-        .await
-        .expect("recreated service resumes cleanup")
-        .into_inner();
-
-    let accepted = expect_accepted(response);
-    assert_eq!(accepted.instance_id, "instance-delete-retry");
-    assert_eq!(accepted.instance_generation, 9);
-    assert_eq!(store.instance().state, DomainInstanceState::Cold);
-    let materialization = store
-        .materialization()
-        .expect("materialization remains recorded");
-    assert_eq!(materialization.state, MaterializationState::Deleted);
-    assert!(materialization.rendered_objects.is_empty());
-    assert_eq!(
-        retry_client.deleted_objects(),
-        vec![object_ref(
-            "apps/v1",
-            "Deployment",
-            "apps",
-            "instance-delete-retry"
-        )]
-    );
+    assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
 }
 
 #[tokio::test]
@@ -277,22 +239,24 @@ async fn report_idle_unowned_live_ref_blocks_cleanup_without_delete() {
     ));
     let service = sidecar_api(store.clone(), client.clone());
 
-    let error = service
+    let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
             instance_id: "instance-unowned".to_owned(),
             expected_generation: 7,
             active_count: 0,
         }))
         .await
-        .expect_err("unowned Kubernetes ref blocks idle cleanup");
+        .expect("idle report does not inspect Kubernetes refs")
+        .into_inner();
 
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("ownership conflict"));
+    let accepted = expect_accepted(response);
+    assert_eq!(accepted.instance_id, "instance-unowned");
+    assert_eq!(accepted.instance_generation, 8);
     assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
     assert_eq!(store.instance().state, DomainInstanceState::Draining);
     let materialization = store
         .materialization()
-        .expect("materialization remains after failed cleanup");
+        .expect("materialization remains after idle report");
     assert_eq!(materialization.state, MaterializationState::Deleting);
 }
 
@@ -491,8 +455,8 @@ async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
         collected.to_bytes().as_ref(),
     ));
     assert_eq!(accepted.instance_id, "instance-transport");
-    assert_eq!(accepted.instance_generation, 4);
-    assert_eq!(store.instance().state, DomainInstanceState::Cold);
+    assert_eq!(accepted.instance_generation, 3);
+    assert_eq!(store.instance().state, DomainInstanceState::Draining);
 }
 
 #[tokio::test]
@@ -588,8 +552,8 @@ async fn native_grpc_sidecar_auth_accepts_valid_report_idle_credentials() {
         .expect("native response body should collect");
     let trailers = collected.trailers().cloned();
     assert_eq!(grpc_status(&headers, trailers.as_ref()), "0");
-    assert_eq!(store.transition_requests().len(), 2);
-    assert_eq!(store.instance().state, DomainInstanceState::Cold);
+    assert_eq!(store.transition_requests().len(), 1);
+    assert_eq!(store.instance().state, DomainInstanceState::Draining);
 }
 
 fn grpc_sidecar_report_idle_request(
@@ -1002,9 +966,12 @@ impl ControlPlaneStore for FakeSidecarStore {
 
     fn load_workload_class_version<'a>(
         &'a self,
-        _request: control_plane::LoadWorkloadClassVersionRequest,
+        request: control_plane::LoadWorkloadClassVersionRequest,
     ) -> StoreFuture<'a, StoreResult<Option<control_plane::WorkloadClassVersion>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let workload_class = fake_workload_class();
+            Ok((workload_class.reference == request.reference).then_some(workload_class))
+        })
     }
 
     fn create_route_binding<'a>(
@@ -1026,6 +993,13 @@ impl ControlPlaneStore for FakeSidecarStore {
         _request: control_plane::DeleteRouteBindingRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
         Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+    }
+
+    fn list_route_bindings_for_instance<'a>(
+        &'a self,
+        _request: control_plane::ListRouteBindingsForInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn resolve_route<'a>(
@@ -1211,6 +1185,53 @@ fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> Ins
         values: Default::default(),
         state,
         generation: Generation::new(generation),
+    }
+}
+
+fn fake_workload_class() -> control_plane::WorkloadClassVersion {
+    control_plane::WorkloadClassVersion {
+        reference: control_plane::WorkloadClassVersionRef::new(
+            control_plane::WorkloadClassId::new("class-1").expect("class id is valid"),
+            Generation::new(1),
+        ),
+        template_generation: Generation::new(1),
+        template: control_plane::ManifestTemplate {
+            workload: control_plane::WorkloadTemplate {
+                kind: control_plane::WorkloadKind::Deployment,
+                name: control_plane::TemplateText::literal("app"),
+                replicas: None,
+                app_container: control_plane::ContainerTemplate {
+                    name: "app".to_owned(),
+                    image: control_plane::TemplateText::literal("example/app:1"),
+                    ports: vec![control_plane::ContainerPortTemplate {
+                        name: Some("http".to_owned()),
+                        container_port: 8080,
+                    }],
+                    env: Vec::new(),
+                },
+            },
+            service: Some(control_plane::ServiceTemplate {
+                name: control_plane::TemplateText::literal("svc"),
+                ports: vec![control_plane::ServicePortTemplate {
+                    name: Some("http".to_owned()),
+                    port: 80,
+                    target_port: 8080,
+                }],
+            }),
+            sidecar: control_plane::SidecarTemplate {
+                name: "sleepypods-sidecar".to_owned(),
+                image: control_plane::TemplateText::literal("sleepypods/sidecar:test"),
+                listen_port: 15000,
+                mode: None,
+            },
+            volumes: Vec::new(),
+            raw_objects: Vec::new(),
+        },
+        default_values: BTreeMap::new(),
+        value_schema: control_plane::WorkloadValueSchema::new(true),
+        sleep_policy: control_plane::WorkloadSleepPolicy::new(120_000, 5_000, 30_000)
+            .expect("sleep policy is valid"),
+        exclusivity_keys: Vec::new(),
     }
 }
 

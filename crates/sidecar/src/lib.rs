@@ -113,6 +113,7 @@ impl SidecarProxy {
             drain.clone(),
             TcpProxyConfig {
                 connect_timeout: config.tcp_connect_timeout(),
+                ..TcpProxyConfig::default()
             },
         );
 

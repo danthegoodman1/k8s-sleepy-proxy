@@ -406,6 +406,13 @@ where
         let request = domain_instance::DeleteInstanceRequest::new(parse_instance_id(
             request.into_inner().instance_id,
         )?);
+        let route_bindings = self
+            .store
+            .list_route_bindings_for_instance(
+                domain_route::ListRouteBindingsForInstanceRequest::new(request.instance_id.clone()),
+            )
+            .await
+            .map_err(store_error_to_status)?;
         let deleted = domain_instance::delete_instance(
             self.store.as_ref(),
             &self.materializer,
@@ -414,6 +421,9 @@ where
         )
         .await
         .map_err(delete_instance_error_to_status)?;
+        if deleted {
+            self.route_events.notify_routes_removed(&route_bindings);
+        }
 
         Ok(Response::new(pb::DeleteInstanceResponse { deleted }))
     }
@@ -581,7 +591,8 @@ where
                     ..MaterializationReconcilerConfig::default()
                 },
                 proxy_core::observability::recorder::ObservabilityRecorder::noop(),
-            );
+            )
+            .with_route_events(self.route_events.clone());
             reconciler.reconcile_materialization(before.clone()).await;
         }
 

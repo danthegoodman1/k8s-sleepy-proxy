@@ -264,6 +264,7 @@ pub(crate) async fn begin_sleep(
         &request.instance_id,
         &request.target,
         request.expected_running_generation,
+        request.drain_grace_timeout,
     )
     .await?;
 
@@ -370,6 +371,7 @@ pub(crate) async fn list_materialization_reconciliation_candidates(
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
             WHERE state IN ('pending', 'deleting')
+                AND updated_at_unix_millis <= $1
                 AND (
                     reconcile_owner IS NULL
                     OR reconcile_lease_expires_at_unix_millis <= $1
@@ -1499,12 +1501,15 @@ async fn mark_active_materialization_deleting_for_sleep(
     instance_id: &crate::ids::InstanceId,
     target: &crate::materialization::MaterializationTarget,
     expected_instance_generation: Generation,
+    drain_grace_timeout: Duration,
 ) -> StoreResult<Option<MaterializationRecord>> {
     let instance_id_value = instance_id.as_str();
     let cluster_id = target.cluster_id();
     let namespace = target.namespace();
     let state = materialization_state_to_db(MaterializationState::Deleting);
     let expected_generation_db = generation_to_i64(expected_instance_generation)?;
+    let drain_grace_millis = i64::try_from(drain_grace_timeout.as_millis())
+        .map_err(|_| StoreError::invalid_argument("drain grace timeout is too large"))?;
     let row = client
         .query_opt(
             "
@@ -1513,7 +1518,7 @@ async fn mark_active_materialization_deleting_for_sleep(
                 backend_uri = NULL,
                 reconcile_owner = NULL,
                 reconcile_lease_expires_at_unix_millis = NULL,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $6
             WHERE instance_id = $1
                 AND cluster_id = $2
                 AND namespace = $3
@@ -1530,6 +1535,7 @@ async fn mark_active_materialization_deleting_for_sleep(
                 &namespace,
                 &expected_generation_db,
                 &state,
+                &drain_grace_millis,
             ],
         )
         .await

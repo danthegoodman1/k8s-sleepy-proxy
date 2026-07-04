@@ -23,6 +23,7 @@ pub struct RenderedManifestObject {
 pub enum ApplyOrder {
     PersistentVolume,
     PersistentVolumeClaim,
+    Secret,
     Service,
     Workload,
 }
@@ -32,6 +33,7 @@ pub enum KubernetesObject {
     Deployment(Deployment),
     StatefulSet(StatefulSet),
     Service(Service),
+    Secret(Secret),
     PersistentVolume(Box<PersistentVolume>),
     PersistentVolumeClaim(PersistentVolumeClaim),
     Raw(RawKubernetesObject),
@@ -123,6 +125,18 @@ pub struct ContainerPort {
 pub struct EnvVar {
     pub name: String,
     pub value: String,
+    pub value_from: Option<EnvVarSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvVarSource {
+    pub secret_key_ref: SecretKeyRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretKeyRef {
+    pub name: String,
+    pub key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +166,13 @@ pub struct Service {
 pub struct ServiceSpec {
     pub selector: BTreeMap<String, String>,
     pub ports: Vec<ServicePort>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Secret {
+    pub metadata: ObjectMeta,
+    pub type_: String,
+    pub string_data: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +261,7 @@ impl KubernetesObject {
             Self::Deployment(_) => "Deployment",
             Self::StatefulSet(_) => "StatefulSet",
             Self::Service(_) => "Service",
+            Self::Secret(_) => "Secret",
             Self::PersistentVolume(_) => "PersistentVolume",
             Self::PersistentVolumeClaim(_) => "PersistentVolumeClaim",
             Self::Raw(object) => object.kind.as_str(),
@@ -251,6 +273,7 @@ impl KubernetesObject {
             Self::Deployment(object) => &object.metadata.name,
             Self::StatefulSet(object) => &object.metadata.name,
             Self::Service(object) => &object.metadata.name,
+            Self::Secret(object) => &object.metadata.name,
             Self::PersistentVolume(object) => &object.metadata.name,
             Self::PersistentVolumeClaim(object) => &object.metadata.name,
             Self::Raw(object) => &object.metadata.name,

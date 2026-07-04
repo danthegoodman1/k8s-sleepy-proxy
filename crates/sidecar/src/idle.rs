@@ -227,7 +227,9 @@ impl IdleDetector {
         ReportIdleRequest::new(
             self.instance_id.clone(),
             self.generation,
-            IdleObservation::zero_active(),
+            IdleObservation {
+                active_count: self.drain.active_count(),
+            },
         )
     }
 }

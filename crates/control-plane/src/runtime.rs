@@ -25,8 +25,8 @@ use tower_http::cors::CorsLayer;
 use crate::{
     api::{
         operator_grpc_service_with_store_and_route_events, operator_grpc_web_server_builder,
-        proxy_grpc_service_with_store_and_route_events, sidecar_grpc_service_with_store,
-        RouteSubscriptionBroker,
+        proxy_grpc_service_with_store_and_route_events,
+        sidecar_grpc_service_with_store_and_route_events, RouteSubscriptionBroker,
     },
     auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
     config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
@@ -187,7 +187,7 @@ where
                 Arc::clone(&store),
                 materializer.clone(),
                 target.clone(),
-                route_events,
+                route_events.clone(),
             ),
             auth.interceptor(
                 crate::api::PROXY_SERVICE_NAME,
@@ -195,7 +195,12 @@ where
             ),
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            sidecar_grpc_service_with_store(store, materializer, target),
+            sidecar_grpc_service_with_store_and_route_events(
+                store,
+                materializer,
+                target,
+                route_events,
+            ),
             auth.interceptor(
                 crate::api::SIDECAR_SERVICE_NAME,
                 crate::auth::CallerRole::Sidecar,
@@ -287,7 +292,8 @@ where
         materializer.clone(),
         MaterializationReconcilerConfig::default(),
         ObservabilityRecorder::global(),
-    );
+    )
+    .with_route_events(route_events.clone());
     tokio::spawn(async move {
         reconciler.run_until_shutdown(reconciler_shutdown).await;
     });

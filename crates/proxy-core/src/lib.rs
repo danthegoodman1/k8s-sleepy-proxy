@@ -20,7 +20,10 @@ pub use http::{
     HttpProxyError, ReverseProxyRequestError, TrackedBody,
 };
 pub use shutdown::Shutdown;
-pub use tcp::{proxy_streams, TcpProxy, TcpProxyConfig, TcpProxyError, TcpProxyStats};
+pub use tcp::{
+    configure_tcp_keepalive, proxy_streams, proxy_streams_with_idle_timeout, TcpProxy,
+    TcpProxyConfig, TcpProxyError, TcpProxyStats,
+};
 pub use timeout::{with_timeout, TimeoutError};
 pub use tls::{
     parse_tls_client_hello_sni, read_tls_client_hello_prefix,

@@ -5,7 +5,8 @@ use super::{
     HostPathPersistentVolumeSource, KubernetesObject, ObjectMeta, PersistentVolume,
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeReclaimPolicy,
     PersistentVolumeSource, PodTemplateMetadata, PodTemplateSpec, PodVolume, RawKubernetesObject,
-    RenderedManifest, RenderedManifestObject, Service, ServicePort, StatefulSet, VolumeMount,
+    RenderedManifest, RenderedManifestObject, Secret, Service, ServicePort, StatefulSet,
+    VolumeMount,
 };
 
 impl RenderedManifest {
@@ -27,7 +28,10 @@ impl KubernetesObject {
     pub fn api_version(&self) -> &str {
         match self {
             Self::Deployment(_) | Self::StatefulSet(_) => "apps/v1",
-            Self::Service(_) | Self::PersistentVolume(_) | Self::PersistentVolumeClaim(_) => "v1",
+            Self::Service(_)
+            | Self::Secret(_)
+            | Self::PersistentVolume(_)
+            | Self::PersistentVolumeClaim(_) => "v1",
             Self::Raw(object) => object.api_version.as_str(),
         }
     }
@@ -37,6 +41,7 @@ impl KubernetesObject {
             Self::Deployment(object) => deployment_to_value(object),
             Self::StatefulSet(object) => stateful_set_to_value(object),
             Self::Service(object) => service_to_value(object),
+            Self::Secret(object) => secret_to_value(object),
             Self::PersistentVolume(object) => persistent_volume_to_value(object),
             Self::PersistentVolumeClaim(object) => persistent_volume_claim_to_value(object),
             Self::Raw(object) => raw_object_to_value(object),
@@ -81,6 +86,14 @@ fn service_to_value(object: &Service) -> Value {
             "ports": object.spec.ports.iter().map(service_port_to_value).collect::<Vec<_>>(),
         }),
     )
+}
+
+fn secret_to_value(object: &Secret) -> Value {
+    let mut value = object_to_value("v1", "Secret", &object.metadata, Value::Object(Map::new()));
+    value["type"] = json!(object.type_);
+    value["stringData"] = json!(object.string_data);
+    value.as_object_mut().expect("object value").remove("spec");
+    value
 }
 
 fn persistent_volume_to_value(object: &PersistentVolume) -> Value {
@@ -248,10 +261,22 @@ fn container_port_to_value(port: &ContainerPort) -> Value {
 }
 
 fn env_var_to_value(env: &EnvVar) -> Value {
-    json!({
-        "name": env.name,
-        "value": env.value,
-    })
+    let mut value = Map::new();
+    value.insert("name".to_owned(), json!(env.name));
+    if let Some(source) = &env.value_from {
+        value.insert(
+            "valueFrom".to_owned(),
+            json!({
+                "secretKeyRef": {
+                    "name": source.secret_key_ref.name,
+                    "key": source.secret_key_ref.key,
+                },
+            }),
+        );
+    } else {
+        value.insert("value".to_owned(), json!(env.value));
+    }
+    Value::Object(value)
 }
 
 fn volume_mount_to_value(mount: &VolumeMount) -> Value {

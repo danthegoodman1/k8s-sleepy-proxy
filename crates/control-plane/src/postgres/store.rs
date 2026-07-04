@@ -21,8 +21,8 @@ use crate::{
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteIdentity,
-        RouteResolution,
+        ListRouteBindingsForInstanceRequest, RouteBindingRecord, RouteDependencyLookup,
+        RouteDependencySet, RouteIdentity, RouteResolution,
     },
     store::{ControlPlaneStore, StoreFuture, StoreResult},
     workload::{
@@ -87,6 +87,13 @@ impl ControlPlaneStore for PostgresStore {
         request: DeleteRouteBindingRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
         Box::pin(async move { route_ops::delete_route_binding(self, request).await })
+    }
+
+    fn list_route_bindings_for_instance<'a>(
+        &'a self,
+        request: ListRouteBindingsForInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
+        Box::pin(async move { route_ops::list_route_bindings_for_instance(self, request).await })
     }
 
     fn resolve_route<'a>(

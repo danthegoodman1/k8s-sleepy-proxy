@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
     ids::{Generation, IdempotencyKey, InstanceId},
-    materialization::{LoadActiveMaterializationRequest, MaterializationTarget},
+    materialization::{
+        LoadActiveMaterializationRequest, MaterializationRecord, MaterializationState,
+        MaterializationTarget,
+    },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     route::{RouteBindingRecord, RouteBindingSpec},
@@ -232,6 +235,28 @@ where
     S: ControlPlaneStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
+    let Some(current) = store
+        .get_instance(GetInstanceRequest::new(request.instance_id.clone()))
+        .await
+        .map_err(DeleteInstanceError::Store)?
+    else {
+        return Ok(false);
+    };
+
+    let deleting = if current.state == InstanceState::Deleting {
+        current
+    } else {
+        store
+            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+                request.instance_id.clone(),
+                current.generation,
+                InstanceState::Deleting,
+                StateTransitionReason::DeleteRequested,
+            ))
+            .await
+            .map_err(DeleteInstanceError::Store)?
+    };
+
     let materialization = store
         .load_active_materialization(LoadActiveMaterializationRequest::new(
             request.instance_id.clone(),
@@ -241,7 +266,9 @@ where
         .map_err(DeleteInstanceError::Store)?;
 
     if let Some(materialization) = materialization.as_ref() {
-        let plan = ProjectionPlan::from_recorded_refs(materialization);
+        let cleanup_materialization =
+            projected_recorded_ref_materialization_for_cleanup(materialization);
+        let plan = ProjectionPlan::from_recorded_refs(&cleanup_materialization);
         ProjectionReconciler::new(materializer)
             .delete_owned(&plan)
             .await
@@ -252,9 +279,19 @@ where
     }
 
     store
-        .delete_instance(request)
+        .delete_instance(DeleteInstanceRequest::new(deleting.id))
         .await
         .map_err(DeleteInstanceError::Store)
+}
+
+fn projected_recorded_ref_materialization_for_cleanup(
+    materialization: &MaterializationRecord,
+) -> MaterializationRecord {
+    let mut projected = materialization.clone();
+    if materialization.state == MaterializationState::Pending {
+        projected.instance_generation = materialization.instance_generation.next();
+    }
+    projected
 }
 
 impl fmt::Display for CreateInstanceValidationError {

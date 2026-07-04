@@ -1,13 +1,14 @@
 use std::{io::ErrorKind, net::SocketAddr, time::Duration};
 
 use proxy_core::{
-    proxy_streams, DrainError, DrainTracker, TcpProxy, TcpProxyConfig, TcpProxyError, TcpProxyStats,
+    proxy_streams, proxy_streams_with_idle_timeout, DrainError, DrainTracker, TcpProxy,
+    TcpProxyConfig, TcpProxyError, TcpProxyStats,
 };
 use socket2::SockRef;
 use tokio::{
     io::{duplex, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    time::timeout,
+    time::{advance, timeout},
 };
 
 const REQUEST: &[u8] = b"preserve these bytes across the proxy";
@@ -56,6 +57,7 @@ async fn tcp_proxy_preserves_bytes_and_tracks_connection_lifecycle() {
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::from_secs(1),
+            ..TcpProxyConfig::default()
         },
     );
 
@@ -126,6 +128,7 @@ async fn tcp_proxy_surfaces_upstream_connect_errors_and_releases_lifecycle() {
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::from_secs(1),
+            ..TcpProxyConfig::default()
         },
     );
 
@@ -166,6 +169,7 @@ async fn tcp_proxy_surfaces_deterministic_connect_timeout_and_releases_lifecycle
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::ZERO,
+            ..TcpProxyConfig::default()
         },
     );
 
@@ -239,6 +243,7 @@ async fn tcp_proxy_releases_lifecycle_after_client_disconnect() {
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::from_secs(1),
+            ..TcpProxyConfig::default()
         },
     );
 
@@ -299,6 +304,7 @@ async fn tcp_proxy_releases_lifecycle_after_upstream_disconnect() {
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::from_secs(1),
+            ..TcpProxyConfig::default()
         },
     );
 
@@ -387,6 +393,7 @@ async fn tcp_proxy_reports_os_level_upstream_reset_and_releases_lifecycle() {
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::from_secs(1),
+            ..TcpProxyConfig::default()
         },
     );
 
@@ -516,6 +523,67 @@ async fn tcp_proxy_stream_allows_reverse_bytes_after_client_half_close() {
     assert_eq!(stats.upstream_to_client, response.len() as u64);
 }
 
+#[tokio::test(start_paused = true)]
+async fn tcp_proxy_stream_idle_timeout_fires_when_both_directions_are_idle() {
+    let (_client, proxy_client) = duplex(64);
+    let (proxy_upstream, _upstream) = duplex(64);
+    let idle_timeout = Duration::from_secs(5);
+
+    // With no bytes flowing either way, the shared stream idle timeout should
+    // fail the session with the standard TimedOut taxonomy.
+    let proxy_task = tokio::spawn(proxy_streams_with_idle_timeout(
+        proxy_client,
+        proxy_upstream,
+        idle_timeout,
+    ));
+
+    advance(idle_timeout).await;
+
+    let error = proxy_task
+        .await
+        .expect("proxy task completed")
+        .expect_err("idle proxy session times out");
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_proxy_stream_one_way_activity_keeps_session_alive() {
+    let (mut client, proxy_client) = duplex(64);
+    let (proxy_upstream, mut upstream) = duplex(64);
+    let idle_timeout = Duration::from_secs(5);
+
+    // Reverse-direction traffic is enough to refresh the shared idle clock, so
+    // a quiet client-to-upstream half must not kill the whole stream.
+    let proxy_task = tokio::spawn(proxy_streams_with_idle_timeout(
+        proxy_client,
+        proxy_upstream,
+        idle_timeout,
+    ));
+
+    for byte in [b'a', b'b', b'c'] {
+        advance(idle_timeout - Duration::from_secs(1)).await;
+        upstream
+            .write_all(&[byte])
+            .await
+            .expect("upstream writes one-way activity");
+
+        let mut received = [0; 1];
+        client
+            .read_exact(&mut received)
+            .await
+            .expect("client receives one-way activity");
+        assert_eq!(received, [byte]);
+        assert!(
+            !proxy_task.is_finished(),
+            "one-way activity should keep the proxy session alive"
+        );
+    }
+
+    drop(client);
+    drop(upstream);
+    proxy_task.await.expect("proxy task joined").ok();
+}
+
 #[tokio::test]
 async fn tcp_proxy_drain_times_out_while_connection_is_stalled_then_releases() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
@@ -550,6 +618,7 @@ async fn tcp_proxy_drain_times_out_while_connection_is_stalled_then_releases() {
         drain.clone(),
         TcpProxyConfig {
             connect_timeout: Duration::from_secs(1),
+            ..TcpProxyConfig::default()
         },
     );
 

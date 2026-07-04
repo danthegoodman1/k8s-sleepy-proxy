@@ -173,15 +173,40 @@ pub(crate) async fn delete_instance(
     store: &PostgresStore,
     request: DeleteInstanceRequest,
 ) -> StoreResult<bool> {
-    let client = store.client().await?;
+    let mut client = store.client().await?;
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let instance_id = request.instance_id.as_str();
-    let deleted = client
-        .execute(
-            "DELETE FROM instances WHERE instance_id = $1",
+    let current = transaction
+        .query_opt(
+            "
+            SELECT state
+            FROM instances
+            WHERE instance_id = $1
+            FOR UPDATE
+            ",
             &[&instance_id],
         )
         .await
         .map_err(map_postgres_error)?;
+    let Some(row) = current else {
+        transaction.commit().await.map_err(map_postgres_error)?;
+        return Ok(false);
+    };
+    let state: String = row.get("state");
+    if state != instance_state_to_db(InstanceState::Deleting) {
+        return Err(StoreError::invalid_argument(
+            "instance delete requires state deleting",
+        ));
+    }
+
+    let deleted = transaction
+        .execute(
+            "DELETE FROM instances WHERE instance_id = $1 AND state = 'deleting'",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    transaction.commit().await.map_err(map_postgres_error)?;
 
     Ok(deleted > 0)
 }

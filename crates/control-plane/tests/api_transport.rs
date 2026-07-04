@@ -1143,10 +1143,13 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     assert!(deleted.deleted);
     assert!(expires_at > SystemTime::now());
 
+    // begin_sleep stamps the deleting materialization with the Running
+    // generation and moves the instance to Draining one generation later, so
+    // the reconciler finalizes the drain only for that generation pairing.
     store.seed_instance(domain_instance(
         "instance-reconcile-operator",
         DomainInstanceState::Draining,
-        3,
+        4,
     ));
     let reconcile_materialization = materialization(
         "instance-reconcile-operator",
@@ -3457,6 +3460,22 @@ impl ControlPlaneStore for FakeInstanceStore {
         })
     }
 
+    fn list_route_bindings_for_instance<'a>(
+        &'a self,
+        request: control_plane::ListRouteBindingsForInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .values()
+                .filter(|route_binding| route_binding.instance_id == request.instance_id)
+                .cloned()
+                .collect())
+        })
+    }
+
     fn resolve_route<'a>(
         &'a self,
         _identity: control_plane::RouteIdentity,
@@ -3466,9 +3485,26 @@ impl ControlPlaneStore for FakeInstanceStore {
 
     fn compare_and_swap_instance_state<'a>(
         &'a self,
-        _request: control_plane::CompareAndSwapInstanceStateRequest,
+        request: control_plane::CompareAndSwapInstanceStateRequest,
     ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let mut instances = self.instances.lock().expect("fake store lock is available");
+            let instance =
+                instances
+                    .get_mut(request.instance_id.as_str())
+                    .ok_or(StoreError::NotFound {
+                        resource: "instance",
+                    })?;
+            if instance.generation != request.expected_generation {
+                return Err(StoreError::GenerationConflict {
+                    expected: request.expected_generation,
+                    actual: instance.generation,
+                });
+            }
+            instance.state = request.next_state;
+            instance.generation = request.expected_generation.next();
+            Ok(instance.clone())
+        })
     }
 
     fn record_materialization<'a>(

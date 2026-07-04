@@ -297,8 +297,8 @@ async fn concurrent_wake_calls_converge(
     assert_workload_generation(
         kube,
         &config.namespace,
-        "lifecycle-concurrent",
-        running.generation - 1,
+        "lifecycle-concurrent-6fce159e",
+        running.generation,
     )
     .await?;
     assert_response_identifies(
@@ -369,7 +369,12 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
     }
 
     load_image_into_kind(config, &config.sleep_while_waking_image)?;
-    delete_workload_pods(kube.clone(), &config.namespace, "lifecycle-sleep-waking").await?;
+    delete_workload_pods(
+        kube.clone(),
+        &config.namespace,
+        "lifecycle-sleep-waking-aea16aec",
+    )
+    .await?;
     let _ = timeout(Duration::from_secs(5), wake).await;
     wait_for_instance_response(
         config,
@@ -390,8 +395,8 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
     assert_workload_generation(
         kube,
         &config.namespace,
-        "lifecycle-sleep-waking",
-        running.generation - 1,
+        "lifecycle-sleep-waking-aea16aec",
+        running.generation,
     )
     .await?;
 
@@ -433,30 +438,21 @@ async fn delete_while_waking_cleans_pending_objects(
     wait_for_stateful_objects_present(
         kube.clone(),
         &config.namespace,
-        "lifecycle-delete-waking",
-        "lifecycle-delete-waking-pvc",
-        "lifecycle-delete-waking-pv",
+        "lifecycle-delete-waking-0b1fe29d",
+        "lifecycle-delete-waking-pvc-0b1fe29d",
+        "lifecycle-delete-waking-pv-0b1fe29d",
         60,
     )
     .await?;
-
-    let deleted = operator
-        .delete_instance(DeleteInstanceRequest {
-            instance_id: "lifecycle-delete-waking".to_owned(),
-        })
-        .await?
-        .into_inner();
-    if !deleted.deleted {
-        return Err("delete while waking did not report deletion".into());
-    }
+    delete_instance_until_deleted(operator, "lifecycle-delete-waking", 60).await?;
     let _ = timeout(Duration::from_secs(5), wake).await;
     assert_instance_not_found(operator, "lifecycle-delete-waking").await?;
     wait_for_stateful_objects_absent(
         kube,
         &config.namespace,
-        "lifecycle-delete-waking",
-        "lifecycle-delete-waking-pvc",
-        "lifecycle-delete-waking-pv",
+        "lifecycle-delete-waking-0b1fe29d",
+        "lifecycle-delete-waking-pvc-0b1fe29d",
+        "lifecycle-delete-waking-pv-0b1fe29d",
         60,
     )
     .await?;
@@ -505,9 +501,9 @@ async fn delete_while_draining_cleans_deleting_materialization(
     wait_for_stateful_objects_present(
         kube.clone(),
         &config.namespace,
-        "lifecycle-delete-draining",
-        "lifecycle-delete-draining-pvc",
-        "lifecycle-delete-draining-pv",
+        "lifecycle-delete-draining-3cf19f0e",
+        "lifecycle-delete-draining-pvc-3cf19f0e",
+        "lifecycle-delete-draining-pv-3cf19f0e",
         60,
     )
     .await?;
@@ -515,26 +511,20 @@ async fn delete_while_draining_cleans_deleting_materialization(
     set_control_plane_statefulset_delete_permission(kube.clone(), &config.namespace, false).await?;
     sleep(Duration::from_secs(2)).await;
     let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
-    let idle_result = sidecar
+    let idle_response = sidecar
         .report_idle(SidecarReportIdleRequest {
             instance_id: "lifecycle-delete-draining".to_owned(),
             expected_generation: running.generation,
             active_count: 0,
         })
-        .await;
+        .await?
+        .into_inner();
     set_control_plane_statefulset_delete_permission(kube.clone(), &config.namespace, true).await?;
-
-    let idle_error =
-        idle_result.expect_err("sleep cleanup should fail while StatefulSet delete is forbidden");
-    if idle_error.code() != tonic::Code::Unavailable
-        || !idle_error.message().contains("sleep cleanup failed")
-    {
-        return Err(format!(
-            "expected forbidden sleep cleanup to return Unavailable cleanup failure, got {:?}: {}",
-            idle_error.code(),
-            idle_error.message()
-        )
-        .into());
+    if !matches!(
+        idle_response.outcome,
+        Some(sidecar_report_idle_response::Outcome::Accepted(_))
+    ) {
+        return Err(format!("ReportIdle while draining returned {idle_response:?}").into());
     }
     let draining = wait_for_instance_state(
         operator,
@@ -551,22 +541,14 @@ async fn delete_while_draining_cleans_deleting_materialization(
         .into());
     }
 
-    let deleted = operator
-        .delete_instance(DeleteInstanceRequest {
-            instance_id: "lifecycle-delete-draining".to_owned(),
-        })
-        .await?
-        .into_inner();
-    if !deleted.deleted {
-        return Err("delete while draining did not report deletion".into());
-    }
+    delete_instance_until_deleted(operator, "lifecycle-delete-draining", 60).await?;
     assert_instance_not_found(operator, "lifecycle-delete-draining").await?;
     wait_for_stateful_objects_absent(
         kube,
         &config.namespace,
-        "lifecycle-delete-draining",
-        "lifecycle-delete-draining-pvc",
-        "lifecycle-delete-draining-pv",
+        "lifecycle-delete-draining-3cf19f0e",
+        "lifecycle-delete-draining-pvc-3cf19f0e",
+        "lifecycle-delete-draining-pv-3cf19f0e",
         60,
     )
     .await?;
@@ -613,7 +595,12 @@ async fn failed_wake_retry_rejects_stale_generation(
     .await?;
 
     load_image_into_kind(config, &config.failed_retry_image)?;
-    delete_workload_pods(kube.clone(), &config.namespace, "lifecycle-failed-retry").await?;
+    delete_workload_pods(
+        kube.clone(),
+        &config.namespace,
+        "lifecycle-failed-retry-8f1a6842",
+    )
+    .await?;
     wait_for_instance_response(
         config,
         "failed wake retry",
@@ -655,8 +642,8 @@ async fn failed_wake_retry_rejects_stale_generation(
     assert_workload_generation(
         kube,
         &config.namespace,
-        "lifecycle-failed-retry",
-        running.generation - 1,
+        "lifecycle-failed-retry-8f1a6842",
+        running.generation,
     )
     .await?;
 
@@ -705,7 +692,7 @@ async fn stale_sidecar_report_is_rejected(
     wait_for_workload_absent(
         kube.clone(),
         &config.namespace,
-        "lifecycle-stale-sidecar",
+        "lifecycle-stale-sidecar-7f9f001b",
         60,
     )
     .await?;
@@ -1040,6 +1027,40 @@ async fn assert_instance_not_found(
         .into());
     }
     Ok(())
+}
+
+async fn delete_instance_until_deleted(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    instance_id: &str,
+    timeout_secs: u64,
+) -> TestResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match operator
+            .delete_instance(DeleteInstanceRequest {
+                instance_id: instance_id.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => {
+                if response.into_inner().deleted {
+                    return Ok(());
+                }
+                return Err(format!("delete {instance_id} returned deleted=false").into());
+            }
+            Err(error) if error.code() == tonic::Code::Unavailable && Instant::now() < deadline => {
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "delete {instance_id} failed with {:?}: {}",
+                    error.code(),
+                    error.message()
+                )
+                .into());
+            }
+        }
+    }
 }
 
 async fn wait_for_instance_state(

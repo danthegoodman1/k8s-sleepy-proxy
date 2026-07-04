@@ -51,6 +51,11 @@ pub struct DeleteRouteBindingRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListRouteBindingsForInstanceRequest {
+    pub instance_id: InstanceId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteResolution {
     Resolved {
         matched_identity: RouteIdentity,
@@ -162,6 +167,12 @@ impl GetRouteBindingRequest {
 impl DeleteRouteBindingRequest {
     pub fn new(route_binding_id: RouteBindingId) -> Self {
         Self { route_binding_id }
+    }
+}
+
+impl ListRouteBindingsForInstanceRequest {
+    pub fn new(instance_id: InstanceId) -> Self {
+        Self { instance_id }
     }
 }
 

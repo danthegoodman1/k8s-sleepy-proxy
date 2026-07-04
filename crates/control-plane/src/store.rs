@@ -23,8 +23,8 @@ use crate::{
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteIdentity,
-        RouteResolution,
+        ListRouteBindingsForInstanceRequest, RouteBindingRecord, RouteDependencyLookup,
+        RouteDependencySet, RouteIdentity, RouteResolution,
     },
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -98,6 +98,14 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> StoreFuture<'a, StoreResult<bool>> {
         let _ = request;
         unsupported_store_method("delete_route_binding")
+    }
+
+    fn list_route_bindings_for_instance<'a>(
+        &'a self,
+        request: ListRouteBindingsForInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
+        let _ = request;
+        unsupported_store_method("list_route_bindings_for_instance")
     }
 
     fn resolve_route<'a>(
@@ -450,6 +458,15 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     ) -> StoreFuture<'a, StoreResult<bool>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
             store.delete_route_binding(request.clone())
+        })
+    }
+
+    fn list_route_bindings_for_instance<'a>(
+        &'a self,
+        request: ListRouteBindingsForInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.list_route_bindings_for_instance(request.clone())
         })
     }
 

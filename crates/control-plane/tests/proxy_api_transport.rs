@@ -11,17 +11,18 @@ use control_plane::api::{
         operator_control_plane_server::OperatorControlPlane,
         proxy_control_plane_client::ProxyControlPlaneClient,
         proxy_control_plane_server::ProxyControlPlane, proxy_subscribe_request,
-        proxy_subscribe_response, proxy_wake_instance_response, HttpRouteIdentity, InstanceState,
-        ProtocolRoute, ProxyCachePolicy, ProxyRouteEntry, ProxyRouteInvalidatedResponse,
-        ProxyRouteInvalidationReason, ProxyRouteMissResponse, ProxyRouteResolvedResponse,
-        ProxySubscribeRequest, ProxySubscribeResponse, ProxySubscribeRouteRequest,
-        ProxyWakeInstanceRequest, ProxyWakeInstanceResponse, ProxyWakeUnavailableReason,
-        RouteHost as ProtoRouteHost, RouteHostKind, RouteIdentity as ProtoRouteIdentity,
-        SniRouteIdentity,
+        proxy_subscribe_response, proxy_wake_instance_response,
+        sidecar_control_plane_server::SidecarControlPlane, sidecar_report_idle_response,
+        HttpRouteIdentity, InstanceState, ProtocolRoute, ProxyCachePolicy, ProxyRouteEntry,
+        ProxyRouteInvalidatedResponse, ProxyRouteInvalidationReason, ProxyRouteMissResponse,
+        ProxyRouteResolvedResponse, ProxySubscribeRequest, ProxySubscribeResponse,
+        ProxySubscribeRouteRequest, ProxyWakeInstanceRequest, ProxyWakeInstanceResponse,
+        ProxyWakeUnavailableReason, RouteHost as ProtoRouteHost, RouteHostKind,
+        RouteIdentity as ProtoRouteIdentity, SidecarReportIdleRequest, SniRouteIdentity,
     },
     proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
     RouteSubscriptionBroker, StoreBackedOperatorApi, StoreBackedProxyApi,
-    StoreBackedProxyGrpcService, OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
+    StoreBackedProxyGrpcService, StoreBackedSidecarApi, OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
@@ -144,7 +145,7 @@ async fn proxy_wake_cold_instance_returns_ready_backend() {
     assert_eq!(ready.instance_generation, 3);
     assert_eq!(
         ready.backend_uri,
-        "http://svc-acme-instance.apps.svc.cluster.local:80"
+        "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 44);
     assert_eq!(client.applied_objects_len(), 2);
@@ -160,7 +161,7 @@ async fn proxy_wake_unowned_live_ref_blocks_apply() {
     ));
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
-    client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-instance"));
+    client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-51c842a3"));
     let service = proxy_api(store, client.clone());
 
     let error = service
@@ -498,7 +499,9 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
     );
     assert_eq!(
         resolved.cache_policy,
-        Some(ProxyCachePolicy { ttl_millis: 10_000 })
+        Some(ProxyCachePolicy {
+            ttl_millis: 300_000
+        })
     );
 }
 
@@ -741,6 +744,196 @@ async fn operator_route_binding_delete_invalidates_active_proxy_subscription() {
         ))
         .await
         .expect("operator delete route succeeds")
+        .into_inner();
+    assert!(deleted.deleted);
+
+    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
+    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
+    assert_eq!(
+        invalidated.reason,
+        ProxyRouteInvalidationReason::RouteRemoved as i32
+    );
+}
+
+#[tokio::test]
+async fn sidecar_report_idle_accepted_invalidates_active_proxy_subscription() {
+    let broker = RouteSubscriptionBroker::new();
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_instance(domain_instance(
+        "instance-idle-active",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_workload_class(domain_workload_class());
+    store.seed_ready_materialization(ready_materialization("instance-idle-active", 7));
+    store.seed_route_resolved(
+        domain_http_identity("idle-active.example.com", None),
+        domain_route_entry(
+            "route-idle-active",
+            "instance-idle-active",
+            DomainInstanceState::Running,
+        ),
+    );
+    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
+    let sidecar = sidecar_api_with_route_events(store, broker);
+    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(request_stream))
+        .await
+        .expect("subscribe stream opens")
+        .into_inner();
+
+    requests
+        .send(subscribe_route_request(
+            "request-idle-active",
+            proto_http_identity(RouteHostKind::Exact, "idle-active.example.com", None),
+        ))
+        .await
+        .expect("subscribe request sends");
+    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    assert_eq!(
+        resolved.route.expect("route returned").route_binding_id,
+        "route-idle-active"
+    );
+
+    // Accepted ReportIdle begins sleep through the sidecar API and must notify
+    // proxies before cleanup relies on cache expiry.
+    let response = sidecar
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            instance_id: "instance-idle-active".to_owned(),
+            expected_generation: 7,
+            active_count: 0,
+        }))
+        .await
+        .expect("sidecar idle report succeeds")
+        .into_inner();
+    assert!(matches!(
+        response.outcome,
+        Some(sidecar_report_idle_response::Outcome::Accepted(_))
+    ));
+
+    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
+    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
+    assert_eq!(
+        invalidated.reason,
+        ProxyRouteInvalidationReason::RouteChanged as i32
+    );
+}
+
+#[tokio::test]
+async fn proxy_wake_completion_invalidates_active_proxy_subscription() {
+    let broker = RouteSubscriptionBroker::new();
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_instance(domain_instance(
+        "instance-wake-active",
+        DomainInstanceState::Cold,
+        7,
+    ));
+    store.seed_workload_class(domain_workload_class());
+    store.seed_route_resolved(
+        domain_http_identity("wake-active.example.com", None),
+        domain_route_entry(
+            "route-wake-active",
+            "instance-wake-active",
+            DomainInstanceState::Cold,
+        ),
+    );
+    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker);
+    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(request_stream))
+        .await
+        .expect("subscribe stream opens")
+        .into_inner();
+
+    requests
+        .send(subscribe_route_request(
+            "request-wake-active",
+            proto_http_identity(RouteHostKind::Exact, "wake-active.example.com", None),
+        ))
+        .await
+        .expect("subscribe request sends");
+    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    assert_eq!(
+        resolved.route.expect("route returned").route_binding_id,
+        "route-wake-active"
+    );
+
+    // A completed proxy wake changes the instance/backend visible to subscribed
+    // routes and must invalidate the held subscription immediately.
+    let response = proxy
+        .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
+            instance_id: "instance-wake-active".to_owned(),
+            expected_generation: 7,
+            backend_generation: Some(44),
+        }))
+        .await
+        .expect("proxy wake succeeds")
+        .into_inner();
+    expect_ready(response);
+
+    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
+    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
+    assert_eq!(
+        invalidated.reason,
+        ProxyRouteInvalidationReason::RouteChanged as i32
+    );
+}
+
+#[tokio::test]
+async fn operator_delete_instance_invalidates_active_proxy_subscription() {
+    let broker = RouteSubscriptionBroker::new();
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_instance(domain_instance(
+        "instance-delete-route-active",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_ready_materialization(ready_materialization("instance-delete-route-active", 7));
+    store.seed_route_resolved(
+        domain_http_identity("delete-instance-active.example.com", None),
+        domain_route_entry(
+            "route-delete-instance-active",
+            "instance-delete-route-active",
+            DomainInstanceState::Running,
+        ),
+    );
+    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
+    let operator = operator_api_with_route_events(store, broker);
+    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(request_stream))
+        .await
+        .expect("subscribe stream opens")
+        .into_inner();
+
+    requests
+        .send(subscribe_route_request(
+            "request-delete-instance-active",
+            proto_http_identity(
+                RouteHostKind::Exact,
+                "delete-instance-active.example.com",
+                None,
+            ),
+        ))
+        .await
+        .expect("subscribe request sends");
+    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    assert_eq!(
+        resolved.route.expect("route returned").route_binding_id,
+        "route-delete-instance-active"
+    );
+
+    // Operator DeleteInstance removes all instance routes from proxy caches even
+    // though the route binding itself is not deleted through the route API.
+    let deleted = operator
+        .delete_instance(tonic::Request::new(
+            control_plane::api::pb::DeleteInstanceRequest {
+                instance_id: "instance-delete-route-active".to_owned(),
+            },
+        ))
+        .await
+        .expect("operator delete instance succeeds")
         .into_inner();
     assert!(deleted.deleted);
 
@@ -1188,7 +1381,7 @@ async fn proxy_wake_after_restart_resumes_waking_generation() {
     assert_eq!(ready.instance_generation, 7);
     assert_eq!(
         ready.backend_uri,
-        "http://svc-acme-instance.apps.svc.cluster.local:80"
+        "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 6);
     assert_eq!(client.applied_objects_len(), 2);
@@ -1774,9 +1967,29 @@ impl ControlPlaneStore for FakeWakeStore {
 
     fn delete_instance<'a>(
         &'a self,
-        _request: control_plane::DeleteInstanceRequest,
+        request: control_plane::DeleteInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let mut instance = self.instance.lock().expect("fake store lock is available");
+            let Some(current) = instance.as_ref() else {
+                return Ok(false);
+            };
+            if current.id != request.instance_id {
+                return Ok(false);
+            }
+            if current.state != DomainInstanceState::Deleting {
+                return Err(StoreError::invalid_argument(
+                    "hard delete requires deleting state",
+                ));
+            }
+
+            *instance = None;
+            self.materializations
+                .lock()
+                .expect("fake store lock is available")
+                .retain(|materialization| materialization.instance_id != request.instance_id);
+            Ok(true)
+        })
     }
 
     fn create_workload_class_version<'a>(
@@ -1838,6 +2051,36 @@ impl ControlPlaneStore for FakeWakeStore {
                 })
                 .is_some_and(|entry| entry.route_binding_id == request.route_binding_id);
             Ok(deleted)
+        })
+    }
+
+    fn list_route_bindings_for_instance<'a>(
+        &'a self,
+        request: control_plane::ListRouteBindingsForInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
+        Box::pin(async move {
+            let route_binding = self
+                .route_resolution
+                .lock()
+                .expect("fake store lock is available")
+                .as_ref()
+                .and_then(|resolution| match resolution {
+                    FakeRouteResolution::Resolved {
+                        matched_identity,
+                        entry,
+                    } if entry.instance_id == request.instance_id => {
+                        Some(control_plane::RouteBindingRecord {
+                            id: entry.route_binding_id.clone(),
+                            instance_id: entry.instance_id.clone(),
+                            identity: matched_identity.clone(),
+                            protocol: protocol_for_identity(matched_identity),
+                        })
+                    }
+                    FakeRouteResolution::Resolved { .. }
+                    | FakeRouteResolution::Miss { .. }
+                    | FakeRouteResolution::Unavailable(_) => None,
+                });
+            Ok(route_binding.into_iter().collect())
         })
     }
 
@@ -2024,9 +2267,52 @@ impl ControlPlaneStore for FakeWakeStore {
 
     fn begin_sleep<'a>(
         &'a self,
-        _request: control_plane::BeginSleepRequest,
+        request: control_plane::BeginSleepRequest,
     ) -> StoreFuture<'a, StoreResult<control_plane::BeginSleepResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        Box::pin(async move {
+            let instance = {
+                let mut instance = self.instance.lock().expect("fake store lock is available");
+                let instance = instance.as_mut().ok_or(StoreError::NotFound {
+                    resource: "instance",
+                })?;
+                if instance.id != request.instance_id {
+                    return Err(StoreError::NotFound {
+                        resource: "instance",
+                    });
+                }
+                if instance.generation != request.expected_running_generation {
+                    return Err(StoreError::GenerationConflict {
+                        expected: request.expected_running_generation,
+                        actual: instance.generation,
+                    });
+                }
+
+                instance.state = DomainInstanceState::Draining;
+                instance.generation = request.expected_running_generation.next();
+                instance.clone()
+            };
+
+            let materialization = self
+                .materializations
+                .lock()
+                .expect("fake store lock is available")
+                .iter_mut()
+                .find(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.target == request.target
+                        && materialization.state != MaterializationState::Deleted
+                })
+                .map(|materialization| {
+                    materialization.state = MaterializationState::Deleting;
+                    materialization.backend = None;
+                    materialization.clone()
+                });
+
+            Ok(control_plane::BeginSleepResult {
+                instance,
+                materialization,
+            })
+        })
     }
 
     fn finalize_sleep<'a>(
@@ -2126,7 +2412,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 return Err(KubernetesClientError::new("not ready"));
             }
 
-            BackendEndpoint::new("http://svc-acme-instance.apps.svc.cluster.local:80")
+            BackendEndpoint::new("http://svc-acme-69856ec0.apps.svc.cluster.local:80")
                 .map_err(|error| KubernetesClientError::new(error.to_string()))
         })
     }
@@ -2167,6 +2453,18 @@ fn operator_api_with_route_events(
     route_events: RouteSubscriptionBroker,
 ) -> StoreBackedOperatorApi<FakeKubernetesClient> {
     StoreBackedOperatorApi::with_route_events(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        proxy_target(),
+        route_events,
+    )
+}
+
+fn sidecar_api_with_route_events(
+    store: Arc<FakeWakeStore>,
+    route_events: RouteSubscriptionBroker,
+) -> StoreBackedSidecarApi<FakeKubernetesClient> {
+    StoreBackedSidecarApi::with_route_events(
         store,
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         proxy_target(),
@@ -2359,6 +2657,13 @@ fn domain_sni_identity(host: &str, kind: RouteHostKind) -> RouteIdentity {
     .expect("route host is valid");
 
     RouteIdentity::Sni { host }
+}
+
+fn protocol_for_identity(identity: &RouteIdentity) -> control_plane::ProtocolRoute {
+    match identity {
+        RouteIdentity::Http { .. } => control_plane::ProtocolRoute::Http,
+        RouteIdentity::Sni { .. } => control_plane::ProtocolRoute::TlsSni,
+    }
 }
 
 fn domain_route_entry(

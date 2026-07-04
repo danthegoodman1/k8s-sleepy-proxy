@@ -43,15 +43,27 @@ impl IdleDetector {
             self.wait_until_idle_timeout_elapsed().await;
 
             loop {
+                let Some(activity) = self.drain.watch_for_activity_after_idle() else {
+                    break;
+                };
                 let request = self.report_request();
 
-                match client.report_idle(request.clone()).await {
-                    Ok(response) => {
-                        self.record_idle_report(&request, idle_report_outcome(&response));
-                        self.reported = true;
-                        return control_plane_idle_report_outcome(request, response);
+                let response = tokio::select! {
+                    response = client.report_idle(request.clone()) => Some(response),
+                    _ = activity.wait_for_update() => None,
+                };
+
+                match response {
+                    None => break,
+                    Some(Ok(response)) => {
+                        let outcome = idle_report_outcome(&response);
+                        self.record_idle_report(&request, outcome);
+                        if idle_report_is_terminal(&response) {
+                            self.reported = true;
+                            return control_plane_idle_report_outcome(request, response);
+                        }
                     }
-                    Err(_error) => {
+                    Some(Err(_error)) => {
                         self.record_idle_report(&request, Outcome::Error);
                     }
                 }
@@ -83,6 +95,13 @@ impl IdleDetector {
             ],
         ));
     }
+}
+
+fn idle_report_is_terminal(response: &ReportIdleResponse) -> bool {
+    matches!(
+        response,
+        ReportIdleResponse::Accepted { .. } | ReportIdleResponse::AlreadyDraining { .. }
+    )
 }
 
 fn idle_report_outcome(response: &ReportIdleResponse) -> Outcome {
@@ -118,7 +137,6 @@ fn control_plane_idle_report_outcome(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -276,9 +294,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn generation_conflict_is_terminal() {
+    async fn generation_conflict_rearms_until_accepted() {
         let mut detector = detector_for(drain_tracker());
-        let mut client = FakeReportIdleClient::new([Ok(generation_conflict_response())]);
+        let mut client = FakeReportIdleClient::new([
+            Ok(generation_conflict_response()),
+            Ok(accepted_response()),
+        ]);
         let requests = client.requests();
 
         let (outcome, ()) = tokio::join!(
@@ -286,32 +307,33 @@ mod tests {
             async {
                 yield_now().await;
                 advance(IDLE_TIMEOUT).await;
+                assert_recorded_count(&requests, 1);
+                advance(RETRY_BACKOFF - ONE_MILLISECOND).await;
+                assert_recorded_count(&requests, 1);
+                advance(ONE_MILLISECOND).await;
             }
         );
 
         assert_eq!(
             outcome,
-            ControlPlaneIdleReportOutcome::GenerationConflict {
-                request: expected_report_request(),
-                expected_generation: generation(),
-                actual_generation: Generation::new(8),
-            }
+            ControlPlaneIdleReportOutcome::Accepted(expected_report_request())
         );
         assert!(detector.has_reported());
-        assert_recorded_count(&requests, 1);
+        assert_recorded_count(&requests, 2);
 
         let second = detector
             .report_to_control_plane_when_idle(&mut client)
             .await;
 
         assert_eq!(second, ControlPlaneIdleReportOutcome::AlreadyReported);
-        assert_recorded_count(&requests, 1);
+        assert_recorded_count(&requests, 2);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unavailable_is_terminal() {
+    async fn unavailable_waking_rearms_until_accepted() {
         let mut detector = detector_for(drain_tracker());
-        let mut client = FakeReportIdleClient::new([Ok(unavailable_response())]);
+        let mut client =
+            FakeReportIdleClient::new([Ok(unavailable_response()), Ok(accepted_response())]);
         let requests = client.requests();
 
         let (outcome, ()) = tokio::join!(
@@ -319,18 +341,19 @@ mod tests {
             async {
                 yield_now().await;
                 advance(IDLE_TIMEOUT).await;
+                assert_recorded_count(&requests, 1);
+                advance(RETRY_BACKOFF - ONE_MILLISECOND).await;
+                assert_recorded_count(&requests, 1);
+                advance(ONE_MILLISECOND).await;
             }
         );
 
         assert_eq!(
             outcome,
-            ControlPlaneIdleReportOutcome::Unavailable {
-                request: expected_report_request(),
-                reason: ReportIdleUnavailableReason::Waking,
-            }
+            ControlPlaneIdleReportOutcome::Accepted(expected_report_request())
         );
         assert!(detector.has_reported());
-        assert_recorded_count(&requests, 1);
+        assert_recorded_count(&requests, 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -386,6 +409,45 @@ mod tests {
                 assert_recorded_count(&requests, 1);
 
                 advance(ONE_MILLISECOND).await;
+            }
+        );
+
+        assert_eq!(
+            outcome,
+            ControlPlaneIdleReportOutcome::Accepted(expected_report_request())
+        );
+        assert_recorded_count(&requests, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_work_during_report_round_trip_aborts_report_and_rearms() {
+        let drain = drain_tracker();
+        let mut detector = detector_for(drain.clone());
+        let mut client =
+            FakeReportIdleClient::new([Ok(accepted_response()), Ok(accepted_response())])
+                .with_response_delay(RETRY_BACKOFF);
+        let requests = client.requests();
+
+        let (outcome, ()) = tokio::join!(
+            detector.report_to_control_plane_when_idle(&mut client),
+            async {
+                yield_now().await;
+                advance(IDLE_TIMEOUT).await;
+                assert_recorded_count(&requests, 1);
+                yield_now().await;
+
+                let permit = drain.try_acquire().expect("work admitted during RTT");
+                yield_now().await;
+                drop(permit);
+                drain.wait_for_active_count(0).await;
+                yield_now().await;
+
+                advance(IDLE_TIMEOUT - ONE_MILLISECOND).await;
+                assert_recorded_count(&requests, 1);
+
+                advance(ONE_MILLISECOND).await;
+                assert_recorded_count(&requests, 2);
+                advance(RETRY_BACKOFF).await;
             }
         );
 
@@ -484,6 +546,7 @@ mod tests {
     struct FakeReportIdleClient {
         responses: VecDeque<Result<ReportIdleResponse, TestReportError>>,
         requests: RecordedRequests,
+        response_delay: Option<Duration>,
     }
 
     impl FakeReportIdleClient {
@@ -493,7 +556,13 @@ mod tests {
             Self {
                 responses: responses.into_iter().collect(),
                 requests: recorded_requests(),
+                response_delay: None,
             }
+        }
+
+        fn with_response_delay(mut self, response_delay: Duration) -> Self {
+            self.response_delay = Some(response_delay);
+            self
         }
 
         fn requests(&self) -> RecordedRequests {
@@ -516,8 +585,14 @@ mod tests {
                 .responses
                 .pop_front()
                 .expect("fake report idle response queued");
+            let response_delay = self.response_delay;
 
-            Box::pin(async move { response })
+            Box::pin(async move {
+                if let Some(response_delay) = response_delay {
+                    tokio::time::sleep(response_delay).await;
+                }
+                response
+            })
         }
     }
 }

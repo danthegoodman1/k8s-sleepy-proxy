@@ -1,8 +1,9 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, Request as HttpRequest, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::timeout;
 use tokio_tungstenite::{
     accept_hdr_async, connect_async,
     tungstenite::{
@@ -24,6 +25,8 @@ use crate::{
     drain::{DrainError, DrainTracker},
     http::forwarded_headers,
 };
+
+const CLOSE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct WebSocketProxy {
@@ -224,6 +227,16 @@ where
 async fn wait_for_close_response<S>(
     websocket: &mut WebSocketStream<S>,
 ) -> Result<(), TungsteniteError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match timeout(CLOSE_HANDSHAKE_TIMEOUT, wait_for_close_frame(websocket)).await {
+        Ok(result) => result,
+        Err(_) => Ok(()),
+    }
+}
+
+async fn wait_for_close_frame<S>(websocket: &mut WebSocketStream<S>) -> Result<(), TungsteniteError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

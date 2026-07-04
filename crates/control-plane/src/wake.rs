@@ -488,6 +488,17 @@ where
     match store.complete_wake(complete).await {
         Ok(result) => Ok(WakeInstanceResult::Completed { result }),
         Err(error) => {
+            // The reconciler drives pending materializations concurrently
+            // with this RPC, so a completion conflict can mean the same wake
+            // already finished under the other driver; that is success, not
+            // an error the proxy should retry.
+            if matches!(error, StoreError::GenerationConflict { .. }) {
+                if let Some(result) =
+                    load_wake_completed_by_other_driver(store, &projected_materialization).await
+                {
+                    return Ok(result);
+                }
+            }
             cleanup_rendered_objects_if_instance_missing_or_terminal(
                 store,
                 materializer,
@@ -497,6 +508,37 @@ where
             Err(map_store_error(error))
         }
     }
+}
+
+async fn load_wake_completed_by_other_driver<S>(
+    store: &S,
+    projected: &MaterializationRecord,
+) -> Option<WakeInstanceResult>
+where
+    S: ControlPlaneStore + ?Sized,
+{
+    let instance = store
+        .get_instance(GetInstanceRequest::new(projected.instance_id.clone()))
+        .await
+        .ok()??;
+    if instance.state != InstanceState::Running
+        || instance.generation != projected.instance_generation
+    {
+        return None;
+    }
+    let materialization = store
+        .load_ready_materialization(LoadReadyMaterializationRequest::new(
+            projected.instance_id.clone(),
+            projected.instance_generation,
+            projected.target.clone(),
+        ))
+        .await
+        .ok()??;
+
+    Some(WakeInstanceResult::AlreadyRunning {
+        instance,
+        materialization,
+    })
 }
 
 async fn cleanup_rendered_objects_if_instance_missing_or_terminal<S, C>(

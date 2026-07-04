@@ -297,13 +297,13 @@ async fn run_conformance(
     assert!(
         rendered_names
             .iter()
-            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-instance"),
+            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-69856ec0"),
         "loaded workload class template should render durable instance Deployment, got {rendered_names:?}"
     );
     assert!(
         rendered_names
             .iter()
-            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-instance"),
+            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-69856ec0"),
         "loaded workload class template should render durable instance Service, got {rendered_names:?}"
     );
 
@@ -393,6 +393,23 @@ async fn run_conformance(
         ))
         .await?;
     assert_eq!(delete_target.instance.generation, Generation::new(0));
+    let direct_delete = store
+        .delete_instance(DeleteInstanceRequest::new(
+            delete_target.instance.id.clone(),
+        ))
+        .await
+        .expect_err("hard delete requires deleting state");
+    assert!(matches!(direct_delete, StoreError::InvalidArgument { .. }));
+    let deleting_target = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            delete_target.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested,
+        ))
+        .await?;
+    assert_eq!(deleting_target.state, InstanceState::Deleting);
+    assert_eq!(deleting_target.generation, Generation::new(1));
     assert!(
         store
             .delete_instance(DeleteInstanceRequest::new(
@@ -409,6 +426,37 @@ async fn run_conformance(
             .delete_instance(DeleteInstanceRequest::new(delete_target.instance.id))
             .await?
     );
+
+    let delete_wake_race = store
+        .create_instance(create_instance_request(
+            "idem-delete-wake-race",
+            "instance-delete-wake-race",
+            class.reference.clone(),
+            vec![],
+        ))
+        .await?;
+    let deleting = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            delete_wake_race.instance.id.clone(),
+            Generation::new(0),
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested,
+        ))
+        .await?;
+    assert_eq!(deleting.generation, Generation::new(1));
+    let wake_after_delete = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            delete_wake_race.instance.id,
+            Generation::new(1),
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await
+        .expect_err("wake after delete CAS is rejected");
+    assert!(matches!(
+        wake_after_delete,
+        StoreError::InvalidArgument { .. }
+    ));
 
     let initial_resolution = store
         .resolve_route(RouteIdentity::Http {
@@ -1988,17 +2036,38 @@ async fn exercise_materialization_reconciliation_leases(
     }];
     ready.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "delete-disk")];
     store.record_materialization(ready).await?;
+    let drain_grace_timeout = Duration::from_secs(60 * 60);
     let begin = store
-        .begin_sleep(BeginSleepRequest::new(
-            running.id.clone(),
-            running.generation,
-            target.clone(),
-        ))
+        .begin_sleep(
+            BeginSleepRequest::new(running.id.clone(), running.generation, target.clone())
+                .with_drain_grace_timeout(drain_grace_timeout),
+        )
         .await?;
     let deleting = begin
         .materialization
         .expect("materialization marked deleting");
     let deleting_id = deleting.id.clone();
+    // begin_sleep future-dates the Deleting row so proxies have the drain
+    // grace window to consume invalidations before reconciliation cleanup.
+    let before_grace_candidates = store
+        .list_materialization_reconciliation_candidates(
+            ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), 100),
+        )
+        .await?;
+    assert!(!before_grace_candidates
+        .iter()
+        .any(|candidate| candidate.id == deleting_id));
+    let after_grace_candidates = store
+        .list_materialization_reconciliation_candidates(
+            ListMaterializationReconciliationCandidatesRequest::new(
+                SystemTime::now() + drain_grace_timeout + Duration::from_secs(1),
+                100,
+            ),
+        )
+        .await?;
+    assert!(after_grace_candidates
+        .iter()
+        .any(|candidate| candidate.id == deleting_id));
     store
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             deleting_id.clone(),

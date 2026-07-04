@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::ids::{
@@ -70,6 +70,7 @@ pub struct BeginSleepRequest {
     pub instance_id: InstanceId,
     pub expected_running_generation: Generation,
     pub target: MaterializationTarget,
+    pub drain_grace_timeout: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,7 +315,13 @@ impl BeginSleepRequest {
             instance_id,
             expected_running_generation,
             target,
+            drain_grace_timeout: Duration::ZERO,
         }
+    }
+
+    pub fn with_drain_grace_timeout(mut self, drain_grace_timeout: Duration) -> Self {
+        self.drain_grace_timeout = drain_grace_timeout;
+        self
     }
 }
 

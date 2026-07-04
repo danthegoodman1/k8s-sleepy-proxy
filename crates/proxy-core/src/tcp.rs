@@ -1,8 +1,19 @@
-use std::{error::Error, fmt, io, net::SocketAddr, time::Duration};
+use std::{
+    error::Error,
+    fmt, io,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
-    io::{self as tokio_io, AsyncRead, AsyncWrite},
+    io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    time::{timeout, Instant},
 };
 
 use crate::drain::{DrainError, DrainTracker};
@@ -11,12 +22,16 @@ use crate::timeout::with_timeout;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpProxyConfig {
     pub connect_timeout: Duration,
+    pub stream_idle_timeout: Duration,
+    pub tcp_keepalive: Duration,
 }
 
 impl Default for TcpProxyConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
+            stream_idle_timeout: Duration::from_secs(60 * 60),
+            tcp_keepalive: Duration::from_secs(60),
         }
     }
 }
@@ -60,9 +75,11 @@ impl TcpProxy {
         upstream_addr: SocketAddr,
     ) -> Result<TcpProxyStats, TcpProxyError> {
         let _permit = self.drain.try_acquire()?;
+        configure_tcp_keepalive(&client, self.config.tcp_keepalive)
+            .map_err(TcpProxyError::Proxy)?;
         let upstream = self.connect_upstream(upstream_addr).await?;
 
-        proxy_streams(client, upstream)
+        proxy_streams_with_idle_timeout(client, upstream, self.config.stream_idle_timeout)
             .await
             .map_err(TcpProxyError::Proxy)
     }
@@ -77,7 +94,11 @@ impl TcpProxy {
         )
         .await
         {
-            Ok(Ok(stream)) => Ok(stream),
+            Ok(Ok(stream)) => {
+                configure_tcp_keepalive(&stream, self.config.tcp_keepalive)
+                    .map_err(TcpProxyError::Connect)?;
+                Ok(stream)
+            }
             Ok(Err(error)) => Err(TcpProxyError::Connect(error)),
             Err(_) => Err(TcpProxyError::ConnectTimeout {
                 timeout: self.config.connect_timeout,
@@ -101,6 +122,122 @@ where
         client_to_upstream,
         upstream_to_client,
     })
+}
+
+pub async fn proxy_streams_with_idle_timeout<Client, Upstream>(
+    client: Client,
+    upstream: Upstream,
+    idle_timeout: Duration,
+) -> io::Result<TcpProxyStats>
+where
+    Client: AsyncRead + AsyncWrite + Unpin,
+    Upstream: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+    let idle_clock = IdleClock::new();
+    let (client_to_upstream, upstream_to_client) = tokio::try_join!(
+        copy_direction(
+            &mut client_read,
+            &mut upstream_write,
+            idle_timeout,
+            idle_clock.clone()
+        ),
+        copy_direction(
+            &mut upstream_read,
+            &mut client_write,
+            idle_timeout,
+            idle_clock
+        ),
+    )?;
+
+    Ok(TcpProxyStats {
+        client_to_upstream,
+        upstream_to_client,
+    })
+}
+
+pub fn configure_tcp_keepalive(stream: &TcpStream, idle: Duration) -> io::Result<()> {
+    let keepalive = TcpKeepalive::new().with_time(idle);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+async fn copy_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    idle_clock: IdleClock,
+) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        let read = match timeout(idle_clock.remaining(idle_timeout), reader.read(&mut buffer)).await
+        {
+            Ok(read) => read?,
+            Err(_) if idle_clock.is_idle_for(idle_timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stream idle timeout elapsed",
+                ));
+            }
+            Err(_) => continue,
+        };
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+
+        idle_clock.record_activity();
+        writer.write_all(&buffer[..read]).await?;
+        idle_clock.record_activity();
+        total += read as u64;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IdleClock {
+    started_at: Instant,
+    last_activity_nanos: Arc<AtomicU64>,
+}
+
+impl IdleClock {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_activity_nanos: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn record_activity(&self) {
+        self.last_activity_nanos
+            .store(self.elapsed_nanos(), Ordering::Relaxed);
+    }
+
+    fn remaining(&self, idle_timeout: Duration) -> Duration {
+        idle_timeout
+            .checked_sub(self.idle_for())
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn is_idle_for(&self, idle_timeout: Duration) -> bool {
+        self.idle_for() >= idle_timeout
+    }
+
+    fn idle_for(&self) -> Duration {
+        Duration::from_nanos(
+            self.elapsed_nanos()
+                .saturating_sub(self.last_activity_nanos.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn elapsed_nanos(&self) -> u64 {
+        self.started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
 }
 
 impl From<DrainError> for TcpProxyError {

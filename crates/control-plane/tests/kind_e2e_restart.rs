@@ -218,7 +218,6 @@ async fn restart_during_wake_recovers_without_stale_backend(
     delete_workload_pods(kube.clone(), &config.namespace, "restart-wake").await?;
     let _ = timeout(Duration::from_secs(5), wake).await;
 
-    let mut operator = connect_operator(&config.operator_endpoint).await?;
     let response = wait_for_instance_response(
         config,
         "wake retry after control-plane restart",
@@ -230,8 +229,12 @@ async fn restart_during_wake_recovers_without_stale_backend(
     .await?;
     assert_instance_response(&response, "wake retry after control-plane restart", "wake")?;
 
-    let running = wait_for_instance_state(
-        &mut operator,
+    // An operator channel opened right after the pod restart rides a
+    // port-forward that may still target the old terminating control-plane
+    // pod and break once it exits, so this wait reconnects on transport
+    // errors instead of failing the scenario on a dead channel.
+    let running = wait_for_instance_state_reconnecting(
+        &config.operator_endpoint,
         "restart-wake",
         PbInstanceState::Running,
         Duration::from_secs(30),
@@ -245,7 +248,10 @@ async fn restart_during_wake_recovers_without_stale_backend(
         )
         .into());
     }
-    assert_workload_generation(kube, &config.namespace, "restart-wake", waking.generation).await?;
+    // Wake stamps rendered objects with the projected Running generation
+    // (the Waking generation plus one), so the live objects must carry the
+    // generation the instance ended at, not the one it woke from.
+    assert_workload_generation(kube, &config.namespace, "restart-wake", running.generation).await?;
 
     Ok(())
 }

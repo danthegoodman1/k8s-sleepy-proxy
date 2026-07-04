@@ -320,6 +320,7 @@ fn api_resource_for_ref(object: &RenderedObjectRef) -> KubernetesClientResult<Ap
         ("apps/v1", "Deployment", false) => "deployments",
         ("apps/v1", "StatefulSet", false) => "statefulsets",
         ("v1", "Service", false) => "services",
+        ("v1", "Secret", false) => "secrets",
         ("v1", "PersistentVolume", true) => "persistentvolumes",
         ("v1", "PersistentVolumeClaim", false) => "persistentvolumeclaims",
         _ => {

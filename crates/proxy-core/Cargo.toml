@@ -13,6 +13,7 @@ http-body-util = { workspace = true, default-features = false, features = ["full
 hyper = { workspace = true, default-features = false, features = ["client", "http1", "http2", "server"] }
 hyper-util = { workspace = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
 pin-project-lite = { version = "0.2.17", default-features = false }
+socket2 = "0.6.4"
 tls-parser = { version = "0.12.2", default-features = false }
 tokio = { workspace = true, default-features = false, features = ["io-util", "net", "sync", "time"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }

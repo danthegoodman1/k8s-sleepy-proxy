@@ -9,8 +9,8 @@ use std::{
 
 use http::Uri;
 use proxy_core::{
-    proxy_streams, read_tls_client_hello_prefix, TcpProxyStats, TlsClientHelloError,
-    TlsClientHelloSni,
+    configure_tcp_keepalive, proxy_streams_with_idle_timeout, read_tls_client_hello_prefix,
+    TcpProxyConfig, TcpProxyStats, TlsClientHelloError, TlsClientHelloSni,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -227,10 +227,16 @@ impl FrontlineTlsAdapter {
         let upstream = TcpStream::connect(upstream)
             .await
             .map_err(TlsPassthroughError::Connect)?;
+        configure_tcp_keepalive(&upstream, TcpProxyConfig::default().tcp_keepalive)
+            .map_err(TlsPassthroughError::Connect)?;
         let client = PrefixedStream::new(client_hello.bytes, client);
-        let stats = proxy_streams(client, upstream)
-            .await
-            .map_err(TlsPassthroughError::Proxy)?;
+        let stats = proxy_streams_with_idle_timeout(
+            client,
+            upstream,
+            TcpProxyConfig::default().stream_idle_timeout,
+        )
+        .await
+        .map_err(TlsPassthroughError::Proxy)?;
 
         Ok(TlsPassthrough { identity, stats })
     }

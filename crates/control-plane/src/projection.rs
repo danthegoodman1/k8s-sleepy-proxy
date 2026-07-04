@@ -659,14 +659,6 @@ fn ownership_mismatch_reason(
         return Some("instance_id_mismatch");
     }
     if metadata
-        .labels
-        .get(crate::manifest::LABEL_INSTANCE_GENERATION)
-        .map(String::as_str)
-        != Some(expected.instance_generation())
-    {
-        return Some("generation_mismatch");
-    }
-    if metadata
         .annotations
         .get(ANNOTATION_MATERIALIZATION_ID)
         .map(String::as_str)
@@ -674,6 +666,30 @@ fn ownership_mismatch_reason(
     {
         return Some("materialization_id_mismatch");
     }
+
+    let live_generation = metadata
+        .labels
+        .get(crate::manifest::LABEL_INSTANCE_GENERATION)
+        .and_then(|value| value.parse::<u64>().ok());
+    let expected_generation = expected
+        .instance_generation()
+        .parse::<u64>()
+        .expect("expected generation stamp is a rendered u64");
+    match live_generation {
+        // Same-instance objects stamped with an OLDER generation are this
+        // instance's stale leftovers (e.g. from a wake attempt that failed
+        // before completing). A newer generation owns them: apply supersedes
+        // them in place and cleanup may delete them. Without this, a wake
+        // retry livelocks: every attempt bumps the generation, so the
+        // leftovers never match exactly and every apply/cleanup is rejected
+        // as an ownership conflict.
+        Some(live) if live < expected_generation => return None,
+        Some(live) if live == expected_generation => {}
+        // A NEWER live generation means another driver already superseded
+        // this plan; touching those objects would clobber the newer owner.
+        _ => return Some("generation_mismatch"),
+    }
+
     if let Some(expected_hash) = expected.rendered_hash() {
         if metadata
             .annotations
@@ -882,6 +898,7 @@ fn object_metadata_mut(object: &mut KubernetesObject) -> &mut ObjectMeta {
         KubernetesObject::Deployment(object) => &mut object.metadata,
         KubernetesObject::StatefulSet(object) => &mut object.metadata,
         KubernetesObject::Service(object) => &mut object.metadata,
+        KubernetesObject::Secret(object) => &mut object.metadata,
         KubernetesObject::PersistentVolume(object) => &mut object.metadata,
         KubernetesObject::PersistentVolumeClaim(object) => &mut object.metadata,
         KubernetesObject::Raw(object) => &mut object.metadata,
@@ -893,6 +910,7 @@ fn pod_template_metadata_mut(object: &mut KubernetesObject) -> Option<&mut PodTe
         KubernetesObject::Deployment(object) => Some(&mut object.spec.template.metadata),
         KubernetesObject::StatefulSet(object) => Some(&mut object.spec.template.metadata),
         KubernetesObject::Service(_)
+        | KubernetesObject::Secret(_)
         | KubernetesObject::PersistentVolume(_)
         | KubernetesObject::PersistentVolumeClaim(_) => None,
         KubernetesObject::Raw(object) => object.pod_template_metadata.as_mut(),
@@ -904,6 +922,7 @@ fn object_labels(object: &KubernetesObject) -> &BTreeMap<String, String> {
         KubernetesObject::Deployment(object) => &object.metadata.labels,
         KubernetesObject::StatefulSet(object) => &object.metadata.labels,
         KubernetesObject::Service(object) => &object.metadata.labels,
+        KubernetesObject::Secret(object) => &object.metadata.labels,
         KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
         KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
         KubernetesObject::Raw(object) => &object.metadata.labels,
@@ -915,6 +934,7 @@ fn object_annotations(object: &KubernetesObject) -> &BTreeMap<String, String> {
         KubernetesObject::Deployment(object) => &object.metadata.annotations,
         KubernetesObject::StatefulSet(object) => &object.metadata.annotations,
         KubernetesObject::Service(object) => &object.metadata.annotations,
+        KubernetesObject::Secret(object) => &object.metadata.annotations,
         KubernetesObject::PersistentVolume(object) => &object.metadata.annotations,
         KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.annotations,
         KubernetesObject::Raw(object) => &object.metadata.annotations,
@@ -1025,6 +1045,8 @@ mod tests {
             Some("managed_by_mismatch")
         );
 
+        // Older-generation stamps are stale leftovers of the same instance:
+        // still owned, so a newer generation can supersede or delete them.
         let mut stale_generation = LiveObjectMetadata::from_rendered_object(
             &plan.manifest().expect("manifest").objects[0].object,
         );
@@ -1036,8 +1058,23 @@ mod tests {
             object,
             ProjectionObjectInspection::Present(stale_generation),
         );
-        assert_eq!(stale.state, ProjectionObservationState::PresentUnowned);
-        assert_eq!(stale.reason.as_deref(), Some("generation_mismatch"));
+        assert_eq!(stale.state, ProjectionObservationState::PresentOwned);
+
+        // Newer-generation stamps belong to a newer owner and must not be
+        // touched by this (stale) plan.
+        let mut newer_generation = LiveObjectMetadata::from_rendered_object(
+            &plan.manifest().expect("manifest").objects[0].object,
+        );
+        newer_generation.labels.insert(
+            crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
+            "8".to_owned(),
+        );
+        let newer = classify_object(
+            object,
+            ProjectionObjectInspection::Present(newer_generation),
+        );
+        assert_eq!(newer.state, ProjectionObservationState::PresentUnowned);
+        assert_eq!(newer.reason.as_deref(), Some("generation_mismatch"));
 
         let mut mutated = LiveObjectMetadata::from_rendered_object(
             &plan.manifest().expect("manifest").objects[0].object,
@@ -1252,6 +1289,7 @@ mod tests {
             KubernetesObject::Deployment(object) => &object.metadata,
             KubernetesObject::StatefulSet(object) => &object.metadata,
             KubernetesObject::Service(object) => &object.metadata,
+            KubernetesObject::Secret(object) => &object.metadata,
             KubernetesObject::PersistentVolume(object) => &object.metadata,
             KubernetesObject::PersistentVolumeClaim(object) => &object.metadata,
             KubernetesObject::Raw(object) => &object.metadata,

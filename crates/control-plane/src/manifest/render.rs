@@ -16,9 +16,9 @@ use super::{
     PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy, PersistentVolumeSource,
     PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec, PodTemplateMetadata,
     PodTemplateSpec, PodVolume, RawKubernetesManifestTemplate, RawKubernetesObject,
-    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Service, ServicePort,
-    ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec, TemplateText,
-    VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
+    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret, SecretKeyRef, Service,
+    ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec,
+    TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
     ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
     LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
@@ -37,6 +37,7 @@ const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
 const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const ENV_SIDECAR_MODE: &str = "SLEEPYPODS_SIDECAR_MODE";
 const ENV_CONTROL_PLANE_SIDECAR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN";
+const SIDECAR_TOKEN_SECRET_KEY: &str = "token";
 const ANNOTATION_BACKEND_SCHEME: &str = "sleepypods.io/backend-scheme";
 
 pub fn render_manifests(
@@ -144,6 +145,29 @@ pub(crate) fn render_manifests_with_options(
         });
     }
 
+    let sidecar_token_secret_name = if let Some(token) = options.sidecar_control_plane_token {
+        let name = render_instance_scoped_name("sleepypods-sidecar-token", &request.instance.id);
+        objects.push(RenderedManifestObject {
+            apply_order: ApplyOrder::Secret,
+            object: KubernetesObject::Secret(Secret {
+                metadata: ObjectMeta {
+                    name: name.clone(),
+                    namespace: Some(request.namespace.to_owned()),
+                    labels: metadata_labels.clone(),
+                    annotations: annotations.clone(),
+                },
+                type_: "Opaque".to_owned(),
+                string_data: BTreeMap::from([(
+                    SIDECAR_TOKEN_SECRET_KEY.to_owned(),
+                    token.as_secret_str().to_owned(),
+                )]),
+            }),
+        });
+        Some(name)
+    } else {
+        None
+    };
+
     let pod_template = PodTemplateSpec {
         metadata: PodTemplateMetadata {
             labels: metadata_labels.clone(),
@@ -162,7 +186,7 @@ pub(crate) fn render_manifests_with_options(
                     &sidecar,
                     request.namespace,
                     request.sleep_policy,
-                    options,
+                    sidecar_token_secret_name.as_deref(),
                 )?,
             ],
             volumes: rendered_volumes
@@ -362,6 +386,7 @@ fn raw_apply_order(api_version: &str, kind: &str) -> Result<ApplyOrder, Manifest
     match (api_version, kind) {
         ("v1", "PersistentVolume") => Ok(ApplyOrder::PersistentVolume),
         ("v1", "PersistentVolumeClaim") => Ok(ApplyOrder::PersistentVolumeClaim),
+        ("v1", "Secret") => Ok(ApplyOrder::Secret),
         ("v1", "Service") => Ok(ApplyOrder::Service),
         ("apps/v1", "Deployment") | ("apps/v1", "StatefulSet") => Ok(ApplyOrder::Workload),
         _ => Err(ManifestRenderError::InvalidField {
@@ -551,6 +576,7 @@ fn validate_unique_rendered_refs(
             KubernetesObject::Deployment(object) => object.metadata.namespace.as_deref(),
             KubernetesObject::StatefulSet(object) => object.metadata.namespace.as_deref(),
             KubernetesObject::Service(object) => object.metadata.namespace.as_deref(),
+            KubernetesObject::Secret(object) => object.metadata.namespace.as_deref(),
             KubernetesObject::PersistentVolume(object) => object.metadata.namespace.as_deref(),
             KubernetesObject::PersistentVolumeClaim(object) => object.metadata.namespace.as_deref(),
             KubernetesObject::Raw(object) => object.metadata.namespace.as_deref(),
@@ -837,6 +863,7 @@ fn render_app_container(
                 Ok(EnvVar {
                     name: env.name.clone(),
                     value: env.value.render(&instance.values)?,
+                    value_from: None,
                 })
             })
             .collect::<Result<Vec<_>, ManifestRenderError>>()?,
@@ -856,58 +883,74 @@ fn render_sidecar_container(
     config: &SidecarRenderConfig,
     namespace: &str,
     sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
-    options: super::RenderManifestOptions<'_>,
+    sidecar_token_secret_name: Option<&str>,
 ) -> Result<Container, ManifestRenderError> {
     let mut env = vec![
         EnvVar {
             name: ENV_LISTEN_PORT.to_owned(),
             value: config.listen_port.to_string(),
+            value_from: None,
         },
         EnvVar {
             name: ENV_SIDECAR_LISTEN_ADDR.to_owned(),
             value: format!("0.0.0.0:{}", config.listen_port),
+            value_from: None,
         },
         EnvVar {
             name: ENV_APP_PORT.to_owned(),
             value: config.app_port.to_string(),
+            value_from: None,
         },
         EnvVar {
             name: ENV_INSTANCE_ID.to_owned(),
             value: instance.id.to_string(),
+            value_from: None,
         },
         EnvVar {
             name: ENV_INSTANCE_GENERATION.to_owned(),
             value: instance.generation.to_string(),
+            value_from: None,
         },
         EnvVar {
             name: ENV_CONTROL_PLANE_ENDPOINT.to_owned(),
             value: format!(
                 "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
             ),
+            value_from: None,
         },
         EnvVar {
             name: ENV_IDLE_TIMEOUT_MS.to_owned(),
             value: sleep_policy.idle_timeout_ms.to_string(),
+            value_from: None,
         },
         EnvVar {
             name: ENV_IDLE_RETRY_BACKOFF_MS.to_owned(),
             value: sleep_policy.idle_retry_backoff_ms.to_string(),
+            value_from: None,
         },
         EnvVar {
             name: ENV_DRAIN_GRACE_TIMEOUT_MS.to_owned(),
             value: sleep_policy.drain_grace_timeout_ms.to_string(),
+            value_from: None,
         },
     ];
     if let Some(mode) = &config.mode {
         env.push(EnvVar {
             name: ENV_SIDECAR_MODE.to_owned(),
             value: mode.clone(),
+            value_from: None,
         });
     }
-    if let Some(token) = options.sidecar_control_plane_token {
+    if let Some(secret_name) = sidecar_token_secret_name {
         env.push(EnvVar {
             name: ENV_CONTROL_PLANE_SIDECAR_TOKEN.to_owned(),
-            value: token.as_secret_str().to_owned(),
+            value: String::new(),
+            value_from: Some(super::EnvVarSource {
+                secret_key_ref: SecretKeyRef {
+                    name: secret_name.to_owned(),
+                    key: SIDECAR_TOKEN_SECRET_KEY.to_owned(),
+                },
+            }),
         });
     }
 
