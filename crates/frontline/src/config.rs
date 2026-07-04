@@ -23,12 +23,14 @@ use crate::{
 
 const DEFAULT_ROUTE_CACHE_CAPACITY: usize = 1024;
 const DEFAULT_DRAIN_GRACE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WAKE_INSTANCE_TIMEOUT_MS: u64 = 5_000;
 const FRONTLINE_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_LISTEN_ADDR";
 const CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
 const CONTROL_PLANE_PROXY_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
 const CONTROL_PLANE_OPERATOR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN";
 const ROUTE_CACHE_CAPACITY: &str = "SLEEPYPODS_ROUTE_CACHE_CAPACITY";
 const DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
+const WAKE_INSTANCE_TIMEOUT_MS: &str = "SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS";
 const TLS_TERMINATION_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR";
 const TLS_TERMINATION_CERTS: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS";
 const TLS_PASSTHROUGH_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR";
@@ -43,6 +45,7 @@ pub struct FrontlineEnvConfig {
     control_plane_operator_token: Option<BearerToken>,
     route_cache_capacity: usize,
     drain_grace_timeout: Duration,
+    wake_instance_timeout: Duration,
     metrics_listen_addr: Option<SocketAddr>,
 }
 
@@ -149,6 +152,11 @@ impl FrontlineEnvConfig {
             DRAIN_GRACE_TIMEOUT_MS,
             DEFAULT_DRAIN_GRACE_TIMEOUT_MS,
         )?;
+        let wake_instance_timeout = optional_duration_ms(
+            &vars,
+            WAKE_INSTANCE_TIMEOUT_MS,
+            DEFAULT_WAKE_INSTANCE_TIMEOUT_MS,
+        )?;
         let tls_termination =
             optional_tls_termination_listener_config(&vars, TLS_TERMINATION_LISTEN_ADDR)?;
         let tls_passthrough = optional_listener_config(&vars, TLS_PASSTHROUGH_LISTEN_ADDR)?
@@ -169,6 +177,7 @@ impl FrontlineEnvConfig {
             control_plane_operator_token,
             route_cache_capacity,
             drain_grace_timeout,
+            wake_instance_timeout,
             metrics_listen_addr,
         })
     }
@@ -235,6 +244,10 @@ impl FrontlineEnvConfig {
 
     pub fn drain_grace_timeout(&self) -> Duration {
         self.drain_grace_timeout
+    }
+
+    pub fn wake_instance_timeout(&self) -> Duration {
+        self.wake_instance_timeout
     }
 
     pub fn metrics_listen_addr(&self) -> Option<SocketAddr> {
@@ -575,6 +588,10 @@ mod tests {
             config.drain_grace_timeout(),
             Duration::from_millis(DEFAULT_DRAIN_GRACE_TIMEOUT_MS)
         );
+        assert_eq!(
+            config.wake_instance_timeout(),
+            Duration::from_millis(DEFAULT_WAKE_INSTANCE_TIMEOUT_MS)
+        );
         assert!(config.tls_termination_listener().is_none());
         assert!(config.tls_passthrough_listener().is_none());
         assert_eq!(config.metrics_listen_addr(), None);
@@ -594,6 +611,7 @@ mod tests {
             (CONTROL_PLANE_OPERATOR_TOKEN, "operator-secret"),
             (ROUTE_CACHE_CAPACITY, "17"),
             (DRAIN_GRACE_TIMEOUT_MS, "250"),
+            (WAKE_INSTANCE_TIMEOUT_MS, "750"),
             (METRICS_LISTEN_ADDR, "127.0.0.1:19091"),
         ])
         .expect("config parses");
@@ -620,6 +638,7 @@ mod tests {
         );
         assert_eq!(config.route_cache_capacity(), 17);
         assert_eq!(config.drain_grace_timeout(), Duration::from_millis(250));
+        assert_eq!(config.wake_instance_timeout(), Duration::from_millis(750));
         assert_eq!(
             config.metrics_listen_addr(),
             Some("127.0.0.1:19091".parse().expect("socket address"))

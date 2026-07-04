@@ -241,6 +241,45 @@ async fn malformed_subscribe_response_is_protocol_error() {
 }
 
 #[tokio::test]
+async fn unknown_route_response_fails_in_flight_subscribe_and_tears_down_session() {
+    let service = FakeProxyControlPlane::default();
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "req-unexpected",
+        "sub-unexpected",
+    ))]));
+    let mut client = test_client(service);
+
+    // The response reader must fail the pending matching request before it
+    // reports the fatal unknown response, otherwise the subscribe future hangs.
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe_route(
+            route_request_id("req-pending"),
+            http_identity("app.example.com", None),
+        ),
+    )
+    .await
+    .expect("in-flight subscribe returns")
+    .expect_err("unknown response request ID should fail subscribe");
+    assert!(matches!(
+        error,
+        GrpcProxyControlPlaneError::UnexpectedRouteResponse { request_id }
+            if request_id == route_request_id("req-unexpected")
+    ));
+
+    let event_error = tokio::time::timeout(Duration::from_secs(1), client.next_update())
+        .await
+        .expect("fatal unknown response event is delivered")
+        .expect_err("unknown response tears down the session");
+    assert!(matches!(
+        event_error,
+        GrpcProxyControlPlaneError::UnexpectedRouteResponse { request_id }
+            if request_id == route_request_id("req-unexpected")
+    ));
+    assert!(client.subscription.is_none());
+}
+
+#[tokio::test]
 async fn closed_subscribe_response_stream_is_surfaced() {
     let service = FakeProxyControlPlane::default();
     service.push_subscribe_action(SubscribeAction::close_after(Vec::new()));

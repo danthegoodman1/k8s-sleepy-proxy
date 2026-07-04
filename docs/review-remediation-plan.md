@@ -284,15 +284,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: Read-path/actor split with explicit single-flight and wake deadline | Missing: design landed; concurrency tests. |
-| Incomplete | Work | 4B: Request-id demux; cancellation-safe wake tracker | Missing: transport rework and cancellation tests. |
-| Incomplete | Work | 4C: Synthetic StreamClosed on in-flight stream loss | Missing: flag + resolver flush test. |
-| Incomplete | Work | 4D: Best-effort background unsubscribes | Missing: resolver change. |
-| Incomplete | Work | 4E: Cache internals (lazy expiry, stable index, hashed negatives, LRU) | Missing: cache rework and bench. |
-| Incomplete | Work | 4F: Single HTTP pipeline; delete dead matcher | Missing: dedup commit. |
-| Incomplete | Work | 4G: WebSocket upstream-first upgrade | Missing: behavior change and test. |
-| Incomplete | Gate | Concurrency test: cold wake does not stall hot hits | Missing: test name and run. |
-| Incomplete | Test | Full-resolve criterion benchmark under budget | Missing: bench and numbers. |
+| Complete | Work | 4A: Read-path/actor split with explicit single-flight and wake deadline | `SharedFrontlineRouteCoordinator` uses read-side `RwLock<SubscriptionState>`, per-identity `RouteFlight`, and an actor channel for subscribe/wake/cache updates. `wake_instance` is actor-owned and timed by configurable `SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS` (default 5s). Evidence: `cargo test -p frontline` includes `route::tests::shared_route_hot_hits_do_not_wait_for_in_flight_cold_wake` and `route::tests::shared_route_same_identity_uses_one_in_flight_subscribe_route`. |
+| Complete | Work | 4B: Request-id demux; cancellation-safe wake tracker | `control_plane_transport` now owns the response reader and routes subscribe responses by `request_id` through pending oneshots; `UnexpectedRouteResponse` drops the session. Wakes run in the actor-owned flight, so dropped request futures cannot strand `WakeTracker` keys. Evidence: `control_plane_transport::tests::pushed_updates_over_response_buffer_are_drained_without_public_cursor`, `control_plane_transport::tests::subscribe_route_after_response_stream_close_opens_new_stream`, and `route::tests::shared_route_cancelled_mid_wake_does_not_strand_recovery`. |
+| Complete | Work | 4C: Synthetic StreamClosed on in-flight stream loss | Subscription response stream closure now surfaces as `RouteSubscriptionEvent::StreamClosed` and resolver maintenance flushes subscription-backed positives. Evidence: `resolver::tests::stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebuilds` and `control_plane_transport::tests::response_stream_close_after_route_response_is_observed_by_response_reader`. |
+| Complete | Work | 4D: Best-effort background unsubscribes | Resolver no longer fails unrelated route refreshes on unsubscribe errors; evicted/expired subscription IDs are emitted to the actor for best-effort unsubscribe. Evidence: `resolver::tests::expired_positive_unsubscribes_best_effort_after_refresh` and `resolver::tests::unsubscribe_client_error_does_not_fail_refresh`. |
+| Complete | Work | 4E: Cache internals (lazy expiry, stable index, hashed negatives, LRU) | Cache entries are `Arc`-backed, positives use indexed lookup with insertion/update-order eviction, negatives use a hashed map with their own bound, and removals update indices without full rebuilds. Evidence: `cache::tests::negative_scanner_traffic_does_not_evict_hot_positive_routes`; `cargo bench -p frontline` route lookup: exact HTTP 156.64ns, wildcard HTTP 264.24ns, same-host paths 159.36ns, SNI 77.45ns, full shared hot resolve 319.62ns. |
+| Partial | Work | 4F: Single HTTP pipeline; delete dead matcher | HTTP-01 gating is aligned across the mutable runtime and production listener path, and listener routing now uses the shared coordinator. The old matcher module remains only as the local route-ranking helper/tests; no dead matcher deletion was made in this phase. |
+| Complete | Work | 4G: WebSocket upstream-first upgrade | Accepted WebSocket upgrades now connect the upstream before returning 101; backend refusal maps to 502. Evidence: `listener::tests::listener_websocket_backend_refusal_returns_bad_gateway_without_upgrade` and existing WebSocket forwarding tests. |
+| Complete | Gate | Concurrency test: cold wake does not stall hot hits | `cargo test -p frontline` passes `route::tests::shared_route_hot_hits_do_not_wait_for_in_flight_cold_wake`; strict frontend smoke passed on rerun, including cold wake latency 1.510ms under 250ms. |
+| Complete | Test | Full-resolve criterion benchmark under budget | `cargo bench -p frontline` includes `route_lookup/full_resolve_http_exact_host_hot` at 319.62ns, below the 1us hot route lookup budget; `./scripts/check-criterion-regressions.py` passed. |
 
 ## Phase 5: Control-Plane Store Scalability
 

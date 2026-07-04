@@ -386,9 +386,9 @@ fn negative_cache_hit_and_expiry_are_distinct() {
 }
 
 #[test]
-fn bounded_eviction_is_fifo_and_returns_positive_subscriptions() {
+fn negative_scanner_traffic_does_not_evict_hot_positive_routes() {
     let now = now();
-    let mut cache = RouteCache::new(2);
+    let mut cache = RouteCache::new(1);
     cache.insert_positive(
         subscription_id("sub-1"),
         http_wildcard_rule("one.example.com", None),
@@ -396,27 +396,22 @@ fn bounded_eviction_is_fifo_and_returns_positive_subscriptions() {
         ttl(10),
         now,
     );
-    cache.insert_negative(http_request("missing.example.com", "/"), ttl(10), now);
-    let result = cache.insert_positive(
-        subscription_id("sub-2"),
-        http_wildcard_rule("two.example.com", None),
-        route_entry("route-2", 1, None),
-        ttl(10),
-        now,
-    );
+    cache.insert_negative(http_request("missing-1.example.com", "/"), ttl(10), now);
+    let result = cache.insert_negative(http_request("missing-2.example.com", "/"), ttl(10), now);
 
-    assert_eq!(
-        result.subscriptions_to_unsubscribe,
-        vec![subscription_id("sub-1")]
-    );
+    assert!(result.subscriptions_to_unsubscribe.is_empty());
     assert_eq!(cache.len(), 2);
     assert!(matches!(
         cache.lookup(&http_request("app.one.example.com", "/"), now),
-        CacheLookup::Absent
+        CacheLookup::Hit(CacheLookupHit::Positive(_))
     ));
     assert!(matches!(
-        cache.lookup(&http_request("missing.example.com", "/"), now),
+        cache.lookup(&http_request("missing-2.example.com", "/"), now),
         CacheLookup::Hit(CacheLookupHit::Negative(_))
+    ));
+    assert!(matches!(
+        cache.lookup(&http_request("missing-1.example.com", "/"), now),
+        CacheLookup::Absent
     ));
 }
 

@@ -18,10 +18,12 @@ use tokio::{
 
 use crate::{
     is_http01_challenge_candidate_path,
-    runtime::{resolve_http01_response, resolve_http_route, route_outcome_or_forward_response},
-    FrontlineForwardContext, FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteCoordinator,
-    FrontlineRouteOutcome, FrontlineTlsAdapter, Http01ChallengeResolver, RouteSubscriptionClient,
-    WakeClient,
+    runtime::{
+        resolve_http01_response, resolve_http_route_shared, route_outcome_or_forward_response,
+    },
+    FrontlineForwardContext, FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteOutcome,
+    FrontlineTlsAdapter, Http01ChallengeResolver, RouteSubscriptionClient,
+    SharedFrontlineRouteCoordinator, WakeClient,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,9 +77,12 @@ pub enum FrontlineListenerError {
     Task(JoinError),
 }
 
-#[derive(Debug)]
-struct SharedFrontlineHttpRuntime<RouteClient, Wake, Http01> {
-    coordinator: std::sync::Arc<Mutex<FrontlineRouteCoordinator<RouteClient, Wake>>>,
+struct SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>
+where
+    RouteClient: RouteSubscriptionClient,
+    Wake: WakeClient,
+{
+    coordinator: SharedFrontlineRouteCoordinator<RouteClient, Wake>,
     http01_resolver: std::sync::Arc<Mutex<Http01>>,
     forwarder: FrontlineForwarder,
     drain: proxy_core::DrainTracker,
@@ -159,9 +164,9 @@ pub async fn serve_http<RouteClient, Wake, Http01>(
 ) -> Result<(), FrontlineHttpListenerError>
 where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
@@ -183,9 +188,9 @@ pub async fn serve_frontline<RouteClient, Wake, Http01>(
 ) -> Result<(), FrontlineListenerError>
 where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
@@ -270,9 +275,9 @@ pub async fn serve_http_listener<RouteClient, Wake, Http01>(
 ) -> Result<(), FrontlineHttpListenerError>
 where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
@@ -296,9 +301,9 @@ async fn serve_http_listener_with_shared<RouteClient, Wake, Http01>(
 ) -> Result<(), FrontlineHttpListenerError>
 where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
@@ -342,7 +347,11 @@ where
     drain_result.map_err(FrontlineHttpListenerError::Drain)
 }
 
-impl<RouteClient, Wake, Http01> Clone for SharedFrontlineHttpRuntime<RouteClient, Wake, Http01> {
+impl<RouteClient, Wake, Http01> Clone for SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>
+where
+    RouteClient: RouteSubscriptionClient,
+    Wake: WakeClient,
+{
     fn clone(&self) -> Self {
         Self {
             coordinator: self.coordinator.clone(),
@@ -362,9 +371,9 @@ async fn serve_tls_termination_listener_with_shared<RouteClient, Wake, Http01>(
 ) -> Result<(), FrontlineListenerError>
 where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
@@ -430,9 +439,9 @@ async fn serve_tls_passthrough_listener_with_shared<RouteClient, Wake, Http01>(
 ) -> Result<(), FrontlineListenerError>
 where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
@@ -486,9 +495,9 @@ async fn serve_http_connection<RouteClient, Wake, Http01, IO>(
     forwarding_context: FrontlineForwardContext,
 ) where
     RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send,
+    RouteClient::Error: Clone + Send,
     Wake: WakeClient + Send + 'static,
-    Wake::Error: Send,
+    Wake::Error: Clone + Send,
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -514,10 +523,10 @@ async fn serve_http_connection<RouteClient, Wake, Http01, IO>(
 
 impl<RouteClient, Wake, Http01> SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>
 where
-    RouteClient: RouteSubscriptionClient + Send,
-    RouteClient::Error: Send,
-    Wake: WakeClient + Send,
-    Wake::Error: Send,
+    RouteClient: RouteSubscriptionClient + Send + 'static,
+    RouteClient::Error: Clone + Send + 'static,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send + 'static,
     Http01: Http01ChallengeResolver + Send,
     Http01::Error: Send,
 {
@@ -525,7 +534,7 @@ where
         let (coordinator, http01_resolver, forwarder, drain) = runtime.into_parts();
 
         Self {
-            coordinator: std::sync::Arc::new(Mutex::new(coordinator)),
+            coordinator: coordinator.into_shared(),
             http01_resolver: std::sync::Arc::new(Mutex::new(http01_resolver)),
             forwarder,
             drain,
@@ -560,10 +569,7 @@ where
             return self.handle_websocket(request, forwarding_context).await;
         }
 
-        let outcome = {
-            let mut coordinator = self.coordinator.lock().await;
-            resolve_http_route(&mut coordinator, &request, Instant::now()).await
-        };
+        let outcome = resolve_http_route_shared(&self.coordinator, &request, Instant::now()).await;
 
         match outcome {
             Ok(outcome) => {
@@ -588,15 +594,13 @@ where
             Ok(client_hello) => client_hello,
             Err(_error) => return,
         };
-        let outcome = {
-            let mut coordinator = self.coordinator.lock().await;
-            coordinator
-                .route(
-                    client_hello.identity().clone().into_identity(),
-                    Instant::now(),
-                )
-                .await
-        };
+        let outcome = self
+            .coordinator
+            .route(
+                client_hello.identity().clone().into_identity(),
+                Instant::now(),
+            )
+            .await;
         let ready = match outcome {
             Ok(FrontlineRouteOutcome::Ready(ready)) => ready,
             Ok(_) | Err(_) => return,
@@ -623,10 +627,7 @@ where
             Err(_error) => return status_response(StatusCode::BAD_REQUEST),
         };
 
-        let outcome = {
-            let mut coordinator = self.coordinator.lock().await;
-            resolve_http_route(&mut coordinator, &request, Instant::now()).await
-        };
+        let outcome = resolve_http_route_shared(&self.coordinator, &request, Instant::now()).await;
 
         match outcome {
             Ok(FrontlineRouteOutcome::Ready(ready)) => {
@@ -636,6 +637,18 @@ where
                     .map(|value| value.as_str().to_owned())
                     .unwrap_or_else(|| "/".to_owned());
                 let upstream_headers = forwarding_context.headers_for_request(&mut request);
+                let upstream = match self
+                    .forwarder
+                    .connect_accepted_websocket_upstream_with_headers(
+                        &ready,
+                        &path_and_query,
+                        &upstream_headers,
+                    )
+                    .await
+                {
+                    Ok(upstream) => upstream,
+                    Err(_error) => return status_response(StatusCode::BAD_GATEWAY),
+                };
                 let upgraded = hyper::upgrade::on(&mut request);
                 let forwarder = self.forwarder.clone();
 
@@ -646,12 +659,7 @@ where
                         return;
                     };
                     let _ = forwarder
-                        .forward_accepted_websocket_with_headers(
-                            &ready,
-                            TokioIo::new(upgraded),
-                            &path_and_query,
-                            &upstream_headers,
-                        )
+                        .forward_connected_accepted_websocket(TokioIo::new(upgraded), upstream)
                         .await;
                 });
 

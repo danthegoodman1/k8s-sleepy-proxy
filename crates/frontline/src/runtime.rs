@@ -14,11 +14,12 @@ use proxy_core::observability::{
 use proxy_core::DrainTracker;
 
 use crate::{
-    intercept_http01_challenge, FrontlineForwardContext, FrontlineForwardError, FrontlineForwarder,
-    FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
-    Http01ChallengeResolver, Http01InterceptDecision, Http01InterceptError,
-    NoopHttp01ChallengeResolver, ReadyBackend, RequestIdentityError, RouteRequestIdentity,
-    RouteSubscriptionClient, WakeClient,
+    intercept_http01_challenge, is_http01_challenge_candidate_path, FrontlineForwardContext,
+    FrontlineForwardError, FrontlineForwarder, FrontlineRouteCoordinator,
+    FrontlineRouteCoordinatorError, FrontlineRouteOutcome, Http01ChallengeResolver,
+    Http01InterceptDecision, Http01InterceptError, NoopHttp01ChallengeResolver, ReadyBackend,
+    RequestIdentityError, RouteRequestIdentity, RouteSubscriptionClient,
+    SharedFrontlineRouteCoordinator, WakeClient,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -143,15 +144,17 @@ where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<BoxError>,
     {
-        match resolve_http01_response(&mut self.http01_resolver, &request).await {
-            Ok(Some(response)) => {
-                record_http01_response(&self.observability, response.status());
-                return response;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                record_http01_error(&self.observability, &error);
-                return http01_intercept_error_response(error);
+        if is_http01_challenge_candidate_path(request.uri().path()) {
+            match resolve_http01_response(&mut self.http01_resolver, &request).await {
+                Ok(Some(response)) => {
+                    record_http01_response(&self.observability, response.status());
+                    return response;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    record_http01_error(&self.observability, &error);
+                    return http01_intercept_error_response(error);
+                }
             }
         }
 
@@ -232,6 +235,25 @@ pub(crate) async fn resolve_http_route<RouteClient, Wake, B>(
 where
     RouteClient: RouteSubscriptionClient,
     Wake: WakeClient,
+{
+    let identity = http_request_identity(request).map_err(FrontlineHttpRouteError::Identity)?;
+
+    coordinator
+        .route(identity.into_identity(), now)
+        .await
+        .map_err(FrontlineHttpRouteError::Coordinator)
+}
+
+pub(crate) async fn resolve_http_route_shared<RouteClient, Wake, B>(
+    coordinator: &SharedFrontlineRouteCoordinator<RouteClient, Wake>,
+    request: &Request<B>,
+    now: Instant,
+) -> Result<FrontlineRouteOutcome, FrontlineHttpRouteError<RouteClient::Error, Wake::Error>>
+where
+    RouteClient: RouteSubscriptionClient + Send + 'static,
+    RouteClient::Error: Clone + Send + 'static,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send + 'static,
 {
     let identity = http_request_identity(request).map_err(FrontlineHttpRouteError::Identity)?;
 

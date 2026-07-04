@@ -2,8 +2,11 @@ use std::{error::Error, fmt, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, Request as HttpRequest, Response};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
 use tokio_tungstenite::{
     accept_hdr_async, connect_async,
     tungstenite::{
@@ -18,11 +21,11 @@ use tokio_tungstenite::{
         protocol::Role,
     },
     tungstenite::{Error as TungsteniteError, Message},
-    WebSocketStream,
+    MaybeTlsStream, WebSocketStream,
 };
 
 use crate::{
-    drain::{DrainError, DrainTracker},
+    drain::{DrainError, DrainPermit, DrainTracker},
     http::forwarded_headers,
 };
 
@@ -39,6 +42,12 @@ pub struct WebSocketProxyStats {
     pub upstream_to_client_messages: u64,
     pub client_to_upstream_bytes: u64,
     pub upstream_to_client_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct AcceptedWebSocketUpstream {
+    upstream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    _permit: DrainPermit,
 }
 
 #[derive(Debug)]
@@ -124,6 +133,38 @@ impl WebSocketProxy {
             .map_err(WebSocketProxyError::UpstreamConnect)?;
 
         proxy_websocket_streams(client, upstream)
+            .await
+            .map_err(WebSocketProxyError::Proxy)
+    }
+
+    pub async fn connect_accepted_upstream_with_headers(
+        &self,
+        upstream_url: &str,
+        upstream_headers: &HeaderMap,
+    ) -> Result<AcceptedWebSocketUpstream, WebSocketProxyError> {
+        let permit = self.drain.try_acquire()?;
+        let upstream_request = upstream_websocket_request(upstream_url, upstream_headers)
+            .map_err(WebSocketProxyError::UpstreamConnect)?;
+        let (upstream, _) = connect_async(upstream_request)
+            .await
+            .map_err(WebSocketProxyError::UpstreamConnect)?;
+
+        Ok(AcceptedWebSocketUpstream {
+            upstream,
+            _permit: permit,
+        })
+    }
+
+    pub async fn proxy_accepted_upgrade_with_upstream<Client>(
+        &self,
+        client: Client,
+        upstream: AcceptedWebSocketUpstream,
+    ) -> Result<WebSocketProxyStats, WebSocketProxyError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        let client = WebSocketStream::from_raw_socket(client, Role::Server, None).await;
+        proxy_websocket_streams(client, upstream.upstream)
             .await
             .map_err(WebSocketProxyError::Proxy)
     }

@@ -871,6 +871,39 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
 }
 
 #[tokio::test]
+async fn listener_websocket_backend_refusal_returns_bad_gateway_without_upgrade() {
+    let refused_addr = reserve_addr().await;
+    let route_client = FakeRouteClient::default();
+    let mut state = SubscriptionState::new(4);
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("initial"),
+            subscription_id("sub-websocket-refused"),
+            http_identity("ws-refused.example.com", "/socket"),
+            route_entry(
+                InstanceState::Running,
+                7,
+                Some((format!("http://{refused_addr}"), 3)),
+            ),
+        ),
+        now(),
+    );
+    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+
+    // The listener must prove the upstream WebSocket is reachable before it
+    // returns 101 to the client, so a refused backend maps to an HTTP error.
+    let status = raw_websocket_upgrade_status(addr, Some("ws-refused.example.com")).await;
+
+    assert!(status.starts_with("HTTP/1.1 502"), "{status}");
+    assert!(route_client.calls().is_empty());
+
+    shutdown.shutdown();
+    task.await
+        .expect("listener task joins")
+        .expect("listener exits");
+}
+
+#[tokio::test]
 async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;

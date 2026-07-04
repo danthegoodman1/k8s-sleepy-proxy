@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, future::Future, pin::Pin, time::Instant};
+use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use control_plane::RouteIdentity;
 use proxy_core::observability::{
@@ -51,8 +51,8 @@ pub enum RouteSubscriptionEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontlineRouteResolution {
-    Resolved(PositiveCacheEntry),
-    Miss(NegativeCacheEntry),
+    Resolved(Arc<PositiveCacheEntry>),
+    Miss(Arc<NegativeCacheEntry>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,9 +186,6 @@ where
     ) -> Result<FrontlineRouteResolution, FrontlineRouteResolverError<Client::Error>> {
         self.drain_subscription_events(now).await?;
 
-        let expired = self.state.cache_mut().expire(now);
-        self.unsubscribe_all(expired).await?;
-
         let lookup = self.state.cache().lookup(&identity, now);
         self.record_cache_lookup(&lookup);
         match lookup {
@@ -308,6 +305,16 @@ where
         Ok(outcome)
     }
 
+    pub async fn maintain(
+        &mut self,
+        now: Instant,
+    ) -> Result<(), FrontlineRouteResolverError<Client::Error>> {
+        self.drain_subscription_events(now).await?;
+        let expired = self.state.cache_mut().expire(now);
+        self.unsubscribe_all(expired).await;
+        Ok(())
+    }
+
     async fn drain_subscription_events(
         &mut self,
         now: Instant,
@@ -343,11 +350,15 @@ where
         match outcome {
             ApplyControlPlaneMessageOutcome::Resolved(result)
             | ApplyControlPlaneMessageOutcome::Miss(result) => {
-                self.unsubscribe_all(result.clone()).await
+                self.unsubscribe_all(result.clone()).await;
+                Ok(())
             }
             ApplyControlPlaneMessageOutcome::Updated(crate::ApplyUpdateOutcome::Replaced(
                 result,
-            )) => self.unsubscribe_all(result.clone()).await,
+            )) => {
+                self.unsubscribe_all(result.clone()).await;
+                Ok(())
+            }
             ApplyControlPlaneMessageOutcome::Updated(
                 crate::ApplyUpdateOutcome::MissingSubscription
                 | crate::ApplyUpdateOutcome::StaleInstanceGeneration { .. }
@@ -357,27 +368,20 @@ where
         }
     }
 
-    async fn unsubscribe_all(
-        &mut self,
-        result: CacheInsertResult,
-    ) -> Result<(), FrontlineRouteResolverError<Client::Error>> {
+    async fn unsubscribe_all(&mut self, result: CacheInsertResult) {
         for subscription_id in result.subscriptions_to_unsubscribe {
-            self.client
+            let outcome = self
+                .client
                 .unsubscribe(subscription_id.clone())
                 .await
                 .map(|()| {
                     self.record_control_plane_call(Operation::Unsubscribe, Outcome::Success);
                 })
-                .map_err(|source| {
+                .map_err(|_source| {
                     self.record_control_plane_call(Operation::Unsubscribe, Outcome::Error);
-                    FrontlineRouteResolverError::Unsubscribe {
-                        subscription_id,
-                        source,
-                    }
-                })?;
+                });
+            let _ = outcome;
         }
-
-        Ok(())
     }
 
     fn record_cache_lookup(&self, lookup: &CacheLookup) {

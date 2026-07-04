@@ -153,6 +153,10 @@ impl SubscriptionState {
         }
     }
 
+    pub fn from_cache(cache: RouteCache) -> Self {
+        Self { cache }
+    }
+
     pub fn cache(&self) -> &RouteCache {
         &self.cache
     }

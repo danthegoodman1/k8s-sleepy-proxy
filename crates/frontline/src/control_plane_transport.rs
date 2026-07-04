@@ -1,4 +1,10 @@
-use std::{collections::VecDeque, error::Error, fmt, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use control_plane::{
     api::pb::{
@@ -7,7 +13,7 @@ use control_plane::{
     },
     Http01ChallengeKey, Http01ChallengeRecord, RouteIdentity,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tonic::codegen::{tokio_stream::wrappers::ReceiverStream, Body};
 
 use crate::{
@@ -21,9 +27,9 @@ use crate::{
 };
 
 const SUBSCRIBE_REQUEST_BUFFER: usize = 16;
-// Matches the request-side buffer so pushed updates are backpressured by proxy
-// demand instead of accumulating unboundedly while the resolver is idle.
-const SUBSCRIBE_RESPONSE_BUFFER: usize = SUBSCRIBE_REQUEST_BUFFER;
+// Pushed updates get enough room to drain bursts, while request-side sends stay
+// tightly bounded because each request waits for its matching response.
+const SUBSCRIBE_RESPONSE_BUFFER: usize = 256;
 const DEFAULT_SUBSCRIBE_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
@@ -32,6 +38,7 @@ pub struct GrpcProxyControlPlaneClient<T> {
     subscription: Option<GrpcRouteSubscriptionSession>,
     subscribe_reconnect_backoff: Duration,
     backoff_before_next_subscription: bool,
+    pending_stream_closed_event: bool,
 }
 
 #[derive(Debug)]
@@ -44,7 +51,17 @@ struct GrpcRouteSubscriptionSession {
     requests: mpsc::Sender<pb::ProxySubscribeRequest>,
     responses: mpsc::Receiver<GrpcRouteSubscriptionEvent>,
     buffered_updates: VecDeque<SubscribeControlPlaneOutput>,
+    pending_route_responses: PendingRouteResponses,
 }
+
+type PendingRouteResponses = Arc<
+    Mutex<
+        HashMap<
+            RouteRequestId,
+            oneshot::Sender<Result<SubscribeControlPlaneOutput, GrpcProxyControlPlaneError>>,
+        >,
+    >,
+>;
 
 #[derive(Debug)]
 enum GrpcRouteSubscriptionEvent {
@@ -52,9 +69,10 @@ enum GrpcRouteSubscriptionEvent {
     ResponseStreamClosed,
     Status(tonic::Status),
     Protocol(ProxyProtocolAdapterError),
+    UnexpectedRouteResponse { request_id: RouteRequestId },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum GrpcProxyControlPlaneError {
     Status(tonic::Status),
     SubscribeRequestStreamClosed,
@@ -63,7 +81,7 @@ pub enum GrpcProxyControlPlaneError {
     UnexpectedRouteResponse { request_id: RouteRequestId },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum GrpcOperatorHttp01ResolverError {
     Status(tonic::Status),
     Protocol(ProxyProtocolAdapterError),
@@ -83,6 +101,7 @@ impl<T> GrpcProxyControlPlaneClient<T> {
             subscription: None,
             subscribe_reconnect_backoff,
             backoff_before_next_subscription: false,
+            pending_stream_closed_event: false,
         }
     }
 
@@ -101,6 +120,7 @@ impl<T> GrpcProxyControlPlaneClient<T> {
     fn drop_failed_subscription(&mut self) {
         self.subscription = None;
         self.backoff_before_next_subscription = true;
+        self.pending_stream_closed_event = true;
     }
 }
 
@@ -174,37 +194,47 @@ where
         request_id: RouteRequestId,
         identity: RouteIdentity,
     ) -> Result<SubscribeControlPlaneOutput, GrpcProxyControlPlaneError> {
+        self.refresh_subscription_status()?;
         let request = proxy_subscribe_input_to_proto(ProxySubscribeInput::SubscribeRoute {
             request_id: request_id.clone(),
             identity,
         });
-        let send_result = {
-            let session = self.ensure_subscription().await?;
-            session.requests.send(request).await
-        };
-        if send_result.is_err() {
-            self.drop_failed_subscription();
-            return Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed);
-        }
-
-        loop {
-            let message = self.next_subscription_message().await?;
-
-            match response_request_id(&message) {
-                Some(actual) if actual == &request_id => return Ok(message),
-                Some(actual) => {
-                    return Err(GrpcProxyControlPlaneError::UnexpectedRouteResponse {
-                        request_id: actual.clone(),
-                    });
+        for retry in 0..2 {
+            let (response_tx, response_rx) = oneshot::channel();
+            let send_result = {
+                let session = self.ensure_subscription().await?;
+                session
+                    .pending_route_responses
+                    .lock()
+                    .await
+                    .insert(request_id.clone(), response_tx);
+                session.requests.send(request.clone()).await
+            };
+            if send_result.is_err() {
+                if let Some(session) = self.subscription.as_mut() {
+                    session
+                        .pending_route_responses
+                        .lock()
+                        .await
+                        .remove(&request_id);
                 }
-                None => self
-                    .subscription
-                    .as_mut()
-                    .expect("subscription exists while buffering pushed updates")
-                    .buffered_updates
-                    .push_back(message),
+                self.drop_failed_subscription();
+                if retry == 0 {
+                    continue;
+                }
+                return Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed);
             }
+
+            return match response_rx.await {
+                Ok(result) => result,
+                Err(_closed) => {
+                    self.drop_failed_subscription();
+                    Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed)
+                }
+            };
         }
+
+        Err(GrpcProxyControlPlaneError::SubscribeRequestStreamClosed)
     }
 
     async fn unsubscribe_via_transport(
@@ -229,6 +259,10 @@ where
         &mut self,
     ) -> Result<Vec<RouteSubscriptionEvent>, GrpcProxyControlPlaneError> {
         let Some(session) = self.subscription.as_mut() else {
+            if self.pending_stream_closed_event {
+                self.pending_stream_closed_event = false;
+                return Ok(vec![RouteSubscriptionEvent::StreamClosed]);
+            }
             return Ok(Vec::new());
         };
 
@@ -259,6 +293,10 @@ where
                     drop_subscription = true;
                     break;
                 }
+                GrpcRouteSubscriptionEvent::UnexpectedRouteResponse { request_id } => {
+                    self.drop_failed_subscription();
+                    return Err(GrpcProxyControlPlaneError::UnexpectedRouteResponse { request_id });
+                }
             }
         }
 
@@ -270,6 +308,47 @@ where
         }
 
         Ok(events)
+    }
+
+    fn refresh_subscription_status(&mut self) -> Result<(), GrpcProxyControlPlaneError> {
+        let Some(session) = self.subscription.as_mut() else {
+            return Ok(());
+        };
+
+        let mut drop_subscription = false;
+        let mut error = None;
+        while let Ok(event) = session.responses.try_recv() {
+            match event {
+                GrpcRouteSubscriptionEvent::Message(message) => {
+                    session.buffered_updates.push_back(message);
+                }
+                GrpcRouteSubscriptionEvent::ResponseStreamClosed
+                | GrpcRouteSubscriptionEvent::Status(_) => {
+                    drop_subscription = true;
+                    break;
+                }
+                GrpcRouteSubscriptionEvent::Protocol(source) => {
+                    error = Some(GrpcProxyControlPlaneError::Protocol(source));
+                    drop_subscription = true;
+                    break;
+                }
+                GrpcRouteSubscriptionEvent::UnexpectedRouteResponse { request_id } => {
+                    error =
+                        Some(GrpcProxyControlPlaneError::UnexpectedRouteResponse { request_id });
+                    drop_subscription = true;
+                    break;
+                }
+            }
+        }
+
+        if drop_subscription {
+            self.drop_failed_subscription();
+        }
+
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn next_subscription_message(
@@ -297,6 +376,10 @@ where
                 self.drop_failed_subscription();
                 Err(GrpcProxyControlPlaneError::Protocol(error))
             }
+            Some(GrpcRouteSubscriptionEvent::UnexpectedRouteResponse { request_id }) => {
+                self.drop_failed_subscription();
+                Err(GrpcProxyControlPlaneError::UnexpectedRouteResponse { request_id })
+            }
         }
     }
 
@@ -319,13 +402,20 @@ where
                 })?
                 .into_inner();
             let (response_tx, response_rx) = mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
-            tokio::spawn(read_subscription_responses(responses, response_tx));
+            let pending_route_responses = Arc::new(Mutex::new(HashMap::new()));
+            tokio::spawn(read_subscription_responses(
+                responses,
+                response_tx,
+                pending_route_responses.clone(),
+            ));
 
             self.backoff_before_next_subscription = false;
+            self.pending_stream_closed_event = false;
             self.subscription = Some(GrpcRouteSubscriptionSession {
                 requests,
                 responses: response_rx,
                 buffered_updates: VecDeque::new(),
+                pending_route_responses,
             });
         }
 
@@ -505,32 +595,86 @@ fn response_request_id(message: &SubscribeControlPlaneOutput) -> Option<&RouteRe
 async fn read_subscription_responses(
     mut responses: tonic::codec::Streaming<pb::ProxySubscribeResponse>,
     events: mpsc::Sender<GrpcRouteSubscriptionEvent>,
+    pending_route_responses: PendingRouteResponses,
 ) {
     loop {
         match responses.message().await {
             Ok(Some(response)) => {
-                let event = match proxy_subscribe_response_from_proto(response) {
-                    Ok(message) => GrpcRouteSubscriptionEvent::Message(message),
-                    Err(error) => GrpcRouteSubscriptionEvent::Protocol(error),
+                let message = match proxy_subscribe_response_from_proto(response) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        fail_pending_route_responses(
+                            &pending_route_responses,
+                            GrpcProxyControlPlaneError::Protocol(error.clone()),
+                        )
+                        .await;
+                        let _ = events
+                            .send(GrpcRouteSubscriptionEvent::Protocol(error))
+                            .await;
+                        return;
+                    }
                 };
-                let terminal = matches!(event, GrpcRouteSubscriptionEvent::Protocol(_));
-                if events.send(event).await.is_err() || terminal {
+
+                if let Some(request_id) = response_request_id(&message).cloned() {
+                    let response = pending_route_responses.lock().await.remove(&request_id);
+                    if let Some(response) = response {
+                        let _ = response.send(Ok(message));
+                    } else {
+                        fail_pending_route_responses(
+                            &pending_route_responses,
+                            GrpcProxyControlPlaneError::UnexpectedRouteResponse {
+                                request_id: request_id.clone(),
+                            },
+                        )
+                        .await;
+                        let _ = events
+                            .send(GrpcRouteSubscriptionEvent::UnexpectedRouteResponse {
+                                request_id,
+                            })
+                            .await;
+                        return;
+                    }
+                } else if events
+                    .send(GrpcRouteSubscriptionEvent::Message(message))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
             Ok(None) => {
+                fail_pending_route_responses(
+                    &pending_route_responses,
+                    GrpcProxyControlPlaneError::SubscribeResponseStreamClosed,
+                )
+                .await;
                 let _ = events
                     .send(GrpcRouteSubscriptionEvent::ResponseStreamClosed)
                     .await;
                 return;
             }
             Err(status) => {
+                fail_pending_route_responses(
+                    &pending_route_responses,
+                    GrpcProxyControlPlaneError::Status(status.clone()),
+                )
+                .await;
                 let _ = events
                     .send(GrpcRouteSubscriptionEvent::Status(status))
                     .await;
                 return;
             }
         }
+    }
+}
+
+async fn fail_pending_route_responses(
+    pending_route_responses: &PendingRouteResponses,
+    error: GrpcProxyControlPlaneError,
+) {
+    let pending = std::mem::take(&mut *pending_route_responses.lock().await);
+    for response in pending.into_values() {
+        let _ = response.send(Err(error.clone()));
     }
 }
 

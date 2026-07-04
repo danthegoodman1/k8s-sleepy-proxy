@@ -352,14 +352,14 @@ async fn absent_route_subscribes_installs_miss_and_reuses_negative_cache() {
     };
     assert_eq!(entry.request_identity, request);
     resolver
-        .resolve(entry.request_identity, now)
+        .resolve(entry.request_identity.clone(), now)
         .await
         .expect("later lookup uses negative cache");
     assert_eq!(resolver.client().calls.len(), 1);
 }
 
 #[tokio::test]
-async fn expired_positive_unsubscribes_before_subscribe() {
+async fn expired_positive_unsubscribes_best_effort_after_refresh() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
@@ -387,13 +387,13 @@ async fn expired_positive_unsubscribes_before_subscribe() {
     assert_eq!(
         resolver.client().calls,
         vec![
-            ClientCall::Unsubscribe {
-                subscription_id: subscription_id("sub-old")
-            },
             ClientCall::Subscribe {
                 request_id: generated_request_id(1),
                 identity: request
-            }
+            },
+            ClientCall::Unsubscribe {
+                subscription_id: subscription_id("sub-old")
+            },
         ]
     );
 }
@@ -539,7 +539,7 @@ async fn subscribe_client_error_is_surfaced() {
 }
 
 #[tokio::test]
-async fn unsubscribe_client_error_is_surfaced_before_subscribe() {
+async fn unsubscribe_client_error_does_not_fail_refresh() {
     let now = now();
     let mut state = SubscriptionState::new(4);
     state.cache_mut().insert_positive(
@@ -559,26 +559,26 @@ async fn unsubscribe_client_error_is_surfaced_before_subscribe() {
     ));
     let mut resolver = FrontlineRouteResolver::from_parts(state, client);
 
-    let error = resolver
+    let result = resolver
         .resolve(
             http_request("app.example.com", "/"),
             now + Duration::from_secs(1),
         )
         .await
-        .expect_err("unsubscribe error");
+        .expect("unsubscribe failure is best effort");
 
-    assert_eq!(
-        error,
-        FrontlineRouteResolverError::Unsubscribe {
-            subscription_id: subscription_id("sub-old"),
-            source: TestClientError::UnsubscribeFailed
-        }
-    );
+    assert!(matches!(result, FrontlineRouteResolution::Resolved(_)));
     assert_eq!(
         resolver.client().calls,
-        vec![ClientCall::Unsubscribe {
-            subscription_id: subscription_id("sub-old")
-        }]
+        vec![
+            ClientCall::Subscribe {
+                request_id: generated_request_id(1),
+                identity: http_request("app.example.com", "/")
+            },
+            ClientCall::Unsubscribe {
+                subscription_id: subscription_id("sub-old")
+            },
+        ]
     );
 }
 

@@ -4,13 +4,26 @@ use std::{
 };
 
 use control_plane::{
-    CachePolicy, Generation, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
-    RouteHost, RouteIdentity,
+    BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
+    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
 };
 use criterion::{criterion_group, criterion_main, Criterion};
-use frontline::{RouteCache, SubscriptionId};
+use frontline::{
+    FrontlineRouteCoordinator, FrontlineRouteResolver, RouteCache, RouteSubscriptionClient,
+    RouteSubscriptionFuture, SubscriptionId, WakeClient, WakeClientFuture, WakeInstanceRequest,
+    WakeInstanceResponse, WakeTracker,
+};
 
 const UNRELATED_ROUTES: usize = 4096;
+
+#[derive(Clone, Debug)]
+struct BenchRouteClient;
+
+#[derive(Clone, Debug)]
+struct BenchWakeClient;
+
+#[derive(Clone, Debug)]
+struct BenchControlPlaneError;
 
 fn http_route_lookup(c: &mut Criterion) {
     let now = Instant::now();
@@ -52,6 +65,62 @@ fn sni_route_lookup(c: &mut Criterion) {
             black_box(cache.lookup(black_box(&request), black_box(now)));
         })
     });
+}
+
+fn full_resolve_lookup(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime builds");
+    let now = Instant::now();
+    let request = http_request("target.example.test", "/api/v1/users");
+    let shared = runtime.block_on(async move {
+        let resolver = FrontlineRouteResolver::from_parts(
+            frontline::SubscriptionState::from_cache(exact_http_cache(now)),
+            BenchRouteClient,
+        );
+        FrontlineRouteCoordinator::new(resolver, WakeTracker::new(), BenchWakeClient).into_shared()
+    });
+
+    c.bench_function("route_lookup/full_resolve_http_exact_host_hot", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                black_box(
+                    shared
+                        .route(black_box(request.clone()), black_box(now))
+                        .await
+                        .expect("hot route resolves"),
+                );
+            });
+        })
+    });
+}
+
+impl RouteSubscriptionClient for BenchRouteClient {
+    type Error = BenchControlPlaneError;
+
+    fn subscribe_route(
+        &mut self,
+        _request_id: frontline::RouteRequestId,
+        _identity: RouteIdentity,
+    ) -> RouteSubscriptionFuture<'_, frontline::SubscribeControlPlaneOutput, Self::Error> {
+        Box::pin(async { panic!("hot benchmark must not subscribe") })
+    }
+
+    fn unsubscribe(
+        &mut self,
+        _subscription_id: SubscriptionId,
+    ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl WakeClient for BenchWakeClient {
+    type Error = BenchControlPlaneError;
+
+    fn wake_instance(
+        &mut self,
+        _request: WakeInstanceRequest,
+    ) -> WakeClientFuture<'_, WakeInstanceResponse, Self::Error> {
+        Box::pin(async { panic!("hot benchmark must not wake") })
+    }
 }
 
 fn exact_http_cache(now: Instant) -> RouteCache {
@@ -236,8 +305,11 @@ fn route_entry(route_binding_id: &str, generation: u64) -> RouteEntry {
         instance_id: InstanceId::new(format!("instance-{route_binding_id}")).expect("instance ID"),
         instance_state: InstanceState::Running,
         instance_generation: Generation::new(generation),
-        backend: None,
-        backend_generation: None,
+        backend: Some(
+            BackendEndpoint::new(format!("http://127.0.0.1:{}", 10_000 + generation))
+                .expect("benchmark backend"),
+        ),
+        backend_generation: Some(BackendGeneration::new(generation)),
     }
 }
 
@@ -249,5 +321,10 @@ fn generation(index: usize) -> u64 {
     u64::try_from(index + 1).expect("benchmark generation fits u64")
 }
 
-criterion_group!(benches, http_route_lookup, sni_route_lookup);
+criterion_group!(
+    benches,
+    http_route_lookup,
+    sni_route_lookup,
+    full_resolve_lookup
+);
 criterion_main!(benches);

@@ -72,7 +72,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         WakeTracker::new(),
         wake_client,
         observability.clone(),
-    );
+    )
+    .with_wake_deadline(env.wake_instance_timeout());
     let drain = DrainTracker::with_observability(env.drain_grace_timeout(), observability.clone());
     let active_streams = RuntimeActiveStreamsCollector::default();
     active_streams.attach(drain.clone());

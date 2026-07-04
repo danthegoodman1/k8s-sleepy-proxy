@@ -8,8 +8,9 @@ use http::{
 use http_body::Body;
 use hyper::body::Incoming;
 use proxy_core::{
-    apply_forwarded_header_policy, forwarded_headers, DrainTracker, HttpProxy, HttpProxyError,
-    TrackedBody, WebSocketProxy, WebSocketProxyError, WebSocketProxyStats,
+    apply_forwarded_header_policy, forwarded_headers, AcceptedWebSocketUpstream, DrainTracker,
+    HttpProxy, HttpProxyError, TrackedBody, WebSocketProxy, WebSocketProxyError,
+    WebSocketProxyStats,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -136,6 +137,33 @@ impl FrontlineForwarder {
         let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
         self.websocket
             .proxy_accepted_upgrade_with_upstream_headers(client, &upstream_url, upstream_headers)
+            .await
+            .map_err(FrontlineForwardError::WebSocket)
+    }
+
+    pub async fn connect_accepted_websocket_upstream_with_headers(
+        &self,
+        ready: &ReadyBackend,
+        upstream_path_and_query: &str,
+        upstream_headers: &HeaderMap,
+    ) -> Result<AcceptedWebSocketUpstream, FrontlineForwardError> {
+        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
+        self.websocket
+            .connect_accepted_upstream_with_headers(&upstream_url, upstream_headers)
+            .await
+            .map_err(FrontlineForwardError::WebSocket)
+    }
+
+    pub async fn forward_connected_accepted_websocket<Client>(
+        &self,
+        client: Client,
+        upstream: AcceptedWebSocketUpstream,
+    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
+    where
+        Client: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.websocket
+            .proxy_accepted_upgrade_with_upstream(client, upstream)
             .await
             .map_err(FrontlineForwardError::WebSocket)
     }

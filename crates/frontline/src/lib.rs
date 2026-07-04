@@ -61,8 +61,8 @@ pub use resolver::{
     RouteSubscriptionFuture, UnexpectedSubscribeResponseKind,
 };
 pub use route::{
-    FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome, WakeClient,
-    WakeClientFuture,
+    FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
+    SharedFrontlineRouteCoordinator, WakeClient, WakeClientFuture,
 };
 pub use runtime::{FrontlineHttpRuntime, FrontlineRuntimeBody};
 pub use subscription::{

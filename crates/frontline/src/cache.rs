@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
+    sync::Arc,
     time::Instant,
 };
 
@@ -37,8 +38,8 @@ pub enum CacheLookup {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CacheLookupHit {
-    Positive(PositiveCacheEntry),
-    Negative(NegativeCacheEntry),
+    Positive(Arc<PositiveCacheEntry>),
+    Negative(Arc<NegativeCacheEntry>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,10 +70,12 @@ pub(crate) enum StaleRouteEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteCache {
     capacity: usize,
-    positives: Vec<PositiveCacheEntry>,
+    negative_capacity: usize,
+    positives: Vec<Arc<PositiveCacheEntry>>,
     positive_index: PositiveRouteIndex,
-    negatives: Vec<NegativeCacheEntry>,
-    order: VecDeque<CacheKey>,
+    negatives: HashMap<RouteIdentity, Arc<NegativeCacheEntry>>,
+    positive_lru: VecDeque<SubscriptionId>,
+    negative_order: VecDeque<RouteIdentity>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -98,12 +101,6 @@ struct HttpPathIndex {
 struct SniRouteIndex {
     exact_hosts: HashMap<String, Vec<usize>>,
     wildcard_suffixes: HashMap<String, Vec<usize>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CacheKey {
-    Positive(SubscriptionId),
-    Negative(RouteIdentity),
 }
 
 impl PositiveCacheEntry {
@@ -163,10 +160,12 @@ impl RouteCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            negative_capacity: capacity,
             positives: Vec::new(),
             positive_index: PositiveRouteIndex::default(),
-            negatives: Vec::new(),
-            order: VecDeque::new(),
+            negatives: HashMap::new(),
+            positive_lru: VecDeque::new(),
+            negative_order: VecDeque::new(),
         }
     }
 
@@ -192,11 +191,7 @@ impl RouteCache {
             matched_expired_positive = true;
         }
 
-        if let Some(entry) = self
-            .negatives
-            .iter()
-            .find(|entry| &entry.request_identity == request_identity)
-        {
+        if let Some(entry) = self.negatives.get(request_identity) {
             return if entry.is_expired(now) {
                 CacheLookup::Expired
             } else {
@@ -234,24 +229,24 @@ impl RouteCache {
                 if replaced.subscription_id != subscription_id {
                     result
                         .subscriptions_to_unsubscribe
-                        .push(replaced.subscription_id);
+                        .push(replaced.subscription_id.clone());
                 }
             }
         }
 
         self.remove_positive(&subscription_id);
-        let positive = PositiveCacheEntry::new(
+        let positive = Arc::new(PositiveCacheEntry::new(
             subscription_id.clone(),
             matched_identity,
             entry,
             cache_policy,
             now,
-        );
+        ));
         let index = self.positives.len();
         self.positive_index.insert(index, &positive);
         self.positives.push(positive);
-        self.order.push_back(CacheKey::Positive(subscription_id));
-        result.extend(self.evict_over_capacity());
+        self.touch_positive(&subscription_id);
+        result.extend(self.evict_positives_over_capacity());
         result
     }
 
@@ -261,15 +256,18 @@ impl RouteCache {
         cache_policy: CachePolicy,
         now: Instant,
     ) -> CacheInsertResult {
-        let mut result = self.expire(now);
+        let result = self.expire(now);
         self.remove_negative(&request_identity);
-        self.negatives.push(NegativeCacheEntry::new(
+        self.negatives.insert(
             request_identity.clone(),
-            cache_policy,
-            now,
-        ));
-        self.order.push_back(CacheKey::Negative(request_identity));
-        result.extend(self.evict_over_capacity());
+            Arc::new(NegativeCacheEntry::new(
+                request_identity.clone(),
+                cache_policy,
+                now,
+            )),
+        );
+        self.touch_negative(&request_identity);
+        self.evict_negatives_over_capacity();
         result
     }
 
@@ -291,8 +289,8 @@ impl RouteCache {
         let expired_negatives = self
             .negatives
             .iter()
-            .filter(|entry| entry.is_expired(now))
-            .map(|entry| entry.request_identity.clone())
+            .filter(|(_, entry)| entry.is_expired(now))
+            .map(|(identity, _)| identity.clone())
             .collect::<Vec<_>>();
         for request_identity in expired_negatives {
             self.remove_negative(&request_identity);
@@ -333,22 +331,26 @@ impl RouteCache {
                 if let Some(removed) = self.remove_positive(&conflicting.subscription_id) {
                     result
                         .subscriptions_to_unsubscribe
-                        .push(removed.subscription_id);
+                        .push(removed.subscription_id.clone());
                 }
             }
         }
 
-        if let Some(existing) = self
+        if let Some(index) = self
             .positive_index
             .by_subscription
             .get(subscription_id)
             .copied()
-            .and_then(|index| self.positives.get_mut(index))
         {
+            let previous = self.positives[index].clone();
+            self.positive_index.remove(index, &previous);
+            let existing = Arc::make_mut(&mut self.positives[index]);
             existing.matched_identity = matched_identity;
             existing.entry = entry;
             existing.expires_at = now + cache_policy.ttl();
-            self.rebuild_positive_index();
+            let updated = self.positives[index].clone();
+            self.positive_index.insert(index, &updated);
+            self.touch_positive(subscription_id);
         }
 
         result
@@ -357,7 +359,7 @@ impl RouteCache {
     pub fn positive_by_subscription(
         &self,
         subscription_id: &SubscriptionId,
-    ) -> Option<&PositiveCacheEntry> {
+    ) -> Option<&Arc<PositiveCacheEntry>> {
         self.positive_index
             .by_subscription
             .get(subscription_id)
@@ -367,26 +369,26 @@ impl RouteCache {
     pub fn positive_by_matched_identity(
         &self,
         matched_identity: &RouteIdentity,
-    ) -> Option<&PositiveCacheEntry> {
+    ) -> Option<&Arc<PositiveCacheEntry>> {
         self.positive_index
             .by_matched_identity
             .get(matched_identity)
             .and_then(|index| self.positives.get(*index))
     }
 
-    pub fn positives(&self) -> &[PositiveCacheEntry] {
+    pub fn positives(&self) -> &[Arc<PositiveCacheEntry>] {
         &self.positives
     }
 
-    pub fn negatives(&self) -> &[NegativeCacheEntry] {
-        &self.negatives
+    pub fn negatives(&self) -> Vec<Arc<NegativeCacheEntry>> {
+        self.negatives.values().cloned().collect()
     }
 
     fn best_positive_match(
         &self,
         request_identity: &RouteIdentity,
         now: Instant,
-    ) -> Option<&PositiveCacheEntry> {
+    ) -> Option<&Arc<PositiveCacheEntry>> {
         let mut best = None;
 
         match request_identity {
@@ -414,54 +416,73 @@ impl RouteCache {
         best.map(|(_, _, index)| &self.positives[index])
     }
 
-    fn remove_positive(&mut self, subscription_id: &SubscriptionId) -> Option<PositiveCacheEntry> {
+    fn remove_positive(
+        &mut self,
+        subscription_id: &SubscriptionId,
+    ) -> Option<Arc<PositiveCacheEntry>> {
         let index = self
             .positive_index
             .by_subscription
             .get(subscription_id)
             .copied()?;
-        self.order.retain(
-            |key| !matches!(key, CacheKey::Positive(existing) if existing == subscription_id),
-        );
-        let removed = self.positives.remove(index);
-        self.rebuild_positive_index();
+        self.positive_lru
+            .retain(|existing| existing != subscription_id);
+        let removed = self.positives.swap_remove(index);
+        self.positive_index.remove(index, &removed);
+        if index < self.positives.len() {
+            let moved = self.positives[index].clone();
+            self.positive_index.remove(self.positives.len(), &moved);
+            self.positive_index.insert(index, &moved);
+        }
         Some(removed)
     }
 
-    fn remove_negative(&mut self, request_identity: &RouteIdentity) -> Option<NegativeCacheEntry> {
-        let index = self
-            .negatives
-            .iter()
-            .position(|entry| &entry.request_identity == request_identity)?;
-        self.order.retain(
-            |key| !matches!(key, CacheKey::Negative(existing) if existing == request_identity),
-        );
-        Some(self.negatives.remove(index))
+    fn remove_negative(
+        &mut self,
+        request_identity: &RouteIdentity,
+    ) -> Option<Arc<NegativeCacheEntry>> {
+        self.negative_order
+            .retain(|existing| existing != request_identity);
+        self.negatives.remove(request_identity)
     }
 
-    fn evict_over_capacity(&mut self) -> CacheInsertResult {
+    fn evict_positives_over_capacity(&mut self) -> CacheInsertResult {
         let mut subscriptions_to_unsubscribe = Vec::new();
 
-        while self.len() > self.capacity {
-            let Some(key) = self.order.pop_front() else {
+        while self.positives.len() > self.capacity {
+            let Some(subscription_id) = self.positive_lru.pop_front() else {
                 break;
             };
 
-            match key {
-                CacheKey::Positive(subscription_id) => {
-                    if self.remove_positive(&subscription_id).is_some() {
-                        subscriptions_to_unsubscribe.push(subscription_id);
-                    }
-                }
-                CacheKey::Negative(identity) => {
-                    self.remove_negative(&identity);
-                }
+            if self.remove_positive(&subscription_id).is_some() {
+                subscriptions_to_unsubscribe.push(subscription_id);
             }
         }
 
         CacheInsertResult {
             subscriptions_to_unsubscribe,
         }
+    }
+
+    fn evict_negatives_over_capacity(&mut self) {
+        while self.negatives.len() > self.negative_capacity {
+            let Some(identity) = self.negative_order.pop_front() else {
+                break;
+            };
+            self.negatives.remove(&identity);
+        }
+    }
+
+    fn touch_positive(&mut self, subscription_id: &SubscriptionId) {
+        self.positive_lru
+            .retain(|existing| existing != subscription_id);
+        self.positive_lru.push_back(subscription_id.clone());
+    }
+
+    fn touch_negative(&mut self, request_identity: &RouteIdentity) {
+        self.negative_order
+            .retain(|existing| existing != request_identity);
+        self.negative_order.push_back(request_identity.clone());
     }
 
     fn consider_http_index(
@@ -548,10 +569,6 @@ impl RouteCache {
             }
         }
     }
-
-    fn rebuild_positive_index(&mut self) {
-        self.positive_index = PositiveRouteIndex::from_entries(&self.positives);
-    }
 }
 
 impl CacheInsertResult {
@@ -562,14 +579,6 @@ impl CacheInsertResult {
 }
 
 impl PositiveRouteIndex {
-    fn from_entries(entries: &[PositiveCacheEntry]) -> Self {
-        let mut index = Self::default();
-        for (position, entry) in entries.iter().enumerate() {
-            index.insert(position, entry);
-        }
-        index
-    }
-
     fn insert(&mut self, index: usize, entry: &PositiveCacheEntry) {
         self.by_subscription
             .insert(entry.subscription_id.clone(), index);
@@ -579,6 +588,16 @@ impl PositiveRouteIndex {
         match &entry.matched_identity {
             RouteIdentity::Http { host, path } => self.http.insert(host, path, index),
             RouteIdentity::Sni { host } => self.sni.insert(host, index),
+        }
+    }
+
+    fn remove(&mut self, index: usize, entry: &PositiveCacheEntry) {
+        self.by_subscription.remove(&entry.subscription_id);
+        self.by_matched_identity.remove(&entry.matched_identity);
+
+        match &entry.matched_identity {
+            RouteIdentity::Http { host, path } => self.http.remove(host, path, index),
+            RouteIdentity::Sni { host } => self.sni.remove(host, index),
         }
     }
 }
@@ -594,11 +613,37 @@ impl HttpRouteIndex {
             index,
         );
     }
+
+    fn remove(&mut self, host: &RouteHost, path: &Option<PathPrefix>, index: usize) {
+        let hosts = match host.kind() {
+            RouteHostKind::Exact => &mut self.exact_hosts,
+            RouteHostKind::WildcardSuffix => &mut self.wildcard_suffixes,
+        };
+        let key = host.as_str();
+        if let Some(paths) = hosts.get_mut(key) {
+            paths.remove(
+                path.as_ref().map(|path| path.as_str()).unwrap_or("/"),
+                index,
+            );
+            if paths.paths.is_empty() {
+                hosts.remove(key);
+            }
+        }
+    }
 }
 
 impl HttpPathIndex {
     fn insert(&mut self, path: &str, index: usize) {
         self.paths.entry(path.to_owned()).or_default().push(index);
+    }
+
+    fn remove(&mut self, path: &str, index: usize) {
+        if let Some(candidates) = self.paths.get_mut(path) {
+            candidates.retain(|candidate| *candidate != index);
+            if candidates.is_empty() {
+                self.paths.remove(path);
+            }
+        }
     }
 }
 
@@ -612,6 +657,20 @@ impl SniRouteIndex {
             .entry(host.as_str().to_owned())
             .or_default()
             .push(index);
+    }
+
+    fn remove(&mut self, host: &RouteHost, index: usize) {
+        let hosts = match host.kind() {
+            RouteHostKind::Exact => &mut self.exact_hosts,
+            RouteHostKind::WildcardSuffix => &mut self.wildcard_suffixes,
+        };
+        let key = host.as_str();
+        if let Some(candidates) = hosts.get_mut(key) {
+            candidates.retain(|candidate| *candidate != index);
+            if candidates.is_empty() {
+                hosts.remove(key);
+            }
+        }
     }
 }
 

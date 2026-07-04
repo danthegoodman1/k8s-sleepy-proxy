@@ -31,6 +31,6 @@ pub use tls::{
     TlsClientHelloSni, MAX_TLS_CLIENT_HELLO_PREFIX_LEN,
 };
 pub use websocket::{
-    proxy_websocket_streams, websocket_upgrade_response, WebSocketProxy, WebSocketProxyError,
-    WebSocketProxyStats,
+    proxy_websocket_streams, websocket_upgrade_response, AcceptedWebSocketUpstream, WebSocketProxy,
+    WebSocketProxyError, WebSocketProxyStats,
 };
