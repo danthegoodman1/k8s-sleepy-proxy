@@ -207,7 +207,11 @@ where
             }
         }
 
-        for apply_order in [ApplyOrder::Service, ApplyOrder::Workload] {
+        for apply_order in [
+            ApplyOrder::Secret,
+            ApplyOrder::Service,
+            ApplyOrder::Workload,
+        ] {
             for object in objects
                 .iter()
                 .filter(|object| object.apply_order == apply_order)

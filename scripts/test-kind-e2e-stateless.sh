@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${repo_root}/scripts/lib/kind-image.sh"
 cluster_name="${SLEEPYPODS_KIND_CLUSTER:-sleepypods-e2e-stateless-test}"
 namespace="${SLEEPYPODS_KIND_E2E_NAMESPACE:-sleepypods-e2e-stateless}"
 keep_cluster="${SLEEPYPODS_KIND_KEEP_CLUSTER:-0}"
@@ -12,6 +13,7 @@ app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/stateless-app:${imag
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19051}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19080}"
+frontline_metrics_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_METRICS_PORT:-19081}"
 operator_token="${SLEEPYPODS_KIND_E2E_OPERATOR_TOKEN:-operator-token}"
 proxy_token="${SLEEPYPODS_KIND_E2E_PROXY_TOKEN:-proxy-token}"
 sidecar_token="${SLEEPYPODS_KIND_E2E_SIDECAR_TOKEN:-sidecar-token}"
@@ -20,6 +22,7 @@ kubeconfig="$(mktemp)"
 created_cluster=0
 control_plane_pf=""
 frontline_pf=""
+frontline_metrics_pf=""
 
 require_command() {
   local name="$1"
@@ -36,6 +39,10 @@ cleanup() {
   if [[ -n "${control_plane_pf}" ]]; then
     kill "${control_plane_pf}" >/dev/null 2>&1 || true
     wait "${control_plane_pf}" 2>/dev/null || true
+  fi
+  if [[ -n "${frontline_metrics_pf}" ]]; then
+    kill "${frontline_metrics_pf}" >/dev/null 2>&1 || true
+    wait "${frontline_metrics_pf}" 2>/dev/null || true
   fi
   if [[ -n "${frontline_pf}" ]]; then
     kill "${frontline_pf}" >/dev/null 2>&1 || true
@@ -91,7 +98,7 @@ for image in \
   "${app_image}" \
   "${postgres_image}"; do
   echo "==> Loading ${image} into kind/${cluster_name}"
-  kind load docker-image "${image}" --name "${cluster_name}"
+  kind_load_image "${cluster_name}" "${image}"
 done
 
 echo "==> Recreating namespace ${namespace}"
@@ -185,7 +192,7 @@ metadata:
     sleepypods.io/kind-e2e: stateless
 rules:
   - apiGroups: [""]
-    resources: ["services"]
+    resources: ["services", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -307,6 +314,8 @@ spec:
           env:
             - name: SLEEPYPODS_FRONTLINE_LISTEN_ADDR
               value: 0.0.0.0:8080
+            - name: SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR
+              value: 0.0.0.0:19091
             - name: SLEEPYPODS_CONTROL_PLANE_ENDPOINT
               value: http://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
             - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
@@ -340,6 +349,9 @@ control_plane_pf=$!
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
   svc/sleepypods-frontline "${frontline_port}:8080" >/tmp/sleepypods-frontline-port-forward.log 2>&1 &
 frontline_pf=$!
+KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
+  deployment/sleepypods-frontline "${frontline_metrics_port}:19091" >/tmp/sleepypods-frontline-metrics-port-forward.log 2>&1 &
+frontline_metrics_pf=$!
 
 echo "==> Running stateless kind E2E driver"
 KUBECONFIG="${kubeconfig}" \
@@ -347,6 +359,7 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
   SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
+  SLEEPYPODS_E2E_FRONTLINE_METRICS_ADDR="127.0.0.1:${frontline_metrics_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
   SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \

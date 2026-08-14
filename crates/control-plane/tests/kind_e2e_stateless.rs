@@ -19,19 +19,16 @@ use control_plane::{
         WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
         WorkloadValueSchema,
     },
-    BearerToken, OptionalBearerTokenInterceptor,
+    render_instance_scoped_name, BearerToken, InstanceId, OptionalBearerTokenInterceptor,
 };
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
-        core::v1::{Pod, Service},
+        core::v1::{Secret, Service},
     },
     apimachinery::pkg::util::intstr::IntOrString,
 };
-use kube::{
-    api::{ListParams, LogParams},
-    Api, Client, Error as KubeError,
-};
+use kube::{Api, Client, Error as KubeError};
 use tokio::time::{sleep, Instant};
 use tonic::{
     service::interceptor::InterceptedService,
@@ -46,10 +43,16 @@ const INSTANCE_ID: &str = "e2e-stateless";
 const ROUTE_ID: &str = "e2e-stateless-route";
 const ROUTE_HOST: &str = "e2e.sleepypods.test";
 const WORKLOAD_NAME: &str = "e2e-app";
-const RENDERED_WORKLOAD_NAME: &str = "e2e-app-e2e-stat";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-app-0efa3edd";
+const SIDECAR_TOKEN_SECRET_BASE: &str = "sleepypods-sidecar-token";
+const RENDERED_SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd";
+const SIDECAR_TOKEN_SECRET_KEY: &str = "token";
 const APP_RESPONSE: &str = "sleepypods-stateless-app";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
+const HOT_REQUEST_COUNT: usize = 5;
+const HOT_METRIC_SETTLE: Duration = Duration::from_millis(300);
+const HOT_CACHE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[tokio::test]
 #[ignore = "requires scripts/test-kind-e2e-stateless.sh or an equivalent kind deployment"]
@@ -60,6 +63,21 @@ async fn stateless_http_lifecycle_through_deployed_platform() -> TestResult<()> 
     }
 
     control_plane::install_rustls_crypto_provider();
+
+    let instance_id = InstanceId::new(INSTANCE_ID)?;
+    for (constant, base) in [
+        (RENDERED_WORKLOAD_NAME, WORKLOAD_NAME),
+        (
+            RENDERED_SIDECAR_TOKEN_SECRET_NAME,
+            SIDECAR_TOKEN_SECRET_BASE,
+        ),
+    ] {
+        assert_eq!(
+            constant,
+            render_instance_scoped_name(base, &instance_id),
+            "rendered name constant no longer matches the control plane's instance-scoped naming"
+        );
+    }
 
     let config = E2eConfig::from_env()?;
     let kube = Client::try_default().await?;
@@ -94,8 +112,7 @@ async fn stateless_http_lifecycle_through_deployed_platform() -> TestResult<()> 
 
     let second = wait_for_frontline_response(&config, Duration::from_secs(30)).await?;
     assert_response(&second, "second request")?;
-    assert_frontline_hot_cache_metrics(kube.clone(), &config.namespace, Duration::from_secs(30))
-        .await?;
+    assert_frontline_serves_hot_requests_from_cache(&config).await?;
 
     let cold_after_idle = wait_for_instance_state(
         &mut operator,
@@ -137,6 +154,7 @@ struct E2eConfig {
     namespace: String,
     operator_endpoint: String,
     frontline_addr: SocketAddr,
+    frontline_metrics_addr: SocketAddr,
     app_image: String,
     sidecar_image: String,
     operator_token: String,
@@ -153,7 +171,6 @@ struct HttpResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FrontlineMetricCounts {
     subscribe_route_success: usize,
-    cache_hits: usize,
 }
 
 impl E2eConfig {
@@ -165,6 +182,9 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:19051".to_owned()),
             frontline_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19080".to_owned())
+                .parse()?,
+            frontline_metrics_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_METRICS_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:19081".to_owned())
                 .parse()?,
             app_image: env::var("SLEEPYPODS_E2E_APP_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/stateless-app:kind-e2e-stateless".to_owned()),
@@ -281,7 +301,10 @@ async fn create_operator_resources(
             template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
-                idle_timeout_ms: 2_000,
+                // Longer than a hot-request burst plus its metric scrapes, so the
+                // instance cannot sleep mid-measurement; the idle-sleep phase below
+                // still runs well inside its 90s budget.
+                idle_timeout_ms: 10_000,
                 idle_retry_backoff_ms: 500,
                 drain_grace_timeout_ms: 500,
                 idle_timeout_override: None,
@@ -444,7 +467,8 @@ async fn assert_materialized_deployment_and_service(
     config: &E2eConfig,
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), &config.namespace);
-    let services: Api<Service> = Api::namespaced(kube, &config.namespace);
+    let services: Api<Service> = Api::namespaced(kube.clone(), &config.namespace);
+    let secrets: Api<Secret> = Api::namespaced(kube, &config.namespace);
     let deployment = deployments.get(RENDERED_WORKLOAD_NAME).await?;
     let pod_spec = deployment
         .spec
@@ -484,11 +508,13 @@ async fn assert_materialized_deployment_and_service(
             config.namespace
         ),
     )?;
-    assert_env(
+    assert_env_from_secret(
         sidecar,
         "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN",
-        &config.sidecar_token,
+        RENDERED_SIDECAR_TOKEN_SECRET_NAME,
+        SIDECAR_TOKEN_SECRET_KEY,
     )?;
+    assert_sidecar_token_secret(secrets, config).await?;
 
     let service = services.get(RENDERED_WORKLOAD_NAME).await?;
     let target_port = service
@@ -504,6 +530,48 @@ async fn assert_materialized_deployment_and_service(
         );
     }
 
+    Ok(())
+}
+
+fn assert_env_from_secret(
+    container: &k8s_openapi::api::core::v1::Container,
+    name: &str,
+    secret_name: &str,
+    secret_key: &str,
+) -> TestResult<()> {
+    let source = container
+        .env
+        .as_ref()
+        .and_then(|vars| vars.iter().find(|var| var.name == name))
+        .and_then(|var| var.value_from.as_ref())
+        .and_then(|source| source.secret_key_ref.as_ref())
+        .ok_or_else(|| format!("env var {name} is not sourced from a Secret"))?;
+    if source.name != secret_name || source.key != secret_key {
+        return Err(format!(
+            "expected env {name} from Secret {secret_name}/{secret_key}, got {:?}/{:?}",
+            source.name, source.key
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn assert_sidecar_token_secret(secrets: Api<Secret>, config: &E2eConfig) -> TestResult<()> {
+    let secret = secrets.get(RENDERED_SIDECAR_TOKEN_SECRET_NAME).await?;
+    let value = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get(SIDECAR_TOKEN_SECRET_KEY))
+        .ok_or_else(|| {
+            format!("Secret {RENDERED_SIDECAR_TOKEN_SECRET_NAME} is missing key {SIDECAR_TOKEN_SECRET_KEY}")
+        })?;
+    let token = String::from_utf8(value.0.clone())?;
+    if token != config.sidecar_token {
+        return Err(format!(
+            "expected sidecar token Secret to carry the configured token, got {token:?}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -549,69 +617,91 @@ async fn wait_for_materialized_objects_deleted(
     }
 }
 
-async fn assert_frontline_hot_cache_metrics(
-    kube: Client,
-    namespace: &str,
-    timeout: Duration,
-) -> TestResult<()> {
-    let deadline = Instant::now() + timeout;
+// The frontline read path serves route-cache hits without per-request
+// instrumentation, so assert the hot-path invariant itself: a burst of requests
+// against an already-resolved route must not call the control plane again.
+//
+// This workload sleeps after a 10s idle timeout, and any burst that straddles a
+// sleep pays a cold wake and legitimately resubscribes. Retry bursts until one
+// completes without the SubscribeRoute counter moving, which is the hot-path
+// property under test.
+async fn assert_frontline_serves_hot_requests_from_cache(config: &E2eConfig) -> TestResult<()> {
+    let initial = frontline_metric_counts(config).await?;
+    if initial.subscribe_route_success < 1 {
+        return Err(format!(
+            "expected at least one successful SubscribeRoute before hot requests; saw {initial:?}"
+        )
+        .into());
+    }
+
+    let deadline = Instant::now() + HOT_CACHE_TIMEOUT;
     loop {
-        let counts = frontline_metric_counts(kube.clone(), namespace).await?;
-        if counts.subscribe_route_success >= 1 && counts.cache_hits >= 1 {
+        let before = frontline_metric_counts(config)
+            .await?
+            .subscribe_route_success;
+        send_hot_requests(config, HOT_REQUEST_COUNT, "hot cache request").await?;
+        sleep(HOT_METRIC_SETTLE).await;
+        let after = frontline_metric_counts(config)
+            .await?
+            .subscribe_route_success;
+
+        if after == before {
             return Ok(());
         }
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "expected at least one SubscribeRoute success and one route-cache hit in frontline logs; saw {counts:?}"
+                "expected a burst of {HOT_REQUEST_COUNT} hot requests to be served from the frontline \
+                 route cache; the last burst moved SubscribeRoute successes from {before} to {after}"
             )
             .into());
         }
-        sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn frontline_metric_counts(
-    kube: Client,
-    namespace: &str,
-) -> TestResult<FrontlineMetricCounts> {
-    let pods: Api<Pod> = Api::namespaced(kube, namespace);
-    let pod = pods
-        .list(&ListParams::default().labels("app.kubernetes.io/name=sleepypods-frontline"))
-        .await?
-        .items
-        .into_iter()
-        .next()
-        .ok_or("frontline pod was not found")?;
-    let pod_name = pod
-        .metadata
-        .name
-        .ok_or("frontline pod is missing metadata.name")?;
-    let logs = pods
-        .logs(
-            &pod_name,
-            &LogParams {
-                container: Some("frontline".to_owned()),
-                ..LogParams::default()
-            },
+async fn send_hot_requests(config: &E2eConfig, count: usize, context: &str) -> TestResult<()> {
+    for _ in 0..count {
+        let response = http_get(config.frontline_addr, ROUTE_HOST, "/").await?;
+        assert_response(&response, context)?;
+    }
+
+    Ok(())
+}
+
+// Frontline suppresses hot-path metrics on stderr, so read them from its
+// Prometheus listener rather than from pod logs.
+async fn frontline_metric_counts(config: &E2eConfig) -> TestResult<FrontlineMetricCounts> {
+    let response = http_get(config.frontline_metrics_addr, "127.0.0.1", "/metrics").await?;
+    if response.status != 200 {
+        return Err(format!(
+            "frontline metrics listener returned HTTP {}",
+            response.status
         )
-        .await?;
+        .into());
+    }
+
     Ok(FrontlineMetricCounts {
-        subscribe_route_success: logs
-            .lines()
-            .filter(|line| {
-                line.contains("metric.name=sleepypods_runtime_control_plane_calls_total")
-                    && line.contains("metric.labels=operation=subscribe_route,outcome=success")
-            })
-            .count(),
-        cache_hits: logs
-            .lines()
-            .filter(|line| {
-                line.contains("metric.name=sleepypods_runtime_route_cache_lookups_total")
-                    && line.contains("metric.labels=outcome=hit")
-            })
-            .count(),
+        subscribe_route_success: prometheus_counter(
+            &response.body,
+            "sleepypods_runtime_control_plane_calls_total",
+            &[("operation", "subscribe_route"), ("outcome", "success")],
+        ),
     })
+}
+
+fn prometheus_counter(body: &str, name: &str, labels: &[(&str, &str)]) -> usize {
+    body.lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| line.starts_with(name))
+        .filter(|line| {
+            labels
+                .iter()
+                .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+        })
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+        .map(|value| value as usize)
+        .sum()
 }
 
 fn is_not_found<T>(result: Result<T, KubeError>) -> bool {

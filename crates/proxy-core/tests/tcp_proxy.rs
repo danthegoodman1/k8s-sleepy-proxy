@@ -560,7 +560,7 @@ async fn tcp_proxy_stream_one_way_activity_keeps_session_alive() {
         idle_timeout,
     ));
 
-    for byte in [b'a', b'b', b'c'] {
+    for byte in *b"abc" {
         advance(idle_timeout - Duration::from_secs(1)).await;
         upstream
             .write_all(&[byte])

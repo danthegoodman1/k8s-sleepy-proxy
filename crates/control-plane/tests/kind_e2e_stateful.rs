@@ -21,6 +21,7 @@ use control_plane::api::pb::{
     WorkloadValueSchema,
 };
 use control_plane::projection::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
+use control_plane::{render_instance_scoped_name, InstanceId};
 use k8s_openapi::{
     api::{
         apps::v1::StatefulSet,
@@ -49,9 +50,9 @@ const ROUTE_ID: &str = "e2e-stateful-route";
 const ROUTE_HOST: &str = "stateful.sleepypods.test";
 const TENANT_VALUE: &str = "stateful";
 const WORKLOAD_NAME: &str = "e2e-stateful-app";
-const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-e2e-stat";
-const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-e2e-stat";
-const RENDERED_PV_NAME: &str = "e2e-stateful-pv-e2e-stat";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-1b49ed6c";
+const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-1b49ed6c";
+const RENDERED_PV_NAME: &str = "e2e-stateful-pv-1b49ed6c";
 const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
 const CLUSTER_ID: &str = "kind-e2e-stateful";
@@ -85,6 +86,19 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
     }
 
     control_plane::install_rustls_crypto_provider();
+
+    let instance_id = InstanceId::new(INSTANCE_ID)?;
+    for (constant, base) in [
+        (RENDERED_WORKLOAD_NAME, WORKLOAD_NAME),
+        (RENDERED_PVC_NAME, "e2e-stateful-pvc"),
+        (RENDERED_PV_NAME, "e2e-stateful-pv"),
+    ] {
+        assert_eq!(
+            constant,
+            render_instance_scoped_name(base, &instance_id),
+            "rendered name constant no longer matches the control plane's instance-scoped naming"
+        );
+    }
 
     let config = E2eConfig::from_env()?;
     let kube = Client::try_default().await?;

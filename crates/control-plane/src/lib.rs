@@ -49,6 +49,7 @@ pub use instance::{
 pub use kube_materializer::{
     InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,
 };
+pub use kubernetes_name::render_instance_scoped_name;
 pub use manifest::{
     render_manifests, ApplyOrder, Container, ContainerPort, ContainerPortTemplate,
     ContainerTemplate, CsiPersistentVolumeSource, Deployment, DeploymentSpec, EnvVar,

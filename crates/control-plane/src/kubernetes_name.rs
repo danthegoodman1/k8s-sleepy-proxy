@@ -5,7 +5,7 @@ pub(crate) const DNS_LABEL_MAX_LEN: usize = 63;
 const INSTANCE_ID_HASH_HEX_LEN: usize = 8;
 const INSTANCE_ID_SEPARATOR_LEN: usize = 1;
 
-pub(crate) fn render_instance_scoped_name(base: &str, instance_id: &InstanceId) -> String {
+pub fn render_instance_scoped_name(base: &str, instance_id: &InstanceId) -> String {
     let suffix = instance_id_suffix(instance_id);
     let base_budget = DNS_LABEL_MAX_LEN - INSTANCE_ID_SEPARATOR_LEN - suffix.len();
     let base = truncate_to_byte_len(base, base_budget);
