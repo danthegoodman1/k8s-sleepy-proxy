@@ -15,6 +15,7 @@ Start here:
 
 - [Production north star](docs/production-north-star.md)
 - [Development plan](docs/development-plan.md)
+- [Dynamic certificate delivery plan](docs/dynamic-certificates-plan.md)
 - [Codebase review and remediation plan](docs/review-remediation-plan.md)
 - [Operator guide](docs/operator-guide.md)
 - [Operator runbook](docs/operator-runbook.md)

@@ -13,6 +13,7 @@ use super::migrations;
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
     pub(crate) pool: Pool,
+    pub(crate) certificate_sealer: Option<std::sync::Arc<crate::certificate::CertificateSealer>>,
     pub(crate) idempotency_retention_millis: Option<i64>,
 }
 
@@ -49,12 +50,23 @@ impl PostgresStore {
             })?;
         let store = Self {
             pool,
+            certificate_sealer: None,
             idempotency_retention_millis: retention,
         };
 
         store.run_migrations().await?;
 
         Ok(store)
+    }
+
+    /// Supplies deployment-owned sealing keys without storing them in PostgreSQL.
+    /// Certificate material operations fail closed until this is configured.
+    pub fn with_certificate_sealer(
+        mut self,
+        sealer: std::sync::Arc<crate::certificate::CertificateSealer>,
+    ) -> Self {
+        self.certificate_sealer = Some(sealer);
+        self
     }
 
     /// Removes at most `limit` keys whose explicitly configured lifetime expired.

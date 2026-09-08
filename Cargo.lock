@@ -348,7 +348,10 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "prost",
+ "rcgen",
+ "ring",
  "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -363,6 +366,8 @@ dependencies = [
  "tonic-web",
  "tower",
  "tower-http 0.7.0",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -2390,6 +2395,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]

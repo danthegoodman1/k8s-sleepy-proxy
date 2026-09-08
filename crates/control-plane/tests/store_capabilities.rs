@@ -1,3 +1,4 @@
+use control_plane::certificate::*;
 #[macro_use]
 #[path = "support/unexpected_store.rs"]
 mod unexpected_store;
@@ -27,6 +28,59 @@ impl CapabilityProbe {
     }
 }
 impl ControlPlaneStore for CapabilityProbe {
+    fn publish_certificate(
+        &self,
+        request: PublishCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        self.fail("publish_certificate", format!("{request:?}"))
+    }
+    fn get_certificate_metadata(
+        &self,
+        id: CertificateId,
+    ) -> StoreFuture<'_, StoreResult<Option<CertificateMetadata>>> {
+        self.fail("get_certificate_metadata", format!("{id:?}"))
+    }
+    fn set_tls_binding(
+        &self,
+        request: SetTlsBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+        self.fail("set_tls_binding", format!("{request:?}"))
+    }
+    fn get_tls_binding(&self, hostname: TlsHostname) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+        self.fail("get_tls_binding", format!("{hostname:?}"))
+    }
+    fn remove_certificate(
+        &self,
+        request: RemoveCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        self.fail("remove_certificate", format!("{request:?}"))
+    }
+    fn resolve_tls_certificate(
+        &self,
+        request: ResolveTlsCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsCertificateResolution>> {
+        self.fail("resolve_tls_certificate", format!("{request:?}"))
+    }
+    fn reencrypt_certificate(
+        &self,
+        request: ReencryptCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        self.fail("reencrypt_certificate", format!("{request:?}"))
+    }
+    fn load_tls_certificate_changes(
+        &self,
+        cursor: CertificateRevision,
+        limit: u32,
+    ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>> {
+        self.fail(
+            "load_tls_certificate_changes",
+            format!("{cursor:?}, {limit:?}"),
+        )
+    }
+    fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
+        self.fail("load_tls_certificate_revision", "()".to_owned())
+    }
+
     fn load_route_changes(
         &self,
         cursor: u64,
@@ -356,6 +410,65 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             probe.check(stringify!($method), expected, $attempts);
         }};
     }
+    let cert_id = CertificateId::new("certificate-probe").unwrap();
+    let cert_rev = CertificateRevision::new(17).unwrap();
+    let tls_host = TlsHostname::new("tls.example").unwrap();
+    check!(
+        1,
+        publish_certificate,
+        PublishCertificateRequest {
+            id: cert_id.clone(),
+            expected_version: cert_rev,
+            bundle: CertificateBundle::new(vec![vec![1, 2]], vec![3, 4]).unwrap()
+        }
+    );
+    check!(2, get_certificate_metadata, cert_id.clone());
+    check!(
+        1,
+        set_tls_binding,
+        SetTlsBindingRequest {
+            hostname: tls_host.clone(),
+            expected_revision: cert_rev,
+            certificate_id: Some(cert_id.clone())
+        }
+    );
+    check!(2, get_tls_binding, tls_host.clone());
+    check!(
+        1,
+        remove_certificate,
+        RemoveCertificateRequest {
+            id: cert_id.clone(),
+            expected_version: cert_rev
+        }
+    );
+    check!(
+        2,
+        resolve_tls_certificate,
+        ResolveTlsCertificateRequest {
+            hostname: tls_host,
+            known_view_revision: Some(cert_rev)
+        }
+    );
+    check!(
+        1,
+        reencrypt_certificate,
+        ReencryptCertificateRequest {
+            id: cert_id,
+            expected_version: cert_rev,
+            expected_sealing_revision: CertificateRevision::new(31).unwrap()
+        }
+    );
+    assert!(store
+        .load_tls_certificate_changes(cert_rev, 19)
+        .await
+        .is_err());
+    probe.check(
+        "load_tls_certificate_changes",
+        format!("{cert_rev:?}, 19"),
+        2,
+    );
+    assert!(store.load_tls_certificate_revision().await.is_err());
+    probe.check("load_tls_certificate_revision", "()".into(), 2);
     assert!(store.load_route_changes(73, 19).await.is_err());
     probe.check("load_route_changes", "73, 19".into(), 2);
     assert!(store.load_route_change_revision().await.is_err());

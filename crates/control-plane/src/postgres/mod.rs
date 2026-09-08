@@ -1,5 +1,6 @@
 //! Postgres-backed implementation of the control-plane store contract.
 
+mod certificate_ops;
 mod connection;
 mod error;
 mod http01_ops;

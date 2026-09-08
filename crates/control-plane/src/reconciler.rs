@@ -355,22 +355,13 @@ where
             return Err(MaterializationReconcileError::Cancelled);
         }
         self.renew_or_lose(claimed).await?;
+        let status_requested_at = tokio::time::Instant::now();
         let status = self
             .store
             .load_materialization_work_status(claimed.id.clone())
             .await
             .map_err(MaterializationReconcileError::Store)?;
-        let remaining = status
-            .filter(|status| status.operation_deadline_unix_millis > 0)
-            .map(|status| {
-                Duration::from_millis(
-                    status
-                        .operation_deadline_unix_millis
-                        .saturating_sub(unix_millis_now())
-                        .max(0) as u64,
-                )
-            })
-            .unwrap_or(Duration::from_secs(600));
+        let remaining = operation_budget(status, status_requested_at.elapsed())?;
         if remaining.is_zero() {
             return Err(MaterializationReconcileError::Deadline);
         }
@@ -920,13 +911,26 @@ fn stable_owner_hash(owner: &str) -> u64 {
     hash
 }
 
-fn unix_millis_now() -> i64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
+fn operation_budget(
+    status: Option<crate::runtime_work::MaterializationWorkStatus>,
+    request_elapsed: Duration,
+) -> Result<Duration, MaterializationReconcileError> {
+    let remaining = match status {
+        Some(status) if status.operation_deadline_unix_millis > 0 => {
+            status.operation_remaining.ok_or_else(|| {
+                MaterializationReconcileError::Store(StoreError::internal(
+                    "persisted operation deadline is missing its database-relative budget",
+                ))
+            })?
+        }
+        _ => Duration::from_secs(600),
+    };
+    // Request-start anchoring deducts pool wait, query/retry and response time.
+    // It can stop conservatively early; only PostgreSQL decides whether failure
+    // is terminal. Work never receives additional lifetime from an RPC delay.
+    Ok(remaining.saturating_sub(request_elapsed))
 }
+
 impl MaterializationReconcileError {
     fn permanent(&self) -> bool {
         fn materializer(error: &MaterializerError) -> bool {
@@ -961,6 +965,39 @@ impl MaterializationReconcileError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operation_budget_uses_database_duration_and_deducts_request_time() {
+        for absolute in [1, 1_000, i64::MAX] {
+            let status = crate::runtime_work::MaterializationWorkStatus {
+                operation_deadline_unix_millis: absolute,
+                operation_remaining: Some(std::time::Duration::from_millis(200)),
+                ..Default::default()
+            };
+            assert_eq!(
+                super::operation_budget(Some(status.clone()), std::time::Duration::from_millis(50))
+                    .unwrap(),
+                std::time::Duration::from_millis(150)
+            );
+            assert_eq!(
+                super::operation_budget(Some(status), std::time::Duration::from_millis(250))
+                    .unwrap(),
+                std::time::Duration::ZERO
+            );
+        }
+        assert!(super::operation_budget(
+            Some(crate::runtime_work::MaterializationWorkStatus {
+                operation_deadline_unix_millis: 1,
+                ..Default::default()
+            }),
+            std::time::Duration::ZERO
+        )
+        .is_err());
+        assert_eq!(
+            super::operation_budget(None, std::time::Duration::from_secs(1)).unwrap(),
+            std::time::Duration::from_secs(599)
+        );
+    }
+
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::{Arc, Mutex},
@@ -1842,6 +1879,92 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn reconciler_anchors_database_budget_before_delayed_status() {
+        for absolute in [1, i64::MAX] {
+            for delay_millis in [50, 250] {
+                let instance = waking_instance("instance-reconcile");
+                let pending = pending_materialization("database-budget", &instance);
+                let mut fake = FakeReconcileStore::new(pending, instance);
+                fake.delayed_status = Some((
+                    Duration::from_millis(delay_millis),
+                    crate::runtime_work::MaterializationWorkStatus {
+                        operation_deadline_unix_millis: absolute,
+                        operation_remaining: Some(Duration::from_millis(200)),
+                        ..Default::default()
+                    },
+                ));
+                let store = Arc::new(fake);
+                let client = FakeKubernetesClient {
+                    readiness_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+                    ..Default::default()
+                };
+                let driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+                let start = tokio::time::Instant::now();
+                let mut jobs = JoinSet::new();
+                jobs.spawn(async move { driver.run_once().await });
+                while !store
+                    .status_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(start.elapsed(), Duration::ZERO);
+                tokio::time::advance(Duration::from_millis(delay_millis)).await;
+                if delay_millis == 50 {
+                    for _ in 0..100 {
+                        if client.wait_readiness_calls() > 0 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(
+                        client.wait_readiness_calls(),
+                        1,
+                        "real readiness must be held after status returns"
+                    );
+                    assert!(jobs.try_join_next().is_none());
+                    tokio::time::advance(Duration::from_millis(149)).await;
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(
+                        jobs.try_join_next().is_none(),
+                        "original 200ms budget is not yet exhausted"
+                    );
+                    // Tokio's timer wheel has millisecond granularity. At201ms
+                    // the original200ms budget must cancel, well before250ms.
+                    tokio::time::advance(Duration::from_millis(2)).await;
+                }
+                let mut finished = false;
+                for _ in 0..100 {
+                    if let Some(result) = jobs.try_join_next() {
+                        result.unwrap();
+                        finished = true;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(finished, "status delay must not grant a new 200ms lifetime");
+                assert_eq!(
+                    start.elapsed(),
+                    Duration::from_millis(if delay_millis == 50 { 201 } else { 250 })
+                );
+                if delay_millis == 250 {
+                    assert_eq!(
+                        client.apply_calls(),
+                        0,
+                        "fully consumed budget cannot dispatch"
+                    );
+                    assert_eq!(client.wait_readiness_calls(), 0);
+                }
+                assert_eq!(store.complete_calls(), 0);
+                assert!(store.effect.lock().unwrap().is_none());
+                assert_eq!(*store.failures.lock().unwrap(), [false]);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn readiness_wait_renews_lease_before_expiry_and_completes() {
         let instance = waking_instance("instance-reconcile");
@@ -2188,6 +2311,8 @@ mod tests {
         instance: InstanceRecord,
         workload_class: WorkloadClassVersion,
         renew_result: Mutex<bool>,
+        delayed_status: Option<(Duration, crate::runtime_work::MaterializationWorkStatus)>,
+        status_requested: std::sync::atomic::AtomicBool,
         renew_calls: Mutex<usize>,
         ack_failure: Mutex<Option<bool>>,
         begin_gate: Option<Arc<tokio::sync::Notify>>,
@@ -2209,6 +2334,8 @@ mod tests {
                 instance,
                 workload_class: workload_class(),
                 renew_result: Mutex::new(true),
+                delayed_status: None,
+                status_requested: std::sync::atomic::AtomicBool::new(false),
                 renew_calls: Mutex::new(0),
                 ack_failure: Mutex::new(None),
                 begin_gate: None,
@@ -2284,6 +2411,15 @@ mod tests {
 
     impl ControlPlaneStore for FakeReconcileStore {
         unexpected_store_methods!(
+            publish_certificate,
+            get_certificate_metadata,
+            set_tls_binding,
+            get_tls_binding,
+            remove_certificate,
+            resolve_tls_certificate,
+            reencrypt_certificate,
+            load_tls_certificate_changes,
+            load_tls_certificate_revision,
             load_route_changes,
             load_route_change_revision,
             enqueue_materialization,
@@ -2332,7 +2468,16 @@ mod tests {
             _id: MaterializationId,
         ) -> StoreFuture<'_, StoreResult<Option<crate::runtime_work::MaterializationWorkStatus>>>
         {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move {
+                self.status_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some((delay, status)) = &self.delayed_status {
+                    tokio::time::sleep(*delay).await;
+                    Ok(Some(status.clone()))
+                } else {
+                    Ok(None)
+                }
+            })
         }
         fn record_materialization_failure(
             &self,

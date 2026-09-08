@@ -64,7 +64,7 @@ pub(super) async fn status(
     id: MaterializationId,
 ) -> StoreResult<Option<MaterializationWorkStatus>> {
     let client = store.client().await?;
-    let Some(row) = client.query_opt("SELECT CASE WHEN m.state = 'ready' THEN GREATEST(0::bigint, (extract(epoch from clock_timestamp()) * 1000)::bigint - m.state_entered_at_unix_millis) ELSE NULL END AS ready_age_millis, m.next_attempt_at_unix_millis, m.operation_deadline_unix_millis, m.failure_count, m.failure_kind, m.failure_message, m.wake_failure_message, e.instance_generation AS effect_generation, e.lease_owner, e.lease_attempt, e.effect_id, e.operation, e.object_ref, e.expected_uid, e.expected_resource_version, e.started_at_unix_millis FROM materializations m LEFT JOIN materialization_effects e USING(materialization_id) WHERE materialization_id = $1", &[&id.as_str()]).await.map_err(map_postgres_error)? else { return Ok(None) };
+    let Some(row) = client.query_opt("SELECT CASE WHEN m.state = 'ready' THEN GREATEST(0::bigint, (extract(epoch from clock_timestamp()) * 1000)::bigint - m.state_entered_at_unix_millis) ELSE NULL END AS ready_age_millis, m.next_attempt_at_unix_millis, m.operation_deadline_unix_millis, CASE WHEN m.operation_deadline_unix_millis > 0 THEN GREATEST(0::bigint, m.operation_deadline_unix_millis - (extract(epoch from clock_timestamp()) * 1000)::bigint) ELSE NULL END AS operation_remaining_millis, m.failure_count, m.failure_kind, m.failure_message, m.wake_failure_message, e.instance_generation AS effect_generation, e.lease_owner, e.lease_attempt, e.effect_id, e.operation, e.object_ref, e.expected_uid, e.expected_resource_version, e.started_at_unix_millis FROM materializations m LEFT JOIN materialization_effects e USING(materialization_id) WHERE materialization_id = $1", &[&id.as_str()]).await.map_err(map_postgres_error)? else { return Ok(None) };
     let effect = if let Some(generation) = row.get::<_, Option<i64>>("effect_generation") {
         let object: serde_json::Value = row.get("object_ref");
         Some(UncertainMaterializationEffect {
@@ -87,6 +87,9 @@ pub(super) async fn status(
             .map(|millis| std::time::Duration::from_millis(millis as u64)),
         next_attempt_at_unix_millis: row.get("next_attempt_at_unix_millis"),
         operation_deadline_unix_millis: row.get("operation_deadline_unix_millis"),
+        operation_remaining: row
+            .get::<_, Option<i64>>("operation_remaining_millis")
+            .map(|millis| std::time::Duration::from_millis(millis as u64)),
         failure_count: row.get::<_, i32>("failure_count") as u32,
         failure_kind: row.get("failure_kind"),
         failure_message: row.get("failure_message"),
@@ -112,7 +115,7 @@ pub(super) async fn record_failure(
         return Ok(false);
     }
     let expected_state = super::mapping::materialization_state_to_db(request.expected_state);
-    let Some(row) = tx.query_opt("SELECT state, instance_id, failure_count, reconcile_lease_expires_at_unix_millis, operation_deadline_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint AS expired FROM materializations WHERE materialization_id = $1 AND reconcile_owner = $2 AND reconcile_attempt = $3 AND instance_generation = $4 AND state = $5 FOR UPDATE", &[&id, &request.owner, &attempt, &generation, &expected_state]).await.map_err(map_postgres_error)? else { return Ok(false) };
+    let Some(row) = tx.query_opt("SELECT state, instance_id, failure_count, reconcile_lease_expires_at_unix_millis, operation_deadline_unix_millis FROM materializations WHERE materialization_id = $1 AND reconcile_owner = $2 AND reconcile_attempt = $3 AND instance_generation = $4 AND state = $5 FOR UPDATE", &[&id, &request.owner, &attempt, &generation, &expected_state]).await.map_err(map_postgres_error)? else { return Ok(false) };
     let now = tx
         .query_one(
             "SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint",
@@ -135,10 +138,13 @@ pub(super) async fn record_failure(
         .await
         .map_err(map_postgres_error)?
         .get::<_, bool>(0);
-    let terminal = !uncertain && (request.permanent || row.get::<_, bool>("expired"));
+    // The locking SELECT may have waited across the deadline. Use the same
+    // fresh post-lock database time as the lease check, not a pre-wait expression.
+    let expired = row.get::<_, i64>("operation_deadline_unix_millis") <= now;
+    let terminal = !uncertain && (request.permanent || expired);
     let kind = if uncertain {
         "uncertain"
-    } else if row.get::<_, bool>("expired") {
+    } else if expired {
         "deadline"
     } else if request.permanent {
         "permanent"
@@ -188,5 +194,6 @@ pub(super) async fn maintain(store: &PostgresStore, limit: u32) -> StoreResult<u
     .await?;
     let client = store.client().await?;
     let outbox = client.execute("DELETE FROM route_change_outbox WHERE revision IN (SELECT revision FROM route_change_outbox WHERE revision < COALESCE((SELECT min(revision) FROM route_change_outbox WHERE created_at_unix_millis >= (extract(epoch from clock_timestamp()) * 1000)::bigint - 600000), 9223372036854775807) ORDER BY revision LIMIT $1)", &[&i64::from(limit)]).await.map_err(map_postgres_error)?;
-    Ok(idempotency + http01 as u64 + outbox)
+    let tls_outbox = client.execute("DELETE FROM tls_certificate_outbox WHERE revision IN (SELECT revision FROM tls_certificate_outbox WHERE revision < COALESCE((SELECT min(revision) FROM tls_certificate_outbox WHERE created_at_unix_millis >= (extract(epoch from clock_timestamp()) * 1000)::bigint - 600000), 9223372036854775807) ORDER BY revision LIMIT $1)", &[&i64::from(limit)]).await.map_err(map_postgres_error)?;
+    Ok(idempotency + http01 as u64 + outbox + tls_outbox)
 }

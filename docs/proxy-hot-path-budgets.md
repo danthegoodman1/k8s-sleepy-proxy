@@ -40,6 +40,30 @@ route on each hot-cache hit.
 
 ## Criterion Benchmark Regression Gate
 
+Dynamic certificate delivery adds a matched warm TLS handshake workload:
+
+```sh
+cargo bench -p frontline --bench tls_handshake -- --save-baseline before-r1
+```
+
+Before changing the certificate lookup path, record three rounds (`before-r1`
+through `before-r3`) and preserve their raw artifacts separately. Repeat against
+the completed implementation on the same machine with the same workload: P-256
+certificate, TLS 1.3 with resumption disabled, verified SNI/peer certificate and
+`h2` ALPN, one connection at a time, 64 KiB in-memory transport, and one response
+byte. Each round uses 2 seconds of warmup and 100 samples over 10 seconds.
+Certificate creation, validation and cache population are outside timing. The
+completed cache must prove that measured warm handshakes make zero additional
+certificate RPCs. This isolates certificate delivery overhead; it does not
+measure deployed throughput, resumed sessions or operating-system networking.
+
+Freeze the comparison before implementation: compare the median of the three
+round means; warn above 15% regression and fail above 25%. Keep individual round
+results so inconsistent measurements remain visible. Existing route, allocation
+and deployed load budgets still apply. Raw Criterion data belongs in ignored
+local artifacts; record commands, source identifiers and the three means in the
+phase evidence document.
+
 Criterion stores benchmark baselines and comparison results under
 `target/criterion`. After running the proxy primitive and frontline route lookup
 benchmarks, check the recorded Criterion estimates with:

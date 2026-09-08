@@ -33,3 +33,7 @@ tonic = { workspace = true, features = ["server", "router"] }
 [[bench]]
 name = "route_lookup"
 harness = false
+
+[[bench]]
+name = "tls_handshake"
+harness = false

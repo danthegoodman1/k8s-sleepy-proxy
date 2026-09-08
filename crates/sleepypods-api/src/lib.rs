@@ -8,6 +8,7 @@ pub const INITIAL_ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration:
 pub const IDLE_RETRY_AFTER_METADATA: &str = "sleepypods-idle-retry-after-ms";
 
 pub mod auth;
+pub mod certificate;
 pub mod http01;
 pub mod instance;
 pub mod materialization;
@@ -19,6 +20,7 @@ pub mod pb {
     tonic::include_proto!("sleepypods.controlplane.v1");
 }
 pub use auth::{BearerToken, InvalidBearerToken, OptionalBearerTokenInterceptor};
+pub use certificate::*;
 pub use http01::*;
 pub use instance::InstanceState;
 pub use materialization::{BackendEndpoint, MaterializationTarget};

@@ -59,6 +59,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "runtime_work",
         sql: include_str!("../../migrations/0010_runtime_work.sql"),
     },
+    Migration {
+        version: 11,
+        name: "dynamic_certificates",
+        sql: include_str!("../../migrations/0011_dynamic_certificates.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &mut deadpool_postgres::Client) -> StoreResult<()> {

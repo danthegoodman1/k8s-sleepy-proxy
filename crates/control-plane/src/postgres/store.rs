@@ -1,3 +1,4 @@
+use crate::certificate::*;
 use crate::{
     http01::{
         DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
@@ -33,6 +34,56 @@ use crate::{
 use super::{connection::PostgresStore, http01_ops, instance_ops, materialization_ops, route_ops};
 
 impl ControlPlaneStore for PostgresStore {
+    fn publish_certificate(
+        &self,
+        request: PublishCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        Box::pin(super::certificate_ops::publish(self, request))
+    }
+    fn get_certificate_metadata(
+        &self,
+        id: CertificateId,
+    ) -> StoreFuture<'_, StoreResult<Option<CertificateMetadata>>> {
+        Box::pin(super::certificate_ops::get_metadata(self, id))
+    }
+    fn set_tls_binding(
+        &self,
+        request: SetTlsBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+        Box::pin(super::certificate_ops::set_binding(self, request))
+    }
+    fn get_tls_binding(&self, hostname: TlsHostname) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+        Box::pin(super::certificate_ops::get_binding(self, hostname))
+    }
+    fn remove_certificate(
+        &self,
+        request: RemoveCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        Box::pin(super::certificate_ops::remove(self, request))
+    }
+    fn resolve_tls_certificate(
+        &self,
+        request: ResolveTlsCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsCertificateResolution>> {
+        Box::pin(super::certificate_ops::resolve(self, request))
+    }
+    fn reencrypt_certificate(
+        &self,
+        request: ReencryptCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        Box::pin(super::certificate_ops::reencrypt(self, request))
+    }
+    fn load_tls_certificate_changes(
+        &self,
+        cursor: CertificateRevision,
+        limit: u32,
+    ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>> {
+        Box::pin(super::certificate_ops::changes(self, cursor, limit))
+    }
+    fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
+        Box::pin(super::certificate_ops::revision(self))
+    }
+
     fn load_route_changes(
         &self,
         cursor: u64,

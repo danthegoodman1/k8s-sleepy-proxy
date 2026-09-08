@@ -4,6 +4,43 @@
 
 macro_rules! unexpected_store_methods {
     () => {};
+    (publish_certificate $(, $rest:ident)* $(,)?) => {
+        fn publish_certificate(&self, _request: control_plane::certificate::PublishCertificateRequest) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::CertificateMetadata>> { panic!("unexpected test store capability: publish_certificate") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (get_certificate_metadata $(, $rest:ident)* $(,)?) => {
+        fn get_certificate_metadata(&self, _id: control_plane::certificate::CertificateId) -> control_plane::StoreFuture<'_, control_plane::StoreResult<Option<control_plane::certificate::CertificateMetadata>>> { panic!("unexpected test store capability: get_certificate_metadata") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (set_tls_binding $(, $rest:ident)* $(,)?) => {
+        fn set_tls_binding(&self, _request: control_plane::certificate::SetTlsBindingRequest) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::TlsBinding>> { panic!("unexpected test store capability: set_tls_binding") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (get_tls_binding $(, $rest:ident)* $(,)?) => {
+        fn get_tls_binding(&self, _hostname: control_plane::certificate::TlsHostname) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::TlsBinding>> { panic!("unexpected test store capability: get_tls_binding") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (remove_certificate $(, $rest:ident)* $(,)?) => {
+        fn remove_certificate(&self, _request: control_plane::certificate::RemoveCertificateRequest) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::CertificateMetadata>> { panic!("unexpected test store capability: remove_certificate") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (resolve_tls_certificate $(, $rest:ident)* $(,)?) => {
+        fn resolve_tls_certificate(&self, _request: control_plane::certificate::ResolveTlsCertificateRequest) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::TlsCertificateResolution>> { panic!("unexpected test store capability: resolve_tls_certificate") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (reencrypt_certificate $(, $rest:ident)* $(,)?) => {
+        fn reencrypt_certificate(&self, _request: control_plane::certificate::ReencryptCertificateRequest) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::CertificateMetadata>> { panic!("unexpected test store capability: reencrypt_certificate") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (load_tls_certificate_changes $(, $rest:ident)* $(,)?) => {
+        fn load_tls_certificate_changes(&self, _cursor: control_plane::certificate::CertificateRevision, _limit: u32) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::DurableTlsCertificateChanges>> { panic!("unexpected test store capability: load_tls_certificate_changes") }
+        unexpected_store_methods!($($rest),*);
+    };
+    (load_tls_certificate_revision $(, $rest:ident)* $(,)?) => {
+        fn load_tls_certificate_revision(&self) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::CertificateRevision>> { panic!("unexpected test store capability: load_tls_certificate_revision") }
+        unexpected_store_methods!($($rest),*);
+    };
+
     (load_route_changes $(, $rest:ident)* $(,)?) => {
     fn load_route_changes(
         &self,

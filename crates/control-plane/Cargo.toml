@@ -10,7 +10,9 @@ deadpool-postgres = "0.14.1"
 http-body.workspace = true
 k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 kube = { version = "4.0.0", default-features = false, features = ["client", "rustls-tls"] }
+ring = "0.17"
 rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
@@ -24,6 +26,8 @@ tonic = { workspace = true, default-features = true, features = ["transport"] }
 tonic-web = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors"] }
+x509-parser = { version = "0.18", features = ["verify"] }
+zeroize = "1"
 
 [dev-dependencies]
 bytes = { workspace = true, default-features = true }
@@ -33,5 +37,6 @@ http-body-util = { workspace = true, default-features = true }
 hyper = { workspace = true, default-features = false, features = ["client", "http2"] }
 hyper-util = { workspace = true, default-features = false, features = ["tokio"] }
 prost = "0.14.4"
-tokio = { workspace = true, default-features = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+rcgen = "0.14"
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util", "time"], default-features = true }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }

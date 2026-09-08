@@ -11,6 +11,10 @@ pub struct MaterializationWorkStatus {
     pub ready_age: Option<std::time::Duration>,
     pub next_attempt_at_unix_millis: i64,
     pub operation_deadline_unix_millis: i64,
+    /// Remaining duration sampled with the persistence clock, never computed
+    /// by subtracting a process wall clock from the persisted timestamp.
+    /// Callers deduct the entire status-request elapsed time conservatively.
+    pub operation_remaining: Option<std::time::Duration>,
     pub failure_count: u32,
     pub failure_kind: Option<String>,
     pub failure_message: String,
