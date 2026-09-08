@@ -1,6 +1,7 @@
 //! Protobuf-defined control-plane API and transport scaffolding.
 
 pub mod admission;
+mod certificate_watch;
 mod certificates;
 mod proxy;
 mod route_events;

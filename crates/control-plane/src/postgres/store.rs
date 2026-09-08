@@ -80,6 +80,13 @@ impl ControlPlaneStore for PostgresStore {
     ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>> {
         Box::pin(super::certificate_ops::changes(self, cursor, limit))
     }
+    fn snapshot_tls_bindings(
+        &self,
+        hostnames: Vec<TlsHostname>,
+    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>> {
+        Box::pin(super::certificate_ops::snapshot(self, hostnames))
+    }
+
     fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
         Box::pin(super::certificate_ops::revision(self))
     }

@@ -61,7 +61,7 @@ The V1 operator service is unary-only:
   `ForceReleaseExclusivityKey`
 
 `WakeInstance`, `Subscribe`, `ResolveHttp01Challenge`, `ResolveTlsCertificate`,
-and `ReportIdle` are runtime services for proxies and sidecars. They are not
+`WatchTlsCertificates`, and `ReportIdle` are runtime services for proxies and sidecars. They are not
 operator or gRPC-Web APIs.
 
 Control-plane authentication is caller authentication at this API boundary. It
@@ -72,7 +72,7 @@ listener use the same role policy:
 
 - Operator credentials call `OperatorControlPlane`.
 - Proxy credentials call `ProxyControlPlane`, including HTTP-01 lookup and
-  certificate resolution.
+  certificate resolution and watches.
 - Sidecar credentials call `SidecarControlPlane/ReportIdle`.
 
 The first provider is static bearer tokens. Configure it with
@@ -174,10 +174,15 @@ successful resolution. The existing bounded control-plane connection setup still
 applies at startup. An empty cache alone does not prevent listener readiness.
 
 The cache admits at most 1,024 hostname entries, including misses and pending
-lookups, with 64 MiB of accounted memory and at most 32 simultaneous fetches.
+lookups, with 64 MiB of accounted memory and at most three simultaneous fetches.
 Memory accounting includes fetch scratch space and configurations still retained
 by handshakes or other references after cache eviction. It is an admission budget, not a
 process RSS limit; connection buffers and the runtime have separate costs.
+The worker reserves four MiB for structures, 32 MiB for watch decoding/state and
+eight MiB for each outstanding fetch. These conservative reservations cover
+malformed repeated protobuf fields as well as valid bundles; they do not imply
+that an idle process allocates that much physical memory. Entry and byte pressure
+can evict cached views before their leases expire.
 Identical misses share one fetch. Lookup has a three-second deadline within the
 overall five-second TLS setup bound; capacity exhaustion fails the handshake.
 
@@ -191,6 +196,27 @@ from the start of the RPC. Failed refreshes never extend that deadline. An
 unchanged response can renew only the exact certificate view still held locally.
 Authoritative misses are cached for at most one second. During a control-plane
 outage, an existing valid view remains usable only until its original deadline.
+
+Frontline opens one native certificate watch when its cache first has interests.
+The watch carries hostname revisions and metadata only. Initial registration and
+reconnect synchronize current bindings atomically before following durable
+changes, including changes made through another control-plane replica. Eviction
+releases the hostname's interest; input updates coalesce into a bounded complete
+replacement set.
+
+A rotation prompts a refresh while an already valid view may remain usable within
+its existing lease. Received removal, unbind or rebind events invalidate the
+affected view before another handshake can select it. A history gap resets and
+resynchronizes the watched views. Per-host revisions and local generations fence
+late responses; a global history cursor never authorizes a hostname. Events,
+reconnects and failed lookups cannot extend a lease. During a partition, delivery
+can be delayed until the original lease expires.
+
+Each control plane admits at most 16 certificate streams. Interests are limited
+to 1,024 exact hosts per stream, messages to 512 KiB, and queued responses to two.
+Initial registration has a three-second setup bound. A registration or history
+poll runs at most once per 250 ms per stream; streams renew after at most 60
+seconds. These are local admission bounds, not a database throughput promise.
 
 TLS 1.2 and 1.3 use full handshakes. Server session storage, session tickets and
 early data are disabled, so an attempted resumption cannot bypass current SNI

@@ -36,6 +36,10 @@ macro_rules! unexpected_store_methods {
         fn load_tls_certificate_changes(&self, _cursor: control_plane::certificate::CertificateRevision, _limit: u32) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::DurableTlsCertificateChanges>> { panic!("unexpected test store capability: load_tls_certificate_changes") }
         unexpected_store_methods!($($rest),*);
     };
+    (snapshot_tls_bindings $(, $rest:ident)* $(,)?) => {
+        fn snapshot_tls_bindings(&self, _: Vec<control_plane::certificate::TlsHostname>) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::TlsBindingSnapshot>> { panic!("unexpected test store capability: snapshot_tls_bindings") }
+        unexpected_store_methods!($($rest),*);
+    };
     (load_tls_certificate_revision $(, $rest:ident)* $(,)?) => {
         fn load_tls_certificate_revision(&self) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::CertificateRevision>> { panic!("unexpected test store capability: load_tls_certificate_revision") }
         unexpected_store_methods!($($rest),*);

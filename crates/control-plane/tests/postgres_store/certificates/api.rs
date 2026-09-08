@@ -581,3 +581,6 @@ async fn postgres_certificate_stalled_drain_discards_dirty_session() -> TestResu
     })
     .await
 }
+
+#[path = "api/watch.rs"]
+mod watch;

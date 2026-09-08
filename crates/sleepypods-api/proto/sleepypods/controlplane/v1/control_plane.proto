@@ -36,6 +36,7 @@ service OperatorControlPlane {
 service ProxyControlPlane {
   rpc ResolveHttp01Challenge(ResolveHttp01ChallengeRequest) returns (ResolveHttp01ChallengeResponse);
   rpc ResolveTlsCertificate(ResolveTlsCertificateRequest) returns (ResolveTlsCertificateResponse);
+  rpc WatchTlsCertificates(stream WatchTlsCertificatesRequest) returns (stream WatchTlsCertificatesResponse);
   rpc WakeInstance(ProxyWakeInstanceRequest) returns (ProxyWakeInstanceResponse);
   rpc Subscribe(stream ProxySubscribeRequest) returns (stream ProxySubscribeResponse);
 }
@@ -690,3 +691,40 @@ message FoundTlsCertificate {
   CertificateBundle bundle = 2;
 }
 message MissingTlsCertificate {}
+
+// A complete replacement interest set, capped at 1024 exact hosts / 512KiB.
+// Registration IDs identify acknowledgements only; cursors order the global
+// outbox and are NEVER a hostname view revision.
+message WatchTlsCertificatesRequest {
+  uint64 registration = 1;
+  repeated TlsCertificateInterest interests = 2;
+}
+message TlsCertificateInterest {
+  string hostname = 1;
+  uint64 known_view_revision = 2;
+}
+message TlsCertificateSnapshot {
+  uint64 registration = 1;
+  uint64 cursor = 2;
+  repeated TlsBinding bindings = 3;
+}
+message TlsCertificateChanges {
+  uint64 cursor = 1;
+  repeated TlsCertificateEvent events = 2;
+}
+message TlsCertificateEvent {
+  string hostname = 1;
+  uint64 view_revision = 2;
+  optional string certificate_id = 3;
+  // Publication may retain an already authorized view during replacement.
+  // All other changes require immediate authorization invalidation.
+  bool invalidate = 4;
+}
+message TlsCertificateReset { uint64 cursor = 1; }
+message WatchTlsCertificatesResponse {
+  oneof value {
+    TlsCertificateSnapshot snapshot = 1;
+    TlsCertificateChanges changes = 2;
+    TlsCertificateReset reset = 3;
+  }
+}

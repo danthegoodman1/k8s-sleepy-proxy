@@ -502,7 +502,7 @@ pub(super) async fn changes(
     cursor: CertificateRevision,
     limit: u32,
 ) -> StoreResult<DurableTlsCertificateChanges> {
-    let work = store.certificate_work.acquire()?;
+    let work = store.certificate_work.acquire_watch()?;
     if limit == 0 || limit > MAX_TLS_CHANGE_BATCH {
         return Err(StoreError::invalid_argument(
             "TLS change batch requires 1–1024 events",
@@ -558,5 +558,51 @@ pub(super) async fn changes(
         },
         reset,
         events,
+    })
+}
+
+// One statement observes both the commit-ordered global cursor and each host's
+// own current view. No chain, sealed key, decryption, or sealer is involved.
+pub(super) async fn snapshot(
+    store: &PostgresStore,
+    hostnames: Vec<TlsHostname>,
+) -> StoreResult<TlsBindingSnapshot> {
+    if hostnames.len() > MAX_CERTIFICATE_BINDINGS {
+        return Err(StoreError::invalid_argument(
+            "TLS interests exceed 1024 hosts",
+        ));
+    }
+    let hosts: Vec<_> = hostnames.iter().map(|h| h.as_str()).collect();
+    let work = store.certificate_work.acquire_watch()?;
+    let row = work.client(store).await?.query_one(
+        "SELECT c.revision, COALESCE((SELECT jsonb_agg(jsonb_build_object('hostname', h.hostname, 'certificate_id', b.certificate_id, 'revision', COALESCE(b.revision,0)) ORDER BY h.ordinality) FROM unnest($1::text[]) WITH ORDINALITY h(hostname,ordinality) LEFT JOIN tls_hostname_bindings b ON b.hostname=h.hostname),'[]'::jsonb) AS bindings FROM tls_certificate_revision c WHERE singleton",
+        &[&hosts],
+    ).await.map_err(map_postgres_error)?;
+    let values: serde_json::Value = row.get("bindings");
+    let mut bindings = Vec::with_capacity(hosts.len());
+    for v in values
+        .as_array()
+        .ok_or_else(|| StoreError::internal("invalid TLS snapshot"))?
+    {
+        bindings.push(TlsBinding {
+            hostname: TlsHostname::new(
+                v["hostname"]
+                    .as_str()
+                    .ok_or_else(|| StoreError::internal("invalid TLS snapshot hostname"))?,
+            )
+            .map_err(invalid)?,
+            certificate_id: v["certificate_id"]
+                .as_str()
+                .map(CertificateId::new)
+                .transpose()
+                .map_err(invalid)?,
+            revision: rev(v["revision"]
+                .as_i64()
+                .ok_or_else(|| StoreError::internal("invalid TLS snapshot revision"))?)?,
+        });
+    }
+    Ok(TlsBindingSnapshot {
+        cursor: rev(row.get("revision"))?,
+        bindings,
     })
 }

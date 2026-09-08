@@ -734,6 +734,22 @@ impl SubscribeAction {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for FakeProxyControlPlane {
+    type WatchTlsCertificatesStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<sleepypods_api::pb::WatchTlsCertificatesResponse, tonic::Status>,
+                > + Send,
+        >,
+    >;
+    async fn watch_tls_certificates(
+        &self,
+        _: tonic::Request<tonic::Streaming<sleepypods_api::pb::WatchTlsCertificatesRequest>>,
+    ) -> Result<tonic::Response<Self::WatchTlsCertificatesStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "unexpected test certificate watch",
+        ))
+    }
+
     async fn resolve_http01_challenge(
         &self,
         _: Request<pb::ResolveHttp01ChallengeRequest>,
@@ -862,6 +878,22 @@ impl FakeProxyControlPlane {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for FakeHttp01Proxy {
+    type WatchTlsCertificatesStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<sleepypods_api::pb::WatchTlsCertificatesResponse, tonic::Status>,
+                > + Send,
+        >,
+    >;
+    async fn watch_tls_certificates(
+        &self,
+        _: tonic::Request<tonic::Streaming<sleepypods_api::pb::WatchTlsCertificatesRequest>>,
+    ) -> Result<tonic::Response<Self::WatchTlsCertificatesStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "unexpected test certificate watch",
+        ))
+    }
+
     type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
     async fn wake_instance(
         &self,

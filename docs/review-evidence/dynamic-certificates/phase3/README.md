@@ -132,6 +132,18 @@ outage boundary. Those claims have separate tests. The deployed TLS, libpq and
 load scripts still need API-seeded native TLS and removal of their old Frontline
 application-key mounts under Phase 5A; they are not valid dynamic gates yet.
 
+Subsequent Phase 4 review identified that bounded protobuf wire messages can
+allocate substantially more decoded repeated-field storage than the Phase 3
+one-MiB fetch reservation. Phase 4 tracks the adversarial decoder proof and
+corrected reservations/concurrency. The earlier cache tests above do not prove
+that malformed-wire allocation bound.
+
 Earlier passing integration records at `gates-20260908T211925Z` and
 `runtime-20260908T212253Z` precede the final short-lease correction. They are
 retained as diagnostics and superseded by the final-source records above.
+
+Hosted [CI run 34281390487](https://github.com/danthegoodman1/sleepypods/actions/runs/34281390487)
+passed on committed Phase 3 source `9d0cfa946802e906ade77900bd9d49ab7bf1b7a4`.
+The raw log is `.generated/dynamic-certificates/phase3/hosted-ci-34281390487.log`;
+the actual PostgreSQL target reports 20 passed, zero failed/ignored, with no
+self-skipped database cases.

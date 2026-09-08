@@ -77,6 +77,12 @@ impl ControlPlaneStore for CapabilityProbe {
             format!("{cursor:?}, {limit:?}"),
         )
     }
+    fn snapshot_tls_bindings(
+        &self,
+        hosts: Vec<TlsHostname>,
+    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>> {
+        self.fail("snapshot_tls_bindings", format!("{hosts:?}"))
+    }
     fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
         self.fail("load_tls_certificate_revision", "()".to_owned())
     }
@@ -467,6 +473,9 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
         format!("{cert_rev:?}, 19"),
         2,
     );
+    let hosts = vec![TlsHostname::new("snapshot.example").unwrap()];
+    assert!(store.snapshot_tls_bindings(hosts.clone()).await.is_err());
+    probe.check("snapshot_tls_bindings", format!("{hosts:?}"), 2);
     assert!(store.load_tls_certificate_revision().await.is_err());
     probe.check("load_tls_certificate_revision", "()".into(), 2);
     assert!(store.load_route_changes(73, 19).await.is_err());

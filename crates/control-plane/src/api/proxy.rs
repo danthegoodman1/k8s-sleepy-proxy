@@ -146,7 +146,7 @@ where
         ObservabilityRecorder::global(),
         route_events,
     ))
-    .max_decoding_message_size(256 * 1024)
+    .max_decoding_message_size(512 * 1024)
     .max_encoding_message_size(1024 * 1024)
 }
 
@@ -156,6 +156,14 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     type SubscribeStream = ProxySubscribeResponseStream;
+    type WatchTlsCertificatesStream = super::certificate_watch::WatchStream;
+    async fn watch_tls_certificates(
+        &self,
+        request: Request<tonic::Streaming<pb::WatchTlsCertificatesRequest>>,
+    ) -> Result<Response<Self::WatchTlsCertificatesStream>, Status> {
+        super::certificate_watch::watch(self.store.clone(), self.route_events.clone(), request)
+            .await
+    }
 
     async fn resolve_http01_challenge(
         &self,

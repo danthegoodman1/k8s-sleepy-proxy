@@ -89,9 +89,12 @@ async fn run_with_shutdown(
         channel.clone(),
         proxy_interceptor.clone(),
     ));
-    let (tls_certificates, certificate_worker) = TlsCertificateStore::new(std::sync::Arc::new(
+    let certificate_client = std::sync::Arc::new(
         frontline::certificates::GrpcCertificateResolver::new(channel, proxy_interceptor),
-    ));
+    );
+    let (tls_certificates, certificate_worker) =
+        TlsCertificateStore::new(certificate_client.clone());
+    let certificate_worker = certificate_worker.with_watch(certificate_client)?;
     let resolver = FrontlineRouteResolver::with_observability(
         env.route_cache_capacity(),
         route_client,

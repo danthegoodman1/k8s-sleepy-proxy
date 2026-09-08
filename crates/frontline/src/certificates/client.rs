@@ -30,3 +30,26 @@ impl CertificateResolver for GrpcCertificateResolver {
         })
     }
 }
+
+impl CertificateWatcher for GrpcCertificateResolver {
+    fn watch(
+        &self,
+        interests: mpsc::Receiver<pb::WatchTlsCertificatesRequest>,
+    ) -> CertificateWatchFuture {
+        use tonic::codegen::tokio_stream::StreamExt;
+        let mut client = self.client.clone().max_decoding_message_size(512 * 1024);
+        Box::pin(async move {
+            let response = client
+                .watch_tls_certificates(
+                    tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(interests),
+                )
+                .await
+                .map_err(|_| CertificateLookupError::Unavailable)?;
+            Ok(Box::pin(
+                response
+                    .into_inner()
+                    .map(|r| r.map_err(|_| CertificateLookupError::Unavailable)),
+            ) as CertificateWatchStream)
+        })
+    }
+}

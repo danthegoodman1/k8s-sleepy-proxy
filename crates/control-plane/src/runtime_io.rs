@@ -335,7 +335,9 @@ mod tests {
             response
                 .headers_mut()
                 .insert("content-type", "application/grpc".parse().unwrap());
-            if request.uri().path().ends_with("/Subscribe") {
+            if request.uri().path().ends_with("/Subscribe")
+                || request.uri().path().ends_with("/WatchTlsCertificates")
+            {
                 let Ok(permit) = self.subscriptions.clone().try_acquire_owned() else {
                     return std::future::ready(Ok(tonic::Status::resource_exhausted(
                         "subscription capacity",
@@ -461,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn native_tls_progress_survives_setup_and_cancels_withheld_delivery() {
         use http_body_util::BodyExt;
-        for subscription in [false, true] {
+        for path in ["WakeInstance", "Subscribe", "WatchTlsCertificates"] {
             let rcgen::CertifiedKey { cert, signing_key } =
                 rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
             let mut roots = rustls::RootCertStore::empty();
@@ -513,11 +515,6 @@ mod tests {
                         let _ = receiver.await;
                     }),
             );
-            let path = if subscription {
-                "Subscribe"
-            } else {
-                "WakeInstance"
-            };
             let request = || {
                 tonic::codegen::http::Request::builder()
                     .method("POST")

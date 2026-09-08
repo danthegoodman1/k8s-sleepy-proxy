@@ -568,6 +568,10 @@ fn ring_digest(bytes: &[u8]) -> Vec<u8> {
 #[tokio::test]
 async fn postgres_certificate_outbox_commit_order_rollback_and_retention() -> TestResult {
     database_test(|store, raw, config| async move {
+        // A successful read may still own its asynchronous protocol drain.
+        // Page observations use the declared bounded read-only retry capability;
+        // mutations below remain direct, one-shot calls.
+        let reads = RetryingControlPlaneStore::with_default_policy(Arc::new(store.clone()));
         store
             .publish_certificate(publish("events", 0, &["a.example.test", "b.example.test"]))
             .await?;
@@ -581,8 +585,8 @@ async fn postgres_certificate_outbox_commit_order_rollback_and_retention() -> Te
         store
             .publish_certificate(publish("events", 1, &["a.example.test", "b.example.test"]))
             .await?;
-        let page1 = store.load_tls_certificate_changes(start, 1).await?;
-        let page2 = store.load_tls_certificate_changes(page1.cursor, 1).await?;
+        let page1 = reads.load_tls_certificate_changes(start, 1).await?;
+        let page2 = reads.load_tls_certificate_changes(page1.cursor, 1).await?;
         assert!(!page1.reset && !page2.reset);
         assert_eq!(page1.events.len(), 1);
         assert_eq!(page2.events.len(), 1);
@@ -645,7 +649,7 @@ async fn postgres_certificate_outbox_commit_order_rollback_and_retention() -> Te
         );
         connections.abort_all();
         while connections.join_next().await.is_some() {}
-        let event = store.load_tls_certificate_changes(before, 10).await?;
+        let event = reads.load_tls_certificate_changes(before, 10).await?;
         assert_eq!(event.events.len(), 1);
         assert_eq!(event.events[0].kind, TlsCertificateChangeKind::Unbound);
         assert!(store
@@ -665,20 +669,21 @@ async fn postgres_certificate_outbox_commit_order_rollback_and_retention() -> Te
                 .get::<_, i64>(0),
             100000
         );
-        let reset = store.load_tls_certificate_changes(rev(0), 10).await?;
+        let reset = reads.load_tls_certificate_changes(rev(0), 10).await?;
         assert!(reset.reset && reset.events.is_empty());
         assert_eq!(reset.cursor, store.load_tls_certificate_revision().await?);
         assert!(
-            store
+            reads
                 .load_tls_certificate_changes(rev(i64::MAX as u64), 10)
                 .await?
                 .reset
         );
-        assert!(store.load_tls_certificate_changes(rev(0), 0).await.is_err());
-        assert!(store
-            .load_tls_certificate_changes(rev(0), 1025)
-            .await
-            .is_err());
+        for limit in [0, 1025] {
+            assert!(matches!(
+                reads.load_tls_certificate_changes(rev(0), limit).await,
+                Err(StoreError::InvalidArgument { .. })
+            ));
+        }
         // Time retention removes at most the requested contiguous prefix.
         raw.execute("UPDATE tls_certificate_outbox SET created_at_unix_millis=0 WHERE revision IN (SELECT revision FROM tls_certificate_outbox ORDER BY revision LIMIT 3)",&[]).await?;
         let old_count: i64 = raw
@@ -708,6 +713,7 @@ impl ControlPlaneStore for LostCertificateResponse {
         resolve_tls_certificate,
         load_tls_certificate_changes,
         load_tls_certificate_revision,
+        snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,
         load_materialization_work_status,

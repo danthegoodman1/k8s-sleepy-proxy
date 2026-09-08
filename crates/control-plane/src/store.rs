@@ -79,6 +79,10 @@ pub trait ControlPlaneStore: Send + Sync {
         limit: u32,
     ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>>;
     fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>>;
+    fn snapshot_tls_bindings(
+        &self,
+        hostnames: Vec<TlsHostname>,
+    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>>;
 
     fn load_route_changes(
         &self,
@@ -451,6 +455,15 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
             store.load_tls_certificate_revision()
+        })
+    }
+
+    fn snapshot_tls_bindings(
+        &self,
+        hostnames: Vec<TlsHostname>,
+    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.snapshot_tls_bindings(hostnames.clone())
         })
     }
 
@@ -1027,6 +1040,7 @@ mod tests {
             reencrypt_certificate,
             load_tls_certificate_changes,
             load_tls_certificate_revision,
+            snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
             load_materialization_work_status,

@@ -349,6 +349,13 @@ TLS termination or SNI passthrough fails:
 4. Confirm client SNI has an exact TLS binding for termination. A wildcard SAN
    can cover that explicit binding. Passthrough uses its exact or wildcard SNI
    route independently of application certificate delivery.
+5. If an update has not appeared, inspect native watch connectivity and stream
+   capacity on both the serving proxy and its control plane. Reconnects and
+   history gaps synchronize current bindings. Neither notifications nor failed
+   refreshes renew permission to serve: an old valid view lasts only until its
+   original lease/chain validity deadline, at most five minutes from resolution.
+   Received removal/unbind/rebind events invalidate new-handshake selection;
+   already established connections follow the normal connection/drain policy.
 
 Postgres or database outage:
 

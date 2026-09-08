@@ -246,6 +246,13 @@ pub struct DurableTlsCertificateChanges {
     pub events: Vec<TlsCertificateChange>,
 }
 
+/// One metadata-only MVCC snapshot; cursor is global, binding revisions are per host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsBindingSnapshot {
+    pub cursor: CertificateRevision,
+    pub bindings: Vec<TlsBinding>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +302,211 @@ mod tests {
         );
         assert!(CertificateBundle::new(vec![], vec![2]).is_err());
         assert!(CertificateRevision::new(i64::MAX as u64 + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod watch_decode_tests {
+    use crate::pb;
+    use prost::Message;
+    #[test]
+    fn bounded_wire_can_expand_repeated_elements_and_valid_full_interests_fit() {
+        let n = (512 * 1024 - 16) / 2;
+        let wire = pb::WatchTlsCertificatesResponse {
+            value: Some(pb::watch_tls_certificates_response::Value::Changes(
+                pb::TlsCertificateChanges {
+                    cursor: 0,
+                    events: vec![pb::TlsCertificateEvent::default(); n],
+                },
+            )),
+        }
+        .encode_to_vec();
+        assert!(wire.len() <= 512 * 1024);
+        let decoded = pb::WatchTlsCertificatesResponse::decode(wire.as_slice()).unwrap();
+        let Some(pb::watch_tls_certificates_response::Value::Changes(decoded)) = decoded.value
+        else {
+            panic!()
+        };
+        let event_bytes =
+            decoded.events.capacity() * std::mem::size_of::<pb::TlsCertificateEvent>();
+        assert!(event_bytes > 4 * 1024 * 1024);
+        assert!(event_bytes + 2 * 512 * 1024 < 24 * 1024 * 1024);
+        let input = pb::WatchTlsCertificatesRequest {
+            registration: 1,
+            interests: vec![pb::TlsCertificateInterest::default(); n],
+        }
+        .encode_to_vec();
+        assert!(input.len() <= 512 * 1024);
+        let decoded_input = pb::WatchTlsCertificatesRequest::decode(input.as_slice()).unwrap();
+        let request_bytes =
+            decoded_input.interests.capacity() * std::mem::size_of::<pb::TlsCertificateInterest>();
+        assert!(request_bytes + 2 * 512 * 1024 <= 12 * 1024 * 1024);
+        let valid = pb::WatchTlsCertificatesRequest {
+            registration: u64::MAX,
+            interests: (0..1024)
+                .map(|i| pb::TlsCertificateInterest {
+                    hostname: format!(
+                        "{:063}.{}.{}.{}",
+                        i,
+                        "b".repeat(63),
+                        "c".repeat(63),
+                        "d".repeat(61)
+                    ),
+                    known_view_revision: i64::MAX as u64,
+                })
+                .collect(),
+        };
+        assert!(valid
+            .interests
+            .iter()
+            .all(|i| super::TlsHostname::new(&i.hostname).is_ok()));
+        assert!(valid.encoded_len() > 256 * 1024);
+        assert!(valid.encoded_len() <= 512 * 1024);
+        // Empty repeated DER and DNS fields likewise allocate before the
+        // domain validator rejects them; charge unary decoding separately.
+        let unary = pb::ResolveTlsCertificateResponse {
+            value: Some(pb::resolve_tls_certificate_response::Value::Found(
+                pb::FoundTlsCertificate {
+                    metadata: Some(pb::CertificateMetadata {
+                        dns_names: vec![String::new(); 65_537],
+                        ..Default::default()
+                    }),
+                    bundle: Some(pb::CertificateBundle {
+                        chain_der: vec![Vec::new(); 65_520],
+                        private_key_pkcs8_der: Vec::new(),
+                    }),
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(unary.len() <= 256 * 1024);
+        let decoded_unary = pb::ResolveTlsCertificateResponse::decode(unary.as_slice()).unwrap();
+        let Some(pb::resolve_tls_certificate_response::Value::Found(decoded_unary)) =
+            decoded_unary.value
+        else {
+            panic!()
+        };
+        let unary_bytes = decoded_unary.metadata.unwrap().dns_names.capacity()
+            * std::mem::size_of::<String>()
+            + decoded_unary.bundle.unwrap().chain_der.capacity() * std::mem::size_of::<Vec<u8>>();
+        assert!(unary_bytes > 4 * 1024 * 1024);
+        assert!(unary_bytes + 2 * 256 * 1024 + 1024 * 1024 < 8 * 1024 * 1024);
+        // Prost retains the previous oneof variant while decoding a different
+        // replacement. Both threshold-rounded vectors coexist at this point.
+        let mut old_bindings = vec![pb::TlsBinding::default(); 65_537];
+        old_bindings[0].hostname = "x".repeat(127 * 1024);
+        let old_wire = pb::WatchTlsCertificatesResponse {
+            value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
+                pb::TlsCertificateSnapshot {
+                    registration: 0,
+                    cursor: 0,
+                    bindings: old_bindings,
+                },
+            )),
+        }
+        .encode_to_vec();
+        let new_wire = pb::WatchTlsCertificatesResponse {
+            value: Some(pb::watch_tls_certificates_response::Value::Changes(
+                pb::TlsCertificateChanges {
+                    cursor: 0,
+                    events: vec![pb::TlsCertificateEvent::default(); 131_073],
+                },
+            )),
+        }
+        .encode_to_vec();
+        let mut replacement = old_wire.clone();
+        replacement.extend_from_slice(&new_wire);
+        assert!(replacement.len() <= 512 * 1024);
+        let old_decoded = pb::WatchTlsCertificatesResponse::decode(old_wire.as_slice()).unwrap();
+        let Some(pb::watch_tls_certificates_response::Value::Snapshot(old_decoded)) =
+            old_decoded.value
+        else {
+            panic!()
+        };
+        let new_decoded = pb::WatchTlsCertificatesResponse::decode(replacement.as_slice()).unwrap();
+        let Some(pb::watch_tls_certificates_response::Value::Changes(new_decoded)) =
+            new_decoded.value
+        else {
+            panic!()
+        };
+        let replacement_peak = old_decoded.bindings.capacity()
+            * std::mem::size_of::<pb::TlsBinding>()
+            + old_decoded
+                .bindings
+                .iter()
+                .map(|b| {
+                    b.hostname.capacity() + b.certificate_id.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>()
+            + new_decoded.events.capacity() * std::mem::size_of::<pb::TlsCertificateEvent>();
+        // A moving realloc can retain the old half-capacity Changes vector
+        // while allocating its doubled replacement, with Snapshot still alive.
+        let growth_overlap =
+            new_decoded.events.capacity() / 2 * std::mem::size_of::<pb::TlsCertificateEvent>();
+        let watch_peak = replacement_peak + growth_overlap;
+        // The 32MiB watch +4MiB shared structure charge covers that peak, two
+        // maximum wire buffers, and up to3MiB registration/queue/task state.
+        // Per-entry/config charges are separate.
+        assert!(watch_peak + 2 * 512 * 1024 + 3 * 1024 * 1024 < 36 * 1024 * 1024);
+        println!("watch_oneof_replacement wire_bytes={} coexisting_capacity_bytes={} growth_overlap_bytes={} envelope_with_wire_and_state={}",replacement.len(),replacement_peak,growth_overlap,watch_peak+2*512*1024+3*1024*1024);
+        // Exercise the corresponding unary Found -> Unchanged replacement.
+        // Its two threshold-rounded DNS vectors and the growing vector's old
+        // allocation must also fit the distinct 8MiB fetch charge.
+        let old = pb::ResolveTlsCertificateResponse {
+            value: Some(pb::resolve_tls_certificate_response::Value::Found(
+                pb::FoundTlsCertificate {
+                    metadata: Some(pb::CertificateMetadata {
+                        dns_names: vec![String::new(); 32_769],
+                        ..Default::default()
+                    }),
+                    bundle: Some(pb::CertificateBundle {
+                        chain_der: vec![Vec::new(); 32_700],
+                        private_key_pkcs8_der: Vec::new(),
+                    }),
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let new = pb::ResolveTlsCertificateResponse {
+            value: Some(pb::resolve_tls_certificate_response::Value::Unchanged(
+                pb::CertificateMetadata {
+                    dns_names: vec![String::new(); 65_537],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let old_decoded = pb::ResolveTlsCertificateResponse::decode(old.as_slice()).unwrap();
+        let Some(pb::resolve_tls_certificate_response::Value::Found(old_decoded)) =
+            old_decoded.value
+        else {
+            panic!()
+        };
+        let mut combined = old;
+        combined.extend_from_slice(&new);
+        assert!(combined.len() <= 256 * 1024);
+        let new_decoded = pb::ResolveTlsCertificateResponse::decode(combined.as_slice()).unwrap();
+        let Some(pb::resolve_tls_certificate_response::Value::Unchanged(new_decoded)) =
+            new_decoded.value
+        else {
+            panic!()
+        };
+        let old_capacity = old_decoded.metadata.unwrap().dns_names.capacity();
+        let old_chain_capacity = old_decoded.bundle.unwrap().chain_der.capacity();
+        let new_capacity = new_decoded.dns_names.capacity();
+        let unary_peak = (old_capacity + old_chain_capacity + new_capacity + new_capacity / 2)
+            * std::mem::size_of::<String>();
+        // Decode and validated-material processing are sequential. Malformed
+        // Unchanged metadata is rejected before cryptographic validation. Do
+        // not add valid-domain crypto scratch to the moving decode allocation.
+        let decode_envelope = unary_peak + 2 * 256 * 1024 + 256 * 1024;
+        let validation_envelope =
+            4 * super::MAX_CERTIFICATE_BUNDLE_BYTES + 2 * 256 * 1024 + 1024 * 1024;
+        assert!(decode_envelope.max(validation_envelope) < 8 * 1024 * 1024);
+        println!("unary_oneof_replacement wire_bytes={} moving_growth_peak_bytes={} decode_envelope={} valid_domain_validation_envelope={}",combined.len(),unary_peak,decode_envelope,validation_envelope);
+        println!("bounded_decode event_struct={} event_capacity_bytes={event_bytes} request_struct={} request_capacity_bytes={request_bytes} unary_capacity_bytes={unary_bytes} valid_interests_wire_bytes={}",std::mem::size_of::<pb::TlsCertificateEvent>(),std::mem::size_of::<pb::TlsCertificateInterest>(),valid.encoded_len());
     }
 }

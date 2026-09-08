@@ -247,6 +247,14 @@ the route outbox's bounded prefix-retention and reset pattern, with a separate
 100,000-event hard cap and at most 1,024 events per read. Events and operator
 metadata contain no private key material.
 
+`snapshot_tls_bindings` reads up to 1,024 requested current bindings and the
+global outbox cursor in one SQL snapshot, without loading or decrypting bundles.
+A native certificate watch starts from this coherent snapshot and polls durable
+changes after its cursor. A retention gap requires reset and resynchronization.
+The cursor advances over unrelated events too; only each hostname's own revision
+can fence that hostname. The client applies received events independently of
+other hostnames' delivery order.
+
 Private keys use a versioned AES-256-GCM envelope. Associated data includes the
 certificate ID/version, sealing key ID and a digest of the complete chain.
 Deployment-provided active/read keys remain outside PostgreSQL; there is no
@@ -276,6 +284,13 @@ five-second local timeout; only a successful protocol round trip returns the
 session to the pool. Failure, timeout or task cancellation discards its transport.
 This bounds admitted local work and session reuse; remote statement termination
 still depends on PostgreSQL and its configured statement timeout.
+
+Snapshot and certificate-feed reads share an additional one-slot watch limit per
+store. The same ownership record carries it through connection checkout, queued
+SQL, protocol drain and discard. Thus a canceled watch read cannot release its
+slot while its SQL/session cleanup is still outstanding. Ordinary certificate
+operations retain the other default slots; the two-connection minimum still
+preserves one ordinary route/lifecycle connection.
 
 The [dynamic certificate plan](dynamic-certificates-plan.md) tracks
 the implementation and actual database validation evidence.

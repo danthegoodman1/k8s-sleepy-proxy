@@ -20,9 +20,9 @@ exact canonical DNS hostnames; a supplied SAN/wildcard certificate is acceptable
 only when standards-based validation covers each explicitly bound hostname.
 
 Implementation is active on `dynamic-certificates`, starting from merged main
-`456d37e`. Phases 1 and 2 are committed and pushed as `f138053` and `4688c23`;
-Phase 3 is active. Prior TLS and routing evidence is a baseline, not proof that dynamic
-delivery works. Execute phases in order, preserving a reviewable commit and
+`456d37e`. Phases 1–4 are complete; the first three are committed and pushed as `f138053`,
+`4688c23` and `9d0cfa9`. Phase 5 is next. Prior TLS and routing evidence is a
+baseline, not proof that dynamic delivery works. Execute phases in order, preserving a reviewable commit and
 independent review at each completed boundary.
 
 ## Implementation Principles
@@ -92,14 +92,18 @@ delay enforcement until the original lease expires. Derive local deadlines
 conservatively from RPC start/authoritative validity using monotonic time; delayed
 responses or wall-clock rollback must not extend permission to serve.
 
-Start with at most 1,024 cached hostname views, 64 MiB of accounted cache memory,
-32 concurrent fetches, 128 KiB per certificate bundle, 16 chain entries and 100
+Use at most 1,024 cached hostname views, 64 MiB of accounted cache memory,
+3 concurrent fetches, 128 KiB per certificate bundle, 16 chain entries and 100
 SANs. Include negative entries, pending work, notification queues, parsed key/
 configuration overhead and bounded TLS session state in resource accounting.
 Handshake waiters remain under connection admission; there is no unbounded
 secondary queue. Reject invalid configurations before allocating work. Measure
 RSS separately from accounted cache bytes and document the envelope; these limits
 may be adjusted only with recorded measurements and unchanged safety semantics.
+Phase 4 reduces the original 32-fetch ceiling to three so conservative decoded
+protobuf and validation reservations fit the same 64 MiB budget. Wire byte limits
+alone do not bound repeated-field allocations tightly enough; the adversarial
+decode evidence and resulting reservations are part of that phase's gate.
 The watch interest cap must cover the cache's hostname cap. Bound certificate
 RPCs and parsing/decryption work on the server as well as on each proxy, leaving
 capacity for route and lifecycle traffic under a multi-proxy miss flood.
@@ -273,11 +277,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: Durable watch, initial synchronization and reset | Missing: protocol/broker/client implementation and cursor-gap proof. |
-| Incomplete | Work | 4B: Rotation/removal/rebind race fencing | Missing: atomic installation and stale-response regression tests. |
-| Incomplete | Work | 4C: Bounded interests, streams and independent progress | Missing: admission integration and repeated disconnect/eviction evidence. |
-| Incomplete | Test | 4T: Multi-replica convergence and adversarial ordering | Missing: actual Postgres/two-replica race and outage tests. |
-| Incomplete | Gate | 4G: Reliable propagation with bounded stale service | Missing: independent review and measured convergence/freshness results. |
+| Complete | Work | 4A: Durable watch, initial synchronization and reset | Independently reviewed native metadata snapshot/outbox watch with bounded streams and current-state reset; [phase evidence](review-evidence/dynamic-certificates/phase4/README.md). |
+| Complete | Work | 4B: Rotation/removal/rebind race fencing | 22 cache/watch/TLS tests cover held stale responses, rebind, per-host ordering, reset, expiry and eviction; actual process fingerprints converge through both replicas. |
+| Complete | Work | 4C: Bounded interests, streams and independent progress | Reviewed decoded-memory reservations and three-fetch bound; SQL drain ownership and ordinary native API progress with 16 active watches on a two-connection pool pass. |
+| Complete | Work | 4D: Regression-gate test corrections | Actual PostgreSQL outbox read-retry red/green and controlled sidecar port-collision red/green; independent review approves both test-only fixes with original safety assertions intact. |
+| Complete | Test | 4T: Multi-replica convergence and adversarial ordering | Four actual PostgreSQL/native watch cases plus 13 two-control-plane/two-Frontline process cases pass; maximum observed post-commit convergence 0.476s, existing H2 survives rotation, pruned-history recovery preserves per-host authority. |
+| Complete | Gate | 4G: Reliable propagation with bounded stale service | Explicit whole-phase independent approval; final fmt/strict workspace Clippy, 864 local executions, actual PostgreSQL 24/0/0, dependency gates and process convergence pass at `49cf4e8a`. |
 
 ## Phase 5: Deployed Certificate Lifecycle and Resource Proof
 

@@ -1,0 +1,278 @@
+//! Metadata-only native watches over the durable outbox. Each stream owns its
+//! cursor; replica switching needs no local broker or historical task registry.
+use super::{
+    admission::SubscriptionLease, certificates, pb, route_events::RouteSubscriptionBroker,
+};
+use crate::{auth::CallerRole, certificate::*, store::ControlPlaneStore};
+use std::{
+    collections::HashSet,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::sync::mpsc;
+use tonic::{
+    codegen::tokio_stream::{self, wrappers::ReceiverStream},
+    Request, Response, Status,
+};
+
+pub(crate) const WATCH_STREAMS: usize = 16;
+const RESPONSE_QUEUE: usize = 2;
+const PAGE: u32 = 256;
+const POLL: Duration = Duration::from_millis(250);
+const LIFETIME: Duration = Duration::from_secs(60);
+const LOOKUP: Duration = Duration::from_secs(3);
+const DELIVERY: Duration = Duration::from_secs(1);
+static NEXT_WATCH: AtomicU64 = AtomicU64::new(0);
+pub(crate) type WatchStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<pb::WatchTlsCertificatesResponse, Status>> + Send>,
+>;
+
+pub(crate) async fn watch(
+    store: Arc<dyn ControlPlaneStore>,
+    broker: RouteSubscriptionBroker,
+    request: Request<tonic::Streaming<pb::WatchTlsCertificatesRequest>>,
+) -> Result<Response<WatchStream>, Status> {
+    certificates::require_secure(&request, CallerRole::Proxy)?;
+    let permit = Arc::new(
+        broker
+            .certificate_streams
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("certificate watch capacity exhausted"))?,
+    );
+    let requests = request.into_inner();
+    let (responses, receiver) = mpsc::channel(RESPONSE_QUEUE);
+    let owned = permit.clone();
+    let task = tokio::spawn(produce(store, broker, requests, responses, owned));
+    let mut response: Response<WatchStream> = Response::new(Box::pin(OwnedWatch {
+        receiver: ReceiverStream::new(receiver),
+        task,
+        _permit: permit.clone(),
+    }));
+    response.extensions_mut().insert(SubscriptionLease {
+        permit,
+        lifetime: LIFETIME,
+    });
+    Ok(response)
+}
+// Kept separate so timer/backpressure ownership can be tested with controlled
+// decoded input; native TLS/body decoding is exercised by the real API tests.
+async fn produce<S>(
+    store: Arc<dyn ControlPlaneStore>,
+    broker: RouteSubscriptionBroker,
+    mut requests: S,
+    responses: mpsc::Sender<Result<pb::WatchTlsCertificatesResponse, Status>>,
+    owned: Arc<tokio::sync::OwnedSemaphorePermit>,
+) where
+    S: tokio_stream::Stream<Item = Result<pb::WatchTlsCertificatesRequest, Status>> + Unpin,
+{
+    let _owned = owned;
+    let cancellation = broker.cancellation.clone();
+    // Per-stream phases avoid a synchronized sixteen-query burst. The store-owned watch
+    // permit bounds both active and draining SQL across all streams. Pool=2
+    // retains its ordinary slot; default pools retain unary cert slots too.
+    let phase = Duration::from_millis((NEXT_WATCH.fetch_add(1, Ordering::Relaxed) % 16) * 15);
+    let mut next_poll = tokio::time::Instant::now() + phase;
+    let setup = tokio::time::sleep(LOOKUP);
+    tokio::pin!(setup);
+    let mut state = WatchState::default();
+    // The same outer bound covers input decode, SQL, and delivery. A dropped
+    // SQL future keeps the existing guarded certificate checkout ownership.
+    let _ = tokio::time::timeout(LIFETIME, async {
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = responses.closed() => return,
+                    _ = &mut setup, if state.cursor.is_none() => return,
+                    next = tokio_stream::StreamExt::next(&mut requests), if state.pending.is_none() => {
+                        let next = match next {
+                            Some(Ok(next)) => next,
+                            _ => return,
+                        };
+                        match state.register(next) {
+                            Ok(()) => {},
+                            Err(error) => {
+                                let _ = responses.try_send(Err(error));
+                                return;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(next_poll), if state.pending.is_some() || state.cursor.is_some() => {
+                        next_poll = tokio::time::Instant::now() + POLL;
+                        let result = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            _ = &mut setup, if state.cursor.is_none() => return,
+                            result = tokio::time::timeout(LOOKUP, state.poll(store.as_ref())) => result,
+                        };
+                        let response = match result {
+                            Ok(response) => response,
+                            Err(_) => Err(Status::deadline_exceeded("certificate watch query deadline elapsed")),
+                        };
+                        let terminal = response.is_err()
+                            || response.as_ref().ok().and_then(|r| r.as_ref()).is_some_and(|r| {
+                                matches!(r.value, Some(pb::watch_tls_certificates_response::Value::Reset(_)))
+                            });
+                        let response = match response {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => continue,
+                            Err(e) => Err(e),
+                        };
+                        if !matches!(
+                            tokio::time::timeout(DELIVERY, responses.send(response)).await,
+                            Ok(Ok(()))
+                        ) || terminal {
+                            return;
+                        }
+                    }
+                }
+            }
+        }).await;
+}
+#[derive(Default)]
+struct WatchState {
+    hosts: HashSet<TlsHostname>,
+    cursor: Option<CertificateRevision>,
+    registration: u64,
+    pending: Option<Vec<TlsHostname>>,
+}
+impl WatchState {
+    fn register(&mut self, request: pb::WatchTlsCertificatesRequest) -> Result<(), Status> {
+        if request.registration <= self.registration {
+            return Err(Status::invalid_argument(
+                "certificate registration must increase",
+            ));
+        }
+        let hosts = interests(request.interests)?;
+        self.registration = request.registration;
+        self.pending = Some(hosts);
+        Ok(())
+    }
+    // A registration replaces one regular poll, never bypasses the 4/s rate.
+    // While pending, input reads stop instead of collecting registration work.
+    async fn poll(
+        &mut self,
+        store: &dyn ControlPlaneStore,
+    ) -> Result<Option<pb::WatchTlsCertificatesResponse>, Status> {
+        use pb::watch_tls_certificates_response::Value;
+        if let Some(names) = self.pending.as_ref() {
+            let snapshot = match store.snapshot_tls_bindings(names.clone()).await {
+                Ok(snapshot) => snapshot,
+                Err(crate::store::StoreError::Unavailable { .. }) => return Ok(None),
+                Err(_) => {
+                    return Err(Status::unavailable(
+                        "certificate synchronization unavailable",
+                    ))
+                }
+            };
+            let names = self.pending.take().unwrap();
+            self.hosts = names.into_iter().collect();
+            self.cursor = Some(snapshot.cursor);
+            return Ok(Some(pb::WatchTlsCertificatesResponse {
+                value: Some(Value::Snapshot(pb::TlsCertificateSnapshot {
+                    registration: self.registration,
+                    cursor: snapshot.cursor.get(),
+                    bindings: snapshot
+                        .bindings
+                        .into_iter()
+                        .map(|b| pb::TlsBinding {
+                            hostname: b.hostname.to_string(),
+                            certificate_id: b.certificate_id.map(|id| id.to_string()),
+                            revision: b.revision.get(),
+                        })
+                        .collect(),
+                })),
+            }));
+        }
+        if self.hosts.is_empty() {
+            return Ok(None);
+        }
+        let page = match store
+            .load_tls_certificate_changes(self.cursor.unwrap(), PAGE)
+            .await
+        {
+            Ok(page) => page,
+            // Certificate admission pressure is transient. Retain the exact
+            // cursor and try a later tick rather than amplify it by reconnecting.
+            Err(crate::store::StoreError::Unavailable { .. }) => return Ok(None),
+            Err(_) => return Err(Status::unavailable("certificate history unavailable")),
+        };
+        self.cursor = Some(page.cursor);
+        if page.reset {
+            return Ok(Some(pb::WatchTlsCertificatesResponse {
+                value: Some(Value::Reset(pb::TlsCertificateReset {
+                    cursor: page.cursor.get(),
+                })),
+            }));
+        }
+        let events: Vec<_> = page
+            .events
+            .into_iter()
+            .filter_map(|event| {
+                let hostname = event.hostname?;
+                self.hosts
+                    .contains(&hostname)
+                    .then(|| pb::TlsCertificateEvent {
+                        hostname: hostname.to_string(),
+                        view_revision: event.revision.get(),
+                        certificate_id: event.certificate_id.map(|id| id.to_string()),
+                        invalidate: event.kind != TlsCertificateChangeKind::Published,
+                    })
+            })
+            .collect();
+        Ok(
+            (!events.is_empty()).then(|| pb::WatchTlsCertificatesResponse {
+                value: Some(Value::Changes(pb::TlsCertificateChanges {
+                    cursor: page.cursor.get(),
+                    events,
+                })),
+            }),
+        )
+    }
+}
+fn interests(values: Vec<pb::TlsCertificateInterest>) -> Result<Vec<TlsHostname>, Status> {
+    if values.len() > MAX_CERTIFICATE_BINDINGS {
+        return Err(Status::resource_exhausted(
+            "certificate interests exceed 1024 hosts",
+        ));
+    }
+    let mut unique = HashSet::new();
+    let mut names = Vec::with_capacity(values.len());
+    for value in values {
+        let name = TlsHostname::new(&value.hostname)
+            .map_err(|_| Status::invalid_argument("invalid certificate interest"))?;
+        if name.as_str() != value.hostname
+            || !unique.insert(name.clone())
+            || CertificateRevision::new(value.known_view_revision).is_err()
+        {
+            return Err(Status::invalid_argument("invalid certificate interest"));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+struct OwnedWatch {
+    receiver: ReceiverStream<Result<pb::WatchTlsCertificatesResponse, Status>>,
+    task: tokio::task::JoinHandle<()>,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+impl tokio_stream::Stream for OwnedWatch {
+    type Item = Result<pb::WatchTlsCertificatesResponse, Status>;
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+impl Drop for OwnedWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests;

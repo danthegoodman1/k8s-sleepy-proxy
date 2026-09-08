@@ -1,8 +1,10 @@
 //! Demand-loaded application certificates. The worker owns all asynchronous
 //! work; the handle only accesses bounded memory and queues bounded fetches.
 mod client;
+mod notifications;
 mod worker;
 pub use client::GrpcCertificateResolver;
+pub use notifications::{CertificateWatchFuture, CertificateWatchStream, CertificateWatcher};
 #[cfg(test)]
 mod handshake_tests;
 #[cfg(test)]
@@ -28,16 +30,20 @@ pub use worker::TlsCertificateWorker;
 
 pub const CERTIFICATE_CACHE_ENTRIES: usize = 1024;
 pub const CERTIFICATE_CACHE_BYTES: usize = 64 * 1024 * 1024;
-pub const CERTIFICATE_FETCHES: usize = 32;
+pub const CERTIFICATE_FETCHES: usize = 3;
 pub const CERTIFICATE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CERTIFICATE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ENTRY_BYTES: usize = 1024;
 // Retained hash-table buckets, bounded channels/task records and state remain
-// allocated even when entries are evicted. Charge their complete envelope.
-const STRUCTURE_BYTES: usize = 1024 * 1024;
+// allocated even when entries are evicted. Includes one 512KiB watch response,
+// one queued/request snapshot, registration maps and coalesced interest state.
+const STRUCTURE_BYTES: usize = 4 * 1024 * 1024;
 // Includes bounded wire response, validation scratch, DER/key copies and the
 // replacement config. On installation this is reduced to the retained charge.
-const FETCH_BYTES: usize = 1024 * 1024;
+const FETCH_BYTES: usize = 8 * 1024 * 1024;
+// Malformed bounded Prost messages may temporarily retain both oneof variants
+// plus old/new allocations during vector growth; this charge includes that peak.
+const WATCH_BYTES: usize = 32 * 1024 * 1024;
 const CONFIG_OVERHEAD: usize = 128 * 1024;
 
 pub type CertificateResolveFuture = Pin<
@@ -99,11 +105,15 @@ struct Shared {
     fetches: Arc<Semaphore>,
 }
 struct State {
+    interests_changed: watch::Sender<()>,
     entries: HashMap<String, Entry>,
     serial: u64,
     stopped: bool,
 }
 struct Entry {
+    incarnation: u64,
+    floor: u64,
+    refresh_requested: bool,
     generation: u64,
     touched: u64,
     value: Option<View>,
@@ -124,6 +134,7 @@ struct Fetch {
     hostname: String,
     generation: u64,
     prior: Option<View>,
+    floor: u64,
     memory: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
 }
@@ -155,6 +166,7 @@ impl TlsCertificateStore {
             task_high_water: std::sync::atomic::AtomicUsize::new(0),
             wall,
             state: Mutex::new(State {
+                interests_changed: watch::channel(()).0,
                 entries: HashMap::new(),
                 serial: 0,
                 stopped: false,
@@ -227,6 +239,9 @@ impl TlsCertificateStore {
                 state.entries.insert(
                     hostname.clone(),
                     Entry {
+                        incarnation: serial,
+                        floor: 0,
+                        refresh_requested: false,
                         generation: serial,
                         touched: serial,
                         value: None,
@@ -237,6 +252,7 @@ impl TlsCertificateStore {
                     },
                 );
             }
+            state.interests_changed.send_replace(());
             self.queue_locked(&mut state, &hostname)?;
             state.entries[&hostname].changed.subscribe()
         };
@@ -299,6 +315,7 @@ impl TlsCertificateStore {
             hostname: hostname.to_owned(),
             generation: entry.generation,
             prior: entry.value.clone(),
+            floor: entry.floor,
             memory,
             _slot: slot,
         };
@@ -306,6 +323,7 @@ impl TlsCertificateStore {
             .try_send(fetch)
             .map_err(|_| CertificateLookupError::Capacity)?;
         entry.pending = true;
+        entry.refresh_requested = false;
         entry.last_error = None;
         Ok(())
     }
@@ -313,6 +331,7 @@ impl TlsCertificateStore {
         let mut state = self.shared.state.lock().unwrap();
         state.stopped = true;
         state.entries.clear();
+        state.interests_changed.send_replace(());
     }
 }
 fn evict_one(state: &mut State, exclude: Option<&str>) -> bool {
@@ -324,6 +343,7 @@ fn evict_one(state: &mut State, exclude: Option<&str>) -> bool {
         .map(|(k, _)| k.clone());
     if let Some(key) = victim {
         state.entries.remove(&key);
+        state.interests_changed.send_replace(());
         true
     } else {
         false

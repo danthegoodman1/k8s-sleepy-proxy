@@ -227,12 +227,12 @@ async fn entries_bytes_fetches_and_old_configuration_ownership_remain_bounded() 
     let mut rig = Rig::new();
     let mut callers = JoinSet::new();
     let mut held = Vec::new();
-    for i in 0..32 {
+    for i in 0..CERTIFICATE_FETCHES {
         let c = rig.cache.clone();
         callers.spawn(async move { c.resolve(&format!("f{i}.example")).await });
         held.push(rig.next().await.1);
     }
-    assert_eq!(rig.cache.usage().fetches, 32);
+    assert_eq!(rig.cache.usage().fetches, CERTIFICATE_FETCHES);
     assert_eq!(
         rig.cache.resolve("overflow.example").await.unwrap_err(),
         CertificateLookupError::Capacity
@@ -421,6 +421,7 @@ async fn malformed_and_delayed_responses_cannot_install_or_extend_a_view() {
         hostname: "app.example".into(),
         generation: 1,
         prior,
+        floor: 0,
         memory: fixture
             .cache
             .shared

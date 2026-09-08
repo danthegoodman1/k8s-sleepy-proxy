@@ -13,6 +13,8 @@ pub struct TlsCertificateWorker {
     cache: TlsCertificateStore,
     resolver: Arc<dyn CertificateResolver>,
     receiver: mpsc::Receiver<Fetch>,
+    watcher: Option<Arc<dyn CertificateWatcher>>,
+    _watch_memory: Option<OwnedSemaphorePermit>,
 }
 impl TlsCertificateWorker {
     pub(super) fn new(
@@ -24,12 +26,45 @@ impl TlsCertificateWorker {
             cache,
             resolver,
             receiver,
+            watcher: None,
+            _watch_memory: None,
+        }
+    }
+    /// The native runtime supplies the same verified client as unary resolves.
+    /// Watches are lazy: an empty HTTP-only/unused TLS cache opens no stream.
+    pub fn with_watch(
+        mut self,
+        watcher: Arc<dyn CertificateWatcher>,
+    ) -> Result<Self, CertificateLookupError> {
+        // Reserve before serving/fetching so active decode work cannot starve
+        // notification delivery. This also owns the stream teardown envelope.
+        self._watch_memory = Some(
+            self.cache
+                .shared
+                .bytes
+                .clone()
+                .try_acquire_many_owned(WATCH_BYTES as u32)
+                .map_err(|_| CertificateLookupError::Capacity)?,
+        );
+        self.watcher = Some(watcher);
+        Ok(self)
+    }
+    pub async fn run(mut self, shutdown: Shutdown) {
+        let _watch_memory = self._watch_memory.take();
+        if let Some(watcher) = self.watcher.clone() {
+            let cache = self.cache.clone();
+            tokio::join!(
+                self.run_fetches(shutdown.clone()),
+                notifications::run(cache, watcher, shutdown)
+            );
+        } else {
+            self.run_fetches(shutdown).await;
         }
     }
     /// On shutdown, cancel network work, then join every validation already
     /// dispatched. Bounded blocking input and its byte/fetch permits survive
     /// caller cancellation; there is no independent refresh task per hostname.
-    pub async fn run(mut self, shutdown: Shutdown) {
+    async fn run_fetches(mut self, shutdown: Shutdown) {
         let mut tasks = JoinSet::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -52,8 +87,8 @@ impl TlsCertificateWorker {
                 _ = ticker.tick() => {
                     let mut state = self.cache.shared.state.lock().unwrap();
                     let due: Vec<_> = state.entries.iter()
-                        .filter(|(_, entry)| !entry.pending && entry.value.as_ref()
-                            .is_some_and(|view| view.config.is_some() && Instant::now() >= view.refresh))
+                        .filter(|(_, entry)| !entry.pending && (entry.refresh_requested || entry.value.as_ref()
+                            .is_some_and(|view| view.config.is_some() && Instant::now() >= view.refresh)))
                         .map(|(hostname, _)| hostname.clone())
                         .collect();
                     for hostname in due {
@@ -127,6 +162,7 @@ async fn fetch_one(
     } else {
         match result {
             Ok(view) if Instant::now() < view.expires => {
+                entry.floor = entry.floor.max(view.revision);
                 entry.value = Some(view);
                 entry.last_error = None;
             }
@@ -166,6 +202,9 @@ pub(super) fn validate_view(
         return Err(invalid());
     }
     CertificateRevision::new(response.view_revision).map_err(|_| invalid())?;
+    if response.view_revision < fetch.floor {
+        return Err(invalid());
+    }
     if fetch
         .prior
         .as_ref()

@@ -44,6 +44,7 @@ impl Default for ApiLimits {
 pub struct RpcAdmissionLayer {
     semaphore: Arc<Semaphore>,
     certificate_semaphore: Arc<Semaphore>,
+    certificate_watch_semaphore: Arc<Semaphore>,
     delivery_timeout: Duration,
 }
 impl RpcAdmissionLayer {
@@ -54,6 +55,9 @@ impl RpcAdmissionLayer {
         Self {
             semaphore: Arc::new(Semaphore::new(limit)),
             certificate_semaphore: Arc::new(Semaphore::new(8)),
+            certificate_watch_semaphore: Arc::new(Semaphore::new(
+                super::certificate_watch::WATCH_STREAMS,
+            )),
             delivery_timeout,
         }
     }
@@ -63,6 +67,7 @@ pub struct RpcAdmissionService<S> {
     inner: S,
     semaphore: Arc<Semaphore>,
     certificate_semaphore: Arc<Semaphore>,
+    certificate_watch_semaphore: Arc<Semaphore>,
     delivery_timeout: Duration,
 }
 impl<S> Layer<S> for RpcAdmissionLayer {
@@ -72,6 +77,7 @@ impl<S> Layer<S> for RpcAdmissionLayer {
             inner,
             semaphore: self.semaphore.clone(),
             certificate_semaphore: self.certificate_semaphore.clone(),
+            certificate_watch_semaphore: self.certificate_watch_semaphore.clone(),
             delivery_timeout: self.delivery_timeout,
         }
     }
@@ -107,7 +113,11 @@ where
                 )
             });
         }
-        let capacity = if certificate {
+        let certificate_watch = request.uri().path()
+            == "/sleepypods.controlplane.v1.ProxyControlPlane/WatchTlsCertificates";
+        let capacity = if certificate_watch {
+            &self.certificate_watch_semaphore
+        } else if certificate {
             &self.certificate_semaphore
         } else {
             &self.semaphore
@@ -139,10 +149,11 @@ where
             }
             return Box::pin(async move { Ok(response) });
         };
-        let subscription = request
-            .uri()
-            .path()
-            .ends_with("/ProxyControlPlane/Subscribe")
+        let subscription = certificate_watch
+            || request
+                .uri()
+                .path()
+                .ends_with("/ProxyControlPlane/Subscribe")
             || request.uri().path() == "/sleepypods.controlplane.v1.ProxyControlPlane/Subscribe";
         let connection = connection_progress(request.extensions()).cloned();
         let delivery_timeout = self.delivery_timeout;
@@ -326,6 +337,7 @@ fn certificate_method(path: &str) -> bool {
             | "/sleepypods.controlplane.v1.OperatorControlPlane/RemoveCertificate"
             | "/sleepypods.controlplane.v1.OperatorControlPlane/ReencryptCertificate"
             | "/sleepypods.controlplane.v1.ProxyControlPlane/ResolveTlsCertificate"
+            | "/sleepypods.controlplane.v1.ProxyControlPlane/WatchTlsCertificates"
     )
 }
 

@@ -8,28 +8,52 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub(crate) struct CertificateWorkLimits {
     operations: Arc<Semaphore>,
     crypto: Arc<Semaphore>,
+    watch_reads: Arc<Semaphore>,
 }
 impl CertificateWorkLimits {
     pub fn new(database_capacity: usize) -> Self {
         Self {
             operations: Arc::new(Semaphore::new(database_capacity.saturating_sub(1).min(4))),
             crypto: Arc::new(Semaphore::new(2)),
+            watch_reads: Arc::new(Semaphore::new(1)),
         }
     }
     pub fn acquire(&self) -> StoreResult<CertificateWork> {
+        self.acquire_with_watch(None)
+    }
+    pub fn acquire_watch(&self) -> StoreResult<CertificateWork> {
+        let watch =
+            self.watch_reads.clone().try_acquire_owned().map_err(|_| {
+                StoreError::unavailable("certificate watch read capacity exhausted")
+            })?;
+        self.acquire_with_watch(Some(watch))
+    }
+    fn acquire_with_watch(
+        &self,
+        watch: Option<OwnedSemaphorePermit>,
+    ) -> StoreResult<CertificateWork> {
         let permit = self
             .operations
             .clone()
             .try_acquire_owned()
             .map_err(|_| StoreError::unavailable("certificate work capacity exhausted"))?;
         Ok(CertificateWork {
-            operation: Arc::new(permit),
+            operation: Arc::new(CertificateWorkPermits {
+                _operation: permit,
+                _watch: watch,
+            }),
             crypto: self.crypto.clone(),
         })
     }
 }
+// The watch-specific slot shares the exact operation/client/drain lifetime.
+// A canceled read cannot release it while SQL is still queued on the session.
+struct CertificateWorkPermits {
+    _operation: OwnedSemaphorePermit,
+    _watch: Option<OwnedSemaphorePermit>,
+}
 pub(crate) struct CertificateWork {
-    operation: Arc<OwnedSemaphorePermit>,
+    operation: Arc<CertificateWorkPermits>,
     crypto: Arc<Semaphore>,
 }
 impl CertificateWork {
@@ -58,7 +82,7 @@ impl CertificateWork {
 /// slot. Timeout or task/runtime cancellation discards the session instead.
 pub(crate) struct CertificateConnection {
     client: Option<deadpool_postgres::Client>,
-    operation: Arc<OwnedSemaphorePermit>,
+    operation: Arc<CertificateWorkPermits>,
 }
 impl std::ops::Deref for CertificateConnection {
     type Target = deadpool_postgres::Client;
@@ -73,7 +97,7 @@ impl std::ops::DerefMut for CertificateConnection {
 }
 struct PendingDrain {
     client: Option<deadpool_postgres::Client>,
-    _operation: Arc<OwnedSemaphorePermit>,
+    _operation: Arc<CertificateWorkPermits>,
 }
 impl Drop for PendingDrain {
     fn drop(&mut self) {
