@@ -10,14 +10,14 @@ use std::{
 };
 
 use bytes::Bytes;
-use control_plane::api::pb::{
-    self,
-    sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
-};
 use http::{Request as HttpRequest, Response as HttpResponse};
 use http_body_util::Full;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use sleepypods_api::pb::{
+    self,
+    sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -118,6 +118,7 @@ fn spawn_sidecar(
         .env("SLEEPYPODS_SIDECAR_LISTEN_ADDR", listen_addr.to_string())
         .env("SLEEPYPODS_APP_PORT", app_port.to_string())
         .env("SLEEPYPODS_INSTANCE_ID", "process-lifecycle-test")
+        .env("SLEEPYPODS_POD_UID", "process-lifecycle-pod")
         .env("SLEEPYPODS_INSTANCE_GENERATION", "7")
         .env(
             "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",

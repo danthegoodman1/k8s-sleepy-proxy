@@ -9,13 +9,10 @@ use std::{
 
 use http::Uri;
 use proxy_core::{
-    configure_tcp_keepalive, proxy_streams_with_idle_timeout, read_tls_client_hello_prefix,
-    TcpProxyConfig, TcpProxyStats, TlsClientHelloError, TlsClientHelloSni,
+    configure_tcp_keepalive, read_tls_client_hello_prefix, TcpProxyConfig, TcpProxyStats,
+    TlsClientHelloError, TlsClientHelloSni,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{
     rustls::{
         self,
@@ -35,6 +32,7 @@ pub struct TlsCertificateStore {
 #[derive(Clone, Debug)]
 pub struct FrontlineTlsAdapter {
     certificates: TlsCertificateStore,
+    resources: proxy_core::ProxyResourceConfig,
 }
 
 #[derive(Debug)]
@@ -135,7 +133,15 @@ impl TlsCertificateStore {
 
 impl FrontlineTlsAdapter {
     pub fn new(certificates: TlsCertificateStore) -> Self {
-        Self { certificates }
+        Self {
+            certificates,
+            resources: proxy_core::ProxyResourceConfig::default(),
+        }
+    }
+
+    pub fn with_resource_config(mut self, config: proxy_core::ProxyResourceConfig) -> Self {
+        self.resources = config;
+        self
     }
 
     pub fn certificates(&self) -> &TlsCertificateStore {
@@ -224,16 +230,17 @@ impl FrontlineTlsAdapter {
         let upstream = passthrough_backend_addr(ready)?;
         let identity = client_hello.identity;
 
-        let upstream = TcpStream::connect(upstream)
+        let upstream = proxy_core::connect_tcp(upstream, self.resources.setup_timeout())
             .await
             .map_err(TlsPassthroughError::Connect)?;
         configure_tcp_keepalive(&upstream, TcpProxyConfig::default().tcp_keepalive)
             .map_err(TlsPassthroughError::Connect)?;
         let client = PrefixedStream::new(client_hello.bytes, client);
-        let stats = proxy_streams_with_idle_timeout(
+        let stats = proxy_core::proxy_streams_with_timeouts(
             client,
             upstream,
             TcpProxyConfig::default().stream_idle_timeout,
+            self.resources.write_idle_timeout(),
         )
         .await
         .map_err(TlsPassthroughError::Proxy)?;
@@ -279,8 +286,8 @@ pub fn passthrough_backend_addr(
 
 fn canonical_sni_key(sni: &str) -> Result<String, RequestIdentityError> {
     match RouteRequestIdentity::sni(sni)?.into_identity() {
-        control_plane::RouteIdentity::Sni { host } => Ok(host.as_str().to_owned()),
-        control_plane::RouteIdentity::Http { .. } => unreachable!("SNI constructor returns SNI"),
+        sleepypods_api::RouteIdentity::Sni { host } => Ok(host.as_str().to_owned()),
+        sleepypods_api::RouteIdentity::Http { .. } => unreachable!("SNI constructor returns SNI"),
     }
 }
 

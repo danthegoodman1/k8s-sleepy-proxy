@@ -1,14 +1,13 @@
 //! Protobuf-defined control-plane API and transport scaffolding.
 
+pub mod admission;
 mod proxy;
 mod route_events;
 pub mod server;
 mod sidecar;
 mod template;
 
-pub mod pb {
-    tonic::include_proto!("sleepypods.controlplane.v1");
-}
+pub use sleepypods_api::pb;
 
 pub use proxy::{
     proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,

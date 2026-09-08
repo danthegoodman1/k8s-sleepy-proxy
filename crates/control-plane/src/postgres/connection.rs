@@ -13,33 +13,60 @@ use super::migrations;
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
     pub(crate) pool: Pool,
+    pub(crate) idempotency_retention_millis: Option<i64>,
 }
 
 impl PostgresStore {
     pub async fn connect(config: &PostgresStoreConfig) -> StoreResult<Self> {
-        let pg_config = parse_connection_url(config.connection_url())?;
+        config.validate_limits().map_err(|setting| {
+            StoreError::invalid_argument(format!("{setting} is outside its supported limits"))
+        })?;
+        let retention = config
+            .idempotency_retention
+            .map(|duration| duration.as_millis() as i64);
+        let statement_timeout = config.statement_timeout.as_millis();
+        let operation_timeout = config.operation_timeout.as_millis();
+        let mut pg_config = parse_connection_url(config.connection_url())?;
+        pg_config.connect_timeout(config.connection_timeout);
+        let options = format!(
+            "{} -c statement_timeout={statement_timeout} -c sleepypods.operation_timeout_ms={operation_timeout}",
+            pg_config.get_options().unwrap_or("")
+        );
+        pg_config.options(&options);
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
         let manager = Manager::from_config(pg_config, NoTls, manager_config);
         let pool = Pool::builder(manager)
-            .max_size(16)
+            .max_size(config.max_connections)
+            .wait_timeout(Some(config.pool_wait_timeout))
+            .create_timeout(Some(config.connection_timeout))
+            .recycle_timeout(Some(config.connection_timeout))
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(|error| {
                 StoreError::internal(format!("failed to build Postgres pool: {error}"))
             })?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            idempotency_retention_millis: retention,
+        };
 
         store.run_migrations().await?;
 
         Ok(store)
     }
 
-    pub async fn run_migrations(&self) -> StoreResult<()> {
-        let client = self.client().await?;
+    /// Removes at most `limit` keys whose explicitly configured lifetime expired.
+    /// Permanent keys and unexpired tombstones are never removed.
+    pub async fn expire_idempotency_records(&self, limit: u32) -> StoreResult<u64> {
+        super::idempotency::expire_records(self, limit).await
+    }
 
-        migrations::run(&client).await
+    pub async fn run_migrations(&self) -> StoreResult<()> {
+        let mut client = self.client().await?;
+
+        migrations::run(&mut client).await
     }
 
     pub(crate) async fn client(&self) -> StoreResult<deadpool_postgres::Client> {
@@ -82,5 +109,26 @@ mod tests {
         fn assert_store<T: crate::store::ControlPlaneStore>() {}
 
         assert_store::<PostgresStore>();
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_invalid_limits_before_parsing_or_allocating() {
+        let mut config = PostgresStoreConfig::new("not a Postgres URL").unwrap();
+        config.max_connections = usize::MAX;
+        let error = PostgresStore::connect(&config).await.unwrap_err();
+        assert!(matches!(error, StoreError::InvalidArgument { message }
+            if message.contains("SLEEPYPODS_POSTGRES_MAX_CONNECTIONS")));
+
+        config.max_connections = 1;
+        config.statement_timeout = std::time::Duration::from_micros(999);
+        let error = PostgresStore::connect(&config).await.unwrap_err();
+        assert!(matches!(error, StoreError::InvalidArgument { message }
+            if message.contains("SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS")));
+
+        config.statement_timeout = std::time::Duration::from_millis(1);
+        config.idempotency_retention = Some(std::time::Duration::from_millis(i64::MAX as u64));
+        let error = PostgresStore::connect(&config).await.unwrap_err();
+        assert!(matches!(error, StoreError::InvalidArgument { message }
+            if message.contains("SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS")));
     }
 }

@@ -258,11 +258,11 @@ fn private_render_options_inject_sidecar_control_plane_token() {
         .value_from
         .as_ref()
         .expect("sidecar token env uses valueFrom");
-    assert_eq!(
-        source.secret_key_ref.name,
-        "sleepypods-sidecar-token-69856ec0"
-    );
-    assert_eq!(source.secret_key_ref.key, "token");
+    let super::EnvVarSource::SecretKeyRef(source) = source else {
+        panic!("expected secret reference")
+    };
+    assert_eq!(source.name, "sleepypods-sidecar-token-69856ec0");
+    assert_eq!(source.key, "token");
     assert_eq!(token_env.value, "");
 }
 
@@ -452,6 +452,18 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     assert_eq!(deployment["metadata"]["name"], json!("app-acme-69856ec0"));
     assert_eq!(deployment["metadata"]["namespace"], json!("apps"));
     assert_eq!(deployment["spec"]["replicas"], json!(1));
+    assert_eq!(deployment["spec"]["strategy"]["type"], json!("Recreate"));
+    let pod_uid = deployment["spec"]["template"]["spec"]["containers"][1]["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|env| env["name"] == "SLEEPYPODS_POD_UID")
+        .unwrap();
+    assert_eq!(
+        pod_uid["valueFrom"]["fieldRef"]["fieldPath"],
+        json!("metadata.uid")
+    );
+    assert!(pod_uid.get("value").is_none());
     assert_eq!(
         deployment["spec"]["selector"]["matchLabels"],
         service["spec"]["selector"]
@@ -738,14 +750,35 @@ spec:
         .find(|object| object_name(&object.object) == "raw-svc-acme")
         .expect("raw service rendered")
         .to_kubernetes_json();
+    let materialization = crate::materialization::MaterializationRecord {
+        id: crate::ids::MaterializationId::new("instance-a:cluster:apps").unwrap(),
+        instance_id: InstanceId::new("instance-a").unwrap(),
+        instance_generation: Generation::new(7),
+        projection_generation: Generation::new(7),
+        target: crate::materialization::MaterializationTarget::new("cluster", "apps").unwrap(),
+        state: crate::materialization::MaterializationState::Pending,
+        backend: None,
+        backend_generation: crate::ids::BackendGeneration::new(1),
+        rendered_objects: vec![],
+        exclusivity_keys: vec![],
+        reconciliation_lease: None,
+    };
+    let plan =
+        crate::projection::ProjectionPlan::from_manifest(&materialization, &rendered).unwrap();
+    assert_eq!(
+        plan.object_refs()
+            .iter()
+            .filter(|object| object.kind == "Service")
+            .map(|object| object.name.as_str())
+            .collect::<Vec<_>>(),
+        ["svc-acme-69856ec0", "raw-svc-acme"],
+        "stable apply ordering preserves the generated primary Service ahead of raw Services"
+    );
     assert_eq!(
         raw_service["metadata"]["labels"][LABEL_INSTANCE_ID],
         json!("instance-a")
     );
-    assert_eq!(
-        raw_service["metadata"]["labels"][LABEL_WORKLOAD_NAME],
-        json!("app-acme-69856ec0")
-    );
+    assert!(raw_service["metadata"]["labels"][LABEL_WORKLOAD_NAME].is_null());
     assert_eq!(raw_service["spec"]["type"], json!("ClusterIP"));
     assert_eq!(
         raw_service["metadata"]["finalizers"],
@@ -891,6 +924,8 @@ kind: PersistentVolume
 metadata:
   name: raw-pv
   namespace: apps
+spec:
+  persistentVolumeReclaimPolicy: Retain
 "#,
     )];
 
@@ -1373,6 +1408,80 @@ fn serializes_host_path_persistent_volume_source_as_kubernetes_json() {
 }
 
 #[test]
+fn managed_storage_rejects_destructive_policy_at_class_admission_and_legacy_render() {
+    let mut template = stateful_template();
+    template.volumes[0].reclaim_policy = PersistentVolumeReclaimPolicy::Delete;
+    let instance = instance(
+        "retention",
+        2,
+        values([("tenant", "acme"), ("volume", "disk")]),
+    );
+    let class = crate::workload::WorkloadClassVersion {
+        reference: instance.workload_class.clone(),
+        template_generation: Generation::new(1),
+        template: template.clone(),
+        default_values: Default::default(),
+        value_schema: crate::workload::WorkloadValueSchema::new(true),
+        sleep_policy: crate::sleep_policy::WorkloadSleepPolicy::new(60_000, 1_000, 30_000).unwrap(),
+        exclusivity_keys: vec![],
+    };
+    assert!(matches!(
+        class.validate(),
+        Err(crate::workload::WorkloadClassValidationError::StorageContract(_))
+    ));
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance,
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("Retain"));
+}
+
+#[test]
+fn raw_storage_cannot_bypass_retention_or_static_binding_validation() {
+    for raw in [
+        r#"{"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"disk"},"spec":{"persistentVolumeReclaimPolicy":"Delete"}}"#,
+        r#"{"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"disk"},"spec":{}}"#,
+        r#"{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"claim"},"spec":{}}"#,
+        r#"{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"claim"},"spec":{"volumeName":"external-unmanaged"}}"#,
+    ] {
+        let mut template = deployment_template();
+        template.raw_objects = vec![raw_manifest(raw)];
+        let result = render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("raw-storage", 2, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+            template_generation: None,
+        });
+        assert!(result.is_err(), "unsafe raw storage must be refused: {raw}");
+    }
+}
+
+#[test]
+fn rendering_legacy_classes_rejects_zero_and_multiple_replicas() {
+    for kind in [WorkloadKind::Deployment, WorkloadKind::StatefulSet] {
+        for replicas in [0, 2] {
+            let mut template = stateful_template();
+            template.workload.kind = kind;
+            template.workload.replicas = Some(replicas);
+            let error = render_manifests(RenderManifestRequest {
+                template: &template,
+                instance: &instance("old-app", 2, values([("tenant", "acme"), ("volume", "v1")])),
+                sleep_policy: sleep_policy(),
+                namespace: "apps",
+                template_generation: None,
+            })
+            .expect_err("legacy unsupported replica count cannot create resources");
+            assert!(matches!(error, ManifestRenderError::InvalidReplicas { .. }));
+        }
+    }
+}
+
+#[test]
 fn rejects_stateful_set_scale_above_one() {
     let mut template = stateful_template();
     template.workload.replicas = Some(2);
@@ -1395,7 +1504,7 @@ fn rejects_stateful_set_scale_above_one() {
         ManifestRenderError::InvalidReplicas {
             kind: WorkloadKind::StatefulSet,
             replicas: 2,
-            message: "StatefulSet replicas above one are not supported in V1".to_owned(),
+            message: "automatic sleep requires exactly one replica".to_owned(),
         }
     );
 }
@@ -2163,4 +2272,286 @@ fn assert_invalid_field(error: ManifestRenderError, field: &'static str, value: 
         }
         other => panic!("expected InvalidField for {field}, got {other:?}"),
     }
+}
+
+#[test]
+fn primary_http_and_tcp_workloads_have_private_transport_readiness() {
+    for mode in [None, Some("tcp".to_owned())] {
+        let mut template = deployment_template();
+        template.sidecar.mode = mode;
+        let rendered = render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+            template_generation: None,
+        })
+        .unwrap();
+        let workload = rendered
+            .objects
+            .iter()
+            .find(|object| object.object.kind() == "Deployment")
+            .unwrap()
+            .to_kubernetes_json();
+        let containers = &workload["spec"]["template"]["spec"]["containers"];
+        assert!(containers[0]["readinessProbe"].is_null());
+        assert_eq!(
+            containers[1]["readinessProbe"],
+            json!({
+                "httpGet": {"path":"/ready", "port":15001},
+                "periodSeconds":1,"timeoutSeconds":1,"failureThreshold":1,
+            })
+        );
+        assert!(containers[1]["env"].as_array().unwrap().contains(&json!({
+            "name":"SLEEPYPODS_SIDECAR_READINESS_LISTEN_ADDR", "value":"0.0.0.0:15001"
+        })));
+        let service = rendered
+            .objects
+            .iter()
+            .find(|object| object.object.kind() == "Service")
+            .unwrap()
+            .to_kubernetes_json();
+        assert_eq!(service["spec"]["ports"].as_array().unwrap().len(), 1);
+        assert_eq!(service["spec"]["ports"][0]["targetPort"], 15000);
+    }
+}
+
+#[test]
+fn readiness_port_skips_declared_app_proxy_and_metrics_ports() {
+    let mut template = deployment_template();
+    template.workload.app_container.ports[0].name = Some("sleepypods".to_owned());
+    template.sidecar.listen_port = 15002;
+    template
+        .workload
+        .app_container
+        .ports
+        .push(ContainerPortTemplate {
+            name: Some("sp-readiness".to_owned()),
+            container_port: 15001,
+        });
+    template.workload.app_container.env.push(EnvVarTemplate {
+        name: "SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR".to_owned(),
+        value: TemplateText::literal("127.0.0.1:15003"),
+    });
+    let render = |template: &ManifestTemplate| {
+        render_manifests(RenderManifestRequest {
+            template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+            template_generation: None,
+        })
+    };
+    let rendered = render(&template).unwrap();
+    let workload = rendered
+        .objects
+        .iter()
+        .find(|object| object.object.kind() == "Deployment")
+        .unwrap()
+        .to_kubernetes_json();
+    let containers = &workload["spec"]["template"]["spec"]["containers"];
+    assert_eq!(containers[0]["ports"][0]["name"], "sleepypods");
+    assert!(
+        containers[1]["ports"][0]["name"].is_null(),
+        "numeric proxy port cannot collide with an app port name"
+    );
+    assert_eq!(containers[0]["ports"][1]["name"], "sp-readiness");
+    assert!(
+        containers[1]["ports"][1]["name"].is_null(),
+        "numeric health port cannot collide with an app port name"
+    );
+    assert_eq!(
+        workload["spec"]["template"]["spec"]["containers"][1]["readinessProbe"]["httpGet"]["port"],
+        15004
+    );
+    template
+        .workload
+        .app_container
+        .env
+        .last_mut()
+        .unwrap()
+        .value = TemplateText::literal("");
+    let empty_metrics =
+        render(&template).expect("empty optional metrics listener remains disabled");
+    let workload = empty_metrics
+        .objects
+        .iter()
+        .find(|object| object.object.kind() == "Deployment")
+        .unwrap()
+        .to_kubernetes_json();
+    assert_eq!(
+        workload["spec"]["template"]["spec"]["containers"][1]["readinessProbe"]["httpGet"]["port"],
+        15003
+    );
+    template.workload.app_container.ports = (1024..=u16::MAX)
+        .map(|container_port| ContainerPortTemplate {
+            name: None,
+            container_port,
+        })
+        .collect();
+    assert!(matches!(
+        render(&template),
+        Err(ManifestRenderError::InvalidField {
+            field: "sidecar.readiness_port",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn raw_auxiliary_workloads_never_match_primary_service_selector() {
+    let mut template = deployment_template();
+    template.raw_objects = ["Deployment", "StatefulSet"]
+        .map(|kind| {
+            raw_manifest(&format!(
+                r#"
+apiVersion: apps/v1
+kind: {kind}
+metadata:
+  name: auxiliary
+spec:
+  selector:
+    matchLabels:
+      app: auxiliary
+  template:
+    metadata:
+      labels:
+        app: auxiliary
+    spec:
+      containers:
+      - name: auxiliary
+        image: example/auxiliary:test
+"#
+            ))
+        })
+        .to_vec();
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .unwrap();
+    let service = rendered
+        .objects
+        .iter()
+        .find(|object| object.object.kind() == "Service")
+        .unwrap()
+        .to_kubernetes_json();
+    let selector = service["spec"]["selector"].as_object().unwrap();
+    for object in rendered
+        .objects
+        .iter()
+        .filter(|object| matches!(object.object, KubernetesObject::Raw(_)))
+    {
+        let value = object.to_kubernetes_json();
+        let labels = value["spec"]["template"]["metadata"]["labels"]
+            .as_object()
+            .unwrap();
+        assert_eq!(labels[LABEL_INSTANCE_ID], "instance-a");
+        assert_eq!(labels[LABEL_INSTANCE_GENERATION], "7");
+        assert!(!labels.contains_key(LABEL_WORKLOAD_NAME));
+        assert!(!selector
+            .iter()
+            .all(|(key, value)| labels.get(key) == Some(value)));
+        assert_eq!(
+            value["spec"]["selector"],
+            json!({"matchLabels":{"app":"auxiliary"}})
+        );
+    }
+}
+
+#[test]
+fn raw_auxiliaries_cannot_supply_reserved_primary_selector_labels_or_expressions() {
+    for pointer in [
+        "/metadata/labels",
+        "/spec/template/metadata/labels",
+        "/spec/selector/matchLabels",
+        "/spec/selector/matchExpressions",
+    ] {
+        let mut raw = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"auxiliary","labels":{}},"spec":{"selector":{"matchLabels":{},"matchExpressions":[]},"template":{"metadata":{"labels":{}},"spec":{"containers":[]}}}});
+        if pointer.ends_with("matchExpressions") {
+            *raw.pointer_mut(pointer).unwrap() =
+                json!([{"key":LABEL_WORKLOAD_NAME,"operator":"Exists"}]);
+        } else {
+            raw.pointer_mut(pointer).unwrap()[LABEL_WORKLOAD_NAME] = json!("app-acme-69856ec0");
+        }
+        let mut template = deployment_template();
+        template.raw_objects = vec![raw_manifest(&raw.to_string())];
+        assert!(matches!(
+            render_manifests(RenderManifestRequest {
+                template: &template,
+                instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+                sleep_policy: sleep_policy(),
+                namespace: "apps",
+                template_generation: None,
+            }),
+            Err(ManifestRenderError::InvalidField {
+                field: "raw_objects.manifest",
+                ..
+            })
+        ));
+    }
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest(
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: unsupported",
+    )];
+    assert!(matches!(
+        render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+            template_generation: None,
+        }),
+        Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.kind",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn raw_service_named_proxy_target_remains_compatible_when_app_name_does_not_collide() {
+    let mut template = deployment_template();
+    template.raw_objects.push(raw_manifest(
+        r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: primary-alias
+spec:
+  selector:
+    sleepypods.io/instance-id: instance-a
+  ports:
+  - port: 80
+    targetPort: sleepypods
+"#,
+    ));
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: None,
+    })
+    .unwrap();
+    let workload = rendered
+        .objects
+        .iter()
+        .find(|object| object.object.kind() == "Deployment")
+        .unwrap()
+        .to_kubernetes_json();
+    assert_eq!(
+        workload["spec"]["template"]["spec"]["containers"][1]["ports"][0]["name"],
+        "sleepypods"
+    );
+    let alias = rendered
+        .objects
+        .iter()
+        .find(|object| matches!(object.object, KubernetesObject::Raw(_)))
+        .unwrap()
+        .to_kubernetes_json();
+    assert_eq!(alias["spec"]["ports"][0]["targetPort"], "sleepypods");
 }

@@ -26,7 +26,7 @@ cleanup_managed_objects() {
   KUBECONFIG="${kubeconfig}" kubectl delete namespace \
     "${stateless_namespace}" "${stateful_namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-    -l "sleepypods.io/instance-id in (e2e-stateless,e2e-stateful)" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    -l "sleepypods.io/instance-id in (e2e-stateless,e2e-stateless-abandoned,e2e-stateful)" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
     "sleepypods-control-plane-${stateful_namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 }
@@ -80,41 +80,10 @@ else
   kind get kubeconfig --name "${cluster_name}" >"${kubeconfig}"
 fi
 
-leaked_objects() {
-  KUBECONFIG="${kubeconfig}" kubectl get namespaces \
-    -l "sleepypods.io/kind-e2e in (stateless,stateful)" \
-    -o name 2>/dev/null || true
-  KUBECONFIG="${kubeconfig}" kubectl get deployments.apps,statefulsets.apps,services,persistentvolumeclaims \
-    --all-namespaces \
-    -l "sleepypods.io/instance-id in (e2e-stateless,e2e-stateful)" \
-    -o name 2>/dev/null || true
-  KUBECONFIG="${kubeconfig}" kubectl get persistentvolumes \
-    -l "sleepypods.io/instance-id in (e2e-stateless,e2e-stateful)" \
-    -o name 2>/dev/null || true
-  KUBECONFIG="${kubeconfig}" kubectl get clusterrole,clusterrolebinding \
-    -l "sleepypods.io/kind-e2e=stateful" \
-    -o name 2>/dev/null || true
-}
+source "${repo_root}/scripts/lib/full-wake-sleep-inventory.sh"
 
 wait_for_no_leaks() {
-  local context="$1"
-  local deadline=$((SECONDS + leak_check_timeout))
-  local leaked
-
-  while true; do
-    leaked="$(leaked_objects)"
-    if [[ -z "${leaked}" ]]; then
-      return 0
-    fi
-
-    if ((SECONDS >= deadline)); then
-      echo "full wake/sleep kind soak ${context} leaked Kubernetes objects:" >&2
-      printf '%s\n' "${leaked}" >&2
-      return 1
-    fi
-
-    sleep 2
-  done
+  wait_for_full_wake_sleep_no_leaks "${kubeconfig}" "$1" "${leak_check_timeout}"
 }
 
 run_stateless_cycle() {

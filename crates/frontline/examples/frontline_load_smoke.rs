@@ -14,13 +14,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use control_plane::{
-    api::pb::{
-        self,
-        proxy_control_plane_server::{ProxyControlPlane, ProxyControlPlaneServer},
-    },
-    RouteHost,
-};
 use futures_util::{SinkExt, StreamExt};
 use http::{
     header::{CONTENT_TYPE, HOST},
@@ -35,6 +28,13 @@ use hyper_util::{
 };
 use proxy_core::websocket_upgrade_response;
 use rcgen::generate_simple_self_signed;
+use sleepypods_api::{
+    pb::{
+        self,
+        proxy_control_plane_server::{ProxyControlPlane, ProxyControlPlaneServer},
+    },
+    RouteHost,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -2008,9 +2008,9 @@ mod tests {
     };
     use crate::REAL_GRPC_PATH;
     use bytes::Bytes;
-    use control_plane::api::pb;
     use http::{header::CONTENT_TYPE, Request as HttpRequest};
     use http_body_util::{BodyExt, Full};
+    use sleepypods_api::pb;
     use std::path::PathBuf;
 
     #[test]

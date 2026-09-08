@@ -21,8 +21,8 @@ use crate::{
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        ListRouteBindingsForInstanceRequest, RouteBindingRecord, RouteDependencyLookup,
-        RouteDependencySet, RouteIdentity, RouteResolution,
+        ListRouteBindingsForInstanceRequest, ResolveRouteRequest, RouteBindingRecord,
+        RouteDependencyLookup, RouteDependencySet, RouteResolution,
     },
     store::{ControlPlaneStore, StoreFuture, StoreResult},
     workload::{
@@ -33,6 +33,61 @@ use crate::{
 use super::{connection::PostgresStore, http01_ops, instance_ops, materialization_ops, route_ops};
 
 impl ControlPlaneStore for PostgresStore {
+    fn load_route_changes(
+        &self,
+        cursor: u64,
+        limit: u32,
+    ) -> StoreFuture<'_, StoreResult<crate::runtime_work::DurableRouteChanges>> {
+        Box::pin(super::runtime_work::changes(self, cursor, limit))
+    }
+    fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
+        Box::pin(super::runtime_work::revision(self))
+    }
+    fn load_materialization_work_status(
+        &self,
+        id: crate::ids::MaterializationId,
+    ) -> StoreFuture<'_, StoreResult<Option<crate::runtime_work::MaterializationWorkStatus>>> {
+        Box::pin(super::runtime_work::status(self, id))
+    }
+    fn record_materialization_failure(
+        &self,
+        request: crate::runtime_work::RecordMaterializationFailure,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        Box::pin(super::runtime_work::record_failure(self, request))
+    }
+    fn enqueue_materialization(
+        &self,
+        id: crate::ids::MaterializationId,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        Box::pin(super::runtime_work::enqueue(self, id))
+    }
+    fn maintain_runtime_records(&self, limit: u32) -> StoreFuture<'_, StoreResult<u64>> {
+        Box::pin(super::runtime_work::maintain(self, limit))
+    }
+
+    fn accept_wake<'a>(
+        &'a self,
+        request: crate::materialization::AcceptWakeRequest,
+    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
+        Box::pin(async move { super::lifecycle_ops::accept_wake(self, request).await })
+    }
+    fn request_instance_deletion<'a>(
+        &'a self,
+        request: crate::instance::RequestInstanceDeletion,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(
+            async move { super::lifecycle_ops::request_instance_deletion(self, request).await },
+        )
+    }
+    fn finalize_instance_deletions<'a>(
+        &'a self,
+        limit: usize,
+    ) -> StoreFuture<'a, StoreResult<usize>> {
+        Box::pin(
+            async move { super::lifecycle_ops::finalize_instance_deletions(self, limit).await },
+        )
+    }
+
     fn create_instance<'a>(
         &'a self,
         request: CreateInstanceRequest,
@@ -98,9 +153,9 @@ impl ControlPlaneStore for PostgresStore {
 
     fn resolve_route<'a>(
         &'a self,
-        identity: RouteIdentity,
+        request: ResolveRouteRequest,
     ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
-        Box::pin(async move { route_ops::resolve_route(self, identity).await })
+        Box::pin(async move { route_ops::resolve_route(self, request).await })
     }
 
     fn compare_and_swap_instance_state<'a>(
@@ -187,6 +242,24 @@ impl ControlPlaneStore for PostgresStore {
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         Box::pin(async move {
             materialization_ops::claim_materialization_reconciliation(self, request).await
+        })
+    }
+
+    fn begin_materialization_effect<'a>(
+        &'a self,
+        request: crate::materialization::MaterializationEffectRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(
+            async move { materialization_ops::begin_materialization_effect(self, request).await },
+        )
+    }
+
+    fn acknowledge_materialization_effect<'a>(
+        &'a self,
+        request: crate::materialization::AcknowledgeMaterializationEffectRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            materialization_ops::acknowledge_materialization_effect(self, request).await
         })
     }
 

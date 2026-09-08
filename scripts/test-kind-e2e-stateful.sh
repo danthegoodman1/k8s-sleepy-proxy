@@ -229,11 +229,17 @@ metadata:
     sleepypods.io/kind-e2e: stateful
 rules:
   - apiGroups: [""]
-    resources: ["services", "persistentvolumeclaims"]
+    resources: ["services", "persistentvolumeclaims", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]

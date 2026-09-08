@@ -6,8 +6,8 @@ use crate::{
     materialization::MaterializationRecord,
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        ListRouteBindingsForInstanceRequest, RouteBindingRecord, RouteDependencyLookup,
-        RouteDependencySet, RouteEntry, RouteIdentity, RouteResolution,
+        ListRouteBindingsForInstanceRequest, ResolveRouteRequest, RouteBindingRecord,
+        RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteResolution,
     },
     store::{StoreError, StoreResult},
 };
@@ -19,8 +19,7 @@ use super::{
     instance_ops::load_instance,
     mapping::{
         default_negative_cache_policy, generation_to_i64, materialization_from_row, protocol_to_db,
-        route_binding_from_row, route_binding_row_from_row, route_entry_from_rows,
-        route_identity_parts, RouteBindingRow,
+        route_binding_from_row, route_binding_row_from_row, route_identity_parts, RouteBindingRow,
     },
 };
 
@@ -35,6 +34,7 @@ pub(crate) async fn create_route_binding(
     let fingerprint = idempotency::create_route_binding_fingerprint(&request)?;
     let idempotency_key = request.idempotency_key.as_str();
     let route_binding_id = request.route_binding_id.as_str();
+    idempotency::expire_key(&transaction, idempotency_key).await?;
     let inserted = transaction
         .execute(
             "
@@ -42,9 +42,10 @@ pub(crate) async fn create_route_binding(
                 idempotency_key,
                 operation,
                 request_fingerprint,
-                resource_id
+                resource_id,
+                expires_at_unix_millis
             )
-            VALUES ($1, $2, $3, $4)
+            VALUES ($1, $2, $3, $4, (extract(epoch from clock_timestamp()) * 1000)::bigint + $5::bigint)
             ON CONFLICT (idempotency_key) DO NOTHING
             ",
             &[
@@ -52,6 +53,7 @@ pub(crate) async fn create_route_binding(
                 &CREATE_ROUTE_BINDING_OPERATION,
                 &fingerprint,
                 &route_binding_id,
+                &store.idempotency_retention_millis,
             ],
         )
         .await
@@ -117,52 +119,85 @@ pub(crate) async fn list_route_bindings_for_instance(
     rows.iter().map(route_binding_from_row).collect()
 }
 
+// One statement selects the route and target backend from the same MVCC snapshot.
+// SQL matching mirrors route_match_score; literal prefix comparisons avoid LIKE escaping.
+pub(crate) const RESOLVE_ROUTE_SQL: &str = "
+    WITH selected AS (
+        SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+        FROM route_bindings
+        WHERE identity_kind = $1
+            AND ((host_kind = 'exact' AND host = $2)
+                OR (host_kind = 'wildcard_suffix' AND host = ANY($3::text[])))
+            AND (path_prefix IS NULL OR ($4::text IS NOT NULL AND (
+                path_prefix = '/' OR path_prefix = $4
+                OR (right(path_prefix, 1) = '/' AND starts_with($4, path_prefix))
+                OR starts_with($4, path_prefix || '/')
+            )))
+        ORDER BY (host_kind = 'exact') DESC, octet_length(host) DESC,
+            COALESCE(octet_length(path_prefix), 0) DESC, route_binding_id
+        LIMIT 1
+    )
+    SELECT selected.*, instances.state, instances.generation,
+        ready.backend_uri, ready.backend_generation
+    FROM selected JOIN instances USING (instance_id)
+    LEFT JOIN LATERAL (
+        SELECT backend_uri, backend_generation FROM materializations
+        WHERE instance_id = selected.instance_id
+            AND instance_generation = instances.generation
+            AND cluster_id = $5 AND namespace = $6 AND state = 'ready'
+        LIMIT 1
+    ) ready ON true
+";
+
 pub(crate) async fn resolve_route(
     store: &PostgresStore,
-    identity: RouteIdentity,
+    request: ResolveRouteRequest,
 ) -> StoreResult<RouteResolution> {
     let client = store.client().await?;
-    let identity_kind = match identity {
-        RouteIdentity::Http { .. } => "http",
-        RouteIdentity::Sni { .. } => "sni",
-    };
-    let rows = client
-        .query(
-            "
-            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
-            FROM route_bindings
-            WHERE identity_kind = $1
-            ",
-            &[&identity_kind],
+    let parts = route_identity_parts(&request.identity);
+    let suffixes: Vec<&str> = parts
+        .host
+        .match_indices('.')
+        .map(|(index, _)| &parts.host[index + 1..])
+        .collect();
+    let row = client
+        .query_opt(
+            RESOLVE_ROUTE_SQL,
+            &[
+                &parts.identity_kind,
+                &parts.host,
+                &suffixes,
+                &parts.path_prefix,
+                &request.target.cluster_id(),
+                &request.target.namespace(),
+            ],
         )
         .await
         .map_err(map_postgres_error)?;
-
-    let mut best: Option<(crate::route::RouteMatchScore, RouteBindingRow)> = None;
-    for row in rows {
-        let route = route_binding_row_from_row(&row)?;
-        if let Some(score) = crate::route::route_match_score(&route.identity, &identity) {
-            if best
-                .as_ref()
-                .map(|(best_score, _)| score > *best_score)
-                .unwrap_or(true)
-            {
-                best = Some((score, route));
-            }
-        }
-    }
-
-    let Some((_, route)) = best else {
+    let Some(row) = row else {
         return Ok(RouteResolution::Miss {
             negative_cache: default_negative_cache_policy(),
         });
     };
-
-    let matched_identity = route.identity.clone();
-    let entry = load_route_entry(&client, &route).await?;
+    let route = route_binding_row_from_row(&row)?;
+    let state: String = row.get("state");
+    let backend_uri: Option<String> = row.get("backend_uri");
+    let backend_generation: Option<i64> = row.get("backend_generation");
     Ok(RouteResolution::Resolved {
-        matched_identity,
-        entry,
+        matched_identity: route.identity,
+        entry: RouteEntry {
+            route_binding_id: route.id,
+            instance_id: route.instance_id,
+            instance_state: super::mapping::instance_state_from_db(&state)?,
+            instance_generation: super::mapping::generation_from_i64(row.get("generation"))?,
+            backend: backend_uri
+                .map(crate::materialization::BackendEndpoint::new)
+                .transpose()
+                .map_err(|error| StoreError::internal(error.to_string()))?,
+            backend_generation: backend_generation
+                .map(super::mapping::backend_generation_from_i64)
+                .transpose()?,
+        },
     })
 }
 
@@ -197,22 +232,35 @@ async fn replay_create_route_binding(
     fingerprint: &Value,
 ) -> StoreResult<RouteBindingRecord> {
     let row = client
-        .query_one(
+        .query_opt(
             "
-            SELECT operation, request_fingerprint, resource_id
+            SELECT operation, request_fingerprint, resource_id, resource_deleted_at_unix_millis
             FROM idempotency_records
             WHERE idempotency_key = $1
+            FOR UPDATE
             ",
             &[&idempotency_key],
         )
         .await
-        .map_err(map_postgres_error)?;
+        .map_err(map_postgres_error)?
+        .ok_or_else(|| {
+            StoreError::unavailable("idempotency key expired during replay; retry request")
+        })?;
     let operation: String = row.get("operation");
     let stored_fingerprint: Value = row.get("request_fingerprint");
     let resource_id: String = row.get("resource_id");
 
     if operation != CREATE_ROUTE_BINDING_OPERATION || stored_fingerprint != *fingerprint {
         return Err(idempotency::idempotency_conflict());
+    }
+
+    if row
+        .get::<_, Option<i64>>("resource_deleted_at_unix_millis")
+        .is_some()
+    {
+        return Err(StoreError::IdempotencyResourceDeleted {
+            resource: "route binding",
+        });
     }
 
     load_route_binding_record(client, &resource_id)
@@ -302,21 +350,6 @@ async fn load_route_binding(
     row.as_ref().map(route_binding_row_from_row).transpose()
 }
 
-async fn load_route_entry(
-    client: &impl GenericClient,
-    route: &RouteBindingRow,
-) -> StoreResult<RouteEntry> {
-    let instance = load_instance(client, route.instance_id.as_str())
-        .await?
-        .ok_or(StoreError::NotFound {
-            resource: "instance",
-        })?;
-    let materialization =
-        load_ready_materialization(client, route.instance_id.as_str(), instance.generation).await?;
-
-    Ok(route_entry_from_rows(route, instance, materialization))
-}
-
 pub(crate) async fn load_ready_materialization(
     client: &impl GenericClient,
     instance_id: &str,
@@ -326,7 +359,7 @@ pub(crate) async fn load_ready_materialization(
     let row = client
         .query_opt(
             "
-            SELECT materialization_id, instance_id, instance_generation, cluster_id,
+            SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
                 namespace, state, backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt

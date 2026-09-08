@@ -39,46 +39,53 @@ const MIGRATIONS: &[Migration] = &[
         name: "materialization_reconciliation_leases",
         sql: include_str!("../../migrations/0006_materialization_reconciliation_leases.sql"),
     },
+    Migration {
+        version: 7,
+        name: "store_scalability",
+        sql: include_str!("../../migrations/0007_store_scalability.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "durable_lifecycle_intent",
+        sql: include_str!("../../migrations/0008_durable_lifecycle_intent.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "fenced_projection_effects",
+        sql: include_str!("../../migrations/0009_fenced_projection_effects.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "runtime_work",
+        sql: include_str!("../../migrations/0010_runtime_work.sql"),
+    },
 ];
 
-pub(crate) async fn run(client: &impl GenericClient) -> StoreResult<()> {
-    client
+pub(crate) async fn run(client: &mut deadpool_postgres::Client) -> StoreResult<()> {
+    // A transaction-scoped lock is released on commit, error, cancellation, or
+    // disconnect. The transaction guard queues ROLLBACK before pool reuse.
+    let transaction = client.transaction().await.map_err(map_migration_error)?;
+    transaction
+        .query_one("SELECT pg_advisory_xact_lock(1936748391, 1835624306)", &[])
+        .await
+        .map_err(map_migration_error)?;
+    transaction
         .batch_execute(
             "
-            CREATE TABLE IF NOT EXISTS control_plane_schema_migrations (
-                version integer PRIMARY KEY,
-                name text NOT NULL,
-                applied_at_unix_millis bigint NOT NULL DEFAULT (
-                    extract(epoch from clock_timestamp()) * 1000
-                )::bigint
-            );
-            ",
+        CREATE TABLE IF NOT EXISTS control_plane_schema_migrations (
+            version integer PRIMARY KEY,
+            name text NOT NULL,
+            applied_at_unix_millis bigint NOT NULL DEFAULT (
+                extract(epoch from clock_timestamp()) * 1000
+            )::bigint
+        )",
         )
         .await
         .map_err(map_migration_error)?;
-
     for migration in MIGRATIONS {
-        let transaction = "BEGIN";
-        client
-            .batch_execute(transaction)
-            .await
-            .map_err(map_migration_error)?;
-        let applied = apply_one(client, migration).await;
-        match applied {
-            Ok(()) => {
-                client
-                    .batch_execute("COMMIT")
-                    .await
-                    .map_err(map_migration_error)?;
-            }
-            Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                return Err(error);
-            }
-        }
+        apply_one(&transaction, migration).await?;
     }
-
-    Ok(())
+    transaction.commit().await.map_err(map_migration_error)
 }
 
 async fn apply_one(client: &impl GenericClient, migration: &Migration) -> StoreResult<()> {

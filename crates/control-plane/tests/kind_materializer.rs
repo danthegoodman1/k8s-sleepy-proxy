@@ -24,7 +24,7 @@ use k8s_openapi::api::{
     },
 };
 use kube::{
-    api::{DeleteParams, ListParams, LogParams, ObjectMeta, PostParams},
+    api::{DeleteParams, ListParams, LogParams, ObjectMeta, Patch, PatchParams, PostParams},
     Api, Client, Error as KubeError,
 };
 use tokio::time::{sleep, Instant};
@@ -67,7 +67,7 @@ fn install_rustls_crypto_provider() {
 }
 
 async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResult<()> {
-    let pv_name = pv_name(namespace);
+    let pv_seed = pv_name(namespace);
     let marker = marker_value(namespace);
     let config = KubeMaterializerClientConfig {
         pvc_bound_timeout: Duration::from_secs(60),
@@ -77,41 +77,70 @@ async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResu
     };
     let kube_client = KubeMaterializerClient::with_config(client.clone(), config)?;
     let materializer = KubernetesMaterializer::new(kube_client);
-    let manifest = kind_manifest(namespace, &pv_name)?;
+    let manifest = kind_manifest(namespace, &pv_seed)?;
     let refs = rendered_refs(&manifest);
+    let name = |kind: &str| {
+        refs.iter()
+            .find(|object| object.kind == kind)
+            .unwrap()
+            .name
+            .clone()
+    };
+    let pv_name = name("PersistentVolume");
+    let pvc_name = name("PersistentVolumeClaim");
+    let workload_name = name("StatefulSet");
 
     let lifecycle_result: TestResult<()> = async {
         let applied_refs = materializer.apply_manifest(&manifest).await?;
-        verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name).await?;
+        verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name, &pvc_name).await?;
         let backend = materializer
             .client()
             .wait_for_readiness(&applied_refs)
             .await?;
-        verify_backend_uri(backend.uri(), namespace)?;
+        verify_backend_uri(backend.uri(), namespace, &workload_name)?;
 
-        write_marker(client.clone(), namespace, &marker).await?;
+        write_marker(client.clone(), namespace, &pvc_name, &marker).await?;
 
+        // Keep the old Pod visible after foreground workload deletion and prove
+        // absence inspection remains blocked until that member is actually gone.
+        let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        let pod = pods.list(&ListParams::default().labels("sleepypods.io/instance-id=kind-materializer")).await?.items.into_iter().next().ok_or("ready workload has no Pod")?;
+        let pod_name = pod.metadata.name.as_deref().ok_or("Pod name missing")?;
+        let uid = pod.metadata.uid.as_deref().ok_or("Pod UID missing")?;
+        pods.patch(pod_name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"metadata":{"uid":uid,"resourceVersion":pod.metadata.resource_version,"finalizers":["sleepypods.io/phase6bd-test-hold"]}}))).await?;
         materializer.delete_rendered_objects(&refs).await?;
-        wait_for_rendered_objects_deleted(client.clone(), namespace, &pv_name).await?;
+        let blocked = materializer.client().ensure_no_descendants(&refs, "kind-materializer").await;
+        pods.patch(pod_name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"metadata":{"uid":uid,"finalizers":null}}))).await?;
+        assert!(blocked.is_err(), "terminating old member must hold cleanup ownership");
+        wait_for_rendered_objects_deleted(
+            client.clone(),
+            namespace,
+            &pv_name,
+            &pvc_name,
+            &workload_name,
+        )
+        .await?;
 
-        let rematerialized_manifest = kind_manifest(namespace, &pv_name)?;
+        let rematerialized_manifest = kind_manifest(namespace, &pv_seed)?;
         let applied_refs = materializer
             .apply_manifest(&rematerialized_manifest)
             .await?;
-        verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name).await?;
+        verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name, &pvc_name).await?;
         let backend = materializer
             .client()
             .wait_for_readiness(&applied_refs)
             .await?;
-        verify_backend_uri(backend.uri(), namespace)?;
+        verify_backend_uri(backend.uri(), namespace, &workload_name)?;
 
-        verify_marker_present(client.clone(), namespace, &marker).await?;
+        verify_marker_present(client.clone(), namespace, &pvc_name, &marker).await?;
         Ok(())
     }
     .await;
 
     let delete_result = materializer.delete_rendered_objects(&refs).await;
-    let deletion_wait_result = wait_for_rendered_objects_deleted(client, namespace, &pv_name).await;
+    let deletion_wait_result =
+        wait_for_rendered_objects_deleted(client, namespace, &pv_name, &pvc_name, &workload_name)
+            .await;
 
     lifecycle_result?;
     delete_result?;
@@ -132,8 +161,8 @@ async fn verify_single_node_cluster(client: Client) -> TestResult<()> {
     Ok(())
 }
 
-fn verify_backend_uri(uri: &str, namespace: &str) -> TestResult<()> {
-    let expected = format!("http://{WORKLOAD_NAME}.{namespace}.svc.cluster.local:8080");
+fn verify_backend_uri(uri: &str, namespace: &str, workload_name: &str) -> TestResult<()> {
+    let expected = format!("http://{workload_name}.{namespace}.svc.cluster.local:8080");
     if uri != expected {
         return Err(format!("expected backend URI {expected}, got {uri}").into());
     }
@@ -201,13 +230,28 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
         generation: Generation::new(1),
     };
 
-    Ok(render_manifests(RenderManifestRequest {
+    let mut manifest = render_manifests(RenderManifestRequest {
         template: &template,
         instance: &instance,
         sleep_policy: resolved_sleep_policy(),
         namespace,
         template_generation: Some(Generation::new(1)),
-    })?)
+    })?;
+    // This isolated PV/projection gate deliberately uses nginx as a serving
+    // fixture, without a control plane or the production sidecar. Keep a real
+    // readiness probe against that fixture's listener. Production sidecar/app
+    // readiness (including the private health port) belongs to the cold E2E gates.
+    for object in &mut manifest.objects {
+        if let control_plane::KubernetesObject::StatefulSet(workload) = &mut object.object {
+            let probe = workload.spec.template.spec.containers[1]
+                .readiness_probe
+                .as_mut()
+                .ok_or("rendered sidecar readiness missing")?;
+            probe.path = "/".to_owned();
+            probe.port = 80;
+        }
+    }
+    Ok(manifest)
 }
 
 fn resolved_sleep_policy() -> ResolvedSleepPolicy {
@@ -222,6 +266,7 @@ async fn verify_pv_and_bound_pvc_exist(
     client: Client,
     namespace: &str,
     pv_name: &str,
+    pvc_name: &str,
 ) -> TestResult<()> {
     let pvs: Api<PersistentVolume> = Api::all(client.clone());
     let pv = pvs.get(pv_name).await?;
@@ -239,14 +284,14 @@ async fn verify_pv_and_bound_pvc_exist(
     }
 
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
-    let pvc = pvcs.get(PVC_NAME).await?;
+    let pvc = pvcs.get(pvc_name).await?;
     let phase = pvc
         .status
         .as_ref()
         .and_then(|status| status.phase.as_deref());
     if phase != Some("Bound") {
         return Err(format!(
-            "expected PersistentVolumeClaim {namespace}/{PVC_NAME} to be Bound, got {phase:?}"
+            "expected PersistentVolumeClaim {namespace}/{pvc_name} to be Bound, got {phase:?}"
         )
         .into());
     }
@@ -254,10 +299,16 @@ async fn verify_pv_and_bound_pvc_exist(
     Ok(())
 }
 
-async fn write_marker(client: Client, namespace: &str, marker: &str) -> TestResult<()> {
+async fn write_marker(
+    client: Client,
+    namespace: &str,
+    pvc_name: &str,
+    marker: &str,
+) -> TestResult<()> {
     run_pvc_helper_pod(
         client,
         namespace,
+        pvc_name,
         "sleepypods-marker-write",
         marker,
         &[
@@ -269,10 +320,16 @@ async fn write_marker(client: Client, namespace: &str, marker: &str) -> TestResu
     .await
 }
 
-async fn verify_marker_present(client: Client, namespace: &str, marker: &str) -> TestResult<()> {
+async fn verify_marker_present(
+    client: Client,
+    namespace: &str,
+    pvc_name: &str,
+    marker: &str,
+) -> TestResult<()> {
     run_pvc_helper_pod(
         client,
         namespace,
+        pvc_name,
         "sleepypods-marker-read",
         marker,
         &[
@@ -287,12 +344,13 @@ async fn verify_marker_present(client: Client, namespace: &str, marker: &str) ->
 async fn run_pvc_helper_pod(
     client: Client,
     namespace: &str,
+    pvc_name: &str,
     name: &str,
     marker: &str,
     command: &[&str],
 ) -> TestResult<()> {
     let pods: Api<Pod> = Api::namespaced(client, namespace);
-    let pod = pvc_helper_pod(namespace, name, marker, command);
+    let pod = pvc_helper_pod(namespace, pvc_name, name, marker, command);
 
     pods.create(&PostParams::default(), &pod).await?;
     let result = wait_for_helper_pod_success(pods.clone(), name).await;
@@ -313,7 +371,13 @@ async fn run_pvc_helper_pod(
     Ok(())
 }
 
-fn pvc_helper_pod(namespace: &str, name: &str, marker: &str, command: &[&str]) -> Pod {
+fn pvc_helper_pod(
+    namespace: &str,
+    pvc_name: &str,
+    name: &str,
+    marker: &str,
+    command: &[&str],
+) -> Pod {
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_owned()),
@@ -345,7 +409,7 @@ fn pvc_helper_pod(namespace: &str, name: &str, marker: &str, command: &[&str]) -
             volumes: Some(vec![Volume {
                 name: "data".to_owned(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: PVC_NAME.to_owned(),
+                    claim_name: pvc_name.to_owned(),
                     read_only: Some(false),
                 }),
                 ..Volume::default()
@@ -397,14 +461,16 @@ async fn wait_for_rendered_objects_deleted(
     client: Client,
     namespace: &str,
     pv_name: &str,
+    pvc_name: &str,
+    workload_name: &str,
 ) -> TestResult<()> {
     let stateful_sets: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
     wait_for_absence(
         || {
             let stateful_sets = stateful_sets.clone();
-            async move { stateful_sets.get(WORKLOAD_NAME).await }
+            async move { stateful_sets.get(workload_name).await }
         },
-        format!("StatefulSet {namespace}/{WORKLOAD_NAME}"),
+        format!("StatefulSet {namespace}/{workload_name}"),
         OBJECT_DELETION_TIMEOUT,
     )
     .await?;
@@ -413,9 +479,9 @@ async fn wait_for_rendered_objects_deleted(
     wait_for_absence(
         || {
             let services = services.clone();
-            async move { services.get(WORKLOAD_NAME).await }
+            async move { services.get(workload_name).await }
         },
-        format!("Service {namespace}/{WORKLOAD_NAME}"),
+        format!("Service {namespace}/{workload_name}"),
         OBJECT_DELETION_TIMEOUT,
     )
     .await?;
@@ -424,9 +490,9 @@ async fn wait_for_rendered_objects_deleted(
     wait_for_absence(
         || {
             let pvcs = pvcs.clone();
-            async move { pvcs.get(PVC_NAME).await }
+            async move { pvcs.get(pvc_name).await }
         },
-        format!("PersistentVolumeClaim {namespace}/{PVC_NAME}"),
+        format!("PersistentVolumeClaim {namespace}/{pvc_name}"),
         OBJECT_DELETION_TIMEOUT,
     )
     .await?;
@@ -514,8 +580,13 @@ fn rendered_refs(manifest: &RenderedManifest) -> Vec<RenderedObjectRef> {
 }
 
 fn unique_namespace() -> TestResult<String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    Ok(format!("sleepypods-kind-{millis}-{}", std::process::id()))
+    Ok(format!(
+        "sleepypods-kind-{millis}-{}-{sequence}",
+        std::process::id()
+    ))
 }
 
 fn pv_name(namespace: &str) -> String {
@@ -528,4 +599,69 @@ fn marker_value(namespace: &str) -> String {
 
 fn is_not_found(error: &KubeError) -> bool {
     matches!(error, KubeError::Api(status) if status.is_not_found())
+}
+
+#[tokio::test]
+#[ignore = "requires SLEEPYPODS_KIND_TEST=1 and isolated kind cluster"]
+async fn conditional_secret_mutations_preserve_same_name_replacements() -> TestResult<()> {
+    if env::var("SLEEPYPODS_KIND_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    install_rustls_crypto_provider();
+    let client = Client::try_default().await?;
+    let namespace = unique_namespace()?;
+    create_namespace(client.clone(), &namespace).await?;
+    let result: TestResult<()> = async {
+        let kube = KubeMaterializerClient::new(client.clone());
+        let object = control_plane::KubernetesObject::Secret(control_plane::manifest::Secret {
+            metadata: control_plane::manifest::ObjectMeta {
+                name: "conditional-secret".into(),
+                namespace: Some(namespace.clone()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            type_: "Opaque".into(),
+            string_data: BTreeMap::from([("token".into(), "test-only".into())]),
+        });
+        let object_ref = rendered_object_ref(&object);
+        kube.apply_object(&object, None).await?;
+        let control_plane::projection::ProjectionObjectInspection::Present(old) =
+            kube.inspect_object(&object_ref).await?
+        else {
+            return Err("created Secret missing".into());
+        };
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client.clone(), &namespace);
+        secrets
+            .delete(&object_ref.name, &DeleteParams::default())
+            .await?;
+        wait_for_absence(
+            || secrets.get(&object_ref.name),
+            "old test Secret".into(),
+            OBJECT_DELETION_TIMEOUT,
+        )
+        .await?;
+        kube.apply_object(&object, None).await?;
+        let replacement = secrets.get(&object_ref.name).await?;
+        assert_ne!(
+            replacement.metadata.uid.as_deref(),
+            Some(old.identity.uid.as_str())
+        );
+        assert!(kube
+            .apply_object(&object, Some(&old.identity))
+            .await
+            .is_err());
+        assert!(kube
+            .delete_object(&object_ref, &old.identity)
+            .await
+            .is_err());
+        assert_eq!(
+            secrets.get(&object_ref.name).await?.metadata.uid,
+            replacement.metadata.uid
+        );
+        Ok(())
+    }
+    .await;
+    delete_namespace(client, &namespace).await?;
+    result
 }

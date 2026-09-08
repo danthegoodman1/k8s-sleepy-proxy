@@ -3,7 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use control_plane::{CachePolicy, PathPrefix, RouteHost, RouteIdentity};
 use proxy_core::observability::{
     metrics::{
         RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME, RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME,
@@ -14,6 +13,7 @@ use proxy_core::observability::{
         FIELD_SUBSCRIPTION_ID,
     },
 };
+use sleepypods_api::{CachePolicy, PathPrefix, RouteHost, RouteIdentity};
 
 use super::{
     FrontlineRouteResolution, FrontlineRouteResolver, FrontlineRouteResolverError,
@@ -21,9 +21,9 @@ use super::{
     RouteSubscriptionFuture, UnexpectedSubscribeResponseKind,
 };
 use crate::{
-    subscription::tests::{route_entry, route_entry_for_instance},
-    ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome, InvalidationReason, RouteRequestId,
-    SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
+    subscription::tests::route_entry, ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome,
+    InvalidationReason, RouteRequestId, SubscribeControlPlaneOutput, SubscriptionId,
+    SubscriptionState,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,7 +84,7 @@ impl RouteSubscriptionClient for FakeRouteSubscriptionClient {
         &mut self,
         request_id: RouteRequestId,
         identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'_, SubscribeControlPlaneOutput, Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
         self.calls.push(ClientCall::Subscribe {
             request_id,
             identity,
@@ -99,7 +99,7 @@ impl RouteSubscriptionClient for FakeRouteSubscriptionClient {
     fn unsubscribe(
         &mut self,
         subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
         self.calls.push(ClientCall::Unsubscribe { subscription_id });
         let response = self.unsubscribe_responses.pop_front().unwrap_or(Ok(()));
         Box::pin(async move { response })
@@ -107,7 +107,7 @@ impl RouteSubscriptionClient for FakeRouteSubscriptionClient {
 
     fn drain_subscription_events(
         &mut self,
-    ) -> RouteSubscriptionFuture<'_, Vec<RouteSubscriptionEvent>, Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, Vec<RouteSubscriptionEvent>, Self::Error> {
         let response = self.events.pop_front().unwrap_or(Ok(Vec::new()));
         Box::pin(async move { response })
     }
@@ -178,7 +178,8 @@ async fn positive_cache_hit_returns_cached_route_without_client_call() {
     let now = now();
     let request = http_request("app.example.com", "/api/users");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -208,7 +209,8 @@ async fn positive_cache_hit_records_lookup_metric_and_route_fields() {
     let sink = InMemoryObservability::default();
     let request = http_request("app.example.com", "/api/users");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -403,7 +405,8 @@ async fn capacity_eviction_unsubscribes_evicted_positive_subscription() {
     let now = now();
     let request = http_request("app.two.example.com", "/");
     let mut state = SubscriptionState::new(1);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        http_request("app.one.example.com", "/"),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-old"),
@@ -635,148 +638,6 @@ async fn apply_control_plane_message_handles_update_and_invalidation_without_sub
 }
 
 #[tokio::test]
-async fn pushed_update_replacing_conflicting_identity_unsubscribes_old_subscription() {
-    let now = now();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial-1"),
-            subscription_id("sub-1"),
-            http_rule("one.example.com", None),
-            "route-1",
-        ),
-        now,
-    );
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial-2"),
-            subscription_id("sub-2"),
-            http_rule("two.example.com", None),
-            "route-2",
-        ),
-        now,
-    );
-    let mut resolver =
-        FrontlineRouteResolver::from_parts(state, FakeRouteSubscriptionClient::default());
-
-    let outcome = resolver
-        .apply_control_plane_message(
-            SubscribeControlPlaneOutput::RouteUpdated {
-                subscription_id: subscription_id("sub-1"),
-                matched_identity: http_rule("two.example.com", None),
-                entry: route_entry("route-1-moved", 2, None),
-                cache_policy: ttl(10),
-            },
-            now,
-        )
-        .await
-        .expect("conflicting update applies");
-
-    assert_eq!(
-        outcome,
-        ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced(
-            crate::CacheInsertResult {
-                subscriptions_to_unsubscribe: vec![subscription_id("sub-2")]
-            }
-        ))
-    );
-    assert!(resolver
-        .state()
-        .cache()
-        .positive_by_subscription(&subscription_id("sub-2"))
-        .is_none());
-    assert_eq!(
-        resolver
-            .state()
-            .cache()
-            .positive_by_subscription(&subscription_id("sub-1"))
-            .expect("moved subscription")
-            .entry
-            .route_binding_id
-            .as_str(),
-        "route-1-moved"
-    );
-    assert_eq!(
-        resolver.client().calls,
-        vec![ClientCall::Unsubscribe {
-            subscription_id: subscription_id("sub-2")
-        }]
-    );
-}
-
-#[tokio::test]
-async fn stale_pushed_update_does_not_replace_newer_conflicting_subscription() {
-    let now = now();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        SubscribeControlPlaneOutput::RouteResolved {
-            request_id: request_id("initial-1"),
-            subscription_id: subscription_id("sub-1"),
-            matched_identity: http_rule("one.example.com", None),
-            entry: route_entry_for_instance("route-1", "instance-shared", 1, Some(1)),
-            cache_policy: ttl(10),
-        },
-        now,
-    );
-    state.apply_control_plane_message(
-        SubscribeControlPlaneOutput::RouteResolved {
-            request_id: request_id("initial-2"),
-            subscription_id: subscription_id("sub-2"),
-            matched_identity: http_rule("two.example.com", None),
-            entry: route_entry_for_instance("route-2", "instance-shared", 3, Some(3)),
-            cache_policy: ttl(10),
-        },
-        now,
-    );
-    let mut resolver =
-        FrontlineRouteResolver::from_parts(state, FakeRouteSubscriptionClient::default());
-
-    let outcome = resolver
-        .apply_control_plane_message(
-            SubscribeControlPlaneOutput::RouteUpdated {
-                subscription_id: subscription_id("sub-1"),
-                matched_identity: http_rule("two.example.com", None),
-                entry: route_entry_for_instance("route-1-stale", "instance-shared", 3, Some(2)),
-                cache_policy: ttl(10),
-            },
-            now,
-        )
-        .await
-        .expect("stale update is handled locally");
-
-    assert_eq!(
-        outcome,
-        ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::StaleBackendGeneration {
-            current: control_plane::BackendGeneration::new(3),
-            incoming: control_plane::BackendGeneration::new(2)
-        })
-    );
-    assert_eq!(
-        resolver
-            .state()
-            .cache()
-            .positive_by_subscription(&subscription_id("sub-2"))
-            .expect("newer conflicting subscription remains")
-            .entry
-            .route_binding_id
-            .as_str(),
-        "route-2"
-    );
-    assert_eq!(
-        resolver
-            .state()
-            .cache()
-            .positive_by_subscription(&subscription_id("sub-1"))
-            .expect("original subscription remains")
-            .entry
-            .route_binding_id
-            .as_str(),
-        "route-1"
-    );
-    assert!(resolver.client().calls.is_empty());
-}
-
-#[tokio::test]
 async fn apply_control_plane_message_unsubscribes_evicted_subscriptions() {
     let now = now();
     let mut state = SubscriptionState::new(1);
@@ -819,7 +680,8 @@ async fn stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebui
     let sink = InMemoryObservability::default();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-old"),

@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
-use control_plane::api::pb::{self, sidecar_control_plane_client::SidecarControlPlaneClient};
+use sleepypods_api::pb::{self, sidecar_control_plane_client::SidecarControlPlaneClient};
 use sleepypods_types::{Generation, InstanceId};
 use tonic::codegen::Body;
 
@@ -19,6 +19,9 @@ pub trait ReportIdleClient {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReportIdleResponse {
+    /// Expected activation deferral, encoded as bounded status metadata without
+    /// changing the protobuf wire contract.
+    RetryAfter { duration: std::time::Duration },
     Accepted {
         instance_id: InstanceId,
         generation: Generation,
@@ -52,6 +55,7 @@ pub enum ReportIdleUnavailableReason {
 #[derive(Debug)]
 pub struct GrpcSidecarControlPlaneClient<T> {
     client: SidecarControlPlaneClient<T>,
+    pod_uid: String,
 }
 
 #[derive(Debug)]
@@ -77,7 +81,16 @@ pub enum SidecarProtocolAdapterError {
 
 impl<T> GrpcSidecarControlPlaneClient<T> {
     pub fn new(client: SidecarControlPlaneClient<T>) -> Self {
-        Self { client }
+        Self {
+            client,
+            pod_uid: String::new(),
+        }
+    }
+
+    /// UID supplied by Kubernetes downward API; empty identities fail closed at the server.
+    pub fn with_pod_uid(mut self, pod_uid: String) -> Self {
+        self.pod_uid = pod_uid;
+        self
     }
 
     pub fn inner(&self) -> &SidecarControlPlaneClient<T> {
@@ -105,15 +118,35 @@ where
         &mut self,
         request: ReportIdleRequest,
     ) -> Result<ReportIdleResponse, GrpcSidecarControlPlaneError> {
-        let response = self
-            .client
-            .report_idle(report_idle_request_to_proto(request))
-            .await
-            .map_err(GrpcSidecarControlPlaneError::Status)?
-            .into_inner();
+        let mut request = report_idle_request_to_proto(request);
+        request.pod_uid = self.pod_uid.clone();
+        let response = match self.client.report_idle(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                if let Some(duration) = idle_retry_after(&status) {
+                    return Ok(ReportIdleResponse::RetryAfter { duration });
+                }
+                return Err(GrpcSidecarControlPlaneError::Status(status));
+            }
+        };
 
         report_idle_response_from_proto(response).map_err(GrpcSidecarControlPlaneError::Protocol)
     }
+}
+
+fn idle_retry_after(status: &tonic::Status) -> Option<std::time::Duration> {
+    if status.code() != tonic::Code::FailedPrecondition {
+        return None;
+    }
+    let millis = status
+        .metadata()
+        .get(sleepypods_api::IDLE_RETRY_AFTER_METADATA)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let duration = std::time::Duration::from_millis(millis);
+    (millis > 0 && duration <= sleepypods_api::INITIAL_ACTIVATION_TIMEOUT).then_some(duration)
 }
 
 impl<T> ReportIdleClient for GrpcSidecarControlPlaneClient<T>
@@ -139,6 +172,7 @@ pub fn report_idle_request_to_proto(request: ReportIdleRequest) -> pb::SidecarRe
         instance_id: request.instance_id().as_str().to_owned(),
         expected_generation: request.generation().get(),
         active_count: request.observation().active_count() as u64,
+        pod_uid: String::new(),
     }
 }
 

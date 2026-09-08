@@ -1,12 +1,12 @@
 use std::{convert::Infallible, error::Error, fmt, future::Future, pin::Pin};
 
 use bytes::Bytes;
-use control_plane::{
-    http01::InvalidHttp01Challenge, Http01ChallengeKey, Http01ChallengeRecord, RouteIdentity,
-};
 use http::{
     header::{CONTENT_TYPE, HOST},
     Request, Response, StatusCode,
+};
+use sleepypods_api::{
+    http01::InvalidHttp01Challenge, Http01ChallengeKey, Http01ChallengeRecord, RouteIdentity,
 };
 
 use crate::{RequestIdentityError, RouteRequestIdentity};

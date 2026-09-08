@@ -13,13 +13,15 @@ use proxy_core::observability::{
 };
 use proxy_core::DrainTracker;
 
+#[cfg(test)]
+use crate::is_http01_challenge_candidate_path;
+
 use crate::{
-    intercept_http01_challenge, is_http01_challenge_candidate_path, FrontlineForwardContext,
-    FrontlineForwardError, FrontlineForwarder, FrontlineRouteCoordinator,
-    FrontlineRouteCoordinatorError, FrontlineRouteOutcome, Http01ChallengeResolver,
-    Http01InterceptDecision, Http01InterceptError, NoopHttp01ChallengeResolver, ReadyBackend,
-    RequestIdentityError, RouteRequestIdentity, RouteSubscriptionClient,
-    SharedFrontlineRouteCoordinator, WakeClient,
+    intercept_http01_challenge, FrontlineForwardContext, FrontlineForwardError, FrontlineForwarder,
+    FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
+    Http01ChallengeResolver, Http01InterceptDecision, Http01InterceptError,
+    NoopHttp01ChallengeResolver, ReadyBackend, RequestIdentityError, RouteRequestIdentity,
+    RouteSubscriptionClient, SharedFrontlineRouteCoordinator, WakeClient,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -105,16 +107,19 @@ impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01> 
         Http01,
         FrontlineForwarder,
         DrainTracker,
+        ObservabilityRecorder,
     ) {
         (
             self.coordinator,
             self.http01_resolver,
             self.forwarder,
             self.drain,
+            self.observability,
         )
     }
 }
 
+#[cfg(test)]
 impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01>
 where
     RouteClient: RouteSubscriptionClient,
@@ -168,7 +173,7 @@ where
     }
 }
 
-fn record_http01_response(observability: &ObservabilityRecorder, status: StatusCode) {
+pub(crate) fn record_http01_response(observability: &ObservabilityRecorder, status: StatusCode) {
     let outcome = if status == StatusCode::OK {
         Outcome::Success
     } else {
@@ -185,7 +190,10 @@ fn record_http01_response(observability: &ObservabilityRecorder, status: StatusC
     ));
 }
 
-fn record_http01_error<E>(observability: &ObservabilityRecorder, error: &Http01InterceptError<E>) {
+pub(crate) fn record_http01_error<E>(
+    observability: &ObservabilityRecorder,
+    error: &Http01InterceptError<E>,
+) {
     let reason = match error {
         Http01InterceptError::MissingHost => "missing_host",
         Http01InterceptError::InvalidHostHeader => "invalid_host_header",
@@ -227,6 +235,7 @@ pub(crate) enum FrontlineHttpRouteError<RouteClientError, WakeClientError> {
     Coordinator(FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>),
 }
 
+#[cfg(test)]
 pub(crate) async fn resolve_http_route<RouteClient, Wake, B>(
     coordinator: &mut FrontlineRouteCoordinator<RouteClient, Wake>,
     request: &Request<B>,
@@ -375,9 +384,12 @@ pub(crate) fn http01_intercept_error_response<E>(
 
 fn forward_error_response(error: FrontlineForwardError) -> Response<FrontlineRuntimeBody> {
     let status = match error {
-        FrontlineForwardError::Http(proxy_core::HttpProxyError::Drain(_)) => {
-            StatusCode::SERVICE_UNAVAILABLE
+        FrontlineForwardError::Http(proxy_core::HttpProxyError::UpstreamHeaderTimeout) => {
+            StatusCode::GATEWAY_TIMEOUT
         }
+        FrontlineForwardError::Http(
+            proxy_core::HttpProxyError::Drain(_) | proxy_core::HttpProxyError::UpstreamSaturated,
+        ) => StatusCode::SERVICE_UNAVAILABLE,
         FrontlineForwardError::Backend(_)
         | FrontlineForwardError::Http(
             proxy_core::HttpProxyError::RequestRewrite(_) | proxy_core::HttpProxyError::Client(_),

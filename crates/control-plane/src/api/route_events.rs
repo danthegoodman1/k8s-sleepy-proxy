@@ -1,93 +1,136 @@
-use tokio::sync::broadcast;
-
-use crate::{ProtocolRoute, RouteBindingId, RouteBindingRecord, RouteIdentity};
+use super::admission::ApiLimits;
+use crate::{InstanceId, ProtocolRoute, RouteBindingId, RouteBindingRecord, RouteIdentity};
+use std::sync::Arc;
+use tokio::sync::{broadcast, Semaphore};
 
 const ROUTE_EVENT_BUFFER: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct RouteSubscriptionBroker {
     sender: broadcast::Sender<RouteBindingChange>,
+    pub(crate) streams: Arc<Semaphore>,
+    pub(crate) admission: super::admission::RpcAdmissionLayer,
+    pub(crate) limits: ApiLimits,
+    pub(crate) cancellation: crate::runtime_work::Cancellation,
 }
 
 #[derive(Clone, Debug)]
-pub struct RouteBindingChange {
-    pub route_binding_id: RouteBindingId,
-    pub reason: RouteBindingChangeReason,
-    pub identity: Option<RouteIdentity>,
-    pub protocol: Option<ProtocolRoute>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RouteBindingChangeReason {
-    Removed,
-    Changed,
+pub enum RouteBindingChange {
+    Route {
+        route_binding_id: RouteBindingId,
+        removed: bool,
+        identity: Option<RouteIdentity>,
+        protocol: Option<ProtocolRoute>,
+    },
+    Instance(InstanceId),
+    Reset,
 }
 
 impl RouteSubscriptionBroker {
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(ROUTE_EVENT_BUFFER);
-        Self { sender }
+        Self::with_limits(ApiLimits::default())
     }
-
+    pub fn with_limits(limits: ApiLimits) -> Self {
+        let (sender, _) = broadcast::channel(ROUTE_EVENT_BUFFER);
+        Self {
+            sender,
+            admission: super::admission::RpcAdmissionLayer::with_delivery_timeout(
+                limits.rpc_concurrency,
+                limits.unary_delivery_timeout,
+            ),
+            streams: Arc::new(Semaphore::new(limits.subscription_streams)),
+            limits,
+            cancellation: crate::runtime_work::Cancellation::new(),
+        }
+    }
     pub fn subscribe(&self) -> broadcast::Receiver<RouteBindingChange> {
         self.sender.subscribe()
     }
-
-    pub fn notify_route_removed(&self, route_binding_id: RouteBindingId) {
-        self.notify(
-            route_binding_id,
-            RouteBindingChangeReason::Removed,
-            None,
-            None,
-        );
+    pub fn reset(&self) {
+        let _ = self.sender.send(RouteBindingChange::Reset);
     }
-
-    pub fn notify_routes_removed(&self, route_bindings: &[RouteBindingRecord]) {
-        for route_binding in route_bindings {
-            self.notify_route_removed(route_binding.id.clone());
+    pub fn shutdown(&self) {
+        self.cancellation.cancel();
+    }
+    pub fn notify_instance_changed(&self, id: InstanceId) {
+        let _ = self.sender.send(RouteBindingChange::Instance(id));
+    }
+    pub fn notify_route_removed(&self, route_binding_id: RouteBindingId) {
+        let _ = self.sender.send(RouteBindingChange::Route {
+            route_binding_id,
+            removed: true,
+            identity: None,
+            protocol: None,
+        });
+    }
+    pub fn notify_routes_removed(&self, bindings: &[RouteBindingRecord]) {
+        for binding in bindings {
+            self.notify_route_removed(binding.id.clone());
         }
     }
-
     pub fn notify_route_changed(
         &self,
         route_binding_id: RouteBindingId,
         identity: RouteIdentity,
         protocol: ProtocolRoute,
     ) {
-        self.notify(
+        let _ = self.sender.send(RouteBindingChange::Route {
             route_binding_id,
-            RouteBindingChangeReason::Changed,
-            Some(identity),
-            Some(protocol),
-        );
+            removed: false,
+            identity: Some(identity),
+            protocol: Some(protocol),
+        });
     }
-
-    pub fn notify_routes_changed(&self, route_bindings: &[RouteBindingRecord]) {
-        for route_binding in route_bindings {
+    pub fn notify_routes_changed(&self, bindings: &[RouteBindingRecord]) {
+        for binding in bindings {
             self.notify_route_changed(
-                route_binding.id.clone(),
-                route_binding.identity.clone(),
-                route_binding.protocol,
+                binding.id.clone(),
+                binding.identity.clone(),
+                binding.protocol,
             );
         }
     }
-
-    fn notify(
+    pub(crate) fn publish_durable(
         &self,
-        route_binding_id: RouteBindingId,
-        reason: RouteBindingChangeReason,
-        identity: Option<RouteIdentity>,
-        protocol: Option<ProtocolRoute>,
-    ) {
-        let _ = self.sender.send(RouteBindingChange {
-            route_binding_id,
-            reason,
-            identity,
-            protocol,
-        });
+        payload: &serde_json::Value,
+    ) -> Result<(), crate::store::StoreError> {
+        let field = |name| {
+            payload[name]
+                .as_str()
+                .ok_or_else(|| crate::store::StoreError::internal("invalid durable route event"))
+        };
+        if field("kind")? == "instance" {
+            self.notify_instance_changed(
+                InstanceId::new(field("instance_id")?)
+                    .map_err(|error| crate::store::StoreError::internal(error.to_string()))?,
+            );
+        } else {
+            let id = RouteBindingId::new(field("route_binding_id")?)
+                .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
+            if payload["removed"].as_bool() == Some(true) {
+                self.notify_route_removed(id);
+                return Ok(());
+            }
+            let host = match field("host_kind")? {
+                "exact" => crate::RouteHost::exact(field("host")?),
+                _ => crate::RouteHost::wildcard_suffix(field("host")?),
+            }
+            .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
+            let (identity, protocol) = if field("identity_kind")? == "http" {
+                let path = payload["path_prefix"]
+                    .as_str()
+                    .map(crate::PathPrefix::new)
+                    .transpose()
+                    .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
+                (RouteIdentity::Http { host, path }, ProtocolRoute::Http)
+            } else {
+                (RouteIdentity::Sni { host }, ProtocolRoute::TlsSni)
+            };
+            self.notify_route_changed(id, identity, protocol);
+        }
+        Ok(())
     }
 }
-
 impl Default for RouteSubscriptionBroker {
     fn default() -> Self {
         Self::new()

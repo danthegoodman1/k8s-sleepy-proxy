@@ -1,3 +1,8 @@
+#[macro_use]
+#[path = "support/unexpected_store.rs"]
+mod unexpected_store;
+#[path = "support/mod.rs"]
+mod transport_support;
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -23,11 +28,11 @@ use control_plane::{
     PutHttp01ChallengeRequest, RecordMaterializationRequest,
     ReleaseMaterializationReconciliationLeaseRequest, RenderManifestRequest,
     RenderedExclusivityKey, RenderedObjectRef, RenewMaterializationReconciliationLeaseRequest,
-    RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost, RouteIdentity,
-    RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason,
-    StoreError, TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion,
-    WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    ResolveRouteRequest, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
+    RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+    StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
+    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind,
+    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -382,7 +387,7 @@ async fn run_conformance(
     exercise_rendered_object_ref_collision_rejection(store, class.reference.clone()).await?;
     exercise_exclusivity_keys(store, config).await?;
     exercise_no_object_apply_failure_release(store).await?;
-    exercise_materialization_reconciliation_leases(store, class.reference.clone()).await?;
+    exercise_materialization_reconciliation_leases(store, config, class.reference.clone()).await?;
 
     let delete_target = store
         .create_instance(create_instance_request(
@@ -459,10 +464,13 @@ async fn run_conformance(
     ));
 
     let initial_resolution = store
-        .resolve_route(RouteIdentity::Http {
-            host: RouteHost::exact("APP.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        })
+        .resolve_route(ResolveRouteRequest::new(
+            RouteIdentity::Http {
+                host: RouteHost::exact("APP.example.com").expect("valid host"),
+                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+            },
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
         .await?;
     let route_entry = match initial_resolution {
         RouteResolution::Resolved { entry, .. } => entry,
@@ -472,10 +480,13 @@ async fn run_conformance(
     assert_eq!(route_entry.backend, None);
 
     let miss = store
-        .resolve_route(RouteIdentity::Http {
-            host: RouteHost::exact("missing.example.com").expect("valid host"),
-            path: None,
-        })
+        .resolve_route(ResolveRouteRequest::new(
+            RouteIdentity::Http {
+                host: RouteHost::exact("missing.example.com").expect("valid host"),
+                path: None,
+            },
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
         .await?;
     assert!(matches!(miss, RouteResolution::Miss { .. }));
 
@@ -564,10 +575,13 @@ async fn run_conformance(
     );
 
     let resolved_with_backend = store
-        .resolve_route(RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        })
+        .resolve_route(ResolveRouteRequest::new(
+            RouteIdentity::Http {
+                host: RouteHost::exact("app.example.com").expect("valid host"),
+                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+            },
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
         .await?;
     match resolved_with_backend {
         RouteResolution::Resolved { entry, .. } => {
@@ -600,10 +614,13 @@ async fn run_conformance(
     }
 
     let resolved_after_rewind_rejection = store
-        .resolve_route(RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        })
+        .resolve_route(ResolveRouteRequest::new(
+            RouteIdentity::Http {
+                host: RouteHost::exact("app.example.com").expect("valid host"),
+                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+            },
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
         .await?;
     match resolved_after_rewind_rejection {
         RouteResolution::Resolved { entry, .. } => {
@@ -644,10 +661,13 @@ async fn run_conformance(
     }
 
     let resolved_after_generation_advance = store
-        .resolve_route(RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        })
+        .resolve_route(ResolveRouteRequest::new(
+            RouteIdentity::Http {
+                host: RouteHost::exact("app.example.com").expect("valid host"),
+                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+            },
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
         .await?;
     match resolved_after_generation_advance {
         RouteResolution::Resolved { entry, .. } => {
@@ -1691,8 +1711,10 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
 
 async fn exercise_materialization_reconciliation_leases(
     store: &PostgresStore,
+    config: &PostgresStoreConfig,
     workload_class: WorkloadClassVersionRef,
 ) -> Result<(), StoreError> {
+    let raw = raw_client(config).await?;
     let target = MaterializationTarget::new("cluster-reconcile", "apps").expect("valid target");
     let created = store
         .create_instance(create_instance_request(
@@ -1793,12 +1815,16 @@ async fn exercise_materialization_reconciliation_leases(
             RenewMaterializationReconciliationLeaseRequest::new(
                 pending_record.id.clone(),
                 "owner-b",
+                1,
+                pending_record.instance_generation,
                 now + Duration::from_secs(40),
+                MaterializationState::Pending,
             ),
         )
         .await?;
     assert!(!wrong_owner_renewed);
 
+    raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&pending_record.id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
     let owner_b_takeover = store
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending_record.id.clone(),
@@ -1829,19 +1855,25 @@ async fn exercise_materialization_reconciliation_leases(
         .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
             pending_record.id.clone(),
             "owner-a",
+            1,
             complete_for_reconciled_pending(&pending_record, "http://10.0.0.40:8080"),
         ))
         .await
         .expect_err("stale lease owner cannot finalize wake");
     assert!(matches!(
         stale_owner_complete,
-        StoreError::Unavailable { .. }
+        StoreError::LeaseConflict { .. }
     ));
 
     let completed = store
         .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
             pending_record.id.clone(),
             "owner-b",
+            owner_b_takeover
+                .reconciliation_lease
+                .as_ref()
+                .unwrap()
+                .attempt,
             complete_for_reconciled_pending(&pending_record, "http://10.0.0.41:8080"),
         ))
         .await?;
@@ -1881,17 +1913,21 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             expired_pending.id.clone(),
             "expired-owner",
-            UNIX_EPOCH + Duration::from_secs(1),
-            UNIX_EPOCH + Duration::from_secs(2),
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(30),
         ))
         .await?
         .expect("expired lease fixture claim succeeds relative to request clock");
+    raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&expired_pending.id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
     let expired_renewed = store
         .renew_materialization_reconciliation_lease(
             RenewMaterializationReconciliationLeaseRequest::new(
                 expired_pending.id.clone(),
                 "expired-owner",
+                1,
+                expired_pending.instance_generation,
                 now + Duration::from_secs(90),
+                MaterializationState::Pending,
             ),
         )
         .await?;
@@ -1900,15 +1936,17 @@ async fn exercise_materialization_reconciliation_leases(
         .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
             expired_pending.id.clone(),
             "expired-owner",
+            1,
             complete_for_reconciled_pending(&expired_pending, "http://10.0.0.42:8080"),
         ))
         .await
         .expect_err("same owner cannot complete wake after lease expiry");
-    assert!(matches!(expired_complete, StoreError::Unavailable { .. }));
+    assert!(matches!(expired_complete, StoreError::LeaseConflict { .. }));
     let expired_delete = store
         .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
             expired_pending.id.clone(),
             "expired-owner",
+            1,
             MaterializationState::Pending,
             expired_pending.instance_id.clone(),
             expired_pending.instance_generation,
@@ -1916,7 +1954,7 @@ async fn exercise_materialization_reconciliation_leases(
         ))
         .await
         .expect_err("same owner cannot mark deleted after lease expiry");
-    assert!(matches!(expired_delete, StoreError::Unavailable { .. }));
+    assert!(matches!(expired_delete, StoreError::LeaseConflict { .. }));
     let expired_pending_loaded = store
         .load_materialization(LoadMaterializationRequest::new(expired_pending.id.clone()))
         .await?
@@ -1960,8 +1998,8 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             stale_race.id.clone(),
             "race-owner",
-            now,
-            now + Duration::from_secs(60),
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(60),
         ))
         .await?
         .expect("race fixture lease claim succeeds");
@@ -1990,6 +2028,7 @@ async fn exercise_materialization_reconciliation_leases(
         .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
             stale_race.id.clone(),
             "race-owner",
+            1,
             MaterializationState::Pending,
             stale_race.instance_id.clone(),
             stale_race.instance_generation,
@@ -2047,8 +2086,7 @@ async fn exercise_materialization_reconciliation_leases(
         .materialization
         .expect("materialization marked deleting");
     let deleting_id = deleting.id.clone();
-    // begin_sleep future-dates the Deleting row so proxies have the drain
-    // grace window to consume invalidations before reconciliation cleanup.
+    // Candidate scans and direct claims must both respect the immutable drain deadline.
     let before_grace_candidates = store
         .list_materialization_reconciliation_candidates(
             ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), 100),
@@ -2068,19 +2106,34 @@ async fn exercise_materialization_reconciliation_leases(
     assert!(after_grace_candidates
         .iter()
         .any(|candidate| candidate.id == deleting_id));
+    assert!(
+        store
+            .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
+                deleting_id.clone(),
+                "delete-owner-a",
+                SystemTime::now(),
+                SystemTime::now() + Duration::from_secs(30),
+            ))
+            .await?
+            .is_none(),
+        "manual claim must not bypass drain grace"
+    );
+    raw.execute("UPDATE materializations SET drain_not_before_unix_millis = 0, next_attempt_at_unix_millis = 0 WHERE materialization_id = $1", &[&deleting_id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
+    let after_grace = SystemTime::now() + drain_grace_timeout + Duration::from_secs(1);
     store
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             deleting_id.clone(),
             "delete-owner-a",
-            now,
-            now + Duration::from_secs(30),
+            after_grace,
+            after_grace + Duration::from_secs(30),
         ))
         .await?
-        .expect("delete lease claim succeeds");
+        .expect("delete lease claim succeeds after grace");
     let stale_finalize = store
         .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
             deleting_id.clone(),
             "delete-owner-b",
+            1,
             FinalizeSleepRequest::new(
                 begin.instance.id.clone(),
                 begin.instance.generation,
@@ -2089,11 +2142,12 @@ async fn exercise_materialization_reconciliation_leases(
         ))
         .await
         .expect_err("wrong owner cannot finalize delete");
-    assert!(matches!(stale_finalize, StoreError::Unavailable { .. }));
+    assert!(matches!(stale_finalize, StoreError::LeaseConflict { .. }));
     let finalized = store
         .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
             deleting_id.clone(),
             "delete-owner-a",
+            1,
             FinalizeSleepRequest::new(
                 begin.instance.id,
                 begin.instance.generation,
@@ -2156,15 +2210,17 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             expired_deleting.id.clone(),
             "expired-delete-owner",
-            UNIX_EPOCH + Duration::from_secs(1),
-            UNIX_EPOCH + Duration::from_secs(2),
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(30),
         ))
         .await?
         .expect("expired delete lease fixture claim succeeds relative to request clock");
+    raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&expired_deleting.id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
     let expired_finalize = store
         .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
             expired_deleting.id.clone(),
             "expired-delete-owner",
+            1,
             FinalizeSleepRequest::new(
                 expired_begin.instance.id,
                 expired_begin.instance.generation,
@@ -2173,7 +2229,7 @@ async fn exercise_materialization_reconciliation_leases(
         ))
         .await
         .expect_err("same owner cannot finalize delete after lease expiry");
-    assert!(matches!(expired_finalize, StoreError::Unavailable { .. }));
+    assert!(matches!(expired_finalize, StoreError::LeaseConflict { .. }));
     let expired_deleting_loaded = store
         .load_materialization(LoadMaterializationRequest::new(expired_deleting.id))
         .await?
@@ -2247,7 +2303,12 @@ async fn exercise_materialization_reconciliation_leases(
 
     let release_missing = store
         .release_materialization_reconciliation_lease(
-            ReleaseMaterializationReconciliationLeaseRequest::new(pending_record.id, "owner-b"),
+            ReleaseMaterializationReconciliationLeaseRequest::new(
+                pending_record.id,
+                "owner-b",
+                1,
+                pending_record.instance_generation,
+            ),
         )
         .await?;
     assert!(!release_missing);
@@ -2431,7 +2492,10 @@ async fn exercise_complete_wake(
     );
 
     match store
-        .resolve_route(http_identity("complete-wake.example.com", None))
+        .resolve_route(ResolveRouteRequest::new(
+            http_identity("complete-wake.example.com", None),
+            MaterializationTarget::new("cluster-complete", "apps").unwrap(),
+        ))
         .await?
     {
         RouteResolution::Resolved { entry, .. } => {
@@ -2735,7 +2799,10 @@ async fn exercise_complete_wake(
     assert_eq!(rewind_after.state, InstanceState::Waking);
     assert_eq!(rewind_after.generation, Generation::new(1));
     match store
-        .resolve_route(http_identity("complete-wake-rewind.example.com", None))
+        .resolve_route(ResolveRouteRequest::new(
+            http_identity("complete-wake-rewind.example.com", None),
+            MaterializationTarget::new("cluster-complete", "rewind").unwrap(),
+        ))
         .await?
     {
         RouteResolution::Resolved { entry, .. } => {
@@ -3028,7 +3095,10 @@ async fn exercise_route_bindings(
     .await?;
 
     let miss = store
-        .resolve_route(http_identity("routes.example.com", None))
+        .resolve_route(ResolveRouteRequest::new(
+            http_identity("routes.example.com", None),
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
         .await?;
     match miss {
         RouteResolution::Miss { negative_cache } => {
@@ -3068,7 +3138,13 @@ async fn assert_resolves_to(
     identity: RouteIdentity,
     expected_route_binding_id: &RouteBindingId,
 ) -> Result<(), StoreError> {
-    match store.resolve_route(identity).await? {
+    match store
+        .resolve_route(ResolveRouteRequest::new(
+            identity,
+            MaterializationTarget::new("cluster-a", "default").unwrap(),
+        ))
+        .await?
+    {
         RouteResolution::Resolved { entry, .. } => {
             assert_eq!(&entry.route_binding_id, expected_route_binding_id);
             Ok(())
@@ -3296,12 +3372,19 @@ fn assert_exclusivity_conflict(
 }
 
 fn unique_schema_name() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after epoch")
         .as_nanos();
 
-    format!("sleepypods_test_{}_{}", std::process::id(), nanos)
+    format!(
+        "sleepypods_test_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        sequence
+    )
 }
 
 fn connection_url_with_search_path(base_url: &str, schema: &str) -> String {
@@ -3309,3 +3392,1350 @@ fn connection_url_with_search_path(base_url: &str, schema: &str) -> String {
 
     format!("{base_url}{separator}options=-csearch_path%3D{schema}")
 }
+
+async fn raw_client(config: &PostgresStoreConfig) -> Result<tokio_postgres::Client, StoreError> {
+    let (client, connection) = tokio_postgres::connect(config.connection_url(), NoTls)
+        .await
+        .map_err(|e| StoreError::internal(e.to_string()))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(client)
+}
+
+#[tokio::test]
+async fn postgres_scalability_contracts_against_real_database() -> TestResult {
+    let Ok(base_url) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
+        eprintln!("skipping Postgres scalability contracts; SLEEPYPODS_POSTGRES_URL is unset");
+        return Ok(());
+    };
+    let admin_config = PostgresStoreConfig::new(&base_url)?;
+    let admin = raw_client(&admin_config).await?;
+    let schema = unique_schema_name();
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
+    // Simultaneous startup must serialize before even creating the metadata table.
+    let (a, b, c, d) = tokio::join!(
+        PostgresStore::connect(&config),
+        PostgresStore::connect(&config),
+        PostgresStore::connect(&config),
+        PostgresStore::connect(&config)
+    );
+    let store = a?;
+    b?;
+    c?;
+    d?;
+    let result = phase5_contracts(&store, &config).await;
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    result
+}
+
+async fn phase5_contracts(store: &PostgresStore, config: &PostgresStoreConfig) -> TestResult {
+    let class = workload_class("phase5-class", 1);
+    store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
+        .await?;
+    phase5_single_slot_pool_and_cancelled_migration(config, &class).await?;
+    phase5_reservation_concurrency(store, config, &class).await?;
+    phase5_idempotency_lifetime(store, config, &class).await?;
+    phase5_route_scale_snapshot_and_target(store, config, &class).await?;
+    Ok(())
+}
+
+async fn phase5_single_slot_pool_and_cancelled_migration(
+    config: &PostgresStoreConfig,
+    class: &WorkloadClassVersion,
+) -> TestResult {
+    let mut config = config.clone();
+    config.max_connections = 1;
+    config.pool_wait_timeout = Duration::from_millis(100);
+    let store = PostgresStore::connect(&config).await?;
+    // The old nested checkout deadlocked on the already-held only slot.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        store.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone())),
+    )
+    .await??;
+    let raw = raw_client(&config).await?;
+    raw.query_one("SELECT pg_advisory_lock(1936748391, 1835624306)", &[])
+        .await?;
+    let migration_store = store.clone();
+    let migration = tokio::spawn(async move { migration_store.run_migrations().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting: bool = raw.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = 1936748391 AND objid = 1835624306 AND NOT granted)", &[]).await.unwrap().get(0);
+            if waiting { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await?;
+    let started = std::time::Instant::now();
+    let error = store
+        .get_instance(GetInstanceRequest::new(InstanceId::new("absent")?))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Unavailable { .. }));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "saturated checkout must be bounded"
+    );
+    migration.abort();
+    assert!(migration.await.unwrap_err().is_cancelled());
+    raw.query_one("SELECT pg_advisory_unlock(1936748391, 1835624306)", &[])
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), store.run_migrations()).await??;
+    assert!(store
+        .get_instance(GetInstanceRequest::new(InstanceId::new("absent")?))
+        .await?
+        .is_none());
+    eprintln!(
+        "phase5 single_slot_pool_and_cancelled_migration passed; saturation bounded to 100ms"
+    );
+    Ok(())
+}
+
+async fn phase5_reservation_concurrency(
+    store: &PostgresStore,
+    config: &PostgresStoreConfig,
+    class: &WorkloadClassVersion,
+) -> TestResult {
+    let mut requests = Vec::new();
+    for index in 0..26 {
+        let id = format!("phase5-reservation-{index}");
+        let instance = create_lifecycle_instance(store, class.reference.clone(), &id, &id)
+            .await?
+            .instance;
+        let mut request = RecordMaterializationRequest::new(
+            instance.id,
+            instance.generation,
+            MaterializationTarget::new("phase5", "apps")?,
+            MaterializationState::Pending,
+            BackendGeneration::new(1),
+        );
+        request.rendered_objects = vec![object_ref("v1", "Service", "apps", &id)];
+        request.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", &id)];
+        requests.push(request);
+    }
+    let held = store.record_materialization(requests[0].clone()).await?;
+    let mut raw = raw_client(config).await?;
+    let transaction = raw.transaction().await?;
+    transaction.execute("UPDATE materializations SET updated_at_unix_millis = updated_at_unix_millis + 1 WHERE materialization_id = $1", &[&held.id.as_str()]).await?;
+    let legacy = raw_client(config).await?;
+    legacy
+        .batch_execute("SET lock_timeout = '100ms'; BEGIN")
+        .await?;
+    let legacy_started = std::time::Instant::now();
+    let legacy_error = legacy
+        .batch_execute("LOCK TABLE materializations IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .unwrap_err();
+    assert_eq!(legacy_error.code().unwrap().code(), "55P03");
+    let legacy_wait = legacy_started.elapsed();
+    legacy.batch_execute("ROLLBACK").await?;
+    let mut tasks = tokio::task::JoinSet::new();
+    let started = std::time::Instant::now();
+    for request in &requests[1..24] {
+        let store = store.clone();
+        let request = request.clone();
+        tasks.spawn(async move { store.record_materialization(request).await });
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+    })
+    .await?;
+    let elapsed = started.elapsed();
+    transaction.rollback().await?;
+    // Two transactions racing to acquire one key must produce one owner.
+    let mut left = requests[24].clone();
+    let mut right = requests[25].clone();
+    left.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "shared-race")];
+    right.exclusivity_keys = left.exclusivity_keys.clone();
+    let (left, right) = tokio::join!(
+        store.record_materialization(left),
+        store.record_materialization(right)
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert!(matches!(
+        left.as_ref().err().or(right.as_ref().err()),
+        Some(StoreError::ExclusivityConflict { .. })
+    ));
+    // An object has one Kubernetes API-group identity across API versions.
+    let mut other_version = requests[25].clone();
+    other_version.exclusivity_keys.clear();
+    other_version.rendered_objects = vec![object_ref(
+        "apps/v1",
+        "Deployment",
+        "apps",
+        "shared-version",
+    )];
+    let mut owner = requests[24].clone();
+    owner.exclusivity_keys.clear();
+    owner.rendered_objects = vec![object_ref(
+        "apps/v1beta1",
+        "Deployment",
+        "apps",
+        "shared-version",
+    )];
+    store.record_materialization(owner).await?;
+    assert!(matches!(
+        store.record_materialization(other_version).await,
+        Err(StoreError::InvalidArgument { .. })
+    ));
+    // Renewal and release preserve state age; retry queue placement is separate.
+    let age_before: i64 = raw.query_one("SELECT state_entered_at_unix_millis FROM materializations WHERE materialization_id = $1", &[&held.id.as_str()]).await?.get(0);
+    let now = SystemTime::now();
+    store
+        .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
+            held.id.clone(),
+            "age-owner",
+            now,
+            now + Duration::from_secs(60),
+        ))
+        .await?
+        .unwrap();
+    store
+        .renew_materialization_reconciliation_lease(
+            RenewMaterializationReconciliationLeaseRequest::new(
+                held.id.clone(),
+                "age-owner",
+                1,
+                held.instance_generation,
+                now + Duration::from_secs(120),
+                MaterializationState::Pending,
+            ),
+        )
+        .await?;
+    store
+        .release_materialization_reconciliation_lease(
+            ReleaseMaterializationReconciliationLeaseRequest::new(
+                held.id.clone(),
+                "age-owner",
+                1,
+                held.instance_generation,
+            ),
+        )
+        .await?;
+    let age_after: i64 = raw.query_one("SELECT state_entered_at_unix_millis FROM materializations WHERE materialization_id = $1", &[&held.id.as_str()]).await?.get(0);
+    assert_eq!(age_before, age_after);
+    eprintln!("phase5 reservation_concurrency passed; legacy table lock timed out after {legacy_wait:?}; 23 independent reservations committed in {elapsed:?} while unrelated row transaction held open; one winner per conflicting key");
+    Ok(())
+}
+
+async fn phase5_idempotency_lifetime(
+    store: &PostgresStore,
+    config: &PostgresStoreConfig,
+    class: &WorkloadClassVersion,
+) -> TestResult {
+    let request = create_instance_request(
+        "phase5-permanent",
+        "phase5-permanent",
+        class.reference.clone(),
+        vec![],
+    );
+    let created = store.create_instance(request.clone()).await?;
+    let deleting = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            created.instance.id.clone(),
+            created.instance.generation,
+            InstanceState::Deleting,
+            StateTransitionReason::DeleteRequested,
+        ))
+        .await?;
+    store
+        .delete_instance(DeleteInstanceRequest::new(deleting.id))
+        .await?;
+    assert!(matches!(
+        store.create_instance(request.clone()).await,
+        Err(StoreError::IdempotencyResourceDeleted {
+            resource: "instance"
+        })
+    ));
+    let recreated = create_instance_request(
+        "phase5-recreated",
+        "phase5-permanent",
+        class.reference.clone(),
+        vec![],
+    );
+    store.create_instance(recreated).await?;
+    assert!(
+        matches!(
+            store.create_instance(request).await,
+            Err(StoreError::IdempotencyResourceDeleted { .. })
+        ),
+        "old key never replays a same-name replacement"
+    );
+    let route = create_route_binding_request(
+        "phase5-route-key",
+        "phase5-route",
+        "phase5-permanent",
+        http_identity("phase5.example.com", None),
+        ProtocolRoute::Http,
+    );
+    store.create_route_binding(route.clone()).await?;
+    store
+        .delete_route_binding(DeleteRouteBindingRequest::new(
+            route.route_binding_id.clone(),
+        ))
+        .await?;
+    assert!(matches!(
+        store.create_route_binding(route).await,
+        Err(StoreError::IdempotencyResourceDeleted {
+            resource: "route binding"
+        })
+    ));
+    let mut finite = config.clone();
+    finite.idempotency_retention = Some(Duration::from_secs(60));
+    let finite_store = PostgresStore::connect(&finite).await?;
+    let finite_request = create_instance_request(
+        "phase5-finite",
+        "phase5-finite",
+        class.reference.clone(),
+        vec![],
+    );
+    finite_store.create_instance(finite_request.clone()).await?;
+    let raw = raw_client(config).await?;
+    let before = raw.query_one("SELECT created_at_unix_millis, expires_at_unix_millis FROM idempotency_records WHERE idempotency_key = 'phase5-finite'", &[]).await?;
+    let expiry: i64 = before.get(1);
+    let created_at: i64 = before.get(0);
+    assert!((59_999..=60_001).contains(&(expiry - created_at)));
+    finite_store.create_instance(finite_request.clone()).await?;
+    assert_eq!(expiry, raw.query_one("SELECT expires_at_unix_millis FROM idempotency_records WHERE idempotency_key = 'phase5-finite'", &[]).await?.get::<_, i64>(0));
+    assert_eq!(finite_store.expire_idempotency_records(1).await?, 0);
+    raw.execute("UPDATE idempotency_records SET expires_at_unix_millis = 0 WHERE idempotency_key IN ('phase5-finite', 'phase5-route-key')", &[]).await?;
+    assert_eq!(store.expire_idempotency_records(1).await?, 1);
+    assert_eq!(store.expire_idempotency_records(1).await?, 1);
+    assert_eq!(store.expire_idempotency_records(1).await?, 0);
+    assert_eq!(
+        raw.query_one(
+            "SELECT count(*) FROM idempotency_records WHERE idempotency_key = 'phase5-permanent'",
+            &[]
+        )
+        .await?
+        .get::<_, i64>(0),
+        1
+    );
+    // A key is reusable after its explicit window expires, with a different
+    // resource ID so live-resource uniqueness remains independently enforced.
+    let changed = create_instance_request(
+        "phase5-finite",
+        "phase5-after-expiry",
+        class.reference.clone(),
+        vec![],
+    );
+    assert!(
+        !finite_store
+            .create_instance(changed)
+            .await?
+            .idempotency_replayed
+    );
+    eprintln!("phase5 idempotency_lifetime passed; permanent tombstones, fixed opt-in expiry, bounded GC, replay after ID replacement");
+    Ok(())
+}
+
+async fn phase5_route_scale_snapshot_and_target(
+    store: &PostgresStore,
+    config: &PostgresStoreConfig,
+    class: &WorkloadClassVersion,
+) -> TestResult {
+    let request = create_instance_request(
+        "phase5-routing",
+        "phase5-routing",
+        class.reference.clone(),
+        vec![],
+    );
+    let instance = store.create_instance(request).await?.instance;
+    let mut raw = raw_client(config).await?;
+    raw.execute("INSERT INTO route_bindings(route_binding_id, instance_id, identity_key, identity_kind, host_kind, host, protocol) SELECT 'bulk-'||n, $1, 'bulk-'||n, 'http', 'exact', 'bulk-'||n||'.example.net', 'http' FROM generate_series(1, 100000) n", &[&instance.id.as_str()]).await?;
+    let rules = [
+        (
+            "broad",
+            RouteIdentity::Http {
+                host: RouteHost::wildcard_suffix("example.net")?,
+                path: None,
+            },
+        ),
+        (
+            "specific",
+            RouteIdentity::Http {
+                host: RouteHost::wildcard_suffix("customer.example.net")?,
+                path: Some(PathPrefix::new("/api")?),
+            },
+        ),
+        ("exact", http_identity("app.customer.example.net", None)),
+        (
+            "path",
+            http_identity("app.customer.example.net", Some("/api/v1")),
+        ),
+        (
+            "trailing",
+            http_identity("app.customer.example.net", Some("/api/v1/")),
+        ),
+        (
+            "literal",
+            http_identity("app.customer.example.net", Some("/api/%_")),
+        ),
+    ];
+    for (name, identity) in &rules {
+        store
+            .create_route_binding(create_route_binding_request(
+                &format!("key-{name}"),
+                name,
+                instance.id.as_str(),
+                identity.clone(),
+                ProtocolRoute::Http,
+            ))
+            .await?;
+    }
+    for host in [
+        "app.customer.example.net",
+        "other.customer.example.net",
+        "other.example.net",
+        "example.net",
+    ] {
+        for path in [
+            None,
+            Some("/"),
+            Some("/api"),
+            Some("/apix"),
+            Some("/api/v1"),
+            Some("/api/v1/users"),
+            Some("/api/%_/child"),
+        ] {
+            let identity = http_identity(host, path);
+            let expected = rules
+                .iter()
+                .filter_map(|(name, rule)| {
+                    control_plane::route::route_match_score(rule, &identity)
+                        .map(|score| (score, *name))
+                })
+                .max_by_key(|(score, _)| *score);
+            match store
+                .resolve_route(ResolveRouteRequest::new(
+                    identity,
+                    MaterializationTarget::new("target", "apps")?,
+                ))
+                .await?
+            {
+                RouteResolution::Resolved { entry, .. } => assert_eq!(
+                    Some(entry.route_binding_id.as_str()),
+                    expected.map(|(_, name)| name)
+                ),
+                RouteResolution::Miss { .. } => assert!(expected.is_none()),
+            }
+        }
+    }
+    let running = wake_to_running(store, instance.id.clone()).await?;
+    for (cluster, generation, uri) in [
+        ("target", 1, "http://127.0.0.1:8081"),
+        ("other", 99, "http://127.0.0.1:8082"),
+    ] {
+        let mut materialization = RecordMaterializationRequest::new(
+            instance.id.clone(),
+            running.generation,
+            MaterializationTarget::new(cluster, "apps")?,
+            MaterializationState::Ready,
+            BackendGeneration::new(generation),
+        );
+        materialization.backend = Some(BackendEndpoint::new(uri)?);
+        store.record_materialization(materialization).await?;
+    }
+    let lookup = ResolveRouteRequest::new(
+        http_identity("app.customer.example.net", None),
+        MaterializationTarget::new("target", "apps")?,
+    );
+    let resolution = store.resolve_route(lookup.clone()).await?;
+    assert!(
+        matches!(resolution, RouteResolution::Resolved { entry, .. } if entry.backend.as_ref().unwrap().uri() == "http://127.0.0.1:8081")
+    );
+    // During a concurrent uncommitted cascade the complete pre-delete snapshot
+    // remains usable; after commit resolution is a miss, never NotFound.
+    let deletion = raw.transaction().await?;
+    deletion
+        .execute(
+            "DELETE FROM instances WHERE instance_id = $1",
+            &[&instance.id.as_str()],
+        )
+        .await?;
+    assert!(matches!(
+        store.resolve_route(lookup.clone()).await?,
+        RouteResolution::Resolved { .. }
+    ));
+    deletion.commit().await?;
+    assert!(matches!(
+        store.resolve_route(lookup).await?,
+        RouteResolution::Miss { .. }
+    ));
+    eprintln!("phase5 route_scale_snapshot_and_target passed; matcher parity over 100k routes, correct target backend, atomic delete/miss");
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_migration_backfill_and_collision_rejection() -> TestResult {
+    let Ok(base_url) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
+        eprintln!("skipping Postgres migration backfill; SLEEPYPODS_POSTGRES_URL is unset");
+        return Ok(());
+    };
+    let admin = raw_client(&PostgresStoreConfig::new(&base_url)?).await?;
+    for conflicting in [false, true] {
+        let schema = unique_schema_name();
+        admin
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await?;
+        let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
+        let raw = raw_client(&config).await?;
+        raw.batch_execute("CREATE TABLE control_plane_schema_migrations (version integer PRIMARY KEY, name text NOT NULL)").await?;
+        for (version, name, sql) in [
+            (
+                1,
+                "initial_control_plane_store",
+                include_str!("../migrations/0001_initial_control_plane_store.sql"),
+            ),
+            (
+                2,
+                "workload_class_value_schema",
+                include_str!("../migrations/0002_workload_class_value_schema.sql"),
+            ),
+            (
+                3,
+                "workload_class_manifest_template",
+                include_str!("../migrations/0003_workload_class_manifest_template.sql"),
+            ),
+            (
+                4,
+                "workload_class_sleep_policy",
+                include_str!("../migrations/0004_workload_class_sleep_policy.sql"),
+            ),
+            (
+                5,
+                "workload_class_exclusivity_keys",
+                include_str!("../migrations/0005_workload_class_exclusivity_keys.sql"),
+            ),
+            (
+                6,
+                "materialization_reconciliation_leases",
+                include_str!("../migrations/0006_materialization_reconciliation_leases.sql"),
+            ),
+        ] {
+            raw.batch_execute(sql).await?;
+            raw.execute(
+                "INSERT INTO control_plane_schema_migrations VALUES ($1, $2)",
+                &[&version, &name],
+            )
+            .await?;
+        }
+        raw.batch_execute("INSERT INTO workload_class_versions(class_id,version,template_generation,default_values,value_schema,manifest_template,sleep_policy,exclusivity_keys) VALUES ('legacy',1,1,'{}','{}','{}','{}','[]');
+            INSERT INTO instances(instance_id,workload_class_id,workload_class_version,values,state,generation) VALUES ('legacy-owner','legacy',1,'{}','waking',1), ('legacy-contender','legacy',1,'{}','waking',1);
+            INSERT INTO materializations(materialization_id,instance_id,instance_generation,cluster_id,namespace,state,backend_generation,rendered_objects,exclusivity_keys,updated_at_unix_millis) VALUES ('legacy-mat','legacy-owner',1,'cluster','one','deleting',1,'[{\"api_version\":\"v1\",\"kind\":\"PersistentVolume\",\"namespace\":\"one\",\"name\":\"disk\"}]','[{\"name\":\"disk\",\"value\":\"one\"},{\"name\":\"disk\",\"value\":\"one\"}]',(extract(epoch from clock_timestamp())*1000)::bigint+60000);
+            INSERT INTO idempotency_records(idempotency_key,operation,request_fingerprint,resource_id) VALUES ('legacy-deleted','create_instance','{}','absent');").await?;
+        raw.batch_execute("INSERT INTO instances(instance_id,workload_class_id,workload_class_version,values,state,generation) VALUES ('legacy-stale-pending','legacy',1,'{}','waking',3);
+            INSERT INTO materializations(materialization_id,instance_id,instance_generation,cluster_id,namespace,state,backend_generation,rendered_objects,exclusivity_keys) VALUES ('legacy-stale-mat','legacy-stale-pending',1,'cluster','one','pending',1,'[]','[]')").await?;
+        if conflicting {
+            raw.batch_execute("INSERT INTO materializations(materialization_id,instance_id,instance_generation,cluster_id,namespace,state,backend_generation,rendered_objects,exclusivity_keys) VALUES ('conflicting-mat','legacy-contender',1,'cluster','two','pending',1,'[{\"api_version\":\"v1\",\"kind\":\"PersistentVolume\",\"namespace\":\"two\",\"name\":\"disk\"}]','[]')").await?;
+            assert!(
+                PostgresStore::connect(&config).await.is_err(),
+                "backfill must reject duplicate PV ownership across namespaces"
+            );
+            let versions: i64 = raw
+                .query_one("SELECT count(*) FROM control_plane_schema_migrations", &[])
+                .await?
+                .get(0);
+            assert_eq!(versions, 6, "failed migration must not record completion");
+            let table: Option<String> = raw
+                .query_one(
+                    "SELECT to_regclass('materialization_object_reservations')::text",
+                    &[],
+                )
+                .await?
+                .get(0);
+            assert!(table.is_none(), "failed migration must roll back its DDL");
+        } else {
+            let store = PostgresStore::connect(&config).await?;
+            let stale = raw.query_one("SELECT i.state, i.generation, m.state AS materialization_state, m.projection_generation FROM instances i JOIN materializations m USING(instance_id) WHERE i.instance_id = 'legacy-stale-pending'", &[]).await?;
+            assert_eq!(stale.get::<_, String>("state"), "failed");
+            assert_eq!(stale.get::<_, i64>("generation"), 4);
+            assert_eq!(stale.get::<_, String>("materialization_state"), "deleting");
+            assert_eq!(stale.get::<_, i64>("projection_generation"), 2);
+            // The raw migration fixture uses skeletal class JSON. Attach the
+            // ordinary typed class fixture before testing a real fresh wake.
+            let recover_class = workload_class("legacy-recover", 1);
+            store
+                .create_workload_class_version(CreateWorkloadClassVersionRequest::new(
+                    recover_class.clone(),
+                ))
+                .await?;
+            raw.execute("UPDATE instances SET workload_class_id = 'legacy-recover', values = '{\"tenant\":\"legacy-recovered\",\"image\":\"example/app:1\"}' WHERE instance_id = 'legacy-stale-pending'", &[]).await?;
+            let recovered_store = std::sync::Arc::new(store.clone());
+            let recover_target = MaterializationTarget::new("cluster", "one")?;
+            let recover_materializer = control_plane::materializer::KubernetesMaterializer::new(
+                LifecycleKubernetes::default(),
+            );
+            let driver = control_plane::MaterializationReconciler::new(
+                recovered_store.clone(),
+                recover_materializer.clone(),
+                recover_target.clone(),
+                Default::default(),
+                sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+            );
+            driver.run_once().await;
+            assert!(store
+                .load_active_materialization(LoadActiveMaterializationRequest::new(
+                    InstanceId::new("legacy-stale-pending")?,
+                    recover_target.clone()
+                ))
+                .await?
+                .is_none());
+            use control_plane::api::pb::proxy_control_plane_server::ProxyControlPlane;
+            let recover_api = control_plane::api::StoreBackedProxyApi::new(
+                recovered_store,
+                recover_materializer,
+                recover_target,
+            );
+            recover_api
+                .wake_instance(tonic::Request::new(
+                    control_plane::api::pb::ProxyWakeInstanceRequest {
+                        instance_id: "legacy-stale-pending".to_owned(),
+                        expected_generation: 4,
+                        backend_generation: None,
+                    },
+                ))
+                .await?;
+            driver.run_once().await;
+            assert_eq!(
+                store
+                    .get_instance(GetInstanceRequest::new(InstanceId::new(
+                        "legacy-stale-pending"
+                    )?))
+                    .await?
+                    .unwrap()
+                    .state,
+                InstanceState::Running
+            );
+            let legacy_orphan = raw.query_one("SELECT state, generation FROM instances WHERE instance_id = 'legacy-contender'", &[]).await?;
+            assert_eq!(
+                legacy_orphan.get::<_, String>("state"),
+                "failed",
+                "old unaccepted Waking gap becomes an explicit retryable terminal result"
+            );
+            assert_eq!(legacy_orphan.get::<_, i64>("generation"), 2);
+            let legacy_projection: i64 = raw.query_one("SELECT projection_generation FROM materializations WHERE materialization_id = 'legacy-mat'", &[]).await?.get(0);
+            assert_eq!(
+                legacy_projection, 1,
+                "legacy Deleting ownership stamp remains unchanged"
+            );
+            let retired = raw.execute("INSERT INTO instances(instance_id, workload_class_id, workload_class_version, values, state, generation) VALUES ('absent', 'legacy', 1, '{}', 'cold', 0)", &[]).await.expect_err("known legacy deleted ID is retired rather than assigned a guessable zero revision");
+            assert_eq!(
+                retired.as_db_error().unwrap().message(),
+                "instance_id_retired"
+            );
+            let row = raw
+                .query_one(
+                    "SELECT namespace FROM materialization_object_reservations WHERE materialization_id = 'legacy-mat'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(
+                row.get::<_, String>(0),
+                "",
+                "PV reservations are cluster scoped"
+            );
+            assert_eq!(
+                raw.query_one("SELECT count(*) FROM materialization_key_reservations", &[])
+                    .await?
+                    .get::<_, i64>(0),
+                1,
+                "duplicate refs within one materialization normalize"
+            );
+            assert!(raw.query_one("SELECT resource_deleted_at_unix_millis IS NOT NULL AND expires_at_unix_millis IS NULL FROM idempotency_records", &[]).await?.get::<_, bool>(0));
+            let row = raw.query_one("SELECT drain_not_before_unix_millis > state_entered_at_unix_millis, next_attempt_at_unix_millis = drain_not_before_unix_millis FROM materializations WHERE materialization_id = 'legacy-mat'", &[]).await?;
+            assert!(row.get::<_, bool>(0));
+            assert!(row.get::<_, bool>(1));
+            assert!(store
+                .claim_materialization_reconciliation(
+                    ClaimMaterializationReconciliationRequest::new(
+                        control_plane::MaterializationId::new("legacy-mat")?,
+                        "early",
+                        SystemTime::now(),
+                        SystemTime::now() + Duration::from_secs(30)
+                    )
+                )
+                .await?
+                .is_none());
+            raw.execute(
+                "UPDATE control_plane_schema_migrations SET name = 'wrong-name' WHERE version = 7",
+                &[],
+            )
+            .await?;
+            assert!(
+                store.run_migrations().await.is_err(),
+                "migration metadata mismatch fails closed"
+            );
+        }
+        admin
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_durable_lifecycle_acceptance_and_fresh_driver() -> TestResult {
+    let Ok(base_url) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let schema = unique_schema_name();
+    let (admin, connection) = tokio_postgres::connect(&base_url, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
+    let store = PostgresStore::connect(&config).await?;
+    store.run_migrations().await?;
+    let result = durable_lifecycle_checks(store).await;
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    connection_task.abort();
+    result
+}
+
+#[derive(Clone, Default)]
+struct LifecycleKubernetes {
+    objects: std::sync::Arc<
+        std::sync::Mutex<BTreeMap<String, control_plane::projection::LiveObjectMetadata>>,
+    >,
+    applies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+fn lifecycle_object_key(object: &RenderedObjectRef) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        object.api_version, object.kind, object.namespace, object.name
+    )
+}
+impl control_plane::materializer::KubernetesMaterializerClient for LifecycleKubernetes {
+    fn apply_object<'a>(
+        &'a self,
+        object: &'a control_plane::manifest::KubernetesObject,
+        _precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async move {
+            self.applies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.objects.lock().unwrap().insert(
+                lifecycle_object_key(&control_plane::materializer::rendered_object_ref(object)),
+                control_plane::projection::LiveObjectMetadata::from_rendered_object(object),
+            );
+            Ok(())
+        })
+    }
+    fn delete_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+        _precondition: &'a control_plane::projection::LiveObjectIdentity,
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async move {
+            self.deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.objects
+                .lock()
+                .unwrap()
+                .remove(&lifecycle_object_key(object));
+            Ok(())
+        })
+    }
+    fn wait_for_pvc_bound<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+    fn wait_for_readiness<'a>(
+        &'a self,
+        _: &'a [RenderedObjectRef],
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<BackendEndpoint>,
+    > {
+        Box::pin(async { Ok(BackendEndpoint::new("http://ready.apps:80").unwrap()) })
+    }
+    fn ensure_no_descendants<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+        _instance_id: &'a str,
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<
+            control_plane::projection::ProjectionObjectInspection,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(&lifecycle_object_key(object))
+                .cloned()
+                .map(control_plane::projection::ProjectionObjectInspection::Present)
+                .unwrap_or(control_plane::projection::ProjectionObjectInspection::Missing))
+        })
+    }
+
+    fn verify_retained_bindings<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
+    use control_plane::api::{pb, StoreBackedProxyApi};
+    use control_plane::instance::RequestInstanceDeletion;
+    use control_plane::materializer::KubernetesMaterializer;
+    use pb::proxy_control_plane_server::ProxyControlPlane;
+    use std::sync::{atomic::Ordering, Arc};
+    let class = workload_class("durable-class", 1);
+    store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
+        .await?;
+    let store =
+        Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(store)));
+    let target = MaterializationTarget::new("cluster-a", "apps")?;
+    let client = LifecycleKubernetes::default();
+    let materializer = KubernetesMaterializer::new(client.clone());
+    let api = StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone());
+    let create = |id: &str| {
+        create_instance_request(
+            &format!("create-{id}"),
+            id,
+            class.reference.clone(),
+            Vec::new(),
+        )
+    };
+    let cold = store
+        .create_instance(create("accepted-wake"))
+        .await?
+        .instance;
+    let wake = pb::ProxyWakeInstanceRequest {
+        backend_generation: Some(44),
+        instance_id: cold.id.as_str().to_owned(),
+        expected_generation: cold.generation.get(),
+    };
+    let (left, right) = tokio::join!(
+        api.wake_instance(tonic::Request::new(wake.clone())),
+        api.wake_instance(tonic::Request::new(wake))
+    );
+    let responses = [left?, right?];
+    assert!(responses.iter().any(|r| matches!(
+        r.get_ref().outcome,
+        Some(pb::proxy_wake_instance_response::Outcome::StillWaking(_))
+    )));
+    assert_eq!(
+        client.applies.load(Ordering::SeqCst),
+        0,
+        "acceptance has no Kubernetes effects"
+    );
+    let pending = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            cold.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(pending.backend_generation, BackendGeneration::new(44));
+    let stamp = pending.projection_generation;
+    assert_eq!(pending.state, MaterializationState::Pending);
+    drop(api); // Simulate cancellation/process loss immediately after durable acceptance.
+    let observations = sleepypods_observability::recorder::InMemoryObservability::default();
+    let fresh_driver = |target: MaterializationTarget| {
+        control_plane::MaterializationReconciler::new(
+            store.clone(),
+            materializer.clone(),
+            target,
+            control_plane::MaterializationReconcilerConfig::default(),
+            observations.recorder(),
+        )
+    };
+    fresh_driver(target.clone()).run_once().await;
+    let running = store
+        .get_instance(GetInstanceRequest::new(cold.id.clone()))
+        .await?
+        .unwrap();
+    assert_eq!(running.state, InstanceState::Running);
+    let ready = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            cold.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(ready.state, MaterializationState::Ready);
+    assert_eq!(
+        ready.projection_generation, stamp,
+        "ownership stamp must not change on completion"
+    );
+    assert!(client
+        .objects
+        .lock()
+        .unwrap()
+        .values()
+        .all(|m| m.labels.get("sleepypods.io/instance-generation") == Some(&stamp.to_string())));
+
+    let drain = store
+        .begin_sleep(
+            BeginSleepRequest::new(running.id.clone(), running.generation, target.clone())
+                .with_drain_grace_timeout(Duration::from_secs(1)),
+        )
+        .await?;
+    let api = StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone());
+    api.wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
+        backend_generation: Some(1),
+        instance_id: running.id.as_str().to_owned(),
+        expected_generation: drain.instance.generation.get(),
+    }))
+    .await?;
+    drop(api);
+    let deletes_before = client.deletes.load(Ordering::SeqCst);
+    fresh_driver(target.clone()).run_once().await;
+    fresh_driver(target.clone())
+        .reconcile_materialization(drain.materialization.unwrap())
+        .await;
+    assert_eq!(
+        client.deletes.load(Ordering::SeqCst),
+        deletes_before,
+        "neither normal nor admin claim may skip persisted grace"
+    );
+    assert_eq!(
+        store
+            .get_instance(GetInstanceRequest::new(cold.id.clone()))
+            .await?
+            .unwrap()
+            .state,
+        InstanceState::Draining
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    fresh_driver(target.clone()).run_once().await;
+    assert_eq!(
+        store
+            .get_instance(GetInstanceRequest::new(cold.id.clone()))
+            .await?
+            .unwrap()
+            .state,
+        InstanceState::Waking,
+        "deferred wake is promoted atomically with completed sleep: {:?}",
+        observations.events()
+    );
+    fresh_driver(target.clone()).run_once().await;
+    let rewoken = store
+        .get_instance(GetInstanceRequest::new(cold.id.clone()))
+        .await?
+        .unwrap();
+    assert_eq!(rewoken.state, InstanceState::Running);
+    assert!(rewoken.generation > running.generation);
+    assert_eq!(
+        store
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                cold.id.clone(),
+                target.clone()
+            ))
+            .await?
+            .unwrap()
+            .backend_generation,
+        BackendGeneration::new(45),
+        "a lower requested floor advances from the prior Deleted row"
+    );
+
+    // Ready, Pending, and zero-materialization deletion all survive loss of the API caller.
+    for state in ["ready", "pending", "zero"] {
+        let id = format!("delete-{state}");
+        let instance = store.create_instance(create(&id)).await?.instance;
+        if state != "zero" {
+            StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone())
+                .wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
+                    backend_generation: None,
+                    instance_id: id.clone(),
+                    expected_generation: instance.generation.get(),
+                }))
+                .await?;
+            if state == "ready" {
+                fresh_driver(target.clone()).run_once().await;
+            }
+        }
+        let current = store
+            .get_instance(GetInstanceRequest::new(instance.id.clone()))
+            .await?
+            .unwrap();
+        let delete = RequestInstanceDeletion {
+            instance_id: instance.id.clone(),
+            expected_generation: current.generation,
+        };
+        assert!(store.request_instance_deletion(delete.clone()).await?);
+        assert!(
+            matches!(
+                store
+                    .request_instance_deletion(RequestInstanceDeletion {
+                        instance_id: instance.id.clone(),
+                        expected_generation: Generation::new(u64::MAX)
+                    })
+                    .await,
+                Err(StoreError::InvalidArgument { .. })
+            ),
+            "out-of-range store revision is rejected before any successor arithmetic"
+        );
+        assert!(
+            store.request_instance_deletion(delete.clone()).await?,
+            "lost response replay is idempotent"
+        );
+        if state != "zero" {
+            assert!(
+                store
+                    .delete_instance(DeleteInstanceRequest::new(instance.id.clone()))
+                    .await
+                    .is_err(),
+                "hard delete cannot release unresolved cleanup"
+            );
+        }
+        fresh_driver(target.clone()).run_once().await;
+        assert!(store
+            .get_instance(GetInstanceRequest::new(instance.id.clone()))
+            .await?
+            .is_none());
+        let replacement = store
+            .create_instance(create_instance_request(
+                &format!("replacement-{id}"),
+                &id,
+                class.reference.clone(),
+                Vec::new(),
+            ))
+            .await?
+            .instance;
+        assert!(replacement.generation > current.generation.next());
+        assert!(
+            matches!(
+                store.request_instance_deletion(delete).await,
+                Err(StoreError::GenerationConflict { .. })
+            ),
+            "old delete cannot delete a replacement ID"
+        );
+        let old_wake =
+            StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone())
+                .wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
+                    backend_generation: None,
+                    instance_id: id,
+                    expected_generation: current.generation.get(),
+                }))
+                .await?
+                .into_inner();
+        assert!(matches!(
+            old_wake.outcome,
+            Some(pb::proxy_wake_instance_response::Outcome::GenerationConflict(_))
+        ));
+    }
+
+    let cancel = store
+        .create_instance(create("cancel-deferred"))
+        .await?
+        .instance;
+    let cancel_api = StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone());
+    cancel_api
+        .wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
+            instance_id: cancel.id.as_str().to_owned(),
+            expected_generation: cancel.generation.get(),
+            backend_generation: None,
+        }))
+        .await?;
+    fresh_driver(target.clone()).run_once().await;
+    let cancel_running = store
+        .get_instance(GetInstanceRequest::new(cancel.id.clone()))
+        .await?
+        .unwrap();
+    let cancel_drain = store
+        .begin_sleep(
+            BeginSleepRequest::new(cancel.id.clone(), cancel_running.generation, target.clone())
+                .with_drain_grace_timeout(Duration::from_secs(1)),
+        )
+        .await?;
+    cancel_api
+        .wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
+            instance_id: cancel.id.as_str().to_owned(),
+            expected_generation: cancel_drain.instance.generation.get(),
+            backend_generation: None,
+        }))
+        .await?;
+    drop(cancel_api);
+    store
+        .request_instance_deletion(RequestInstanceDeletion {
+            instance_id: cancel.id.clone(),
+            expected_generation: cancel_drain.instance.generation,
+        })
+        .await?;
+    fresh_driver(target.clone()).run_once().await;
+    assert_eq!(
+        store
+            .get_instance(GetInstanceRequest::new(cancel.id.clone()))
+            .await?
+            .unwrap()
+            .state,
+        InstanceState::Deleting
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    fresh_driver(target.clone()).run_once().await;
+    assert!(
+        store
+            .get_instance(GetInstanceRequest::new(cancel.id))
+            .await?
+            .is_none(),
+        "delete atomically cancels deferred wake and retains grace"
+    );
+
+    // All targets become deleting, but a driver may prove cleanup only for its own target.
+    let other_target = MaterializationTarget::new("cluster-b", "apps")?;
+    let second = RecordMaterializationRequest::new(
+        rewoken.id.clone(),
+        rewoken.generation,
+        other_target.clone(),
+        MaterializationState::Ready,
+        BackendGeneration::new(rewoken.generation.get()),
+    );
+    store.record_materialization(second).await?;
+    store
+        .request_instance_deletion(RequestInstanceDeletion {
+            instance_id: rewoken.id.clone(),
+            expected_generation: rewoken.generation,
+        })
+        .await?;
+    fresh_driver(target.clone()).run_once().await;
+    assert!(
+        store
+            .get_instance(GetInstanceRequest::new(rewoken.id.clone()))
+            .await?
+            .is_some(),
+        "local absence cannot finalize another cluster"
+    );
+    let other = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            rewoken.id.clone(),
+            other_target.clone(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(other.state, MaterializationState::Deleting);
+    fresh_driver(target).reconcile_materialization(other).await;
+    assert!(store
+        .get_instance(GetInstanceRequest::new(rewoken.id.clone()))
+        .await?
+        .is_some());
+    fresh_driver(other_target).run_once().await;
+    assert!(store
+        .get_instance(GetInstanceRequest::new(rewoken.id))
+        .await?
+        .is_none());
+    eprintln!("phase6a durable acceptance, fresh-driver recovery, stable projection, grace, target-scoped cleanup, and ID-reuse fencing passed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_effect_barriers_and_same_owner_attempt_fencing() -> TestResult {
+    use control_plane::materialization::{
+        AcknowledgeMaterializationEffectRequest, MaterializationEffectRequest,
+    };
+    use std::sync::Arc;
+    let Ok(base_url) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let schema = unique_schema_name();
+    let (admin, connection) = tokio_postgres::connect(&base_url, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
+    let raw_store = PostgresStore::connect(&config).await?;
+    raw_store.run_migrations().await?;
+    let store = Arc::new(
+        control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(raw_store)),
+    );
+    let (mut raw, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
+    let raw_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let result: TestResult = async {
+        let class = workload_class("effect-class", 1);
+        store.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone())).await?;
+        let cold = store.create_instance(create_instance_request("effect-create", "effect-instance", class.reference, vec![])).await?.instance;
+        let waking = store.compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(cold.id.clone(), cold.generation, InstanceState::Waking, StateTransitionReason::WakeRequested)).await?;
+        let target = MaterializationTarget::new("effects-cluster", "apps")?;
+        let mut request = RecordMaterializationRequest::new(waking.id, waking.generation, target.clone(), MaterializationState::Pending, BackendGeneration::new(1));
+        request.rendered_objects = vec![RenderedObjectRef { api_version: "v1".into(), kind: "Service".into(), namespace: "apps".into(), name: "effect-service".into() }];
+        request.exclusivity_keys = vec![RenderedExclusivityKey::new("singleton", "effects")];
+        let pending = store.record_materialization(request).await?;
+        let claim = |owner: &str| ClaimMaterializationReconciliationRequest::new(pending.id.clone(), owner, SystemTime::now(), SystemTime::now() + Duration::from_secs(30));
+        let first = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
+        let first_attempt = first.reconciliation_lease.as_ref().unwrap().attempt;
+        raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
+        let second = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
+        let second_attempt = second.reconciliation_lease.as_ref().unwrap().attempt;
+        assert!(second_attempt > first_attempt);
+        assert!(!store.renew_materialization_reconciliation_lease(RenewMaterializationReconciliationLeaseRequest::new(
+pending.id.clone(),
+"same-owner",
+first_attempt,
+pending.instance_generation,
+SystemTime::now() + Duration::from_secs(30), MaterializationState::Pending)).await?);
+        assert!(!store.release_materialization_reconciliation_lease(ReleaseMaterializationReconciliationLeaseRequest::new(
+pending.id.clone(),
+"same-owner",
+first_attempt,
+pending.instance_generation,
+)).await?);
+        assert!(matches!(store.complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(pending.id.clone(), "same-owner", first_attempt, complete_for_reconciled_pending(&pending, "http://ready:80"))).await, Err(StoreError::LeaseConflict { .. })));
+        assert!(matches!(store.delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(pending.id.clone(), "same-owner", first_attempt, pending.state, pending.instance_id.clone(), pending.instance_generation, target)).await, Err(StoreError::LeaseConflict { .. })));
+        let effect = |effect_id| MaterializationEffectRequest { effect_id, materialization_id: pending.id.clone(), owner: "same-owner".into(), attempt: second_attempt, instance_generation: pending.instance_generation, expected_state: pending.state, operation: "apply", object: pending.rendered_objects[0].clone(), precondition: None };
+        let ack = |effect_id| AcknowledgeMaterializationEffectRequest { instance_generation: pending.instance_generation, effect_id, materialization_id: pending.id.clone(), owner: "same-owner".into(), attempt: second_attempt };
+        let mut stale = effect(1); stale.attempt = first_attempt;
+        assert!(!store.begin_materialization_effect(stale).await?);
+        assert!(store.begin_materialization_effect(effect(1)).await?, "production retry wrapper forwards begin");
+        assert!(store.begin_materialization_effect(effect(1)).await?, "exact begin replay is idempotent");
+        let mut different = effect(1); different.object.name = "other".into();
+        assert!(!store.begin_materialization_effect(different).await?, "same token with different operation is refused");
+        assert!(store.acknowledge_materialization_effect(ack(1)).await?);
+        assert!(store.begin_materialization_effect(effect(2)).await?);
+        assert!(!store.acknowledge_materialization_effect(ack(1)).await?, "late ACK A cannot clear B");
+        assert_eq!(raw.query_one("SELECT effect_id FROM materialization_effects WHERE materialization_id = $1", &[&pending.id.as_str()]).await?.get::<_,i64>(0), 2);
+        assert!(!store.release_materialization_reconciliation_lease(ReleaseMaterializationReconciliationLeaseRequest::new(
+pending.id.clone(),
+"same-owner",
+second_attempt,
+pending.instance_generation,
+)).await?);
+        assert!(matches!(store.complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(pending.id.clone(), "same-owner", second_attempt, complete_for_reconciled_pending(&pending, "http://ready:80"))).await, Err(StoreError::LeaseConflict { .. })));
+        raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
+        assert!(store.claim_materialization_reconciliation(claim("new-owner")).await?.is_none(), "unresolved create blocks transfer even if Kubernetes name is absent");
+        assert!(store.list_materialization_reconciliation_candidates(ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), 32)).await?.is_empty());
+        // The old API response finally arrives: only exact acknowledgement removes
+        // uncertainty. A fresh driver may then inspect/delete the late created UID.
+        assert!(store.acknowledge_materialization_effect(ack(2)).await?);
+
+        // Reproduce an uncommitted begin followed by a lease-expiry claim. Claim's
+        // pre-lock snapshot sees no effect; its post-lock fresh statement must see it.
+        let third = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
+        let third_attempt = third.reconciliation_lease.as_ref().unwrap().attempt as i64;
+        let transaction = raw.transaction().await?;
+        transaction.query_one("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&pending.id.as_str()]).await?;
+        transaction.execute("INSERT INTO materialization_effects(materialization_id,effect_id,lease_owner,lease_attempt,instance_generation,operation,object_ref) VALUES ($1,3,'same-owner',$2,$3,'apply','{}')", &[&pending.id.as_str(), &third_attempt, &(pending.instance_generation.get() as i64)]).await?;
+        transaction.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
+        let other_store = store.clone(); let takeover_request = claim("new-owner");
+        let takeover = tokio::spawn(async move { other_store.claim_materialization_reconciliation(takeover_request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%SELECT materialization_id FROM materializations%' AND pid <> pg_backend_pid())", &[]).await.unwrap().get(0);
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await?;
+        transaction.commit().await?;
+        assert!(takeover.await??.is_none(), "claim must recheck barrier after its row lock wait");
+        let still_held = store.load_materialization(LoadMaterializationRequest::new(pending.id.clone())).await?.unwrap();
+        assert_eq!(still_held.exclusivity_keys, pending.exclusivity_keys);
+        // Known-not-dispatched ACK waits for a still-uncommitted begin. Its
+        // fresh snapshot must clear the eventual commit rather than miss it.
+        let mut third_ack = ack(3); third_ack.attempt = third_attempt as u64;
+        assert!(store.acknowledge_materialization_effect(third_ack.clone()).await?);
+        let fourth = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
+        let fourth_attempt = fourth.reconciliation_lease.as_ref().unwrap().attempt as i64;
+        let transaction = raw.transaction().await?;
+        transaction.query_one("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&pending.id.as_str()]).await?;
+        transaction.execute("INSERT INTO materialization_effects(materialization_id,effect_id,lease_owner,lease_attempt,instance_generation,operation,object_ref) VALUES ($1,4,'same-owner',$2,$3,'apply','{}')", &[&pending.id.as_str(), &fourth_attempt, &(pending.instance_generation.get() as i64)]).await?;
+        let mut fourth_ack = ack(4); fourth_ack.attempt = fourth_attempt as u64;
+        let ack_store = store.clone(); let acknowledgement = tokio::spawn(async move { ack_store.acknowledge_materialization_effect(fourth_ack).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%SELECT materialization_id FROM materializations%' AND pid <> pg_backend_pid())", &[]).await.unwrap().get(0);
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await?;
+        transaction.commit().await?;
+        assert!(acknowledgement.await??, "ACK sees the begin commit after its row lock wait");
+        assert!(raw.query_opt("SELECT 1 FROM materialization_effects WHERE materialization_id = $1", &[&pending.id.as_str()]).await?.is_none());
+        // Leave another deliberately unresolved operation for force recovery.
+        let mut unresolved = effect(5); unresolved.attempt = fourth_attempt as u64;
+        assert!(store.begin_materialization_effect(unresolved).await?);
+        // Existing force API is the explicitly audited recovery boundary after
+        // operators have fenced the old process/request and cleaned the cluster.
+        store.force_delete_materialization(control_plane::ForceDeleteMaterializationRequest::new(pending.id.clone(), "test-operator", "old driver and API request fenced; actual cluster cleanup independently confirmed")).await?;
+        assert!(raw.query_opt("SELECT 1 FROM materialization_effects WHERE materialization_id = $1", &[&pending.id.as_str()]).await?.is_none());
+        store.request_instance_deletion(control_plane::instance::RequestInstanceDeletion { instance_id: pending.instance_id.clone(), expected_generation: pending.instance_generation }).await?;
+        store.finalize_instance_deletions(10).await?;
+        assert!(store.get_instance(GetInstanceRequest::new(pending.instance_id.clone())).await?.is_none());
+        let recreated = store.create_instance(create_instance_request("effect-recreate", pending.instance_id.as_str(), workload_class("effect-class",1).reference, vec![])).await?.instance;
+        let recreated_waking = store.compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(recreated.id, recreated.generation, InstanceState::Waking, StateTransitionReason::WakeRequested)).await?;
+        let mut new_request = RecordMaterializationRequest::new(recreated_waking.id, recreated_waking.generation, pending.target.clone(), MaterializationState::Pending, BackendGeneration::new(1));
+        new_request.rendered_objects = pending.rendered_objects.clone(); new_request.exclusivity_keys = pending.exclusivity_keys.clone();
+        let recreated_pending = store.record_materialization(new_request).await?;
+        assert_eq!(recreated_pending.id, pending.id, "materialization names are deterministic across ID reuse");
+        assert!(recreated_pending.instance_generation > pending.instance_generation);
+        let reused_claim = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
+        assert_eq!(reused_claim.reconciliation_lease.as_ref().unwrap().attempt, first_attempt, "attempt counter may restart after row deletion");
+        assert!(!store.renew_materialization_reconciliation_lease(RenewMaterializationReconciliationLeaseRequest::new(pending.id.clone(), "same-owner", first_attempt, pending.instance_generation, SystemTime::now()+Duration::from_secs(30), MaterializationState::Pending)).await?);
+        assert!(!store.release_materialization_reconciliation_lease(ReleaseMaterializationReconciliationLeaseRequest::new(pending.id.clone(), "same-owner", first_attempt, pending.instance_generation)).await?);
+        let new_effect = MaterializationEffectRequest { instance_generation: recreated_pending.instance_generation, attempt: first_attempt, ..effect(1) };
+        assert!(store.begin_materialization_effect(new_effect).await?);
+        let old_ack = AcknowledgeMaterializationEffectRequest { attempt: first_attempt, ..ack(1) };
+        assert!(!store.acknowledge_materialization_effect(old_ack).await?, "old incarnation ACK cannot erase same numeric effect token after ID reuse");
+        assert!(raw.query_opt("SELECT 1 FROM materialization_effects WHERE materialization_id = $1", &[&pending.id.as_str()]).await?.is_some());
+        Ok(())
+    }.await;
+    drop(store);
+    drop(raw);
+    raw_task.abort();
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    connection_task.abort();
+    result
+}
+
+#[path = "postgres_store/runtime_work.rs"]
+mod runtime_work;
+
+#[path = "postgres_store/retry_boundaries.rs"]
+mod retry_boundaries;
+
+#[path = "postgres_store/activation_idle.rs"]
+mod activation_idle;
+
+#[path = "postgres_store/cleanup_boundary.rs"]
+mod cleanup_boundary;

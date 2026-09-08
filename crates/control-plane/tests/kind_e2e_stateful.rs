@@ -1,3 +1,6 @@
+#[path = "support/http_once.rs"]
+mod http_once;
+
 use std::{
     collections::{BTreeMap, HashMap},
     env,
@@ -49,9 +52,10 @@ const ROUTE_ID: &str = "e2e-stateful-route";
 const ROUTE_HOST: &str = "stateful.sleepypods.test";
 const TENANT_VALUE: &str = "stateful";
 const WORKLOAD_NAME: &str = "e2e-stateful-app";
-const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-e2e-stat";
-const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-e2e-stat";
-const RENDERED_PV_NAME: &str = "e2e-stateful-pv-e2e-stat";
+// Expected suffix: first eight SHA-256 hex digits of the complete INSTANCE_ID.
+const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-1b49ed6c";
+const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-1b49ed6c";
+const RENDERED_PV_NAME: &str = "e2e-stateful-pv-1b49ed6c";
 const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
 const CLUSTER_ID: &str = "kind-e2e-stateful";
@@ -103,14 +107,12 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
 
     let write_path = format!("/write/{marker}");
     eprintln!("stateful E2E: cold write through frontline");
-    let first = wait_for_frontline_response(
-        &config,
-        "cold write request",
-        &write_path,
-        "wrote:",
-        Duration::from_secs(180),
+    // Do not replay the cold write: the first request must survive the readiness wait.
+    let first = tokio::time::timeout(
+        Duration::from_secs(140),
+        http_get(config.frontline_addr, ROUTE_HOST, &write_path),
     )
-    .await?;
+    .await??;
     assert_response(&first, "cold write request", "wrote:")?;
     let running = wait_for_instance_state(
         &mut operator,
@@ -142,7 +144,7 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
     let cold_after_idle = wait_for_instance_state(
         &mut operator,
         PbInstanceState::Cold,
-        STATEFUL_CLEANUP_TIMEOUT,
+        sleepypods_api::INITIAL_ACTIVATION_TIMEOUT + STATEFUL_CLEANUP_TIMEOUT,
     )
     .await?;
     if cold_after_idle.generation <= running.generation {
@@ -160,16 +162,18 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
     .await?;
 
     sleep(Duration::from_secs(11)).await;
-    eprintln!("stateful E2E: re-wake read through frontline");
-    let rewake = wait_for_frontline_response(
-        &config,
-        "re-wake read request",
-        &read_path,
-        "read:",
-        Duration::from_secs(180),
+    eprintln!("stateful E2E: single re-wake read through frontline");
+    let rewake = tokio::time::timeout(
+        Duration::from_secs(140),
+        http_get_once(
+            config.frontline_addr,
+            ROUTE_HOST,
+            &read_path,
+            Duration::from_secs(130),
+        ),
     )
-    .await?;
-    assert_response(&rewake, "re-wake read request", "read:")?;
+    .await??;
+    assert_response(&rewake, "re-wake read request", &format!("read:{marker}\n"))?;
     let running_after_rewake = wait_for_instance_state(
         &mut operator,
         PbInstanceState::Running,
@@ -187,11 +191,12 @@ async fn stateful_volume_lifecycle_through_deployed_platform() -> TestResult<()>
 
     let deleted = operator
         .delete_instance(DeleteInstanceRequest {
+            expected_generation: Some(running_after_rewake.generation),
             instance_id: INSTANCE_ID.to_owned(),
         })
         .await?
         .into_inner();
-    if !deleted.deleted {
+    if !deleted.accepted {
         return Err(
             "expected deployed operator DeleteInstance to delete the running instance".into(),
         );
@@ -238,15 +243,11 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
 
     eprintln!("exclusivity E2E: waking owner with shared key");
     let owner_path = format!("/write/{marker}-owner");
-    let owner_response = wait_for_frontline_response_for_host(
-        &config,
-        EXCLUSIVE_OWNER_HOST,
-        "owner wake",
-        &owner_path,
-        "wrote:",
-        Duration::from_secs(180),
+    let owner_response = tokio::time::timeout(
+        Duration::from_secs(140),
+        http_get(config.frontline_addr, EXCLUSIVE_OWNER_HOST, &owner_path),
     )
-    .await?;
+    .await??;
     assert_response(&owner_response, "owner wake", "wrote:")?;
     let owner_running = wait_for_named_instance_state(
         &mut operator,
@@ -275,14 +276,18 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
     eprintln!("exclusivity E2E: same key is rejected without applying objects");
     let blocked_path = format!("/write/{marker}-blocked");
     let started = Instant::now();
-    let blocked_response = wait_for_frontline_status_for_host(
-        &config,
-        EXCLUSIVE_BLOCKED_HOST,
-        &blocked_path,
-        503,
+    let blocked_response = tokio::time::timeout(
         Duration::from_secs(60),
+        http_get(config.frontline_addr, EXCLUSIVE_BLOCKED_HOST, &blocked_path),
     )
-    .await?;
+    .await??;
+    if blocked_response.status != 503 {
+        return Err(format!(
+            "same-key admission must reject the single request with503, got {}",
+            blocked_response.status
+        )
+        .into());
+    }
     if started.elapsed() > Duration::from_secs(65) {
         return Err(format!(
             "same-key contention was not bounded; elapsed {:?}",
@@ -293,19 +298,25 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
     if blocked_response.body.contains("wrote:") {
         return Err("same-key contention unexpectedly reached the blocked backend".into());
     }
-    let blocked_failed = wait_for_named_instance_state_with_reconnect(
-        &config.operator_endpoint,
+    let mut observer = connect_operator(&config.operator_endpoint).await?;
+    // Failed atomic admission rolls back Waking, inventory and reservations.
+    // It does not publish an accepted lifecycle failure or consume a generation.
+    assert_instance_generation(
+        &mut observer,
         EXCLUSIVE_BLOCKED_INSTANCE_ID,
-        PbInstanceState::Failed,
-        Duration::from_secs(30),
+        PbInstanceState::Cold,
+        blocked_created.generation,
     )
     .await?;
-    if blocked_failed.generation <= blocked_created.generation {
-        return Err(format!(
-            "expected blocked wake to advance generation beyond {}, got {}",
-            blocked_created.generation, blocked_failed.generation
-        )
-        .into());
+    let blocked_status = observer
+        .reconcile_materialization(ReconcileMaterializationRequest {
+            status_only: true,
+            materialization_id: config.materialization_id(EXCLUSIVE_BLOCKED_INSTANCE_ID),
+        })
+        .await?
+        .into_inner();
+    if blocked_status.found {
+        return Err("rejected exclusivity admission must not create a materialization".into());
     }
     assert_no_materialized_objects_for_instance(
         kube.clone(),
@@ -313,18 +324,41 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
         EXCLUSIVE_BLOCKED_INSTANCE_ID,
     )
     .await?;
+    assert_instance_generation(
+        &mut observer,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+        PbInstanceState::Running,
+        owner_running.generation,
+    )
+    .await?;
+    assert_materialized_objects_for_instance(
+        kube.clone(),
+        &config.namespace,
+        EXCLUSIVE_OWNER_INSTANCE_ID,
+    )
+    .await?;
+    let owner_read = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_get(
+            config.frontline_addr,
+            EXCLUSIVE_OWNER_HOST,
+            &format!("/read/{marker}-owner"),
+        ),
+    )
+    .await??;
+    assert_response(
+        &owner_read,
+        "owner retained data after rejected admission",
+        "read:",
+    )?;
 
     eprintln!("exclusivity E2E: unrelated key can wake independently");
     let other_path = format!("/write/{marker}-other");
-    let other_response = wait_for_frontline_response_for_host(
-        &config,
-        EXCLUSIVE_OTHER_HOST,
-        "unrelated key wake",
-        &other_path,
-        "wrote:",
-        Duration::from_secs(180),
+    let other_response = tokio::time::timeout(
+        Duration::from_secs(140),
+        http_get(config.frontline_addr, EXCLUSIVE_OTHER_HOST, &other_path),
     )
-    .await?;
+    .await??;
     assert_response(&other_response, "unrelated key wake", "wrote:")?;
     wait_for_named_instance_state_with_reconnect(
         &config.operator_endpoint,
@@ -358,15 +392,11 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
     )
     .await?;
 
-    let recovered_response = wait_for_frontline_response_for_host(
-        &config,
-        EXCLUSIVE_BLOCKED_HOST,
-        "shared key wake after owner cleanup",
-        &blocked_path,
-        "wrote:",
-        Duration::from_secs(180),
+    let recovered_response = tokio::time::timeout(
+        Duration::from_secs(140),
+        http_get(config.frontline_addr, EXCLUSIVE_BLOCKED_HOST, &blocked_path),
     )
-    .await?;
+    .await??;
     assert_response(
         &recovered_response,
         "shared key wake after owner cleanup",
@@ -379,10 +409,10 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
         Duration::from_secs(30),
     )
     .await?;
-    if blocked_running.generation <= blocked_failed.generation {
+    if blocked_running.generation <= blocked_created.generation {
         return Err(format!(
             "expected released-key wake to advance generation beyond {}, got {}",
-            blocked_failed.generation, blocked_running.generation
+            blocked_created.generation, blocked_running.generation
         )
         .into());
     }
@@ -567,28 +597,40 @@ async fn run_projection_drift_and_finalizer_safety(
     }
     assert_unowned_service_present(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
 
-    let delete_error = operator
+    add_stateful_set_finalizer(
+        kube.clone(),
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        PROJECTION_DRIFT_FINALIZER,
+    )
+    .await?;
+    let accepted = operator
         .delete_instance(DeleteInstanceRequest {
             instance_id: INSTANCE_ID.to_owned(),
+            expected_generation: Some(running.generation),
         })
-        .await
-        .expect_err("unowned same-name Service must block normal cleanup");
-    if delete_error.code() != Code::Unavailable
-        || !delete_error.message().contains("ownership conflict")
-    {
-        return Err(format!(
-            "expected DeleteInstance to fail with ownership conflict, got {}: {}",
-            delete_error.code(),
-            delete_error.message()
-        )
-        .into());
+        .await?
+        .into_inner();
+    if !accepted.accepted {
+        return Err(
+            "deletion must be durably accepted while the injected finalizer blocks cleanup".into(),
+        );
     }
+    let blocked_collision = reconcile_materialization(operator, &materialization_id).await?;
+    expect_projection_observation(
+        &blocked_collision.projection_observations,
+        "v1",
+        "Service",
+        &config.namespace,
+        RENDERED_WORKLOAD_NAME,
+        "present_unowned",
+    )?;
     assert_unowned_service_present(kube.clone(), &config.namespace, RENDERED_WORKLOAD_NAME).await?;
     assert_instance_generation(
         operator,
         INSTANCE_ID,
-        PbInstanceState::Running,
-        running.generation,
+        PbInstanceState::Deleting,
+        running.generation + 1,
     )
     .await?;
 
@@ -602,45 +644,10 @@ async fn run_projection_drift_and_finalizer_safety(
     )
     .await?;
     restore_owned_service(kube.clone(), &config.namespace, &original_service).await?;
-    let restored = reconcile_materialization(operator, &materialization_id).await?;
-    assert_ready_reconcile_report_only(&restored, &materialization_id)?;
-    assert_no_unowned_projection_observations(
-        &restored.projection_observations,
-        "restored Service",
-    )?;
-    expect_projection_observation(
-        &restored.projection_observations,
-        "v1",
-        "Service",
-        &config.namespace,
-        RENDERED_WORKLOAD_NAME,
-        "present_owned",
-    )?;
-
-    eprintln!("projection drift E2E: blocking owned StatefulSet deletion with a finalizer");
-    add_stateful_set_finalizer(
-        kube.clone(),
-        &config.namespace,
-        RENDERED_WORKLOAD_NAME,
-        PROJECTION_DRIFT_FINALIZER,
-    )
-    .await?;
-    let finalizer_error = operator
-        .delete_instance(DeleteInstanceRequest {
-            instance_id: INSTANCE_ID.to_owned(),
-        })
-        .await
-        .expect_err("owned finalizer must block normal cleanup");
-    if finalizer_error.code() != Code::Unavailable
-        || !finalizer_error.message().contains("cleanup blocked")
-    {
-        return Err(format!(
-            "expected DeleteInstance to fail with cleanup blocked, got {}: {}",
-            finalizer_error.code(),
-            finalizer_error.message()
-        )
-        .into());
-    }
+    eprintln!(
+        "projection drift E2E: accepted cleanup now blocked by the owned StatefulSet finalizer"
+    );
+    let _ = reconcile_materialization(operator, &materialization_id).await?;
 
     let blocked = wait_for_reconcile_observation(
         operator,
@@ -655,7 +662,13 @@ async fn run_projection_drift_and_finalizer_safety(
         Duration::from_secs(30),
     )
     .await?;
-    assert_ready_reconcile_report_only(&blocked, &materialization_id)?;
+    if blocked.state != "Deleting" {
+        return Err(format!(
+            "expected blocked materialization state Deleting, got {}",
+            blocked.state
+        )
+        .into());
+    }
     let blocked_stateful_set = expect_projection_observation(
         &blocked.projection_observations,
         "apps/v1",
@@ -844,31 +857,7 @@ async fn delete_instance_with_reconnect(
     instance_id: &str,
     timeout: Duration,
 ) -> TestResult<DeleteInstanceOutcome> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let mut operator = connect_operator(endpoint).await?;
-        match operator
-            .delete_instance(DeleteInstanceRequest {
-                instance_id: instance_id.to_owned(),
-            })
-            .await
-        {
-            Ok(response) => {
-                return Ok(DeleteInstanceOutcome {
-                    deleted: response.into_inner().deleted,
-                });
-            }
-            Err(status)
-                if retryable_operator_transport_status(&status) && Instant::now() < deadline =>
-            {
-                eprintln!(
-                    "retrying DeleteInstance for {instance_id} after transient operator transport error: {status}"
-                );
-                sleep(Duration::from_secs(1)).await;
-            }
-            Err(status) => return Err(status.into()),
-        }
-    }
+    delete_instance_until_cleanup_complete(endpoint, instance_id, timeout).await
 }
 
 async fn delete_instance_until_cleanup_complete(
@@ -877,31 +866,38 @@ async fn delete_instance_until_cleanup_complete(
     timeout: Duration,
 ) -> TestResult<DeleteInstanceOutcome> {
     let deadline = Instant::now() + timeout;
+    let mut accepted = false;
     loop {
         let mut operator = connect_operator(endpoint).await?;
         match operator
-            .delete_instance(DeleteInstanceRequest {
+            .get_instance(GetInstanceRequest {
                 instance_id: instance_id.to_owned(),
             })
             .await
         {
+            Err(status) if status.code() == Code::NotFound => {
+                return Ok(DeleteInstanceOutcome { deleted: true });
+            }
             Ok(response) => {
-                return Ok(DeleteInstanceOutcome {
-                    deleted: response.into_inner().deleted,
-                });
+                let current = response.into_inner();
+                if !accepted && current.state != PbInstanceState::Deleting as i32 {
+                    operator
+                        .delete_instance(DeleteInstanceRequest {
+                            instance_id: instance_id.to_owned(),
+                            expected_generation: Some(current.generation),
+                        })
+                        .await?;
+                }
+                accepted = true;
             }
             Err(status)
-                if (retryable_operator_transport_status(&status)
-                    || status.code() == Code::Unavailable)
-                    && Instant::now() < deadline =>
-            {
-                eprintln!(
-                    "retrying DeleteInstance for {instance_id} while cleanup converges: {status}"
-                );
-                sleep(Duration::from_secs(1)).await;
-            }
+                if retryable_operator_transport_status(&status) && Instant::now() < deadline => {}
             Err(status) => return Err(status.into()),
         }
+        if Instant::now() >= deadline {
+            return Err("accepted instance deletion did not complete".into());
+        }
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1162,6 +1158,7 @@ async fn reconcile_materialization(
 ) -> TestResult<ReconcileMaterializationResponse> {
     Ok(operator
         .reconcile_materialization(ReconcileMaterializationRequest {
+            status_only: false,
             materialization_id: materialization_id.to_owned(),
         })
         .await?
@@ -1401,40 +1398,26 @@ async fn wait_for_frontline_response_for_host(
     }
 }
 
-async fn wait_for_frontline_status_for_host(
-    config: &E2eConfig,
-    host: &str,
-    path: &str,
-    expected_status: u16,
-    timeout: Duration,
-) -> TestResult<HttpResponse> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let last_error = match http_get(config.frontline_addr, host, path).await {
-            Ok(response) if response.status == expected_status => return Ok(response),
-            Ok(response) => format!(
-                "frontline returned HTTP {} with body {:?}",
-                response.status, response.body
-            ),
-            Err(error) => error.to_string(),
-        };
-
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for frontline HTTP {expected_status} for host {host} path {path}: {last_error}"
-            )
-            .into());
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-
 async fn http_get(addr: SocketAddr, host: &str, path: &str) -> TestResult<HttpResponse> {
     let host = host.to_owned();
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || http_get_blocking(addr, &host, &path))
         .await
         .map_err(|error| format!("HTTP request task failed: {error}"))?
+}
+
+// The shared helper preserves single-connection framing and cancellation ownership.
+async fn http_get_once(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    timeout: Duration,
+) -> TestResult<HttpResponse> {
+    let response = http_once::get_once(addr, host, path, timeout).await?;
+    Ok(HttpResponse {
+        status: response.status().as_u16(),
+        body: response.into_body(),
+    })
 }
 
 fn http_get_blocking(addr: SocketAddr, host: &str, path: &str) -> TestResult<HttpResponse> {
@@ -2316,4 +2299,122 @@ fn tenant_suffixed_text(prefix: &str, suffix: &str) -> TemplateText {
 fn unique_marker() -> TestResult<String> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     Ok(format!("marker-{millis}-{}", std::process::id()))
+}
+
+#[tokio::test]
+async fn stateful_one_shot_read_preserves_marker_and_never_retries_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, body) in [(200, "read:retained-marker\n"), (502, "bad gateway\n")] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, hold) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() <= 1024);
+            }
+            assert!(request.starts_with(b"GET /read/retained-marker HTTP/1.1\r\n"));
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            // Hold EOF until the complete framed response has returned.
+            let _ = tokio::time::timeout(Duration::from_secs(1), hold).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let response = http_get_once(
+            address,
+            ROUTE_HOST,
+            "/read/retained-marker",
+            Duration::from_millis(500),
+        )
+        .await;
+        let _ = release.send(());
+        server.await.unwrap();
+        let response = response.unwrap();
+        assert_eq!(response.status, status);
+        assert_eq!(response.body, body);
+        let assertion = assert_response(&response, "re-wake read", "read:retained-marker\n");
+        assert_eq!(assertion.is_ok(), status == 200);
+    }
+}
+
+#[tokio::test]
+async fn stateful_one_shot_deadline_closes_owned_connection() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), socket.read_to_end(&mut received))
+            .await
+            .expect("request timeout must close its owned socket")
+            .unwrap();
+        assert!(received.starts_with(b"GET /read/retained-marker HTTP/1.1\r\n"));
+        assert_eq!(
+            received.windows(4).filter(|part| *part == b"GET ").count(),
+            1
+        );
+    });
+    let error = http_get_once(
+        address,
+        ROUTE_HOST,
+        "/read/retained-marker",
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("exceeded"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stateful_one_shot_external_cancellation_closes_owned_connection() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut buffer = [0; 1024];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+            assert!(request.len() <= 1024);
+        }
+        assert!(request.starts_with(b"GET /read/retained-marker HTTP/1.1\r\n"));
+        sent.send(()).unwrap();
+        let mut remaining = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), socket.read_to_end(&mut remaining))
+            .await
+            .expect("caller cancellation must close the owned driver socket")
+            .unwrap();
+        assert!(remaining.is_empty());
+    });
+    let request = tokio::spawn(http_get_once(
+        address,
+        ROUTE_HOST,
+        "/read/retained-marker",
+        Duration::from_secs(130),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), received)
+        .await
+        .unwrap()
+        .unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    server.await.unwrap();
 }

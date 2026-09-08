@@ -1,10 +1,12 @@
+mod fenced_client;
+
 use std::{
     cmp, fmt,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
-use proxy_core::observability::{
+use sleepypods_observability::{
     metrics::{
         KUBERNETES_OPERATIONS_TOTAL, KUBERNETES_OPERATION_DURATION_SECONDS,
         RECONCILER_CANDIDATES_TOTAL, RECONCILER_CLAIMS_TOTAL, RECONCILER_LEASE_RENEWALS_TOTAL,
@@ -17,7 +19,7 @@ use proxy_core::observability::{
     },
     Operation, Outcome,
 };
-use tokio::{sync::watch, task::JoinSet, time::sleep};
+use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
     api::RouteSubscriptionBroker,
@@ -35,7 +37,6 @@ use crate::{
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
-    route::ListRouteBindingsForInstanceRequest,
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
@@ -54,9 +55,11 @@ pub struct MaterializationReconcilerConfig {
 pub struct MaterializationReconciler<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
+    target: crate::materialization::MaterializationTarget,
     config: MaterializationReconcilerConfig,
     observability: ObservabilityRecorder,
     route_events: RouteSubscriptionBroker,
+    cancellation: crate::runtime_work::Cancellation,
 }
 
 #[derive(Debug)]
@@ -67,13 +70,15 @@ pub enum MaterializationReconcileError {
     Render(String),
     StaleDesiredRefs,
     LeaseLost,
+    Cancelled,
+    Deadline,
 }
 
 impl Default for MaterializationReconcilerConfig {
     fn default() -> Self {
         Self {
             owner: default_owner(),
-            interval: Duration::from_secs(15),
+            interval: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(60),
             batch_size: 32,
             concurrency_limit: 4,
@@ -88,15 +93,18 @@ where
     pub fn new(
         store: Arc<dyn ControlPlaneStore>,
         materializer: KubernetesMaterializer<C>,
+        target: crate::materialization::MaterializationTarget,
         config: MaterializationReconcilerConfig,
         observability: ObservabilityRecorder,
     ) -> Self {
         Self {
             store,
             materializer,
+            target,
             config,
             observability,
             route_events: RouteSubscriptionBroker::new(),
+            cancellation: crate::runtime_work::Cancellation::new(),
         }
     }
 
@@ -105,24 +113,88 @@ where
         self
     }
 
-    pub async fn run_until_shutdown(self, mut shutdown: watch::Receiver<bool>) {
-        self.run_once().await;
-        loop {
+    pub async fn run_until_shutdown(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), StoreError> {
+        let cancelled = crate::runtime_work::Cancellation::new();
+        let mut jobs = JoinSet::new();
+        let mut active = std::collections::HashMap::new();
+        let mut ticker =
+            tokio::time::interval(self.interval_with_jitter().max(Duration::from_millis(10)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut scan_failures = 0;
+        let outcome = loop {
+            if *shutdown.borrow() {
+                break Ok(());
+            }
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        return;
+                biased;
+                _ = shutdown.changed() => { break Ok(()); }
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    match result.expect("active job") {
+                        Ok(id) => { active.remove(&id); },
+                        Err(error) => break Err(StoreError::unavailable(format!("reconciliation task failed: {error}"))),
                     }
                 }
-                _ = sleep(self.interval_with_jitter()) => {
-                    self.run_once().await;
+                _ = ticker.tick() => {
+                    let scan_started = Instant::now();
+                    if let Err(error) = self.store.finalize_instance_deletions(self.config.batch_size).await { self.record_reconciler_run(Outcome::Error, scan_started.elapsed()); break Err(error); }
+                    let candidates = self.store.list_materialization_reconciliation_candidates(
+                        ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), self.config.batch_size).for_target(self.target.clone())
+                    ).await;
+                    let candidates = match candidates {
+                        Ok(candidates) => { scan_failures = 0; candidates },
+                        Err(error) => { self.record_reconciler_run(Outcome::Error, scan_started.elapsed()); scan_failures += 1; if scan_failures >= 5 { break Err(error); } continue; }
+                    };
+                    for candidate in candidates {
+                        self.record_candidate(candidate.state);
+                        let capacity = self.config.concurrency_limit.max(2);
+                        let waking = active.values().filter(|state| **state == MaterializationState::Pending).count();
+                        if active.len() >= capacity || active.contains_key(&candidate.id) || (candidate.state == MaterializationState::Pending && waking >= capacity - 1) { continue; }
+                        let id = candidate.id.clone();
+                        active.insert(id.clone(), candidate.state);
+                        let mut reconciler = self.clone();
+                        reconciler.cancellation = crate::runtime_work::Cancellation::new();
+                        let cancelled = cancelled.clone();
+                        jobs.spawn(async move { reconciler.claim_and_reconcile_with_cancel(candidate, &cancelled).await; id });
+                    }
+                    // One production run is a discovery/scheduling scan; work latency is tracked separately.
+                    self.record_reconciler_run(Outcome::Success, scan_started.elapsed());
                 }
             }
-        }
+        };
+        cancelled.cancel();
+        // Live cancellation gets an owned opportunity to ACK unsent effects.
+        let drained = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut error = None;
+            while let Some(result) = jobs.join_next().await {
+                if let Err(failure) = result {
+                    error.get_or_insert_with(|| StoreError::unavailable(failure.to_string()));
+                }
+            }
+            error.map_or(Ok(()), Err)
+        })
+        .await;
+        let drain_result = match drained {
+            Ok(result) => result,
+            Err(_) => {
+                jobs.abort_all();
+                while jobs.join_next().await.is_some() {}
+                Err(StoreError::unavailable(
+                    "reconciliation shutdown deadline exceeded",
+                ))
+            }
+        };
+        outcome.and(drain_result)
     }
 
     pub async fn run_once(&self) {
         let started = Instant::now();
+        let _ = self
+            .store
+            .finalize_instance_deletions(self.config.batch_size)
+            .await;
         let now = SystemTime::now();
         let candidates = match self
             .store
@@ -130,7 +202,8 @@ where
                 ListMaterializationReconciliationCandidatesRequest::new(
                     now,
                     self.config.batch_size,
-                ),
+                )
+                .for_target(self.target.clone()),
             )
             .await
         {
@@ -155,6 +228,10 @@ where
             });
         }
         while join_set.join_next().await.is_some() {}
+        let _ = self
+            .store
+            .finalize_instance_deletions(self.config.batch_size)
+            .await;
         self.record_reconciler_run(Outcome::Success, started.elapsed());
     }
 
@@ -163,6 +240,22 @@ where
     }
 
     async fn claim_and_reconcile(&self, candidate: MaterializationRecord) {
+        // Public one-shot entry points can share a reconciler or invoke it again.
+        // Cancellation belongs to this claimed job, never its siblings/future calls.
+        let mut job = self.clone();
+        job.cancellation = crate::runtime_work::Cancellation::new();
+        job.claim_and_reconcile_with_cancel(candidate, &crate::runtime_work::Cancellation::new())
+            .await;
+    }
+
+    async fn claim_and_reconcile_with_cancel(
+        &self,
+        candidate: MaterializationRecord,
+        cancelled: &crate::runtime_work::Cancellation,
+    ) {
+        if candidate.target != self.target {
+            return;
+        }
         let candidate_state = candidate.state;
         let lease_expires_at = SystemTime::now() + self.config.lease_ttl;
         let claimed = match self
@@ -191,31 +284,153 @@ where
             }
         };
         self.record_outcome("claim", Outcome::Success, None);
+        if cancelled.is_cancelled() {
+            self.cancellation.cancel();
+        }
 
-        let result = match claimed.state {
-            MaterializationState::Pending => self.reconcile_pending(claimed.clone()).await,
-            MaterializationState::Deleting => self.reconcile_deleting(claimed.clone()).await,
-            _ => Ok(()),
-        };
+        let result = self.reconcile_with_heartbeat(&claimed, cancelled).await;
 
         match result {
-            Ok(()) => self.record_outcome("reconcile", Outcome::Success, None),
+            Ok(()) => {
+                self.record_outcome("reconcile", Outcome::Success, None);
+                return; // Completion already consumes the lease.
+            }
             Err(MaterializationReconcileError::LeaseLost) => {
                 self.record_outcome("lease_lost", Outcome::Rejected, None)
             }
+            Err(MaterializationReconcileError::Cancelled) => {}
             Err(error) => {
                 self.record_outcome("reconcile", Outcome::Error, Some(&error.to_string()));
-                let _ = self
+                let recorded = self
                     .store
-                    .release_materialization_reconciliation_lease(
-                        ReleaseMaterializationReconciliationLeaseRequest::new(
-                            claimed.id,
-                            self.config.owner.clone(),
-                        ),
+                    .record_materialization_failure(
+                        crate::runtime_work::RecordMaterializationFailure {
+                            expected_state: claimed.state,
+                            materialization_id: claimed.id.clone(),
+                            owner: self.config.owner.clone(),
+                            attempt: claimed
+                                .reconciliation_lease
+                                .as_ref()
+                                .expect("claimed lease")
+                                .attempt,
+                            generation: claimed.instance_generation,
+                            permanent: error.permanent(),
+                            message: error.to_string(),
+                        },
                     )
                     .await;
+                if matches!(recorded, Ok(true)) {
+                    return; // Committed failure atomically consumes the lease.
+                }
             }
         }
+
+        // The owned operation has settled or been dropped after cooperative
+        // cancellation. Release only this live stamp, and only without an
+        // unresolved effect. Superseded Pending work must not retain the lease
+        // until expiry or publish its old failure into accepted Deleting work.
+        let _ = self
+            .store
+            .release_materialization_reconciliation_lease(
+                ReleaseMaterializationReconciliationLeaseRequest::new(
+                    claimed.id.clone(),
+                    self.config.owner.clone(),
+                    claimed
+                        .reconciliation_lease
+                        .as_ref()
+                        .expect("claimed lease")
+                        .attempt,
+                    claimed.instance_generation,
+                ),
+            )
+            .await;
+    }
+
+    async fn reconcile_with_heartbeat(
+        &self,
+        claimed: &MaterializationRecord,
+        cancelled: &crate::runtime_work::Cancellation,
+    ) -> Result<(), MaterializationReconcileError> {
+        if cancelled.is_cancelled() {
+            return Err(MaterializationReconcileError::Cancelled);
+        }
+        self.renew_or_lose(claimed).await?;
+        let status = self
+            .store
+            .load_materialization_work_status(claimed.id.clone())
+            .await
+            .map_err(MaterializationReconcileError::Store)?;
+        let remaining = status
+            .filter(|status| status.operation_deadline_unix_millis > 0)
+            .map(|status| {
+                Duration::from_millis(
+                    status
+                        .operation_deadline_unix_millis
+                        .saturating_sub(unix_millis_now())
+                        .max(0) as u64,
+                )
+            })
+            .unwrap_or(Duration::from_secs(600));
+        if remaining.is_zero() {
+            return Err(MaterializationReconcileError::Deadline);
+        }
+        let deadline = tokio::time::sleep(remaining);
+        tokio::pin!(deadline);
+        let work = async {
+            match claimed.state {
+                MaterializationState::Pending => self.reconcile_pending(claimed.clone()).await,
+                MaterializationState::Deleting => self.reconcile_deleting(claimed.clone()).await,
+                _ => Ok(()),
+            }
+        };
+        tokio::pin!(work);
+        let period = (self.config.lease_ttl / 3).max(Duration::from_millis(1));
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            // Work may own the row lock required by renewal and need another
+            // poll to commit it. Keep one owned renewal future alongside work;
+            // awaiting it inside the tick branch would deadlock that transaction
+            // and hide cancellation until the database statement timed out.
+            let renewal = async {
+                heartbeat.tick().await;
+                self.renew_or_lose(claimed).await
+            };
+            tokio::pin!(renewal);
+            tokio::select! {
+                biased;
+                result = &mut work => return result,
+                _ = cancelled.cancelled() => {
+                    self.cancellation.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(15), &mut work).await;
+                    return Err(MaterializationReconcileError::Cancelled);
+                }
+                _ = &mut deadline => {
+                    self.cancellation.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(15), &mut work).await;
+                    return Err(MaterializationReconcileError::Deadline);
+                }
+                renewed = &mut renewal => {
+                    if renewed.is_err() {
+                        self.cancellation.cancel();
+                        let _ = tokio::time::timeout(Duration::from_secs(15), &mut work).await;
+                        return Err(MaterializationReconcileError::LeaseLost);
+                    }
+                },
+            }
+        }
+    }
+
+    fn fenced_materializer(
+        &self,
+        materialization: &MaterializationRecord,
+    ) -> KubernetesMaterializer<fenced_client::FencedKubernetesClient<C>> {
+        KubernetesMaterializer::new(fenced_client::FencedKubernetesClient {
+            inner: self.materializer.client().clone(),
+            cancellation: self.cancellation.clone(),
+            store: self.store.clone(),
+            materialization: materialization.clone(),
+        })
     }
 
     async fn reconcile_pending(
@@ -245,8 +460,10 @@ where
             ));
         }
 
-        let projected_instance = projected_pending_wake_instance(&instance);
-        let projected_materialization = projected_pending_wake_materialization(&materialization);
+        let mut projected_instance = instance.clone();
+        projected_instance.state = InstanceState::Running;
+        projected_instance.generation = materialization.projection_generation;
+        let projected_materialization = materialization.clone();
         let manifest = self
             .render_current_manifest(&projected_instance, &materialization)
             .await?;
@@ -257,9 +474,10 @@ where
             return Err(MaterializationReconcileError::StaleDesiredRefs);
         }
 
-        self.apply_projection_observed(&projection_plan).await?;
+        self.apply_projection_observed(&projection_plan, &materialization)
+            .await?;
         let backend = self
-            .wait_for_projection_readiness_observed(&projection_plan)
+            .wait_for_projection_readiness_observed(&projection_plan, &materialization)
             .await?;
         let observations = self.inspect_projection_observed(&projection_plan).await?;
         ProjectionReconciler::new(&self.materializer)
@@ -289,8 +507,13 @@ where
         let result = self
             .store
             .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
-                materialization.id,
+                materialization.id.clone(),
                 self.config.owner.clone(),
+                materialization
+                    .reconciliation_lease
+                    .as_ref()
+                    .expect("claimed lease")
+                    .attempt,
                 complete,
             ))
             .await
@@ -305,7 +528,8 @@ where
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
         let projection_plan = ProjectionPlan::from_recorded_refs(&materialization);
-        self.delete_projection_observed(&projection_plan).await?;
+        self.delete_projection_observed(&projection_plan, &materialization)
+            .await?;
         self.renew_or_lose(&materialization).await?;
 
         let Some(instance) = self
@@ -329,8 +553,13 @@ where
         let result = self
             .store
             .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
-                materialization.id,
+                materialization.id.clone(),
                 self.config.owner.clone(),
+                materialization
+                    .reconciliation_lease
+                    .as_ref()
+                    .expect("claimed lease")
+                    .attempt,
                 FinalizeSleepRequest::new(instance.id, instance.generation, materialization.target),
             ))
             .await
@@ -344,12 +573,7 @@ where
         &self,
         instance_id: InstanceId,
     ) -> Result<(), MaterializationReconcileError> {
-        let route_bindings = self
-            .store
-            .list_route_bindings_for_instance(ListRouteBindingsForInstanceRequest::new(instance_id))
-            .await
-            .map_err(MaterializationReconcileError::Store)?;
-        self.route_events.notify_routes_changed(&route_bindings);
+        self.route_events.notify_instance_changed(instance_id);
         Ok(())
     }
 
@@ -357,10 +581,9 @@ where
         &self,
         materialization: MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
-        let projection_materialization =
-            projected_recorded_ref_materialization_for_cleanup(&materialization);
-        let projection_plan = ProjectionPlan::from_recorded_refs(&projection_materialization);
-        self.delete_projection_observed(&projection_plan).await?;
+        let projection_plan = ProjectionPlan::from_recorded_refs(&materialization);
+        self.delete_projection_observed(&projection_plan, &materialization)
+            .await?;
         self.renew_or_lose(&materialization).await?;
         self.mark_deleted(materialization).await
     }
@@ -371,8 +594,13 @@ where
     ) -> Result<(), MaterializationReconcileError> {
         self.store
             .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
-                materialization.id,
+                materialization.id.clone(),
                 self.config.owner.clone(),
+                materialization
+                    .reconciliation_lease
+                    .as_ref()
+                    .expect("claimed lease")
+                    .attempt,
                 materialization.state,
                 materialization.instance_id,
                 materialization.instance_generation,
@@ -393,7 +621,14 @@ where
                 RenewMaterializationReconciliationLeaseRequest::new(
                     materialization.id.clone(),
                     self.config.owner.clone(),
+                    materialization
+                        .reconciliation_lease
+                        .as_ref()
+                        .expect("claimed lease")
+                        .attempt,
+                    materialization.instance_generation,
                     SystemTime::now() + self.config.lease_ttl,
+                    materialization.state,
                 ),
             )
             .await
@@ -426,11 +661,11 @@ where
     async fn apply_projection_observed(
         &self,
         plan: &ProjectionPlan,
+        materialization: &MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
         let started = Instant::now();
-        let result = ProjectionReconciler::new(&self.materializer)
-            .apply(plan)
-            .await;
+        let fenced = self.fenced_materializer(materialization);
+        let result = ProjectionReconciler::new(&fenced).apply(plan).await;
         self.record_kubernetes_operation(
             Operation::Apply,
             outcome_for_result(&result),
@@ -442,9 +677,11 @@ where
     async fn wait_for_projection_readiness_observed(
         &self,
         plan: &ProjectionPlan,
+        materialization: &MaterializationRecord,
     ) -> Result<BackendEndpoint, MaterializationReconcileError> {
         let started = Instant::now();
-        let result = ProjectionReconciler::new(&self.materializer)
+        let fenced = self.fenced_materializer(materialization);
+        let result = ProjectionReconciler::new(&fenced)
             .wait_for_readiness(plan)
             .await;
         self.record_kubernetes_operation(
@@ -458,11 +695,11 @@ where
     async fn delete_projection_observed(
         &self,
         plan: &ProjectionPlan,
+        materialization: &MaterializationRecord,
     ) -> Result<(), MaterializationReconcileError> {
         let started = Instant::now();
-        let result = ProjectionReconciler::new(&self.materializer)
-            .delete_owned(plan)
-            .await;
+        let fenced = self.fenced_materializer(materialization);
+        let result = ProjectionReconciler::new(&fenced).delete_owned(plan).await;
         self.record_kubernetes_operation(
             Operation::Delete,
             outcome_for_result(&result),
@@ -615,29 +852,18 @@ fn outcome_for_result<T, E>(result: &Result<T, E>) -> Outcome {
     }
 }
 
+#[cfg(test)]
 fn projected_pending_wake_instance(instance: &InstanceRecord) -> InstanceRecord {
     let mut projected = instance.clone();
     projected.state = InstanceState::Running;
     projected.generation = instance.generation.next();
     projected
 }
-
+#[cfg(test)]
 fn projected_pending_wake_materialization(
     materialization: &MaterializationRecord,
 ) -> MaterializationRecord {
-    let mut projected = materialization.clone();
-    projected.instance_generation = materialization.instance_generation.next();
-    projected
-}
-
-fn projected_recorded_ref_materialization_for_cleanup(
-    materialization: &MaterializationRecord,
-) -> MaterializationRecord {
-    if materialization.state == MaterializationState::Pending {
-        projected_pending_wake_materialization(materialization)
-    } else {
-        materialization.clone()
-    }
+    materialization.clone()
 }
 
 impl<C> Clone for MaterializationReconciler<C>
@@ -648,9 +874,11 @@ where
         Self {
             store: Arc::clone(&self.store),
             materializer: self.materializer.clone(),
+            target: self.target.clone(),
             config: self.config.clone(),
             observability: self.observability.clone(),
             route_events: self.route_events.clone(),
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -665,6 +893,8 @@ impl fmt::Display for MaterializationReconcileError {
             Self::StaleDesiredRefs => {
                 f.write_str("rendered object refs no longer match persisted refs")
             }
+            Self::Cancelled => write!(f, "reconciliation cancelled"),
+            Self::Deadline => write!(f, "operation deadline expired"),
             Self::LeaseLost => f.write_str("reconciliation lease was lost"),
         }
     }
@@ -688,6 +918,45 @@ fn stable_owner_hash(owner: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+fn unix_millis_now() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+impl MaterializationReconcileError {
+    fn permanent(&self) -> bool {
+        fn materializer(error: &MaterializerError) -> bool {
+            match error {
+                MaterializerError::InvalidManifest { .. } => true,
+                MaterializerError::Apply { source, .. }
+                | MaterializerError::Delete { source, .. } => {
+                    !source.is_retryable() && !source.outcome_uncertain()
+                }
+                MaterializerError::PvcBoundWait { .. }
+                | MaterializerError::ReadinessWait { .. } => false,
+            }
+        }
+        match self {
+            Self::Render(_)
+            | Self::StaleDesiredRefs
+            | Self::Store(StoreError::InvalidArgument { .. } | StoreError::NotFound { .. }) => true,
+            Self::Materializer(error) => materializer(error),
+            Self::Projection(
+                ProjectionError::Apply { source, .. } | ProjectionError::Delete { source, .. },
+            ) => materializer(source),
+            Self::Projection(
+                ProjectionError::MissingManifest | ProjectionError::OwnershipConflict { .. },
+            ) => true,
+            Self::Projection(ProjectionError::Inspect { source, .. }) => {
+                !source.is_retryable() && !source.outcome_uncertain()
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -719,7 +988,7 @@ mod tests {
         },
         WorkloadSleepPolicy,
     };
-    use proxy_core::observability::recorder::{InMemoryObservability, ObservabilityEvent};
+    use sleepypods_observability::recorder::{InMemoryObservability, ObservabilityEvent};
 
     use super::*;
 
@@ -776,7 +1045,11 @@ mod tests {
         reconciler.run_once().await;
 
         assert_eq!(store.finalize_calls(), 0);
-        assert_eq!(store.release_calls(), 0);
+        assert_eq!(
+            store.release_calls(),
+            1,
+            "attempt exact conditional release after work stops"
+        );
     }
 
     #[tokio::test]
@@ -910,6 +1183,77 @@ mod tests {
             KUBERNETES_OPERATIONS_TOTAL.name(),
             &[("operation", "readiness"), ("outcome", "success")],
         );
+    }
+
+    #[tokio::test]
+    async fn pending_pre_readiness_projection_fails_permanently_without_rewrite_and_can_be_cleaned()
+    {
+        let instance = waking_instance("instance-reconcile");
+        let materialization = pending_materialization("mat-pre-readiness-upgrade", &instance);
+        let class = workload_class();
+        let mut projected_instance = instance.clone();
+        projected_instance.state = InstanceState::Running;
+        projected_instance.generation = materialization.projection_generation;
+        let mut legacy_manifest = render_manifests(RenderManifestRequest {
+            template: &class.template,
+            instance: &projected_instance,
+            sleep_policy: class.sleep_policy.resolve(&instance.values).unwrap(),
+            namespace: "apps",
+            template_generation: Some(class.template_generation),
+        })
+        .unwrap();
+        for object in &mut legacy_manifest.objects {
+            if let crate::manifest::KubernetesObject::Deployment(workload) = &mut object.object {
+                let sidecar = &mut workload.spec.template.spec.containers[1];
+                let health_port = sidecar.readiness_probe.take().unwrap().port;
+                sidecar
+                    .ports
+                    .retain(|port| port.container_port != health_port);
+                sidecar.ports[0].name = Some("sleepypods".to_owned());
+                sidecar
+                    .env
+                    .retain(|env| env.name != "SLEEPYPODS_SIDECAR_READINESS_LISTEN_ADDR");
+            }
+        }
+        let legacy_plan =
+            ProjectionPlan::from_manifest(&materialization, &legacy_manifest).unwrap();
+        let client = FakeKubernetesClient::default();
+        for object in &legacy_plan.manifest().unwrap().objects {
+            client.set_live(
+                crate::materializer::rendered_object_ref(&object.object),
+                ProjectionObjectInspection::Present(LiveObjectMetadata::from_rendered_object(
+                    &object.object,
+                )),
+            );
+        }
+        let store = Arc::new(FakeReconcileStore::new(materialization.clone(), instance));
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let driver = reconciler(store.clone(), materializer);
+        driver.run_once().await;
+        assert_eq!(
+            *store.failures.lock().unwrap(),
+            [true],
+            "same-generation old hash is a permanent wake failure"
+        );
+        assert_eq!(store.complete_calls(), 0);
+        assert_eq!(
+            client.apply_calls(),
+            0,
+            "never merge new labels/probes into old same-generation projection"
+        );
+        // The production store queues terminal wakes for cleanup. Its recorded-ref
+        // plan deliberately checks identity/generation without the obsolete hash.
+        let materializer = KubernetesMaterializer::new(client.clone());
+        let cleanup = ProjectionPlan::from_recorded_refs(&materialization);
+        ProjectionReconciler::new(&materializer)
+            .delete_owned(&cleanup)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.deleted.lock().unwrap().len(),
+            materialization.rendered_objects.len()
+        );
+        assert!(client.live.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1154,6 +1498,7 @@ mod tests {
         MaterializationReconciler::new(
             store,
             materializer,
+            target(),
             MaterializationReconcilerConfig {
                 owner: "test-owner".to_owned(),
                 interval: Duration::from_secs(60),
@@ -1183,11 +1528,507 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn continuous_scheduler_records_scan_and_candidate_metrics() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("scan-observation", &instance);
+        let store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let sink = InMemoryObservability::default();
+        let driver = reconciler_with_observability(
+            store.clone(),
+            KubernetesMaterializer::new(FakeKubernetesClient::default()),
+            sink.recorder(),
+        );
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(driver.run_until_shutdown(receiver));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.complete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+        assert_metric(
+            &sink.events(),
+            RECONCILER_RUNS_TOTAL.name(),
+            &[("outcome", "success")],
+        );
+        assert_metric(
+            &sink.events(),
+            RECONCILER_RUN_DURATION_SECONDS.name(),
+            &[("outcome", "success")],
+        );
+        assert_metric(
+            &sink.events(),
+            RECONCILER_CANDIDATES_TOTAL.name(),
+            &[("state", "pending")],
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_shutdown_and_fatal_scan_ack_unsent_begin_before_releasing() {
+        for fatal in [false, true] {
+            let instance = waking_instance("instance-reconcile");
+            let pending = pending_materialization("cancel-begin", &instance);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let mut fake = FakeReconcileStore::new(pending, instance);
+            fake.begin_gate = Some(gate.clone());
+            let store = Arc::new(fake);
+            let client = FakeKubernetesClient::default();
+            let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+            driver.config.interval = Duration::from_millis(10);
+            let (shutdown, receiver) = watch::channel(false);
+            let task = tokio::spawn(driver.run_until_shutdown(receiver));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while store.effect.lock().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if fatal {
+                store
+                    .fatal_scan
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                shutdown.send_replace(true);
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                !task.is_finished(),
+                "owned begin must settle before shutdown finishes"
+            );
+            gate.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), fatal);
+            assert!(
+                store.effect.lock().unwrap().is_none(),
+                "known-unsent begin is exactly acknowledged"
+            );
+            assert_eq!(
+                client.apply_calls(),
+                0,
+                "cancellation before dispatch never polls Kubernetes"
+            );
+            assert!(store
+                .materialization
+                .lock()
+                .unwrap()
+                .reconciliation_lease
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_supersession_acks_known_unsent_begin_before_exact_release() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("superseded-unsent", &instance);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut fake = FakeReconcileStore::new(pending, instance);
+        fake.begin_gate = Some(gate.clone());
+        let store = Arc::new(fake);
+        let client = FakeKubernetesClient::default();
+        let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+        driver.store = Arc::new(crate::RetryingControlPlaneStore::with_default_policy(
+            store.clone(),
+        ));
+        driver.config.lease_ttl = Duration::from_millis(30);
+        let cancellation = driver.cancellation.clone();
+        let candidate = store.materialization.lock().unwrap().clone();
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async move {
+            driver
+                .claim_and_reconcile_with_cancel(
+                    candidate,
+                    &crate::runtime_work::Cancellation::new(),
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.effect.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        store.materialization.lock().unwrap().state = MaterializationState::Deleting;
+        tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.release_calls(),
+            0,
+            "must await the owned begin result"
+        );
+        assert_eq!(client.apply_calls(), 0);
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), jobs.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.apply_calls(), 0, "no dispatch after supersession");
+        assert!(
+            store.effect.lock().unwrap().is_none(),
+            "exact unsent ACK settled"
+        );
+        assert!(store
+            .materialization
+            .lock()
+            .unwrap()
+            .reconciliation_lease
+            .is_none());
+        assert!(
+            store.failures.lock().unwrap().is_empty(),
+            "old work cannot publish a new failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_one_shot_jobs_isolate_cancellation_and_allow_reuse() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("one-shot-isolation", &instance);
+        let left_store = Arc::new(FakeReconcileStore::new(pending.clone(), instance.clone()));
+        let right_store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let left_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let right_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let left_client = FakeKubernetesClient {
+            readiness_gate: Some(left_gate.clone()),
+            ..Default::default()
+        };
+        let right_client = FakeKubernetesClient {
+            readiness_gate: Some(right_gate.clone()),
+            ..Default::default()
+        };
+        let mut left = reconciler(
+            left_store.clone(),
+            KubernetesMaterializer::new(left_client.clone()),
+        );
+        left.config.lease_ttl = Duration::from_millis(30);
+        // Model cloned public handles with separate fake backends so each test
+        // job has independent state while retaining the original shared token.
+        let mut right = left.clone();
+        right.store = right_store.clone();
+        right.materializer = KubernetesMaterializer::new(right_client.clone());
+        let left_job = left.clone();
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async move {
+            left_job.run_once().await;
+            "left"
+        });
+        jobs.spawn(async move {
+            right.run_once().await;
+            "right"
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while left_client.wait_readiness_calls() == 0
+                || right_client.wait_readiness_calls() == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        *left_store.renew_result.lock().unwrap() = false;
+        let finished = tokio::time::timeout(Duration::from_secs(1), jobs.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finished, "left",
+            "only the canceled job can settle before gate release"
+        );
+        assert_eq!(left_store.complete_calls(), 0);
+        assert_eq!(
+            right_store.complete_calls(),
+            0,
+            "sibling readiness remains held"
+        );
+        right_gate.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), jobs.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "right"
+        );
+        assert_eq!(
+            right_store.complete_calls(),
+            1,
+            "sibling cancellation must stay local"
+        );
+        *left_store.renew_result.lock().unwrap() = true;
+        left_gate.add_permits(1);
+        let candidate = left_store.materialization.lock().unwrap().clone();
+        left.reconcile_materialization(candidate).await;
+        assert_eq!(
+            left_store.complete_calls(),
+            1,
+            "future public calls receive a fresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_renewal_keeps_polling_transaction_and_cancellation() {
+        for cancel in [false, true] {
+            let instance = waking_instance("instance-reconcile");
+            let pending = pending_materialization("renew-transaction", &instance);
+            let progress = Arc::new(BeginRenewProgress {
+                started: tokio::sync::Notify::new(),
+                renewal_started: tokio::sync::Notify::new(),
+                allow_commit: tokio::sync::Semaphore::new(0),
+                committed: watch::channel(false).0,
+            });
+            let mut fake = FakeReconcileStore::new(pending.clone(), instance);
+            fake.begin_renew_progress = Some(progress.clone());
+            let store = Arc::new(fake);
+            let client = FakeKubernetesClient::default();
+            let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+            driver.store = Arc::new(crate::RetryingControlPlaneStore::with_default_policy(
+                store.clone(),
+            ));
+            driver.config.lease_ttl = Duration::from_millis(30);
+            let cancelled = crate::runtime_work::Cancellation::new();
+            let shutdown = cancelled.clone();
+            let observed_cancellation = driver.cancellation.clone();
+            let mut jobs = JoinSet::new();
+            jobs.spawn(async move {
+                driver
+                    .claim_and_reconcile_with_cancel(pending, &cancelled)
+                    .await;
+            });
+            tokio::time::timeout(Duration::from_secs(1), progress.started.notified())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), progress.renewal_started.notified())
+                .await
+                .unwrap();
+            // Model the captured PG interleaving: begin holds a row lock, renewal
+            // awaits it, and committing requires the work future to be polled.
+            if cancel {
+                shutdown.cancel();
+                tokio::time::timeout(Duration::from_secs(1), observed_cancellation.cancelled())
+                    .await
+                    .expect("blocked renewal must not hide cancellation");
+            }
+            progress.allow_commit.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(1), jobs.join_next())
+                .await
+                .expect("work must commit while its renewal waits")
+                .unwrap()
+                .unwrap();
+            assert_eq!(store.complete_calls(), usize::from(!cancel));
+            assert!(store.effect.lock().unwrap().is_none());
+            if cancel {
+                assert_eq!(
+                    client.apply_calls(),
+                    0,
+                    "known-unsent canceled begin must ACK before release"
+                );
+                assert!(store
+                    .materialization
+                    .lock()
+                    .unwrap()
+                    .reconciliation_lease
+                    .is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_renews_lease_before_expiry_and_completes() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("heartbeat", &instance);
+        let store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let client = FakeKubernetesClient {
+            readiness_delay: Duration::from_millis(90),
+            ..Default::default()
+        };
+        let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client));
+        driver.config.lease_ttl = Duration::from_millis(30);
+        driver.run_once().await;
+        assert_eq!(store.complete_calls(), 1);
+        assert!(
+            *store.renew_calls.lock().unwrap() >= 4,
+            "renewals must run during readiness, not only afterward"
+        );
+        assert!(
+            store.effect.lock().unwrap().is_none(),
+            "reads have no mutation barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_loss_cancels_readiness_without_quarantining_read_only_work() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("heartbeat-loss", &instance);
+        let store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let client = FakeKubernetesClient {
+            readiness_delay: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+        driver.config.lease_ttl = Duration::from_millis(30);
+        let task = tokio::spawn(async move {
+            driver.run_once().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.wait_readiness_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        *store.renew_result.lock().unwrap() = false;
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.complete_calls(), 0);
+        assert!(store.effect.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn late_create_after_driver_cancellation_keeps_barrier_and_exclusivity() {
+        let instance = waking_instance("instance-reconcile");
+        let mut pending = pending_materialization("late-create", &instance);
+        pending.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "singleton")];
+        let store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let client = FakeKubernetesClient {
+            late_create: Some(gate.clone()),
+            ..Default::default()
+        };
+        let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+        driver.config.lease_ttl = Duration::from_millis(30);
+        let task = tokio::spawn(async move {
+            driver.run_once().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.effect.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        *store.renew_result.lock().unwrap() = false;
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.apply_calls(), 0, "the API name is still absent");
+        *store.renew_result.lock().unwrap() = true;
+        let replacement = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+        replacement.run_once().await;
+        assert!(
+            store.effect.lock().unwrap().is_some(),
+            "absence cannot clear old dispatched create"
+        );
+        gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.apply_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        replacement.run_once().await;
+        assert_eq!(client.apply_calls(), 1);
+        assert_eq!(client.delete_calls(), 0);
+        assert_eq!(store.complete_calls(), 0);
+        assert_eq!(
+            store.exclusivity_keys(),
+            vec![RenderedExclusivityKey::new("disk", "singleton")]
+        );
+        assert!(
+            store.effect.lock().unwrap().is_some(),
+            "lost acknowledgement requires explicit recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_mutation_is_dispatched_once_through_production_retry_wrappers() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("uncertain-once", &instance);
+        let store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let client = FakeKubernetesClient {
+            uncertain_apply: true,
+            ..Default::default()
+        };
+        let driver = MaterializationReconciler::new(
+            Arc::new(crate::RetryingControlPlaneStore::with_default_policy(
+                store.clone(),
+            )),
+            KubernetesMaterializer::new(
+                crate::materializer::RetryingKubernetesMaterializerClient::with_default_policy(
+                    client.clone(),
+                ),
+            ),
+            target(),
+            MaterializationReconcilerConfig::default(),
+            ObservabilityRecorder::default(),
+        );
+        driver.run_once().await;
+        driver.run_once().await;
+        assert_eq!(
+            client.apply_calls(),
+            1,
+            "neither client retries nor replacement scans replay ambiguous effects"
+        );
+        assert_eq!(store.complete_calls(), 0);
+        assert!(store.effect.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn definite_kubernetes_response_recovers_from_ack_failure_before_or_after_commit() {
+        for after_commit in [false, true] {
+            let instance = waking_instance("instance-reconcile");
+            let pending = pending_materialization("ack-retry", &instance);
+            let store = Arc::new(FakeReconcileStore::new(pending, instance));
+            *store.ack_failure.lock().unwrap() = Some(after_commit);
+            let client = FakeKubernetesClient::default();
+            let driver = MaterializationReconciler::new(
+                Arc::new(crate::RetryingControlPlaneStore::with_default_policy(
+                    store.clone(),
+                )),
+                KubernetesMaterializer::new(
+                    crate::materializer::RetryingKubernetesMaterializerClient::with_default_policy(
+                        client,
+                    ),
+                ),
+                target(),
+                MaterializationReconcilerConfig::default(),
+                ObservabilityRecorder::default(),
+            );
+            driver.run_once().await;
+            assert!(
+                store.effect.lock().unwrap().is_none(),
+                "definite response must not leave a quarantine after recoverable ACK failure"
+            );
+            if store.complete_calls() == 0 {
+                driver.run_once().await;
+            }
+            assert_eq!(
+                store.complete_calls(),
+                1,
+                "accepted work resumes without an operator action"
+            );
+        }
+    }
+
     fn deleting_materialization(id: &str) -> MaterializationRecord {
         MaterializationRecord {
             id: MaterializationId::new(id).expect("valid materialization id"),
             instance_id: InstanceId::new("instance-reconcile").expect("valid instance id"),
             instance_generation: Generation::new(7),
+            projection_generation: Generation::new(7),
             target: target(),
             state: MaterializationState::Deleting,
             backend: None,
@@ -1232,6 +2073,7 @@ mod tests {
             id: MaterializationId::new(id).expect("valid materialization id"),
             instance_id: instance.id.clone(),
             instance_generation: instance.generation,
+            projection_generation: instance.generation.next(),
             target: target(),
             state: MaterializationState::Pending,
             backend: None,
@@ -1333,11 +2175,26 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct BeginRenewProgress {
+        started: tokio::sync::Notify,
+        renewal_started: tokio::sync::Notify,
+        allow_commit: tokio::sync::Semaphore,
+        committed: watch::Sender<bool>,
+    }
+
+    #[derive(Debug)]
     struct FakeReconcileStore {
         materialization: Mutex<MaterializationRecord>,
         instance: InstanceRecord,
         workload_class: WorkloadClassVersion,
         renew_result: Mutex<bool>,
+        renew_calls: Mutex<usize>,
+        ack_failure: Mutex<Option<bool>>,
+        begin_gate: Option<Arc<tokio::sync::Notify>>,
+        begin_renew_progress: Option<Arc<BeginRenewProgress>>,
+        fatal_scan: std::sync::atomic::AtomicBool,
+        failures: Mutex<Vec<bool>>,
+        effect: Mutex<Option<crate::materialization::MaterializationEffectRequest>>,
         replace_before_guarded_delete: Mutex<Option<MaterializationRecord>>,
         finalize_calls: Mutex<usize>,
         complete_calls: Mutex<usize>,
@@ -1352,6 +2209,13 @@ mod tests {
                 instance,
                 workload_class: workload_class(),
                 renew_result: Mutex::new(true),
+                renew_calls: Mutex::new(0),
+                ack_failure: Mutex::new(None),
+                begin_gate: None,
+                begin_renew_progress: None,
+                fatal_scan: std::sync::atomic::AtomicBool::new(false),
+                failures: Mutex::new(Vec::new()),
+                effect: Mutex::new(None),
                 replace_before_guarded_delete: Mutex::new(None),
                 finalize_calls: Mutex::new(0),
                 complete_calls: Mutex::new(0),
@@ -1419,6 +2283,74 @@ mod tests {
     }
 
     impl ControlPlaneStore for FakeReconcileStore {
+        unexpected_store_methods!(
+            load_route_changes,
+            load_route_change_revision,
+            enqueue_materialization,
+            maintain_runtime_records,
+            accept_wake,
+            request_instance_deletion,
+            create_instance,
+            delete_instance,
+            create_workload_class_version,
+            create_route_binding,
+            get_route_binding,
+            delete_route_binding,
+            resolve_route,
+            compare_and_swap_instance_state,
+            record_materialization,
+            load_ready_materialization,
+            load_active_materialization,
+            load_materialization,
+            complete_wake,
+            begin_sleep,
+            finalize_sleep,
+            load_materialization_operational_metrics,
+            force_delete_materialization,
+            force_release_exclusivity_key,
+            lookup_route_dependencies,
+            put_http01_challenge,
+            resolve_http01_challenge,
+            delete_http01_challenge,
+            expire_http01_challenges
+        );
+
+        fn finalize_instance_deletions(
+            &self,
+            _limit: usize,
+        ) -> StoreFuture<'_, StoreResult<usize>> {
+            Box::pin(async {
+                if self.fatal_scan.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(StoreError::internal("injected controller failure"))
+                } else {
+                    Ok(0)
+                }
+            })
+        }
+        fn load_materialization_work_status(
+            &self,
+            _id: MaterializationId,
+        ) -> StoreFuture<'_, StoreResult<Option<crate::runtime_work::MaterializationWorkStatus>>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+        fn record_materialization_failure(
+            &self,
+            request: crate::runtime_work::RecordMaterializationFailure,
+        ) -> StoreFuture<'_, StoreResult<bool>> {
+            if self.materialization.lock().unwrap().state != request.expected_state {
+                return Box::pin(async { Ok(false) });
+            }
+            self.failures.lock().unwrap().push(request.permanent);
+            self.release_materialization_reconciliation_lease(
+                ReleaseMaterializationReconciliationLeaseRequest::new(
+                    request.materialization_id,
+                    request.owner,
+                    request.attempt,
+                    request.generation,
+                ),
+            )
+        }
         fn get_instance<'a>(
             &'a self,
             _request: GetInstanceRequest,
@@ -1460,7 +2392,9 @@ mod tests {
             Box::pin(async move {
                 let mut materialization =
                     self.materialization.lock().expect("materialization lock");
-                if materialization.id != request.materialization_id {
+                if materialization.id != request.materialization_id
+                    || self.effect.lock().unwrap().is_some()
+                {
                     return Ok(None);
                 }
                 materialization.reconciliation_lease = Some(MaterializationReconciliationLease {
@@ -1474,17 +2408,42 @@ mod tests {
 
         fn renew_materialization_reconciliation_lease<'a>(
             &'a self,
-            _request: RenewMaterializationReconciliationLeaseRequest,
+            request: RenewMaterializationReconciliationLeaseRequest,
         ) -> StoreFuture<'a, StoreResult<bool>> {
-            Box::pin(async move { Ok(*self.renew_result.lock().expect("renew lock")) })
+            Box::pin(async move {
+                *self.renew_calls.lock().unwrap() += 1;
+                if let Some(progress) = &self.begin_renew_progress {
+                    let mut committed = progress.committed.subscribe();
+                    if self.effect.lock().unwrap().is_some() && !*committed.borrow_and_update() {
+                        progress.renewal_started.notify_one();
+                        while !*committed.borrow_and_update() {
+                            committed.changed().await.expect("commit progress alive");
+                        }
+                    }
+                }
+                Ok(*self.renew_result.lock().expect("renew lock")
+                    && self.materialization.lock().unwrap().state == request.expected_state)
+            })
         }
 
         fn release_materialization_reconciliation_lease<'a>(
             &'a self,
-            _request: ReleaseMaterializationReconciliationLeaseRequest,
+            request: ReleaseMaterializationReconciliationLeaseRequest,
         ) -> StoreFuture<'a, StoreResult<bool>> {
             Box::pin(async move {
                 *self.release_calls.lock().expect("release lock") += 1;
+                if self.effect.lock().unwrap().is_some() {
+                    return Ok(false);
+                }
+                let mut record = self.materialization.lock().unwrap();
+                if record.instance_generation != request.instance_generation
+                    || record.reconciliation_lease.as_ref().is_none_or(|lease| {
+                        lease.owner != request.owner || lease.attempt != request.attempt
+                    })
+                {
+                    return Ok(false);
+                }
+                record.reconciliation_lease = None;
                 Ok(true)
             })
         }
@@ -1580,6 +2539,67 @@ mod tests {
                 Ok(Some(previous))
             })
         }
+
+        fn begin_materialization_effect<'a>(
+            &'a self,
+            request: crate::materialization::MaterializationEffectRequest,
+        ) -> StoreFuture<'a, StoreResult<bool>> {
+            Box::pin(async move {
+                {
+                    let mut effect = self.effect.lock().unwrap();
+                    if effect.is_some() {
+                        return Ok(false);
+                    }
+                    *effect = Some(request);
+                }
+                if let Some(progress) = &self.begin_renew_progress {
+                    if !*progress.committed.borrow() {
+                        progress.started.notify_one();
+                        progress
+                            .allow_commit
+                            .acquire()
+                            .await
+                            .expect("commit gate alive")
+                            .forget();
+                        progress.committed.send_replace(true);
+                    }
+                }
+                if let Some(gate) = &self.begin_gate {
+                    gate.notified().await;
+                }
+                Ok(true)
+            })
+        }
+        fn acknowledge_materialization_effect<'a>(
+            &'a self,
+            request: crate::materialization::AcknowledgeMaterializationEffectRequest,
+        ) -> StoreFuture<'a, StoreResult<bool>> {
+            Box::pin(async move {
+                let failure = self.ack_failure.lock().unwrap().take();
+                if failure == Some(false) {
+                    return Err(StoreError::Unavailable {
+                        message: "transient ACK error before commit".into(),
+                    });
+                }
+                let mut effect = self.effect.lock().unwrap();
+                if effect.as_ref().is_some_and(|effect| {
+                    effect.effect_id == request.effect_id
+                        && effect.attempt == request.attempt
+                        && effect.owner == request.owner
+                        && effect.instance_generation == request.instance_generation
+                }) {
+                    *effect = None;
+                    if failure == Some(true) {
+                        return Err(StoreError::Unavailable {
+                            message: "transient ACK reply loss after commit".into(),
+                        });
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+        }
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1587,6 +2607,10 @@ mod tests {
         applied: Arc<Mutex<Vec<crate::manifest::KubernetesObject>>>,
         deleted: Arc<Mutex<Vec<RenderedObjectRef>>>,
         wait_readiness_calls: Arc<Mutex<usize>>,
+        readiness_delay: Duration,
+        readiness_gate: Option<Arc<tokio::sync::Semaphore>>,
+        uncertain_apply: bool,
+        late_create: Option<Arc<tokio::sync::Notify>>,
         delete_errors: Arc<Mutex<VecDeque<KubernetesClientError>>>,
         live: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
     }
@@ -1645,6 +2669,11 @@ mod tests {
             self.set_live(
                 object_ref,
                 ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    persistent_volume_reclaim_policy: Some("Retain".into()),
+                    identity: crate::projection::LiveObjectIdentity {
+                        uid: "test-uid".into(),
+                        resource_version: "1".into(),
+                    },
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     deleting: false,
@@ -1696,9 +2725,31 @@ mod tests {
         fn apply_object<'a>(
             &'a self,
             object: &'a crate::manifest::KubernetesObject,
+            _precondition: Option<&'a crate::projection::LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
                 let object_ref = crate::materializer::rendered_object_ref(object);
+                if let Some(gate) = &self.late_create {
+                    let gate = gate.clone();
+                    let live = self.live.clone();
+                    let applied = self.applied.clone();
+                    let object = object.clone();
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        gate.notified().await;
+                        applied.lock().unwrap().push(object.clone());
+                        live.lock().unwrap().insert(
+                            object_key(&object_ref),
+                            ProjectionObjectInspection::Present(
+                                LiveObjectMetadata::from_rendered_object(&object),
+                            ),
+                        );
+                        let _ = sender.send(());
+                    });
+                    return receiver
+                        .await
+                        .map_err(|_| KubernetesClientError::uncertain("mock API reply lost"));
+                }
                 self.applied
                     .lock()
                     .expect("applied lock")
@@ -1709,6 +2760,11 @@ mod tests {
                         object,
                     )),
                 );
+                if self.uncertain_apply {
+                    return Err(KubernetesClientError::uncertain(
+                        "API reply lost after create",
+                    ));
+                }
                 Ok(())
             })
         }
@@ -1716,6 +2772,7 @@ mod tests {
         fn delete_object<'a>(
             &'a self,
             object: &'a RenderedObjectRef,
+            _precondition: &'a crate::projection::LiveObjectIdentity,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
                 match self
@@ -1757,6 +2814,10 @@ mod tests {
                     .wait_readiness_calls
                     .lock()
                     .expect("wait readiness lock") += 1;
+                if let Some(gate) = &self.readiness_gate {
+                    gate.acquire().await.expect("readiness gate open").forget();
+                }
+                tokio::time::sleep(self.readiness_delay).await;
                 BackendEndpoint::new("http://svc.apps.svc.cluster.local:80")
                     .map_err(|error| KubernetesClientError::new(error.to_string()))
             })
@@ -1777,10 +2838,33 @@ mod tests {
                     .unwrap_or(ProjectionObjectInspection::Missing))
             })
         }
+
+        fn ensure_no_descendants<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+            _instance_id: &'a str,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn verify_retained_bindings<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+        ) -> crate::materializer::KubernetesClientFuture<
+            'a,
+            crate::materializer::KubernetesClientResult<()>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn live_owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata {
         LiveObjectMetadata {
+            persistent_volume_reclaim_policy: Some("Retain".into()),
+            identity: crate::projection::LiveObjectIdentity {
+                uid: "test-uid".into(),
+                resource_version: "1".into(),
+            },
             labels: BTreeMap::from([
                 (
                     crate::projection::LABEL_MANAGED_BY.to_owned(),
@@ -1792,7 +2876,7 @@ mod tests {
                 ),
                 (
                     crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
-                    materialization.instance_generation.to_string(),
+                    materialization.projection_generation.to_string(),
                 ),
             ]),
             annotations: BTreeMap::from([(

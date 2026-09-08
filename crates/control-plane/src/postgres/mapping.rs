@@ -19,8 +19,8 @@ use crate::{
         MaterializationState, MaterializationTarget, RenderedObjectRef,
     },
     route::{
-        CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteEntry,
-        RouteHost, RouteHostKind, RouteIdentity,
+        CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteHost,
+        RouteHostKind, RouteIdentity,
     },
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{StoreError, StoreResult},
@@ -119,23 +119,6 @@ pub(crate) fn route_binding_row_from_row(row: &Row) -> StoreResult<RouteBindingR
     })
 }
 
-pub(crate) fn route_entry_from_rows(
-    route: &RouteBindingRow,
-    instance: InstanceRecord,
-    materialization: Option<MaterializationRecord>,
-) -> RouteEntry {
-    RouteEntry {
-        route_binding_id: route.id.clone(),
-        instance_id: instance.id,
-        instance_state: instance.state,
-        instance_generation: instance.generation,
-        backend: materialization
-            .as_ref()
-            .and_then(|record| record.backend.clone()),
-        backend_generation: materialization.map(|record| record.backend_generation),
-    }
-}
-
 pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<MaterializationRecord> {
     let materialization_id: String = row.get("materialization_id");
     let instance_id: String = row.get("instance_id");
@@ -156,6 +139,7 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
         id: MaterializationId::new(materialization_id).map_err(invalid_stored_data)?,
         instance_id: InstanceId::new(instance_id).map_err(invalid_stored_data)?,
         instance_generation: generation_from_i64(instance_generation)?,
+        projection_generation: generation_from_i64(row.get("projection_generation"))?,
         target: MaterializationTarget::new(cluster_id, namespace).map_err(invalid_stored_data)?,
         state: materialization_state_from_db(&state)?,
         backend: backend_uri
@@ -556,7 +540,7 @@ pub(crate) fn unix_millis_from_system_time(value: SystemTime) -> StoreResult<i64
 }
 
 pub(crate) fn default_negative_cache_policy() -> CachePolicy {
-    CachePolicy::new(Duration::from_secs(5))
+    CachePolicy::new(Duration::from_secs(1))
 }
 
 fn route_identity_from_parts(
@@ -598,7 +582,7 @@ fn route_host_kind_to_db(kind: RouteHostKind) -> &'static str {
     }
 }
 
-fn instance_state_from_db(value: &str) -> StoreResult<InstanceState> {
+pub(crate) fn instance_state_from_db(value: &str) -> StoreResult<InstanceState> {
     match value {
         "cold" => Ok(InstanceState::Cold),
         "waking" => Ok(InstanceState::Waking),
@@ -636,13 +620,13 @@ fn protocol_from_db(value: &str) -> StoreResult<ProtocolRoute> {
     }
 }
 
-fn generation_from_i64(value: i64) -> StoreResult<Generation> {
+pub(crate) fn generation_from_i64(value: i64) -> StoreResult<Generation> {
     u64::try_from(value)
         .map(Generation::new)
         .map_err(|_| StoreError::internal(format!("stored generation {value} is invalid")))
 }
 
-fn backend_generation_from_i64(value: i64) -> StoreResult<BackendGeneration> {
+pub(crate) fn backend_generation_from_i64(value: i64) -> StoreResult<BackendGeneration> {
     u64::try_from(value)
         .map(BackendGeneration::new)
         .map_err(|_| StoreError::internal(format!("stored backend generation {value} is invalid")))

@@ -177,16 +177,24 @@ impl IdleDetector {
             self.wait_until_idle_timeout_elapsed().await;
 
             loop {
+                let Some(activity) = self.drain.watch_for_activity_after_idle() else {
+                    break;
+                };
+                let activity = activity.wait_for_update();
+                tokio::pin!(activity);
                 let request = self.report_request();
-
-                if reporter(request.clone()).await.is_ok() {
+                let response = tokio::select! {
+                    result = reporter(request.clone()) => result,
+                    _ = &mut activity => break,
+                };
+                if response.is_ok() {
                     self.reported = true;
                     return IdleReportOutcome::Reported(request);
                 }
 
-                if self
-                    .active_appeared_before(self.config.retry_backoff())
+                if timeout(self.config.retry_backoff(), &mut activity)
                     .await
+                    .is_ok()
                 {
                     break;
                 }

@@ -1,5 +1,12 @@
 //! Domain model and persistence contract for the SleepyPods control plane.
 
+#[cfg(test)]
+extern crate self as control_plane;
+#[cfg(test)]
+#[macro_use]
+#[path = "../tests/support/unexpected_store.rs"]
+mod unexpected_store;
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -18,6 +25,8 @@ pub mod reconciler;
 pub mod retry;
 pub mod route;
 pub mod runtime;
+mod runtime_io;
+pub mod runtime_work;
 pub mod sleep_policy;
 pub mod store;
 mod wake;
@@ -85,9 +94,9 @@ pub use reconciler::{MaterializationReconciler, MaterializationReconcilerConfig}
 pub use retry::RetryPolicy;
 pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-    ListRouteBindingsForInstanceRequest, PathPrefix, ProtocolRoute, RouteBindingRecord,
-    RouteBindingSpec, RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost,
-    RouteHostKind, RouteIdentity, RouteResolution,
+    ListRouteBindingsForInstanceRequest, PathPrefix, ProtocolRoute, ResolveRouteRequest,
+    RouteBindingRecord, RouteBindingSpec, RouteDependencyLookup, RouteDependencySet, RouteEntry,
+    RouteHost, RouteHostKind, RouteIdentity, RouteResolution,
 };
 pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,

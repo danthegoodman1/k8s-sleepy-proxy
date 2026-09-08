@@ -1,13 +1,9 @@
 use std::{convert::Infallible, error::Error, fmt, io, net::SocketAddr, time::Instant};
 
 use bytes::Bytes;
-use http::{header::CONNECTION, header::UPGRADE, Method, StatusCode};
+use http::StatusCode;
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Incoming, service::service_fn};
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto,
-};
+use hyper::body::Incoming;
 use proxy_core::{websocket_upgrade_response, DrainError, Shutdown};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -19,7 +15,8 @@ use tokio::{
 use crate::{
     is_http01_challenge_candidate_path,
     runtime::{
-        resolve_http01_response, resolve_http_route_shared, route_outcome_or_forward_response,
+        record_http01_error, record_http01_response, resolve_http01_response,
+        resolve_http_route_shared, route_outcome_or_forward_response,
     },
     FrontlineForwardContext, FrontlineForwarder, FrontlineHttpRuntime, FrontlineRouteOutcome,
     FrontlineTlsAdapter, Http01ChallengeResolver, RouteSubscriptionClient,
@@ -29,6 +26,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrontlineHttpListenerConfig {
     listen_addr: SocketAddr,
+    resources: proxy_core::ProxyResourceConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +55,7 @@ pub enum FrontlineListenerKind {
 
 #[derive(Debug)]
 pub enum FrontlineHttpListenerError {
+    InitialActivationBudgetExceeded,
     Bind { addr: SocketAddr, source: io::Error },
     Accept(io::Error),
     Drain(DrainError),
@@ -64,6 +63,7 @@ pub enum FrontlineHttpListenerError {
 
 #[derive(Debug)]
 pub enum FrontlineListenerError {
+    InitialActivationBudgetExceeded,
     Bind {
         kind: FrontlineListenerKind,
         addr: SocketAddr,
@@ -87,11 +87,25 @@ where
     forwarder: FrontlineForwarder,
     drain: proxy_core::DrainTracker,
     websocket_tasks: std::sync::Arc<Mutex<JoinSet<()>>>,
+    observability: proxy_core::observability::recorder::ObservabilityRecorder,
+    admission: proxy_core::ProxyAdmission,
 }
 
 impl FrontlineHttpListenerConfig {
     pub fn new(listen_addr: SocketAddr) -> Self {
-        Self { listen_addr }
+        Self {
+            listen_addr,
+            resources: proxy_core::ProxyResourceConfig::default(),
+        }
+    }
+
+    pub fn with_resource_config(mut self, config: proxy_core::ProxyResourceConfig) -> Self {
+        self.resources = config;
+        self
+    }
+
+    pub fn resource_config(&self) -> proxy_core::ProxyResourceConfig {
+        self.resources
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -170,6 +184,12 @@ where
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
+    if !crate::config::initial_activation_budget_valid(
+        runtime.coordinator().route_deadline(),
+        config.resources,
+    ) {
+        return Err(FrontlineHttpListenerError::InitialActivationBudgetExceeded);
+    }
     let listener = TcpListener::bind(config.listen_addr())
         .await
         .map_err(|source| FrontlineHttpListenerError::Bind {
@@ -177,7 +197,13 @@ where
             source,
         })?;
 
-    serve_http_listener(listener, runtime, shutdown).await
+    serve_http_listener_with_admission(
+        listener,
+        runtime,
+        shutdown,
+        proxy_core::ProxyAdmission::new(config.resources),
+    )
+    .await
 }
 
 pub async fn serve_frontline<RouteClient, Wake, Http01>(
@@ -194,7 +220,17 @@ where
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
-    let shared = SharedFrontlineHttpRuntime::from_runtime(runtime);
+    if !crate::config::initial_activation_budget_valid(
+        runtime.coordinator().route_deadline(),
+        config.http.resources,
+    ) {
+        return Err(FrontlineListenerError::InitialActivationBudgetExceeded);
+    }
+    let tls_adapter = tls_adapter.with_resource_config(config.http.resources);
+    let shared = SharedFrontlineHttpRuntime::from_runtime(
+        runtime,
+        proxy_core::ProxyAdmission::new(config.http.resources),
+    );
     let mut listeners = JoinSet::new();
 
     listeners.spawn({
@@ -281,7 +317,36 @@ where
     Http01: Http01ChallengeResolver + Send + 'static,
     Http01::Error: Send,
 {
-    let shared = SharedFrontlineHttpRuntime::from_runtime(runtime);
+    serve_http_listener_with_admission(
+        listener,
+        runtime,
+        shutdown,
+        proxy_core::ProxyAdmission::new(proxy_core::ProxyResourceConfig::default()),
+    )
+    .await
+}
+
+pub async fn serve_http_listener_with_admission<RouteClient, Wake, Http01>(
+    listener: TcpListener,
+    runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>,
+    shutdown: Shutdown,
+    admission: proxy_core::ProxyAdmission,
+) -> Result<(), FrontlineHttpListenerError>
+where
+    RouteClient: RouteSubscriptionClient + Send + 'static,
+    RouteClient::Error: Clone + Send,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send,
+    Http01: Http01ChallengeResolver + Send + 'static,
+    Http01::Error: Send,
+{
+    if !crate::config::initial_activation_budget_valid(
+        runtime.coordinator().route_deadline(),
+        admission.config(),
+    ) {
+        return Err(FrontlineHttpListenerError::InitialActivationBudgetExceeded);
+    }
+    let shared = SharedFrontlineHttpRuntime::from_runtime(runtime, admission);
     serve_http_listener_with_shared(listener, shared, shutdown).await
 }
 
@@ -323,12 +388,14 @@ where
                     }
                 };
                 let _ = stream.set_nodelay(true);
+                let stream = match shared.admission.admit_io(stream) { Ok(stream) => stream, Err(_) => continue };
+                let handshake = match shared.admission.handshakes.try_acquire() { Ok(permit) => permit, Err(_) => continue };
                 let runtime = shared.clone();
                 let connection_shutdown = shutdown.clone();
                 let forwarding_context = FrontlineForwardContext::http(peer_addr.ip());
 
                 connections.spawn(async move {
-                    serve_http_connection(stream, runtime, connection_shutdown, forwarding_context)
+                    serve_http_connection(stream, runtime, connection_shutdown, forwarding_context, handshake)
                         .await;
                 });
             }
@@ -359,6 +426,8 @@ where
             forwarder: self.forwarder.clone(),
             drain: self.drain.clone(),
             websocket_tasks: self.websocket_tasks.clone(),
+            observability: self.observability.clone(),
+            admission: self.admission.clone(),
         }
     }
 }
@@ -396,15 +465,19 @@ where
                     }
                 };
                 let _ = stream.set_nodelay(true);
+                let stream = match shared.admission.admit_io(stream) { Ok(stream) => stream, Err(_) => continue };
+                let handshake = match shared.admission.handshakes.try_acquire() { Ok(permit) => permit, Err(_) => continue };
                 let runtime = shared.clone();
                 let tls_adapter = tls_adapter.clone();
                 let connection_shutdown = shutdown.clone();
                 let forwarding_context = FrontlineForwardContext::https(peer_addr.ip());
 
                 connections.spawn(async move {
-                    let terminated = match tls_adapter.terminate(stream).await {
-                        Ok(terminated) => terminated,
-                        Err(_error) => return,
+                    let terminated = tokio::select! {
+                        _ = connection_shutdown.cancelled() => return,
+                        result = tokio::time::timeout(runtime.admission.config().setup_timeout(), tls_adapter.terminate(stream)) => match result {
+                            Ok(Ok(terminated)) => terminated, _ => return,
+                        }
                     };
 
                     serve_http_connection(
@@ -412,6 +485,7 @@ where
                         runtime,
                         connection_shutdown,
                         forwarding_context,
+                        handshake,
                     )
                     .await;
                 });
@@ -464,12 +538,14 @@ where
                     }
                 };
                 let _ = stream.set_nodelay(true);
+                let stream = match shared.admission.admit_io(stream) { Ok(stream) => stream, Err(_) => continue };
+                let handshake = match shared.admission.handshakes.try_acquire() { Ok(permit) => permit, Err(_) => continue };
                 let runtime = shared.clone();
                 let tls_adapter = tls_adapter.clone();
 
                 connections.spawn(async move {
                     runtime
-                        .handle_tls_passthrough_connection(stream, tls_adapter)
+                        .handle_tls_passthrough_connection(stream, tls_adapter, handshake)
                         .await;
                 });
             }
@@ -493,6 +569,7 @@ async fn serve_http_connection<RouteClient, Wake, Http01, IO>(
     runtime: SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>,
     shutdown: Shutdown,
     forwarding_context: FrontlineForwardContext,
+    handshake: proxy_core::AdmissionPermit,
 ) where
     RouteClient: RouteSubscriptionClient + Send + 'static,
     RouteClient::Error: Clone + Send,
@@ -502,23 +579,18 @@ async fn serve_http_connection<RouteClient, Wake, Http01, IO>(
     Http01::Error: Send,
     IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let service = service_fn(move |request| {
-        let runtime = runtime.clone();
-        async move { Ok::<_, Infallible>(runtime.handle(request, forwarding_context).await) }
-    });
-    let builder = auto::Builder::new(TokioExecutor::new());
-    let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
-    tokio::pin!(connection);
-
-    tokio::select! {
-        result = connection.as_mut() => {
-            let _ = result;
-        }
-        _ = shutdown.cancelled() => {
-            connection.as_mut().graceful_shutdown();
-            let _ = connection.await;
-        }
-    }
+    proxy_core::serve_http_connection_admitted(
+        stream,
+        shutdown,
+        runtime.admission.clone(),
+        handshake,
+        None,
+        move |request| {
+            let runtime = runtime.clone();
+            async move { Ok::<_, Infallible>(runtime.handle(request, forwarding_context).await) }
+        },
+    )
+    .await;
 }
 
 impl<RouteClient, Wake, Http01> SharedFrontlineHttpRuntime<RouteClient, Wake, Http01>
@@ -530,15 +602,20 @@ where
     Http01: Http01ChallengeResolver + Send,
     Http01::Error: Send,
 {
-    fn from_runtime(runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>) -> Self {
-        let (coordinator, http01_resolver, forwarder, drain) = runtime.into_parts();
+    fn from_runtime(
+        runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>,
+        admission: proxy_core::ProxyAdmission,
+    ) -> Self {
+        let (coordinator, http01_resolver, forwarder, drain, observability) = runtime.into_parts();
 
         Self {
             coordinator: coordinator.into_shared(),
             http01_resolver: std::sync::Arc::new(Mutex::new(http01_resolver)),
-            forwarder,
+            forwarder: forwarder.with_resource_config(admission.config()),
+            admission,
             drain,
             websocket_tasks: std::sync::Arc::new(Mutex::new(JoinSet::new())),
+            observability,
         }
     }
 
@@ -559,13 +636,19 @@ where
                 resolve_http01_response(&mut *resolver, &request).await
             };
             match http01_response {
-                Ok(Some(response)) => return response,
+                Ok(Some(response)) => {
+                    record_http01_response(&self.observability, response.status());
+                    return response;
+                }
                 Ok(None) => {}
-                Err(error) => return crate::runtime::http01_intercept_error_response(error),
+                Err(error) => {
+                    record_http01_error(&self.observability, &error);
+                    return crate::runtime::http01_intercept_error_response(error);
+                }
             }
         }
 
-        if is_websocket_upgrade_candidate(&request) {
+        if proxy_core::is_websocket_upgrade(&request) {
             return self.handle_websocket(request, forwarding_context).await;
         }
 
@@ -585,14 +668,25 @@ where
         }
     }
 
-    async fn handle_tls_passthrough_connection(
+    async fn handle_tls_passthrough_connection<IO: AsyncRead + AsyncWrite + Unpin>(
         &self,
-        mut stream: tokio::net::TcpStream,
+        mut stream: IO,
         tls_adapter: FrontlineTlsAdapter,
+        handshake: proxy_core::AdmissionPermit,
     ) {
-        let client_hello = match tls_adapter.read_passthrough_client_hello(&mut stream).await {
-            Ok(client_hello) => client_hello,
-            Err(_error) => return,
+        let client_hello = match tokio::time::timeout(
+            self.admission.config().setup_timeout(),
+            tls_adapter.read_passthrough_client_hello(&mut stream),
+        )
+        .await
+        {
+            Ok(Ok(client_hello)) => client_hello,
+            _ => return,
+        };
+        drop(handshake);
+        let _request = match self.admission.requests.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => return,
         };
         let outcome = self
             .coordinator
@@ -622,8 +716,8 @@ where
         mut request: http::Request<Incoming>,
         forwarding_context: FrontlineForwardContext,
     ) -> http::Response<crate::FrontlineRuntimeBody> {
-        let switching_protocols = match websocket_upgrade_response(&request, empty_body()) {
-            Ok(response) => response,
+        match websocket_upgrade_response(&request, ()) {
+            Ok(_) => {}
             Err(_error) => return status_response(StatusCode::BAD_REQUEST),
         };
 
@@ -631,39 +725,24 @@ where
 
         match outcome {
             Ok(FrontlineRouteOutcome::Ready(ready)) => {
-                let path_and_query = request
-                    .uri()
-                    .path_and_query()
-                    .map(|value| value.as_str().to_owned())
-                    .unwrap_or_else(|| "/".to_owned());
-                let upstream_headers = forwarding_context.headers_for_request(&mut request);
-                let upstream = match self
+                let (response, upgrade) = match self
                     .forwarder
-                    .connect_accepted_websocket_upstream_with_headers(
-                        &ready,
-                        &path_and_query,
-                        &upstream_headers,
-                    )
+                    .prepare_websocket_upgrade(&ready, &mut request, forwarding_context)
                     .await
                 {
-                    Ok(upstream) => upstream,
-                    Err(_error) => return status_response(StatusCode::BAD_GATEWAY),
+                    Ok(upgrade) => upgrade,
+                    Err(crate::FrontlineForwardError::WebSocket(error)) => {
+                        return proxy_core::websocket_error_response(&error)
+                            .map(|body| body.map_err(|error| match error {}).boxed_unsync())
+                    }
+                    Err(_) => return status_response(StatusCode::BAD_GATEWAY),
                 };
-                let upgraded = hyper::upgrade::on(&mut request);
-                let forwarder = self.forwarder.clone();
-
                 let mut websocket_tasks = self.websocket_tasks.lock().await;
                 reap_completed_tasks(&mut websocket_tasks);
                 websocket_tasks.spawn(async move {
-                    let Ok(upgraded) = upgraded.await else {
-                        return;
-                    };
-                    let _ = forwarder
-                        .forward_connected_accepted_websocket(TokioIo::new(upgraded), upstream)
-                        .await;
+                    let _ = upgrade.run().await;
                 });
-
-                switching_protocols
+                response.map(|body| body.map_err(|error| match error {}).boxed_unsync())
             }
             Ok(outcome) => route_outcome_response(outcome),
             Err(error) => crate::runtime::route_resolution_error_response(error),
@@ -673,28 +752,6 @@ where
 
 fn reap_completed_tasks(tasks: &mut JoinSet<()>) {
     while tasks.try_join_next().is_some() {}
-}
-
-fn is_websocket_upgrade_candidate(request: &http::Request<Incoming>) -> bool {
-    request.method() == Method::GET
-        && header_contains_token(request.headers(), CONNECTION, "upgrade")
-        && header_contains_token(request.headers(), UPGRADE, "websocket")
-}
-
-fn header_contains_token(
-    headers: &http::HeaderMap,
-    name: http::header::HeaderName,
-    token: &str,
-) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(token))
-        })
-        .unwrap_or(false)
 }
 
 fn route_outcome_response(
@@ -733,6 +790,9 @@ fn empty_body() -> crate::FrontlineRuntimeBody {
 impl fmt::Display for FrontlineHttpListenerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InitialActivationBudgetExceeded => {
+                f.write_str("route and initial setup exceed the 190-second activation budget")
+            }
             Self::Bind { addr, source } => {
                 write!(
                     f,
@@ -748,6 +808,9 @@ impl fmt::Display for FrontlineHttpListenerError {
 impl From<FrontlineHttpListenerError> for FrontlineListenerError {
     fn from(error: FrontlineHttpListenerError) -> Self {
         match error {
+            FrontlineHttpListenerError::InitialActivationBudgetExceeded => {
+                Self::InitialActivationBudgetExceeded
+            }
             FrontlineHttpListenerError::Bind { addr, source } => Self::Bind {
                 kind: FrontlineListenerKind::Http,
                 addr,
@@ -775,6 +838,9 @@ impl fmt::Display for FrontlineListenerKind {
 impl fmt::Display for FrontlineListenerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InitialActivationBudgetExceeded => {
+                f.write_str("route and initial setup exceed the 190-second activation budget")
+            }
             Self::Bind { kind, addr, source } => {
                 write!(
                     f,
@@ -793,6 +859,7 @@ impl fmt::Display for FrontlineListenerError {
 impl Error for FrontlineHttpListenerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InitialActivationBudgetExceeded => None,
             Self::Bind { source, .. } => Some(source),
             Self::Accept(error) => Some(error),
             Self::Drain(error) => Some(error),
@@ -803,6 +870,7 @@ impl Error for FrontlineHttpListenerError {
 impl Error for FrontlineListenerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InitialActivationBudgetExceeded => None,
             Self::Bind { source, .. } | Self::Accept { source, .. } => Some(source),
             Self::Drain(error) => Some(error),
             Self::Task(error) => Some(error),

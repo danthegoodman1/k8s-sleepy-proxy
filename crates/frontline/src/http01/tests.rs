@@ -9,11 +9,11 @@ use std::{
 };
 
 use bytes::Bytes;
-use control_plane::{http01::InvalidHttp01Challenge, Http01ChallengeKey, Http01ChallengeRecord};
 use http::{
     header::{CONTENT_TYPE, HOST},
     HeaderValue, Request, StatusCode,
 };
+use sleepypods_api::{http01::InvalidHttp01Challenge, Http01ChallengeKey, Http01ChallengeRecord};
 
 use super::{
     http01_challenge_key, http01_challenge_token, intercept_http01_challenge,

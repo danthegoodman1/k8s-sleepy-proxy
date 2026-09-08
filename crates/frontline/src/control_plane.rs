@@ -4,8 +4,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use control_plane::{
-    api::pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
+use sleepypods_api::{
+    pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
     Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
     RouteHost, RouteHostKind, RouteIdentity,
 };

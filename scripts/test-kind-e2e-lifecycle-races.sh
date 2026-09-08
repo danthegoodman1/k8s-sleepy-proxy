@@ -9,9 +9,11 @@ keep_namespace="${SLEEPYPODS_KIND_E2E_KEEP_NAMESPACE:-0}"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-kind-e2e-lifecycle-races}"
 app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/routing-app:${image_tag}}"
-sleep_waking_image="${SLEEPYPODS_KIND_E2E_SLEEP_WHILE_WAKING_IMAGE:-${image_prefix}/routing-app-sleep-waking:${image_tag}}"
-delete_waking_image="${SLEEPYPODS_KIND_E2E_DELETE_WHILE_WAKING_IMAGE:-${image_prefix}/routing-app-delete-waking:${image_tag}}"
-failed_retry_image="${SLEEPYPODS_KIND_E2E_FAILED_RETRY_IMAGE:-${image_prefix}/routing-app-failed-retry:${image_tag}}"
+# Unique defaults keep delayed images absent in a retained cluster on every run.
+late_image_suffix="$(date +%s)-$$"
+sleep_waking_image="${SLEEPYPODS_KIND_E2E_SLEEP_WHILE_WAKING_IMAGE:-${image_prefix}/routing-app-sleep-waking:${image_tag}-${late_image_suffix}}"
+delete_waking_image="${SLEEPYPODS_KIND_E2E_DELETE_WHILE_WAKING_IMAGE:-${image_prefix}/routing-app-delete-waking:${image_tag}-${late_image_suffix}}"
+failed_retry_image="${SLEEPYPODS_KIND_E2E_FAILED_RETRY_IMAGE:-${image_prefix}/routing-app-failed-retry:${image_tag}-${late_image_suffix}}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19851}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19880}"
@@ -191,11 +193,17 @@ metadata:
     sleepypods.io/kind-e2e: lifecycle-races
 rules:
   - apiGroups: [""]
-    resources: ["services", "persistentvolumeclaims"]
+    resources: ["services", "persistentvolumeclaims", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -280,6 +288,9 @@ spec:
               value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
+            # Allow normal 30s Pod grace plus cleanup retries; keep failed wake bounded.
+            - name: SLEEPYPODS_OPERATION_TIMEOUT_MS
+              value: "90000"
             - name: SLEEPYPODS_CLUSTER_ID
               value: kind-e2e-lifecycle-races
             - name: SLEEPYPODS_NAMESPACE

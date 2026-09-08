@@ -1,13 +1,13 @@
 use std::{convert::Infallible, sync::Arc};
 
 use bytes::Bytes;
-use control_plane::{BackendEndpoint, BackendGeneration, Generation, InstanceId, RouteIdentity};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use proxy_core::DrainTracker;
 use rcgen::generate_simple_self_signed;
+use sleepypods_api::{BackendEndpoint, BackendGeneration, Generation, InstanceId, RouteIdentity};
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -282,6 +282,71 @@ async fn passthrough_extracts_sni_and_preserves_preread_prefix_and_tail() {
 }
 
 #[tokio::test]
+async fn passthrough_waits_for_late_listener_after_refusal_and_sends_prefix_once() {
+    use std::time::Duration;
+
+    // Close a real listener and verify refusal before starting SNI setup. A bound
+    // but non-listening TcpSocket blackholes SYNs on macOS instead of refusing.
+    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    assert_eq!(
+        TcpStream::connect(address).await.unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    let ready = ready_backend(format!("tcp://{address}"));
+    let hello = client_hello(Some(sni_extension(b"late.example.com")));
+    let tail = b"opaque TLS bytes after ClientHello";
+    let mut expected = hello.clone();
+    expected.extend_from_slice(tail);
+    let expected_len = expected.len();
+    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::new()).with_resource_config(
+        proxy_core::ProxyResourceConfig::default()
+            .with_timeouts(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+    );
+    let (mut client, proxy_side) = io::duplex(4096);
+    client.write_all(&hello).await.unwrap();
+    client.write_all(tail).await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut proxy = tokio::spawn(async move { adapter.passthrough(&ready, proxy_side).await });
+
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut proxy).await;
+    assert!(
+        early.is_err(),
+        "SNI setup must remain pending through a pre-dispatch refusal: {early:?}"
+    );
+    let listener = TcpListener::bind(address).await.unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut actual = Vec::new();
+        socket.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+        socket.write_all(b"single upstream response").await.unwrap();
+        socket.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, b"single upstream response");
+    let result = proxy.await.unwrap().unwrap();
+    assert_eq!(result.stats.client_to_upstream, expected_len as u64);
+    assert_eq!(result.stats.upstream_to_client, response.len() as u64);
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
 async fn passthrough_rejects_bad_inputs_before_connecting() {
     assert!(matches!(
         passthrough_backend_addr(&ready_backend("http://127.0.0.1:1")),
@@ -467,4 +532,89 @@ fn push_u24(bytes: &mut Vec<u8>, value: usize) {
         ((value >> 8) & 0xff) as u8,
         (value & 0xff) as u8,
     ]);
+}
+
+#[tokio::test]
+async fn passthrough_setup_timeout_and_cancellation_do_not_redial() {
+    use std::time::Duration;
+    for cancel in [false, true] {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let ready = ready_backend(format!("tcp://{address}"));
+        let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::new()).with_resource_config(
+            proxy_core::ProxyResourceConfig::default()
+                .with_timeouts(
+                    Duration::from_millis(120),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+        );
+        let (mut client, proxy_side) = io::duplex(4096);
+        client
+            .write_all(&client_hello(Some(sni_extension(b"late.example.com"))))
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { adapter.passthrough(&ready, proxy_side).await });
+        if cancel {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            let error = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, TlsPassthroughError::Connect(error) if error.kind() == std::io::ErrorKind::TimedOut)
+            );
+            assert!(started.elapsed() >= Duration::from_millis(120));
+        }
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+        let listener = TcpListener::bind(address).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn passthrough_does_not_replay_after_clienthello_dispatch() {
+    use std::time::Duration;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let ready = ready_backend(format!("tcp://{address}"));
+    let hello = client_hello(Some(sni_extension(b"once.example.com")));
+    let expected = hello.clone();
+    let (mut client, proxy_side) = io::duplex(4096);
+    client.write_all(&hello).await.unwrap();
+    let task = tokio::spawn(async move {
+        FrontlineTlsAdapter::new(TlsCertificateStore::new())
+            .passthrough(&ready, proxy_side)
+            .await
+    });
+    let (mut upstream, _) = listener.accept().await.unwrap();
+    let mut actual = vec![0; expected.len()];
+    upstream.read_exact(&mut actual).await.unwrap();
+    assert_eq!(actual, expected);
+    // The upstream ends after receiving TLS bytes; setup recovery must be over.
+    drop(upstream);
+    client.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_err()
+    );
 }

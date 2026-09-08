@@ -110,7 +110,7 @@ async fn tcp_proxy_preserves_bytes_and_tracks_connection_lifecycle() {
 }
 
 #[tokio::test]
-async fn tcp_proxy_surfaces_upstream_connect_errors_and_releases_lifecycle() {
+async fn tcp_proxy_bounds_repeated_upstream_refusal_and_releases_lifecycle() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("temporary upstream listener binds");
@@ -151,7 +151,7 @@ async fn tcp_proxy_surfaces_upstream_connect_errors_and_releases_lifecycle() {
         .await
         .expect("proxy task completed")
         .expect_err("proxy reports upstream connect failure");
-    assert!(matches!(error, TcpProxyError::Connect(_)));
+    assert!(matches!(error, TcpProxyError::ConnectTimeout { .. }));
     drain.wait_for_active_count(0).await;
     assert_eq!(drain.active_count(), 0);
 }
@@ -560,7 +560,7 @@ async fn tcp_proxy_stream_one_way_activity_keeps_session_alive() {
         idle_timeout,
     ));
 
-    for byte in [b'a', b'b', b'c'] {
+    for byte in *b"abc" {
         advance(idle_timeout - Duration::from_secs(1)).await;
         upstream
             .write_all(&[byte])
@@ -658,4 +658,29 @@ async fn tcp_proxy_drain_times_out_while_connection_is_stalled_then_releases() {
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
     assert_eq!(drain.active_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_idle_deadline_terminates_both_directions_blocked_on_write() {
+    let (mut client, proxy_client) = tokio::io::duplex(1024);
+    let (mut upstream, proxy_upstream) = tokio::io::duplex(1024);
+    let idle = Duration::from_secs(5);
+    let proxy = tokio::spawn(proxy_streams_with_idle_timeout(
+        proxy_client,
+        proxy_upstream,
+        idle,
+    ));
+    let client_writer = tokio::spawn(async move { client.write_all(&vec![1; 128 * 1024]).await });
+    let upstream_writer =
+        tokio::spawn(async move { upstream.write_all(&vec![2; 128 * 1024]).await });
+    tokio::task::yield_now().await;
+    advance(idle).await;
+    let error = timeout(Duration::from_secs(1), proxy)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    client_writer.abort();
+    upstream_writer.abort();
 }

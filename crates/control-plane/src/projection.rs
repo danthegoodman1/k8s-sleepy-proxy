@@ -58,7 +58,15 @@ pub enum ProjectionReadinessInspection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveObjectIdentity {
+    pub uid: String,
+    pub resource_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveObjectMetadata {
+    pub persistent_volume_reclaim_policy: Option<String>,
+    pub identity: LiveObjectIdentity,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub deleting: bool,
@@ -67,6 +75,8 @@ pub struct LiveObjectMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionObservation {
+    pub persistent_volume_reclaim_policy: Option<String>,
+    pub identity: Option<LiveObjectIdentity>,
     pub object_ref: RenderedObjectRef,
     pub state: ProjectionObservationState,
     pub reason: Option<String>,
@@ -147,7 +157,7 @@ impl ProjectionPlan {
                 ExpectedOwnershipStamp::new(
                     &materialization.id,
                     &materialization.instance_id,
-                    materialization.instance_generation,
+                    materialization.projection_generation,
                     rendered_hash,
                 ),
             );
@@ -169,7 +179,7 @@ impl ProjectionPlan {
         Ok(Self {
             materialization_id: materialization.id.clone(),
             instance_id: materialization.instance_id.clone(),
-            instance_generation: materialization.instance_generation,
+            instance_generation: materialization.projection_generation,
             manifest: Some(manifest),
             objects,
         })
@@ -179,7 +189,7 @@ impl ProjectionPlan {
         let expected = ExpectedOwnershipStamp::new(
             &materialization.id,
             &materialization.instance_id,
-            materialization.instance_generation,
+            materialization.projection_generation,
             None,
         );
         let objects = materialization
@@ -195,7 +205,7 @@ impl ProjectionPlan {
         Self {
             materialization_id: materialization.id.clone(),
             instance_id: materialization.instance_id.clone(),
-            instance_generation: materialization.instance_generation,
+            instance_generation: materialization.projection_generation,
             manifest: None,
             objects,
         }
@@ -274,6 +284,15 @@ impl ExpectedOwnershipStamp {
 impl LiveObjectMetadata {
     pub fn from_rendered_object(object: &KubernetesObject) -> Self {
         Self {
+            persistent_volume_reclaim_policy: object
+                .to_kubernetes_json()
+                .pointer("/spec/persistentVolumeReclaimPolicy")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            identity: LiveObjectIdentity {
+                uid: "test-uid".into(),
+                resource_version: "1".into(),
+            },
             labels: object_labels(object).clone(),
             annotations: object_annotations(object).clone(),
             deleting: false,
@@ -300,6 +319,8 @@ impl ProjectionObservation {
 
     pub fn ready(object_ref: RenderedObjectRef, backend: &BackendEndpoint) -> Self {
         Self {
+            persistent_volume_reclaim_policy: None,
+            identity: None,
             object_ref,
             state: ProjectionObservationState::Ready,
             reason: None,
@@ -355,6 +376,8 @@ impl ProjectionObservation {
         finalizers: Vec<String>,
     ) -> Self {
         Self {
+            persistent_volume_reclaim_policy: None,
+            identity: None,
             object_ref,
             state,
             reason: reason.map(bound_detail),
@@ -477,13 +500,17 @@ where
     pub async fn apply(&self, plan: &ProjectionPlan) -> Result<(), ProjectionError> {
         let observations = self.inspect(plan).await?;
         self.reject_unowned(&observations)?;
-        self.apply_without_inspection(plan).await
+        self.apply_with_observations(plan, &observations).await
     }
 
-    async fn apply_without_inspection(&self, plan: &ProjectionPlan) -> Result<(), ProjectionError> {
+    async fn apply_with_observations(
+        &self,
+        plan: &ProjectionPlan,
+        observations: &[ProjectionObservation],
+    ) -> Result<(), ProjectionError> {
         let manifest = plan.manifest().ok_or(ProjectionError::MissingManifest)?;
         self.materializer
-            .apply_manifest(manifest)
+            .apply_manifest_with_preconditions(manifest, observations)
             .await
             .map_err(|source| ProjectionError::Apply {
                 observations: apply_rejected_observations(plan, &source),
@@ -512,8 +539,43 @@ where
     pub async fn delete_owned(&self, plan: &ProjectionPlan) -> Result<(), ProjectionError> {
         let before = self.inspect(plan).await?;
         self.reject_unowned(&before)?;
+        // PVC deletion itself can trigger destructive PV reclamation. Validate
+        // every live volume before issuing any teardown request.
+        let unsafe_volumes = before
+            .iter()
+            .filter(|observation| {
+                observation.object_ref.kind == "PersistentVolume"
+                    && observation.state != ProjectionObservationState::Missing
+                    && observation.persistent_volume_reclaim_policy.as_deref() != Some("Retain")
+            })
+            .map(|observation| {
+                ProjectionObservation::delete_blocked(
+                    observation.object_ref.clone(),
+                    "managed_volume_requires_retain_before_cleanup",
+                    &observation.finalizers,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !unsafe_volumes.is_empty() {
+            return Err(ProjectionError::CleanupBlocked {
+                observations: unsafe_volumes,
+            });
+        }
 
         let object_refs = plan.object_refs();
+        self.materializer
+            .client()
+            .verify_retained_bindings(&object_refs)
+            .await
+            .map_err(|source| ProjectionError::Inspect {
+                object_ref: Box::new(readiness_observation_ref(plan)),
+                observations: vec![ProjectionObservation::delete_blocked(
+                    readiness_observation_ref(plan),
+                    "retained_static_binding_not_proven",
+                    &[],
+                )],
+                source,
+            })?;
         for object_ref in delete_order(&object_refs) {
             let Some(observation) = before
                 .iter()
@@ -523,7 +585,13 @@ where
             };
             if observation.state == ProjectionObservationState::PresentOwned {
                 self.materializer
-                    .delete_rendered_object(object_ref)
+                    .delete_rendered_object_conditionally(
+                        object_ref,
+                        observation
+                            .identity
+                            .as_ref()
+                            .expect("owned inspection has identity"),
+                    )
                     .await
                     .map_err(|source| ProjectionError::Delete {
                         observations: vec![ProjectionObservation::delete_blocked(
@@ -542,6 +610,19 @@ where
             .iter()
             .all(|observation| observation.state == ProjectionObservationState::Missing)
         {
+            self.materializer
+                .client()
+                .ensure_no_descendants(&object_refs, plan.instance_id().as_str())
+                .await
+                .map_err(|source| ProjectionError::Inspect {
+                    object_ref: Box::new(readiness_observation_ref(plan)),
+                    observations: vec![ProjectionObservation::delete_blocked(
+                        readiness_observation_ref(plan),
+                        "descendants_remain_or_inspection_failed",
+                        &[],
+                    )],
+                    source,
+                })?;
             return Ok(());
         }
 
@@ -621,7 +702,15 @@ fn classify_object(
     object: &ProjectionObjectPlan,
     inspection: ProjectionObjectInspection,
 ) -> ProjectionObservation {
-    match inspection {
+    let persistent_volume_reclaim_policy = match &inspection {
+        ProjectionObjectInspection::Present(live) => live.persistent_volume_reclaim_policy.clone(),
+        ProjectionObjectInspection::Missing => None,
+    };
+    let identity = match &inspection {
+        ProjectionObjectInspection::Present(live) => Some(live.identity.clone()),
+        ProjectionObjectInspection::Missing => None,
+    };
+    let mut observation = match inspection {
         ProjectionObjectInspection::Missing => {
             ProjectionObservation::missing(object.object_ref.clone())
         }
@@ -640,7 +729,10 @@ fn classify_object(
                 metadata.finalizers,
             )
         }
-    }
+    };
+    observation.identity = identity;
+    observation.persistent_volume_reclaim_policy = persistent_volume_reclaim_policy;
+    observation
 }
 
 fn ownership_mismatch_reason(
@@ -709,14 +801,14 @@ fn stamp_object_base(object: &mut KubernetesObject, materialization: &Materializ
         object_metadata_mut(object),
         &materialization.id,
         &materialization.instance_id,
-        materialization.instance_generation,
+        materialization.projection_generation,
     );
     if let Some(metadata) = pod_template_metadata_mut(object) {
         stamp_pod_template_base(
             metadata,
             &materialization.id,
             &materialization.instance_id,
-            materialization.instance_generation,
+            materialization.projection_generation,
         );
     }
 }
@@ -1119,6 +1211,11 @@ mod tests {
             ProjectionPlan::from_manifest(&materialization, &manifest()).expect("projection plan");
         let client =
             FakeProjectionClient::new(ProjectionObjectInspection::Present(LiveObjectMetadata {
+                persistent_volume_reclaim_policy: Some("Retain".into()),
+                identity: crate::projection::LiveObjectIdentity {
+                    uid: "test-uid".into(),
+                    resource_version: "1".into(),
+                },
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
                 deleting: false,
@@ -1231,6 +1328,7 @@ mod tests {
         fn apply_object<'a>(
             &'a self,
             object: &'a KubernetesObject,
+            _precondition: Option<&'a crate::projection::LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
                 self.applied_objects
@@ -1244,6 +1342,7 @@ mod tests {
         fn delete_object<'a>(
             &'a self,
             _object: &'a RenderedObjectRef,
+            _precondition: &'a crate::projection::LiveObjectIdentity,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -1282,6 +1381,24 @@ mod tests {
         {
             Box::pin(async move { Ok(self.readiness.clone()) })
         }
+
+        fn ensure_no_descendants<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+            _instance_id: &'a str,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn verify_retained_bindings<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+        ) -> crate::materializer::KubernetesClientFuture<
+            'a,
+            crate::materializer::KubernetesClientResult<()>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn object_metadata(object: &KubernetesObject) -> &ObjectMeta {
@@ -1304,6 +1421,7 @@ mod tests {
                 .expect("valid materialization id"),
             instance_id: InstanceId::new("instance-a").expect("valid instance id"),
             instance_generation: Generation::new(7),
+            projection_generation: Generation::new(7),
             target: MaterializationTarget::new("cluster-a", "apps").expect("valid target"),
             state: MaterializationState::Pending,
             backend: None,

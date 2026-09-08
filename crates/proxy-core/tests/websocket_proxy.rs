@@ -402,16 +402,13 @@ async fn websocket_proxy_surfaces_upstream_upgrade_failure_and_releases_lifecycl
         proxy.accept_and_proxy(stream, &upstream_url).await
     });
 
-    let (mut client, _) = connect_async(format!("ws://{proxy_addr}"))
+    let error = connect_async(format!("ws://{proxy_addr}"))
         .await
-        .expect("client websocket handshake with proxy succeeds");
-    let disconnect = timeout(TEST_TIMEOUT, client.next())
-        .await
-        .expect("client observes failed upstream upgrade before timeout");
-    assert!(
-        disconnect.is_none() || matches!(disconnect, Some(Err(_))),
-        "client should observe EOF or a websocket error after upstream upgrade failure"
-    );
+        .expect_err("upstream rejection is returned before 101");
+    let TungsteniteError::Http(response) = error else {
+        panic!("expected upstream HTTP rejection");
+    };
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
 
     let error = timeout(TEST_TIMEOUT, proxy_task)
         .await
@@ -503,6 +500,7 @@ async fn websocket_proxy_releases_lifecycle_after_upstream_peer_disconnect() {
         .expect("upstream listener has address");
     let upstream_url = format!("ws://{upstream_addr}");
 
+    let (disconnect_tx, disconnect_rx) = oneshot::channel();
     let upstream_task = tokio::spawn(async move {
         let (stream, _) = upstream_listener
             .accept()
@@ -511,6 +509,7 @@ async fn websocket_proxy_releases_lifecycle_after_upstream_peer_disconnect() {
         let websocket = accept_async(stream)
             .await
             .expect("upstream accepts websocket");
+        disconnect_rx.await.unwrap();
         drop(websocket);
     });
 
@@ -534,6 +533,7 @@ async fn websocket_proxy_releases_lifecycle_after_upstream_peer_disconnect() {
         .await
         .expect("client connects to proxy websocket");
     drain.wait_for_active_count(1).await;
+    disconnect_tx.send(()).unwrap();
 
     let disconnected = timeout(TEST_TIMEOUT, client.next())
         .await
@@ -765,4 +765,205 @@ impl Callback for AssertForwardedHeaders {
             .expect("test waits for headers");
         Ok(response)
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn websocket_blocked_frame_write_has_a_deadline_without_a_session_lifetime_limit() {
+    let (client_io, proxy_client) = duplex(1024);
+    let (upstream_io, proxy_upstream) = duplex(1024);
+    let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+    let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
+    let proxy_client = WebSocketStream::from_raw_socket(proxy_client, Role::Server, None).await;
+    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
+    let config = proxy_core::WebSocketProxyConfig {
+        write_timeout: Duration::from_secs(5),
+        ..proxy_core::WebSocketProxyConfig::default()
+    };
+    let proxy = tokio::spawn(proxy_core::proxy_websocket_streams_with_config(
+        proxy_client,
+        proxy_upstream,
+        config,
+    ));
+    // An inactive but established WebSocket remains valid beyond write timeout.
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert!(!proxy.is_finished());
+    let writer = tokio::spawn(async move {
+        client
+            .send(Message::Binary(vec![7; 128 * 1024].into()))
+            .await
+    });
+    writer.await.unwrap().unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(config.write_timeout).await;
+    let result = timeout(Duration::from_secs(1), proxy)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(result, TungsteniteError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+    );
+    drop(upstream);
+}
+
+#[tokio::test]
+async fn websocket_upstream_handshake_timeout_returns_504_and_releases_permit() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_url = format!("ws://{}", upstream.local_addr().unwrap());
+    let (accepted, accepted_rx) = oneshot::channel();
+    let app_task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        accepted.send(()).unwrap();
+        let _stream = stream;
+        std::future::pending::<()>().await;
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let drain = DrainTracker::new(Duration::from_secs(1));
+    let proxy = WebSocketProxy::with_config(
+        drain.clone(),
+        proxy_core::WebSocketProxyConfig {
+            handshake_timeout: Duration::from_millis(100),
+            ..proxy_core::WebSocketProxyConfig::default()
+        },
+    );
+    let proxy_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        proxy.accept_and_proxy(stream, &upstream_url).await
+    });
+    let client = tokio::spawn(connect_async(format!("ws://{addr}")));
+    accepted_rx.await.unwrap();
+    let error = timeout(TEST_TIMEOUT, client)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, TungsteniteError::Http(response) if response.status() == http::StatusCode::GATEWAY_TIMEOUT)
+    );
+    assert!(proxy_task.await.unwrap().is_err());
+    assert_eq!(drain.active_count(), 0);
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn websocket_cancelled_handshake_releases_upstream_connection_and_permit() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let drain = DrainTracker::new(Duration::from_secs(1));
+    let proxy = WebSocketProxy::new(drain.clone());
+    let task = tokio::spawn(async move {
+        proxy
+            .connect_accepted_upstream_with_headers(&url, &http::HeaderMap::new())
+            .await
+    });
+    let (mut app, _) = listener.accept().await.unwrap();
+    assert_eq!(drain.active_count(), 1);
+    task.abort();
+    let _ = task.await;
+    assert_eq!(drain.active_count(), 0);
+    let mut bytes = Vec::new();
+    timeout(
+        TEST_TIMEOUT,
+        tokio::io::AsyncReadExt::read_to_end(&mut app, &mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn websocket_blocked_close_write_uses_close_deadline() {
+    let (client_peer, proxy_client) = duplex(1);
+    let (upstream_peer, proxy_upstream) = duplex(64);
+    let proxy_client = WebSocketStream::from_raw_socket(proxy_client, Role::Server, None).await;
+    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
+    let mut upstream = WebSocketStream::from_raw_socket(upstream_peer, Role::Server, None).await;
+    let config = proxy_core::WebSocketProxyConfig {
+        close_timeout: Duration::from_secs(5),
+        write_timeout: Duration::from_secs(60),
+        ..proxy_core::WebSocketProxyConfig::default()
+    };
+    let proxy = tokio::spawn(proxy_core::proxy_websocket_streams_with_config(
+        proxy_client,
+        proxy_upstream,
+        config,
+    ));
+    upstream.send(Message::Close(None)).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(config.close_timeout).await;
+    let error = timeout(Duration::from_secs(1), proxy)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, TungsteniteError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+    );
+    drop(client_peer);
+}
+
+#[tokio::test(start_paused = true)]
+async fn websocket_close_reply_wait_is_bounded() {
+    let (client_peer, proxy_client) = duplex(64);
+    let (_upstream_peer, proxy_upstream) = duplex(64);
+    let proxy_client = WebSocketStream::from_raw_socket(proxy_client, Role::Server, None).await;
+    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
+    let mut client = WebSocketStream::from_raw_socket(client_peer, Role::Client, None).await;
+    let config = proxy_core::WebSocketProxyConfig {
+        close_timeout: Duration::from_secs(5),
+        ..proxy_core::WebSocketProxyConfig::default()
+    };
+    let proxy = tokio::spawn(proxy_core::proxy_websocket_streams_with_config(
+        proxy_client,
+        proxy_upstream,
+        config,
+    ));
+    client.send(Message::Close(None)).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(config.close_timeout).await;
+    assert!(timeout(Duration::from_secs(1), proxy)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_ok());
+}
+
+#[tokio::test]
+async fn websocket_proxy_connects_to_an_ipv6_literal_upstream() {
+    let app = TcpListener::bind(("::1", 0))
+        .await
+        .expect("IPv6 loopback listener");
+    let url = format!("ws://{}/socket", app.local_addr().unwrap());
+    let app_task = tokio::spawn(async move {
+        let (stream, _) = app.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        socket.send(message).await.unwrap();
+        let close = socket.next().await.unwrap().unwrap();
+        assert!(close.is_close());
+        socket.flush().await.unwrap();
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let drain = DrainTracker::new(Duration::from_secs(1));
+    let proxy = WebSocketProxy::new(drain.clone());
+    let proxy_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        proxy.accept_and_proxy(stream, &url).await
+    });
+    let (mut client, _) = connect_async(format!("ws://{addr}/socket")).await.unwrap();
+    client
+        .send(Message::Text("ipv6 echo".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.next().await.unwrap().unwrap(),
+        Message::Text("ipv6 echo".into())
+    );
+    client.close(None).await.unwrap();
+    let _ = client.next().await;
+    proxy_task.await.unwrap().unwrap();
+    app_task.await.unwrap();
+    assert_eq!(drain.active_count(), 0);
 }

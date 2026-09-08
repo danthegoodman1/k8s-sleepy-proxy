@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use control_plane::api::pb::{
+use sleepypods_api::pb::{
     self,
     sidecar_control_plane_client::SidecarControlPlaneClient,
     sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
@@ -20,6 +20,32 @@ use super::{
     ReportIdleResponse, ReportIdleUnavailableReason, SidecarProtocolAdapterError,
 };
 use crate::{IdleObservation, ReportIdleRequest};
+
+#[tokio::test]
+async fn activation_retry_hint_is_bounded_and_mapped_through_generated_transport() {
+    for (code, hint, expected) in [
+        (tonic::Code::FailedPrecondition, "190000", true),
+        (tonic::Code::FailedPrecondition, "190001", false),
+        (tonic::Code::FailedPrecondition, "0", false),
+        (tonic::Code::FailedPrecondition, "bogus", false),
+        (tonic::Code::Unavailable, "1000", false),
+    ] {
+        let service = FakeSidecarControlPlane::default();
+        let mut status = Status::new(code, "activation pending");
+        status.metadata_mut().insert(
+            sleepypods_api::IDLE_RETRY_AFTER_METADATA,
+            hint.parse().unwrap(),
+        );
+        service.set_response(Err(status));
+        let result = test_client(service)
+            .report_idle(report_idle_request("instance-a", 7))
+            .await;
+        assert_eq!(
+            matches!(result, Ok(ReportIdleResponse::RetryAfter { .. })),
+            expected
+        );
+    }
+}
 
 #[tokio::test]
 async fn accepted_response_maps_through_generated_client() {
@@ -49,6 +75,7 @@ async fn accepted_response_maps_through_generated_client() {
     assert_eq!(
         service.requests(),
         vec![pb::SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-a".to_owned(),
             expected_generation: 7,
             active_count: 0,
@@ -293,6 +320,7 @@ fn test_client(
     GrpcSidecarControlPlaneClient::new(SidecarControlPlaneClient::new(InProcessService::new(
         server,
     )))
+    .with_pod_uid("test-pod".to_owned())
 }
 
 fn report_idle_request(instance_id: &str, generation: u64) -> ReportIdleRequest {

@@ -13,7 +13,8 @@ libpq_sni_image="${SLEEPYPODS_KIND_E2E_LIBPQ_SNI_IMAGE:-${image_prefix}/libpq-sn
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19751}"
 route_host="${SLEEPYPODS_KIND_E2E_LIBPQ_SNI_HOST:-exact.sni.sleepypods.test}"
 miss_host="${SLEEPYPODS_KIND_E2E_LIBPQ_SNI_MISS_HOST:-passthrough.sleepypods.test}"
-workload_name="e2e-libpq-sni-postgres"
+# SHA-256(e2e-libpq-sni-postgres), first eight hex digits.
+workload_name="e2e-libpq-sni-postgres-56db3511"
 kubeconfig="$(mktemp)"
 control_plane_pf_log="$(mktemp)"
 created_cluster=0
@@ -354,11 +355,17 @@ metadata:
     sleepypods.io/kind-e2e: libpq-sni
 rules:
   - apiGroups: [""]
-    resources: ["services"]
+    resources: ["services", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -495,17 +502,9 @@ spec:
             - /bin/sh
             - -ceu
             - |
-              deadline=\$((\$(date +%s) + 180))
-              marker=""
-              conninfo="host=\${ROUTE_HOST} hostaddr=\${FRONTLINE_IP} port=9443 dbname=libpq_sni user=libpq_sni sslmode=verify-full sslrootcert=/etc/postgresql/tls/tls.crt sslnegotiation=direct connect_timeout=5"
-              while [ "\$(date +%s)" -lt "\${deadline}" ]; do
-                if output="\$(psql "\${conninfo}" -Atv ON_ERROR_STOP=1 -c "select value from kind_e2e_marker" 2>&1)"; then
-                  marker="\${output}"
-                  break
-                fi
-                echo "\${output}"
-                sleep 2
-              done
+              # The operator fixture asserted Cold. One libpq connection must survive wake.
+              conninfo="host=\${ROUTE_HOST} hostaddr=\${FRONTLINE_IP} port=9443 dbname=libpq_sni user=libpq_sni sslmode=verify-full sslrootcert=/etc/postgresql/tls/tls.crt sslnegotiation=direct connect_timeout=140"
+              marker="\$(psql "\${conninfo}" -Atv ON_ERROR_STOP=1 -c "select value from kind_e2e_marker")"
               if [ "\${marker}" != "sleepypods-libpq-sni" ]; then
                 echo "expected marker sleepypods-libpq-sni, got: \${marker}" >&2
                 exit 1

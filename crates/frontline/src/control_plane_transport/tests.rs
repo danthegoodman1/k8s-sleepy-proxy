@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 
-use control_plane::{
-    api::pb::{
+use sleepypods_api::{
+    pb::{
         self,
         operator_control_plane_client::OperatorControlPlaneClient,
         operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
@@ -95,7 +95,7 @@ async fn subscribe_route_resolved_response_maps_through_generated_client() {
         .expect("subscribe route succeeds");
 
     assert_eq!(
-        response,
+        wire_message(response),
         SubscribeControlPlaneOutput::RouteResolved {
             request_id: route_request_id("req-1"),
             subscription_id: subscription_id("sub-1"),
@@ -156,11 +156,11 @@ async fn pushed_updates_before_route_response_are_buffered_for_next_update() {
         .expect("matching route response is returned");
 
     assert!(matches!(
-        response,
+        wire_message(response),
         SubscribeControlPlaneOutput::RouteResolved { .. }
     ));
     assert_eq!(
-        client.next_update().await.expect("first buffered update"),
+        wire_message(client.next_update().await.expect("first buffered update")),
         SubscribeControlPlaneOutput::RouteUpdated {
             subscription_id: subscription_id("sub-update"),
             matched_identity: http_identity("app.example.com", None),
@@ -169,7 +169,7 @@ async fn pushed_updates_before_route_response_are_buffered_for_next_update() {
         }
     );
     assert_eq!(
-        client.next_update().await.expect("second buffered update"),
+        wire_message(client.next_update().await.expect("second buffered update")),
         SubscribeControlPlaneOutput::RouteInvalidated {
             subscription_id: subscription_id("sub-invalidated"),
             reason: InvalidationReason::BackendChanged,
@@ -180,22 +180,33 @@ async fn pushed_updates_before_route_response_are_buffered_for_next_update() {
 #[tokio::test]
 async fn unsubscribe_sends_request_and_does_not_wait_for_ack() {
     let service = FakeProxyControlPlane::default();
-    service.push_subscribe_action(SubscribeAction::respond(Vec::new()));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "first",
+        "sub-opaque",
+    ))]));
     let mut client = test_client(service.clone());
-
+    let SubscribeControlPlaneOutput::RouteResolved {
+        subscription_id, ..
+    } = client
+        .subscribe_route(
+            route_request_id("first"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .expect("subscribe succeeds")
+    else {
+        panic!("resolved")
+    };
     client
-        .unsubscribe(subscription_id("sub-opaque"))
+        .unsubscribe(subscription_id)
         .await
         .expect("unsubscribe send succeeds");
-
-    let requests = service.wait_for_subscribe_requests(1).await;
-    match requests[0].input.as_ref().expect("input") {
+    let requests = service.wait_for_subscribe_requests(2).await;
+    match requests[1].input.as_ref().expect("input") {
         pb::proxy_subscribe_request::Input::Unsubscribe(request) => {
             assert_eq!(request.subscription_id, "sub-opaque");
         }
-        pb::proxy_subscribe_request::Input::SubscribeRoute(_) => {
-            panic!("expected unsubscribe request")
-        }
+        _ => panic!("expected unsubscribe request"),
     }
 }
 
@@ -276,7 +287,13 @@ async fn unknown_route_response_fails_in_flight_subscribe_and_tears_down_session
         GrpcProxyControlPlaneError::UnexpectedRouteResponse { request_id }
             if request_id == route_request_id("req-unexpected")
     ));
-    assert!(client.subscription.is_none());
+    assert!(client
+        .transport
+        .lock()
+        .await
+        .session
+        .as_ref()
+        .is_some_and(|session| session.closed.load(std::sync::atomic::Ordering::Acquire)));
 }
 
 #[tokio::test]
@@ -330,7 +347,7 @@ async fn subscribe_route_after_response_stream_close_opens_new_stream() {
         .expect("next subscribe uses a fresh stream");
 
     assert_eq!(
-        response,
+        wire_message(response),
         SubscribeControlPlaneOutput::RouteResolved {
             request_id: route_request_id("req-reconnected"),
             subscription_id: subscription_id("sub-reconnected"),
@@ -346,7 +363,7 @@ async fn subscribe_route_after_response_stream_close_opens_new_stream() {
 
 #[tokio::test(start_paused = true)]
 async fn subscribe_route_reconnect_waits_for_backoff_after_stream_close() {
-    let backoff = Duration::from_secs(5);
+    let backoff = Duration::from_secs(1);
     let service = FakeProxyControlPlane::default();
     service.push_subscribe_action(SubscribeAction::close_after(Vec::new()));
     service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
@@ -393,7 +410,7 @@ async fn subscribe_route_reconnect_waits_for_backoff_after_stream_close() {
         .await
         .expect("second subscribe opens after backoff elapses");
     assert!(matches!(
-        response,
+        wire_message(response),
         SubscribeControlPlaneOutput::RouteResolved { .. }
     ));
 
@@ -452,7 +469,7 @@ async fn pushed_updates_over_response_buffer_are_drained_without_public_cursor()
     .expect("subscribe completes while upstream response sender backpressures")
     .expect("route response succeeds");
     assert!(matches!(
-        response,
+        wire_message(response),
         SubscribeControlPlaneOutput::RouteResolved { .. }
     ));
 
@@ -462,7 +479,7 @@ async fn pushed_updates_over_response_buffer_are_drained_without_public_cursor()
             .expect("buffered update is delivered")
             .expect("buffered update maps");
         assert_eq!(
-            update,
+            wire_message(update),
             SubscribeControlPlaneOutput::RouteUpdated {
                 subscription_id: subscription_id(&format!("sub-update-{index}")),
                 matched_identity: http_identity("app.example.com", None),
@@ -478,15 +495,26 @@ async fn closed_subscribe_request_stream_is_surfaced() {
     let service = FakeProxyControlPlane::default();
     let mut client = test_client(service);
     client
-        .ensure_subscription()
+        .transport
+        .lock()
+        .await
+        .ensure(client.events.clone())
         .await
         .expect("subscription starts");
     let (closed_requests, closed_receiver) = mpsc::channel(1);
     drop(closed_receiver);
-    client.subscription.as_mut().expect("session").requests = closed_requests;
+    client
+        .transport
+        .lock()
+        .await
+        .session
+        .as_mut()
+        .expect("session")
+        .requests = closed_requests;
 
+    let session_id = client.transport.lock().await.session.as_ref().unwrap().id;
     let error = client
-        .unsubscribe(subscription_id("sub-closed"))
+        .unsubscribe(subscription_id("sub-closed").with_session(session_id))
         .await
         .expect_err("closed request stream should surface");
 
@@ -685,6 +713,7 @@ struct FakeOperatorControlPlaneState {
 }
 
 struct SubscribeAction {
+    gate: Option<Arc<Notify>>,
     responses: Vec<Result<pb::ProxySubscribeResponse, Status>>,
     close_after: bool,
 }
@@ -694,6 +723,7 @@ impl SubscribeAction {
         Self {
             responses,
             close_after: false,
+            gate: None,
         }
     }
 
@@ -701,6 +731,7 @@ impl SubscribeAction {
         Self {
             responses,
             close_after: true,
+            gate: None,
         }
     }
 }
@@ -755,6 +786,9 @@ impl ProxyControlPlane for FakeProxyControlPlane {
                 };
                 subscribe_notify.notify_waiters();
 
+                if let Some(gate) = action.gate {
+                    gate.notified().await;
+                }
                 for response in action.responses {
                     if responses.send(response).await.is_err() {
                         return;
@@ -1142,4 +1176,339 @@ fn route_binding_id(value: &str) -> RouteBindingId {
 
 fn backend(value: &str) -> BackendEndpoint {
     BackendEndpoint::new(value).expect("backend")
+}
+
+#[tokio::test]
+async fn review_probe_refresh_buffered_invalidation_reaches_production_drain() {
+    let service = FakeProxyControlPlane::default();
+    service.push_subscribe_action(SubscribeAction::respond(vec![
+        Ok(route_invalidated_response("old")),
+        Ok(route_resolved_response("first", "first-sub")),
+    ]));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "second",
+        "second-sub",
+    ))]));
+    let mut client = test_client(service);
+    client
+        .subscribe_route(
+            route_request_id("first"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .unwrap();
+    // A second request used to move queued updates to a buffer that drain never read.
+    client
+        .subscribe_route(
+            route_request_id("second"),
+            http_identity("other.example.com", None),
+        )
+        .await
+        .unwrap();
+    let events = client.drain_subscription_events().await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], crate::RouteSubscriptionEvent::Update(message) if matches!(&**message, SubscribeControlPlaneOutput::RouteInvalidated {subscription_id: id,..} if id.as_str() == "old" && id.session().is_some()))
+    );
+}
+#[tokio::test]
+async fn generated_transport_overflow_fails_pending_route_and_preserves_close_barrier() {
+    let service = FakeProxyControlPlane::default();
+    let mut responses = (0..300)
+        .map(|index| Ok(route_invalidated_response(&format!("sub-{index}"))))
+        .collect::<Vec<_>>();
+    responses.push(Ok(route_resolved_response("overflow", "overflow-sub")));
+    service.push_subscribe_action(SubscribeAction::respond(responses));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "reconnect",
+        "new-sub",
+    ))]));
+    let mut client = test_client(service);
+    let failed = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe_route(
+            route_request_id("overflow"),
+            http_identity("app.example.com", None),
+        ),
+    )
+    .await
+    .expect("overflow cannot deadlock");
+    assert!(failed.is_err());
+    client
+        .subscribe_route(
+            route_request_id("reconnect"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .unwrap();
+    let events = client.drain_subscription_events().await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, crate::RouteSubscriptionEvent::StreamClosed)),
+        "reconnection cannot erase old cache flush"
+    );
+}
+
+#[tokio::test]
+async fn production_coordinator_recovers_generated_transport_overflow_and_flushes_hot_cache() {
+    let service = FakeProxyControlPlane::default();
+    let mut burst = (0..300)
+        .map(|index| Ok(route_invalidated_response(&format!("unrelated-{index}"))))
+        .collect::<Vec<_>>();
+    burst.push(Ok(route_miss_response("req:1")));
+    service.push_subscribe_action(SubscribeAction::respond(burst));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_miss_response(
+        "req:2",
+    ))]));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "req:3", "new-hot",
+    ))]));
+    let mut state = crate::SubscriptionState::new(8);
+    state.cache_mut().insert_positive(
+        subscription_id("old-hot"),
+        http_identity("app.example.com", None),
+        route_entry(),
+        cache_policy(30_000),
+        std::time::Instant::now(),
+    );
+    let shared = crate::FrontlineRouteCoordinator::new(
+        crate::FrontlineRouteResolver::from_parts(state, test_client(service.clone())),
+        crate::WakeTracker::new(),
+        test_client(service.clone()),
+    )
+    .into_shared();
+    let missing = tokio::time::timeout(
+        Duration::from_secs(2),
+        shared.route(
+            http_identity("missing.example.com", None),
+            std::time::Instant::now(),
+        ),
+    )
+    .await
+    .expect("overflow recovery bounded")
+    .unwrap();
+    assert!(matches!(missing, crate::FrontlineRouteOutcome::Miss(_)));
+    assert!(matches!(
+        shared
+            .route(
+                http_identity("app.example.com", None),
+                std::time::Instant::now()
+            )
+            .await
+            .unwrap(),
+        crate::FrontlineRouteOutcome::Ready(_)
+    ));
+    assert_eq!(
+        service.subscribe_request_count(),
+        3,
+        "hot cache was flushed before reconnect authority was installed"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_subscription_response_is_unsubscribed_without_killing_other_requests() {
+    let service = FakeProxyControlPlane::default();
+    let gate = Arc::new(Notify::new());
+    service.push_subscribe_action(SubscribeAction {
+        responses: vec![Ok(route_resolved_response("cancelled", "cancelled-sub"))],
+        close_after: false,
+        gate: Some(gate.clone()),
+    });
+    let mut client = test_client(service.clone());
+    let request = client.subscribe_route(
+        route_request_id("cancelled"),
+        http_identity("app.example.com", None),
+    );
+    let task = tokio::spawn(request);
+    service.wait_for_subscribe_requests(1).await;
+    task.abort();
+    let _ = task.await;
+    // Admit B while A is still cancelled but has not received its late reply.
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "next", "next-sub",
+    ))]));
+    let next = tokio::spawn(client.subscribe_route(
+        route_request_id("next"),
+        http_identity("app.example.com", None),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let transport = client.transport.lock().await;
+            if transport
+                .session
+                .as_ref()
+                .unwrap()
+                .pending
+                .lock()
+                .await
+                .len()
+                == 2
+            {
+                break;
+            }
+            drop(transport);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("B admitted before late A response");
+    gate.notify_one();
+    assert!(next.await.unwrap().is_ok(), "late A must not fail B");
+    let requests = service.wait_for_subscribe_requests(3).await;
+    assert!(requests.iter().any(|message| matches!(
+        &message.input,
+        Some(pb::proxy_subscribe_request::Input::Unsubscribe(request))
+            if request.subscription_id == "cancelled-sub"
+    )));
+}
+
+#[tokio::test]
+async fn deferred_reset_does_not_close_a_session_already_reconnected_by_subscribe() {
+    let service = FakeProxyControlPlane::default();
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "old", "old-sub",
+    ))]));
+    service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+        "new", "new-sub",
+    ))]));
+    let mut client = test_client(service);
+    client
+        .subscribe_route(
+            route_request_id("old"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .unwrap();
+    let reset = client.reset_subscription();
+    let events = client.drain_subscription_events().await.unwrap();
+    assert_eq!(events, vec![crate::RouteSubscriptionEvent::StreamClosed]);
+    client
+        .subscribe_route(
+            route_request_id("new"),
+            http_identity("app.example.com", None),
+        )
+        .await
+        .unwrap();
+    reset.await.unwrap();
+    assert!(
+        client.transport.lock().await.session.is_some(),
+        "an already-consumed reset must not close the replacement session"
+    );
+    assert!(client.drain_subscription_events().await.unwrap().is_empty());
+}
+
+// Protocol mapping assertions compare the unchanged wire identity separately
+// from the private session ownership carried by all transport responses.
+fn wire_message(mut message: SubscribeControlPlaneOutput) -> SubscribeControlPlaneOutput {
+    match &mut message {
+        SubscribeControlPlaneOutput::RouteResolved {
+            subscription_id, ..
+        }
+        | SubscribeControlPlaneOutput::RouteUpdated {
+            subscription_id, ..
+        }
+        | SubscribeControlPlaneOutput::RouteInvalidated {
+            subscription_id, ..
+        } => {
+            assert!(
+                subscription_id.session().is_some(),
+                "transport ID must carry session ownership"
+            );
+            *subscription_id = SubscriptionId::new(subscription_id.as_str()).unwrap();
+        }
+        SubscribeControlPlaneOutput::RouteMiss { .. } => {}
+    }
+    message
+}
+
+#[tokio::test]
+async fn old_subscription_cleanup_cannot_remove_a_reused_id_on_a_replacement_stream() {
+    for create_cleanup_after_reconnect in [false, true] {
+        let service = FakeProxyControlPlane::default();
+        service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+            "old", "reused",
+        ))]));
+        service.push_subscribe_action(SubscribeAction::respond(vec![Ok(route_resolved_response(
+            "new", "reused",
+        ))]));
+        let mut client = test_client(service.clone());
+        let identity = http_identity("app.example.com", None);
+        let SubscribeControlPlaneOutput::RouteResolved {
+            subscription_id: old,
+            ..
+        } = client
+            .subscribe_route(route_request_id("old"), identity.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("old resolved")
+        };
+        // Hold the future entirely unpolled to force cleanup to acquire the
+        // transport lock only after B has replaced A and reused the wire ID.
+        let cleanup = (!create_cleanup_after_reconnect).then(|| client.unsubscribe(old.clone()));
+        client.reset_subscription().await.unwrap();
+        client.drain_subscription_events().await.unwrap();
+        let new_message = client
+            .subscribe_route(route_request_id("new"), identity.clone())
+            .await
+            .unwrap();
+        let SubscribeControlPlaneOutput::RouteResolved {
+            subscription_id: new,
+            ..
+        } = &new_message
+        else {
+            panic!("new resolved")
+        };
+        assert_eq!(old.as_str(), new.as_str());
+        assert_ne!(
+            old, *new,
+            "equal wire IDs from different sessions must not alias"
+        );
+        let new = new.clone();
+        let mut state = crate::SubscriptionState::new(4);
+        state.apply_resolved_response(identity.clone(), new_message, std::time::Instant::now());
+        cleanup
+            .unwrap_or_else(|| client.unsubscribe(old))
+            .await
+            .unwrap();
+        assert!(
+            client.unsubscribe(subscription_id("reused")).await.is_err(),
+            "raw IDs cannot target an unproven session"
+        );
+
+        // Ordered on B: a probe asks the fake authority to invalidate B's reused
+        // subscription. No cleanup for A may have appeared in B's request stream.
+        service.push_subscribe_action(SubscribeAction::respond(vec![
+            Ok(route_invalidated_response("reused")),
+            Ok(route_miss_response("probe")),
+        ]));
+        client
+            .subscribe_route(
+                route_request_id("probe"),
+                http_identity("missing.example.com", None),
+            )
+            .await
+            .unwrap();
+        let requests = service.wait_for_subscribe_requests(3).await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| matches!(
+            request.input,
+            Some(pb::proxy_subscribe_request::Input::SubscribeRoute(_))
+        )));
+        let events = client.drain_subscription_events().await.unwrap();
+        assert_eq!(events.len(), 1);
+        let crate::RouteSubscriptionEvent::Update(message) = events.into_iter().next().unwrap()
+        else {
+            panic!("invalidation")
+        };
+        assert!(
+            matches!(&*message, SubscribeControlPlaneOutput::RouteInvalidated { subscription_id, .. } if subscription_id == &new)
+        );
+        state.apply_control_plane_message(*message, std::time::Instant::now());
+        assert!(matches!(
+            state.cache().lookup(&identity, std::time::Instant::now()),
+            crate::CacheLookup::Absent
+        ));
+    }
 }

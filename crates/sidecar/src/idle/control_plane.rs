@@ -47,15 +47,21 @@ impl IdleDetector {
                     break;
                 };
                 let request = self.report_request();
+                let activity = activity.wait_for_update();
+                tokio::pin!(activity);
 
                 let response = tokio::select! {
                     response = client.report_idle(request.clone()) => Some(response),
-                    _ = activity.wait_for_update() => None,
+                    _ = &mut activity => None,
                 };
 
+                let mut retry_backoff = self.config.retry_backoff();
                 match response {
                     None => break,
                     Some(Ok(response)) => {
+                        if let ReportIdleResponse::RetryAfter { duration } = &response {
+                            retry_backoff = retry_backoff.max(*duration);
+                        }
                         let outcome = idle_report_outcome(&response);
                         self.record_idle_report(&request, outcome);
                         if idle_report_is_terminal(&response) {
@@ -68,9 +74,9 @@ impl IdleDetector {
                     }
                 }
 
-                if self
-                    .active_appeared_before(self.config.retry_backoff())
+                if tokio::time::timeout(retry_backoff, &mut activity)
                     .await
+                    .is_ok()
                 {
                     break;
                 }
@@ -106,6 +112,7 @@ fn idle_report_is_terminal(response: &ReportIdleResponse) -> bool {
 
 fn idle_report_outcome(response: &ReportIdleResponse) -> Outcome {
     match response {
+        ReportIdleResponse::RetryAfter { .. } => Outcome::Rejected,
         ReportIdleResponse::Accepted { .. } => Outcome::Success,
         ReportIdleResponse::AlreadyDraining { .. } => Outcome::AlreadyDraining,
         ReportIdleResponse::GenerationConflict { .. } | ReportIdleResponse::Unavailable { .. } => {
@@ -119,6 +126,7 @@ fn control_plane_idle_report_outcome(
     response: ReportIdleResponse,
 ) -> ControlPlaneIdleReportOutcome {
     match response {
+        ReportIdleResponse::RetryAfter { .. } => unreachable!("retry hints are nonterminal"),
         ReportIdleResponse::Accepted { .. } => ControlPlaneIdleReportOutcome::Accepted(request),
         ReportIdleResponse::AlreadyDraining { .. } => {
             ControlPlaneIdleReportOutcome::AlreadyDraining(request)
@@ -175,6 +183,120 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     struct TestReportError;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_during_the_response_poll_preserves_the_original_activity_revision() {
+        struct BurstClient {
+            drain: DrainTracker,
+            calls: Arc<Mutex<usize>>,
+            hint: bool,
+        }
+        impl ReportIdleClient for BurstClient {
+            type Error = TestReportError;
+            fn report_idle(
+                &mut self,
+                _: ReportIdleRequest,
+            ) -> ReportIdleFuture<'_, ReportIdleResponse, TestReportError> {
+                Box::pin(async move {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    if *calls == 1 {
+                        drop(self.drain.try_acquire().unwrap());
+                        if self.hint {
+                            Ok(ReportIdleResponse::RetryAfter {
+                                duration: RETRY_BACKOFF,
+                            })
+                        } else {
+                            Err(TestReportError)
+                        }
+                    } else {
+                        Ok(accepted_response())
+                    }
+                })
+            }
+        }
+        for hint in [false, true] {
+            let mut detector = detector_for(drain_tracker());
+            let calls = Arc::new(Mutex::new(0));
+            let mut client = BurstClient {
+                drain: detector.drain.clone(),
+                calls: calls.clone(),
+                hint,
+            };
+            let (_, ()) = tokio::join!(
+                detector.report_to_control_plane_when_idle(&mut client),
+                async {
+                    yield_now().await;
+                    advance(IDLE_TIMEOUT).await;
+                    assert_eq!(*calls.lock().unwrap(), 1);
+                    advance(IDLE_TIMEOUT - ONE_MILLISECOND).await;
+                    assert_eq!(
+                        *calls.lock().unwrap(),
+                        1,
+                        "a completed burst must reset to full idle, not retry backoff"
+                    );
+                    advance(ONE_MILLISECOND).await;
+                }
+            );
+            assert_eq!(*calls.lock().unwrap(), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_retry_hint_avoids_polling_and_activity_rearms_full_idle_interval() {
+        let drain = drain_tracker();
+        let mut detector = detector_for(drain.clone());
+        let mut client = FakeReportIdleClient::new([
+            Ok(ReportIdleResponse::RetryAfter {
+                duration: Duration::from_secs(190),
+            }),
+            Ok(accepted_response()),
+        ]);
+        let requests = client.requests();
+        let (_, ()) = tokio::join!(
+            detector.report_to_control_plane_when_idle(&mut client),
+            async {
+                yield_now().await;
+                advance(IDLE_TIMEOUT).await;
+                assert_recorded_count(&requests, 1);
+                advance(Duration::from_secs(100)).await;
+                assert_recorded_count(&requests, 1);
+                let permit = drain.try_acquire().unwrap();
+                yield_now().await;
+                advance(Duration::from_secs(200)).await;
+                assert_recorded_count(&requests, 1);
+                drop(permit);
+                yield_now().await;
+                advance(IDLE_TIMEOUT - ONE_MILLISECOND).await;
+                assert_recorded_count(&requests, 1);
+                advance(ONE_MILLISECOND).await;
+            }
+        );
+        assert_recorded_count(&requests, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_activation_retry_expires_finitely_without_traffic() {
+        let mut detector = detector_for(drain_tracker());
+        let mut client = FakeReportIdleClient::new([
+            Ok(ReportIdleResponse::RetryAfter {
+                duration: Duration::from_secs(190),
+            }),
+            Ok(accepted_response()),
+        ]);
+        let requests = client.requests();
+        let (_, ()) = tokio::join!(
+            detector.report_to_control_plane_when_idle(&mut client),
+            async {
+                yield_now().await;
+                advance(IDLE_TIMEOUT).await;
+                advance(Duration::from_secs(190) - ONE_MILLISECOND).await;
+                assert_recorded_count(&requests, 1);
+                advance(ONE_MILLISECOND).await;
+            }
+        );
+        assert_recorded_count(&requests, 2);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn accepted_marks_reported_and_is_idempotent() {

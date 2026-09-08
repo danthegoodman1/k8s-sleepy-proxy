@@ -1,4 +1,4 @@
-use control_plane::{
+use sleepypods_api::{
     BackendEndpoint, BackendGeneration, Generation, InstanceId, InstanceState, RouteBindingId,
     RouteEntry,
 };

@@ -1,17 +1,17 @@
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use control_plane::RouteIdentity;
 use proxy_core::observability::{
     metrics::{
         RUNTIME_CONTROL_PLANE_CALLS_TOTAL, RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
         RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
     },
     recorder::{
-        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityEvent, ObservabilityRecorder,
         EVENT_ROUTE_CACHE_LOOKUP, EVENT_SUBSCRIBE_STREAM,
     },
     Operation, Outcome,
 };
+use sleepypods_api::RouteIdentity;
 
 use crate::{
     matcher::rank_match, ApplyControlPlaneMessageOutcome, CacheInsertResult, CacheLookup,
@@ -29,16 +29,21 @@ pub trait RouteSubscriptionClient {
         &mut self,
         request_id: RouteRequestId,
         identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'_, SubscribeControlPlaneOutput, Self::Error>;
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error>;
 
     fn unsubscribe(
         &mut self,
         subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'_, (), Self::Error>;
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error>;
+
+    /// Discard a session when deferred cleanup cannot be delivered within bounds.
+    fn reset_subscription(&mut self) -> RouteSubscriptionFuture<'static, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn drain_subscription_events(
         &mut self,
-    ) -> RouteSubscriptionFuture<'_, Vec<RouteSubscriptionEvent>, Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, Vec<RouteSubscriptionEvent>, Self::Error> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -113,6 +118,10 @@ where
 impl<Client> Eq for FrontlineRouteResolver<Client> where Client: Eq {}
 
 impl<Client> FrontlineRouteResolver<Client> {
+    pub(crate) fn into_parts(self) -> (SubscriptionState, Client, ObservabilityRecorder) {
+        (self.state, self.client, self.observability)
+    }
+
     pub fn new(cache_capacity: usize, client: Client) -> Self {
         Self {
             state: SubscriptionState::new(cache_capacity),
@@ -214,70 +223,11 @@ where
             }
         };
 
-        match &message {
-            SubscribeControlPlaneOutput::RouteResolved {
-                request_id: actual, ..
-            }
-            | SubscribeControlPlaneOutput::RouteMiss {
-                request_id: actual, ..
-            } => {
-                if actual != &request_id {
-                    return Err(FrontlineRouteResolverError::Protocol(
-                        RouteResolverProtocolError::MismatchedRequestId {
-                            expected: request_id,
-                            actual: actual.clone(),
-                        },
-                    ));
-                }
-            }
-            SubscribeControlPlaneOutput::RouteUpdated { .. } => {
-                return Err(FrontlineRouteResolverError::Protocol(
-                    RouteResolverProtocolError::UnexpectedSubscribeResponse {
-                        kind: UnexpectedSubscribeResponseKind::RouteUpdated,
-                    },
-                ));
-            }
-            SubscribeControlPlaneOutput::RouteInvalidated { .. } => {
-                return Err(FrontlineRouteResolverError::Protocol(
-                    RouteResolverProtocolError::UnexpectedSubscribeResponse {
-                        kind: UnexpectedSubscribeResponseKind::RouteInvalidated,
-                    },
-                ));
-            }
-        }
+        validate_subscribe_response(&request_id, &identity, &message)?;
 
-        match &message {
-            SubscribeControlPlaneOutput::RouteResolved {
-                matched_identity, ..
-            } => {
-                if rank_match(&identity, matched_identity).is_none() {
-                    return Err(FrontlineRouteResolverError::Protocol(
-                        RouteResolverProtocolError::MismatchedResolvedIdentity {
-                            requested: identity,
-                            matched: matched_identity.clone(),
-                        },
-                    ));
-                }
-            }
-            SubscribeControlPlaneOutput::RouteMiss {
-                request_identity, ..
-            } => {
-                if request_identity != &identity {
-                    return Err(FrontlineRouteResolverError::Protocol(
-                        RouteResolverProtocolError::MismatchedMissIdentity {
-                            expected: identity,
-                            actual: request_identity.clone(),
-                        },
-                    ));
-                }
-            }
-            SubscribeControlPlaneOutput::RouteUpdated { .. }
-            | SubscribeControlPlaneOutput::RouteInvalidated { .. } => {
-                unreachable!("unexpected subscribe responses are rejected before validation")
-            }
-        }
-
-        let outcome = self.state.apply_control_plane_message(message, now);
+        let outcome = self
+            .state
+            .apply_resolved_response(identity.clone(), message, now);
         self.unsubscribe_outcome(&outcome).await?;
 
         match self.state.cache().lookup(&identity, now) {
@@ -328,12 +278,12 @@ where
         for event in events {
             match event {
                 RouteSubscriptionEvent::Update(message) => {
-                    self.record_subscribe_message(&message);
+                    record_subscribe_message(&self.observability, &message);
                     let outcome = self.state.apply_control_plane_message(*message, now);
                     self.unsubscribe_outcome(&outcome).await?;
                 }
                 RouteSubscriptionEvent::StreamClosed => {
-                    self.record_subscribe_stream_closed();
+                    record_subscribe_stream_closed(&self.observability);
                     self.state
                         .invalidate_active_subscriptions(InvalidationReason::StreamClosed, now);
                 }
@@ -385,26 +335,7 @@ where
     }
 
     fn record_cache_lookup(&self, lookup: &CacheLookup) {
-        let (outcome, fields) = match lookup {
-            CacheLookup::Hit(CacheLookupHit::Positive(entry)) => (
-                Outcome::Hit,
-                vec![
-                    LogField::subscription_id(entry.subscription_id.as_str()),
-                    LogField::route_id(entry.entry.route_binding_id.as_str()),
-                    LogField::instance_id(entry.entry.instance_id.as_str()),
-                    LogField::generation(entry.entry.instance_generation.get()),
-                ],
-            ),
-            CacheLookup::Hit(CacheLookupHit::Negative(_)) => (Outcome::Hit, Vec::new()),
-            CacheLookup::Expired | CacheLookup::Absent => (Outcome::Miss, Vec::new()),
-        };
-        self.observability.record_metric(MetricObservation::new(
-            RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
-            vec![outcome.metric_label()],
-            1.0,
-        ));
-        self.observability
-            .record_log(LifecycleLogEvent::new(EVENT_ROUTE_CACHE_LOOKUP, fields));
+        record_cache_lookup(&self.observability, lookup);
     }
 
     fn record_control_plane_call(&self, operation: Operation, outcome: Outcome) {
@@ -414,51 +345,150 @@ where
             1.0,
         ));
     }
+}
 
-    fn record_subscribe_message(&self, message: &SubscribeControlPlaneOutput) {
-        let (outcome, fields) = match message {
-            SubscribeControlPlaneOutput::RouteUpdated {
-                subscription_id,
-                entry,
-                ..
-            } => (
-                Outcome::Updated,
-                vec![
-                    LogField::subscription_id(subscription_id.as_str()),
-                    LogField::route_id(entry.route_binding_id.as_str()),
-                    LogField::instance_id(entry.instance_id.as_str()),
-                    LogField::generation(entry.instance_generation.get()),
-                ],
-            ),
-            SubscribeControlPlaneOutput::RouteInvalidated {
-                subscription_id, ..
-            } => (
-                Outcome::Invalidated,
-                vec![LogField::subscription_id(subscription_id.as_str())],
-            ),
-            SubscribeControlPlaneOutput::RouteResolved { .. }
-            | SubscribeControlPlaneOutput::RouteMiss { .. } => return,
+pub(crate) fn record_cache_lookup(observability: &ObservabilityRecorder, lookup: &CacheLookup) {
+    observability.record_lazy(|| {
+        let outcome = match lookup {
+            CacheLookup::Hit(_) => Outcome::Hit,
+            CacheLookup::Expired | CacheLookup::Absent => Outcome::Miss,
         };
-        self.observability.record_metric(MetricObservation::new(
-            RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+        ObservabilityEvent::Metric(MetricObservation::new(
+            RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
             vec![outcome.metric_label()],
             1.0,
-        ));
-        self.observability
-            .record_log(LifecycleLogEvent::new(EVENT_SUBSCRIBE_STREAM, fields));
+        ))
+    });
+    observability.record_lazy(|| {
+        let fields = match lookup {
+            CacheLookup::Hit(CacheLookupHit::Positive(entry)) => vec![
+                LogField::subscription_id(entry.subscription_id.as_str()),
+                LogField::route_id(entry.entry.route_binding_id.as_str()),
+                LogField::instance_id(entry.entry.instance_id.as_str()),
+                LogField::generation(entry.entry.instance_generation.get()),
+            ],
+            _ => Vec::new(),
+        };
+        ObservabilityEvent::Log(LifecycleLogEvent::new(EVENT_ROUTE_CACHE_LOOKUP, fields))
+    });
+}
+
+pub(crate) fn record_subscribe_message(
+    observability: &ObservabilityRecorder,
+    message: &SubscribeControlPlaneOutput,
+) {
+    let (outcome, fields) = match message {
+        SubscribeControlPlaneOutput::RouteUpdated {
+            subscription_id,
+            entry,
+            ..
+        } => (
+            Outcome::Updated,
+            vec![
+                LogField::subscription_id(subscription_id.as_str()),
+                LogField::route_id(entry.route_binding_id.as_str()),
+                LogField::instance_id(entry.instance_id.as_str()),
+                LogField::generation(entry.instance_generation.get()),
+            ],
+        ),
+        SubscribeControlPlaneOutput::RouteInvalidated {
+            subscription_id, ..
+        } => (
+            Outcome::Invalidated,
+            vec![LogField::subscription_id(subscription_id.as_str())],
+        ),
+        SubscribeControlPlaneOutput::RouteResolved { .. }
+        | SubscribeControlPlaneOutput::RouteMiss { .. } => return,
+    };
+    observability.record_metric(MetricObservation::new(
+        RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+        vec![outcome.metric_label()],
+        1.0,
+    ));
+    observability.record_log(LifecycleLogEvent::new(EVENT_SUBSCRIBE_STREAM, fields));
+}
+
+pub(crate) fn record_subscribe_stream_closed(observability: &ObservabilityRecorder) {
+    observability.record_metric(MetricObservation::new(
+        RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+        vec![Outcome::Closed.metric_label()],
+        1.0,
+    ));
+    observability.record_log(LifecycleLogEvent::new(
+        EVENT_SUBSCRIBE_STREAM,
+        vec![LogField::error_reason("response_stream_closed")],
+    ));
+}
+
+pub(crate) fn validate_subscribe_response<E>(
+    request_id: &RouteRequestId,
+    identity: &RouteIdentity,
+    message: &SubscribeControlPlaneOutput,
+) -> Result<(), FrontlineRouteResolverError<E>> {
+    match message {
+        SubscribeControlPlaneOutput::RouteResolved {
+            request_id: actual, ..
+        }
+        | SubscribeControlPlaneOutput::RouteMiss {
+            request_id: actual, ..
+        } => {
+            if actual != request_id {
+                return Err(FrontlineRouteResolverError::Protocol(
+                    RouteResolverProtocolError::MismatchedRequestId {
+                        expected: request_id.clone(),
+                        actual: actual.clone(),
+                    },
+                ));
+            }
+        }
+        SubscribeControlPlaneOutput::RouteUpdated { .. } => {
+            return Err(FrontlineRouteResolverError::Protocol(
+                RouteResolverProtocolError::UnexpectedSubscribeResponse {
+                    kind: UnexpectedSubscribeResponseKind::RouteUpdated,
+                },
+            ));
+        }
+        SubscribeControlPlaneOutput::RouteInvalidated { .. } => {
+            return Err(FrontlineRouteResolverError::Protocol(
+                RouteResolverProtocolError::UnexpectedSubscribeResponse {
+                    kind: UnexpectedSubscribeResponseKind::RouteInvalidated,
+                },
+            ));
+        }
     }
 
-    fn record_subscribe_stream_closed(&self) {
-        self.observability.record_metric(MetricObservation::new(
-            RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
-            vec![Outcome::Closed.metric_label()],
-            1.0,
-        ));
-        self.observability.record_log(LifecycleLogEvent::new(
-            EVENT_SUBSCRIBE_STREAM,
-            vec![LogField::error_reason("response_stream_closed")],
-        ));
+    match message {
+        SubscribeControlPlaneOutput::RouteResolved {
+            matched_identity, ..
+        } => {
+            if rank_match(identity, matched_identity).is_none() {
+                return Err(FrontlineRouteResolverError::Protocol(
+                    RouteResolverProtocolError::MismatchedResolvedIdentity {
+                        requested: identity.clone(),
+                        matched: matched_identity.clone(),
+                    },
+                ));
+            }
+        }
+        SubscribeControlPlaneOutput::RouteMiss {
+            request_identity, ..
+        } => {
+            if request_identity != identity {
+                return Err(FrontlineRouteResolverError::Protocol(
+                    RouteResolverProtocolError::MismatchedMissIdentity {
+                        expected: identity.clone(),
+                        actual: request_identity.clone(),
+                    },
+                ));
+            }
+        }
+        SubscribeControlPlaneOutput::RouteUpdated { .. }
+        | SubscribeControlPlaneOutput::RouteInvalidated { .. } => {
+            unreachable!("unexpected subscribe responses are rejected before validation")
+        }
     }
+
+    Ok(())
 }
 
 impl<ClientError> fmt::Display for FrontlineRouteResolverError<ClientError>

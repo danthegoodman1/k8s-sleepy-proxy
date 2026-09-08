@@ -1,16 +1,11 @@
+pub use sleepypods_api::InstanceState;
+
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
     ids::{Generation, IdempotencyKey, InstanceId},
-    materialization::{
-        LoadActiveMaterializationRequest, MaterializationRecord, MaterializationState,
-        MaterializationTarget,
-    },
-    materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     route::{RouteBindingRecord, RouteBindingSpec},
     sleep_policy::SleepPolicyError,
-    store::{ControlPlaneStore, StoreError},
     workload::{ValueSchemaError, WorkloadClassVersion, WorkloadClassVersionRef},
 };
 
@@ -23,17 +18,6 @@ pub struct InstanceRecord {
     pub values: InstanceValues,
     pub state: InstanceState,
     pub generation: Generation,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum InstanceState {
-    Cold,
-    Waking,
-    Running,
-    Draining,
-    Failed,
-    Deleting,
-    Deleted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +39,12 @@ pub struct CreateInstanceResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetInstanceRequest {
     pub instance_id: InstanceId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestInstanceDeletion {
+    pub instance_id: InstanceId,
+    pub expected_generation: Generation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +194,9 @@ impl CreateInstanceRequest {
         mut self,
         workload_class: &WorkloadClassVersion,
     ) -> Result<Self, CreateInstanceValidationError> {
+        workload_class
+            .validate()
+            .map_err(CreateInstanceValidationError::WorkloadClass)?;
         self.values = workload_class.value_schema.validate_values(&self.values)?;
         workload_class.sleep_policy.resolve(&self.values)?;
         Ok(self)
@@ -212,91 +205,15 @@ impl CreateInstanceRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateInstanceValidationError {
+    WorkloadClass(crate::workload::WorkloadClassValidationError),
     ValueSchema(ValueSchemaError),
     SleepPolicy(SleepPolicyError),
-}
-
-#[derive(Debug)]
-pub enum DeleteInstanceError {
-    Projection {
-        instance_id: InstanceId,
-        source: ProjectionError,
-    },
-    Store(StoreError),
-}
-
-pub async fn delete_instance<S, C>(
-    store: &S,
-    materializer: &KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-    request: DeleteInstanceRequest,
-) -> Result<bool, DeleteInstanceError>
-where
-    S: ControlPlaneStore + ?Sized,
-    C: KubernetesMaterializerClient,
-{
-    let Some(current) = store
-        .get_instance(GetInstanceRequest::new(request.instance_id.clone()))
-        .await
-        .map_err(DeleteInstanceError::Store)?
-    else {
-        return Ok(false);
-    };
-
-    let deleting = if current.state == InstanceState::Deleting {
-        current
-    } else {
-        store
-            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                request.instance_id.clone(),
-                current.generation,
-                InstanceState::Deleting,
-                StateTransitionReason::DeleteRequested,
-            ))
-            .await
-            .map_err(DeleteInstanceError::Store)?
-    };
-
-    let materialization = store
-        .load_active_materialization(LoadActiveMaterializationRequest::new(
-            request.instance_id.clone(),
-            target,
-        ))
-        .await
-        .map_err(DeleteInstanceError::Store)?;
-
-    if let Some(materialization) = materialization.as_ref() {
-        let cleanup_materialization =
-            projected_recorded_ref_materialization_for_cleanup(materialization);
-        let plan = ProjectionPlan::from_recorded_refs(&cleanup_materialization);
-        ProjectionReconciler::new(materializer)
-            .delete_owned(&plan)
-            .await
-            .map_err(|source| DeleteInstanceError::Projection {
-                instance_id: request.instance_id.clone(),
-                source,
-            })?;
-    }
-
-    store
-        .delete_instance(DeleteInstanceRequest::new(deleting.id))
-        .await
-        .map_err(DeleteInstanceError::Store)
-}
-
-fn projected_recorded_ref_materialization_for_cleanup(
-    materialization: &MaterializationRecord,
-) -> MaterializationRecord {
-    let mut projected = materialization.clone();
-    if materialization.state == MaterializationState::Pending {
-        projected.instance_generation = materialization.instance_generation.next();
-    }
-    projected
 }
 
 impl fmt::Display for CreateInstanceValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WorkloadClass(error) => error.fmt(f),
             Self::ValueSchema(error) => error.fmt(f),
             Self::SleepPolicy(error) => error.fmt(f),
         }
@@ -314,31 +231,6 @@ impl From<ValueSchemaError> for CreateInstanceValidationError {
 impl From<SleepPolicyError> for CreateInstanceValidationError {
     fn from(error: SleepPolicyError) -> Self {
         Self::SleepPolicy(error)
-    }
-}
-
-impl fmt::Display for DeleteInstanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Projection {
-                instance_id,
-                source,
-            } => write!(
-                f,
-                "Kubernetes projection cleanup failed for instance {}: {source}",
-                instance_id.as_str()
-            ),
-            Self::Store(error) => error.fmt(f),
-        }
-    }
-}
-
-impl Error for DeleteInstanceError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Projection { source, .. } => Some(source),
-            Self::Store(error) => Some(error),
-        }
     }
 }
 
@@ -410,6 +302,39 @@ mod tests {
             validated.values,
             values([("image", "example/app:1"), ("tenant", "acme")])
         );
+    }
+
+    #[test]
+    fn replica_contract_rejects_zero_and_multiple_replicas_at_class_validation() {
+        for kind in [
+            crate::manifest::WorkloadKind::Deployment,
+            crate::manifest::WorkloadKind::StatefulSet,
+        ] {
+            for replicas in [0, 2] {
+                let mut class = workload_class(WorkloadValueSchema::new(true));
+                class.template.workload.kind = kind;
+                class.template.workload.replicas = Some(replicas);
+                assert!(
+                    class.validate().is_err(),
+                    "{kind:?} replicas={replicas} must fail class validation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replica_contract_rejects_instances_pinned_to_legacy_invalid_classes() {
+        for kind in [
+            crate::manifest::WorkloadKind::Deployment,
+            crate::manifest::WorkloadKind::StatefulSet,
+        ] {
+            for replicas in [0, 2] {
+                let mut class = workload_class(WorkloadValueSchema::new(true));
+                class.template.workload.kind = kind;
+                class.template.workload.replicas = Some(replicas);
+                assert!(create_request().validate_values_against(&class).is_err());
+            }
+        }
     }
 
     #[test]

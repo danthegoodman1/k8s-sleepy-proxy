@@ -9,7 +9,9 @@ keep_namespace="${SLEEPYPODS_KIND_E2E_KEEP_NAMESPACE:-0}"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-kind-e2e-restart}"
 app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/routing-app:${image_tag}}"
-late_app_image="${SLEEPYPODS_KIND_E2E_LATE_APP_IMAGE:-${image_prefix}/routing-app-late:${image_tag}}"
+# Each invocation needs a genuinely absent image, including the second HA run
+# against a retained cluster whose node already has the previous late image.
+late_app_image="${SLEEPYPODS_KIND_E2E_LATE_APP_IMAGE:-${image_prefix}/routing-app-late:${image_tag}-$(date +%s)-$$}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19751}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19780}"
@@ -230,11 +232,17 @@ metadata:
     sleepypods.io/kind-e2e: restart
 rules:
   - apiGroups: [""]
-    resources: ["services"]
+    resources: ["services", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]

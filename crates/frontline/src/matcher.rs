@@ -1,4 +1,4 @@
-use control_plane::{RouteEntry, RouteHost, RouteHostKind, RouteIdentity};
+use sleepypods_api::{RouteEntry, RouteHost, RouteHostKind, RouteIdentity};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteRule {
@@ -151,7 +151,7 @@ fn path_prefix_matches(request_path: &str, rule_path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use control_plane::{PathPrefix, RouteHost, RouteIdentity};
+    use sleepypods_api::{PathPrefix, RouteHost, RouteIdentity};
 
     use super::{path_prefix_matches, RouteMatcher, RouteRule};
     use crate::subscription::tests::route_entry;

@@ -526,16 +526,19 @@ async fn assert_http01_flow(
     {
         return Err("expired HTTP-01 challenge key authorization was still served".into());
     }
-    let expired = operator
-        .expire_http01_challenges(ExpireHttp01ChallengesRequest {
-            now_unix_millis: unix_millis(SystemTime::now())?,
-            limit: Some(10),
+    // The background wall-clock sweep may already have physically removed
+    // this naturally expired row. Either delete result is valid after the
+    // unchanged frontend 404/no-key-authorization proof above.
+    operator
+        .delete_http01_challenge(DeleteHttp01ChallengeRequest {
+            key: Some(http01_key(EXACT_HOST, HTTP01_EXPIRING_TOKEN)),
         })
-        .await?
-        .into_inner();
-    if expired.expired < 1 {
-        return Err("expected ExpireHttp01Challenges to delete the expired challenge".into());
-    }
+        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        assert_manual_http01_expiry(operator),
+    )
+    .await??;
 
     wait_for_instance_response(
         config,
@@ -547,6 +550,83 @@ async fn assert_http01_flow(
     )
     .await?;
 
+    Ok(())
+}
+
+async fn assert_manual_http01_expiry(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+) -> TestResult<()> {
+    let target = "routing-manual-expiry-token";
+    let sentinel = "routing-later-expiry-token";
+    let now = SystemTime::now();
+    // This whole phase is bounded to 30s. Background wall-clock GC cannot
+    // preempt these future records; only the explicit RPC cutoff reaches them.
+    let target_expiry = now + Duration::from_secs(3_600);
+    for (token, expiry) in [
+        (target, target_expiry),
+        (sentinel, now + Duration::from_secs(7_200)),
+    ] {
+        put_http01_challenge(operator, EXACT_HOST, token, token, expiry).await?;
+        assert_operator_http01_value(operator, token, Some(token)).await?;
+    }
+    let request = ExpireHttp01ChallengesRequest {
+        now_unix_millis: unix_millis(target_expiry)?,
+        limit: Some(1),
+    };
+    let expired = operator
+        .expire_http01_challenges(request)
+        .await?
+        .into_inner();
+    if expired.expired != 1 {
+        return Err(format!(
+            "manual expiry must delete exactly its future target, got {}",
+            expired.expired
+        )
+        .into());
+    }
+    assert_operator_http01_value(operator, target, None).await?;
+    assert_operator_http01_value(operator, sentinel, Some(sentinel)).await?;
+    let repeated = operator
+        .expire_http01_challenges(request)
+        .await?
+        .into_inner();
+    if repeated.expired != 0 {
+        return Err("repeated manual expiry must be idempotent at the same cutoff".into());
+    }
+    let deleted = operator
+        .delete_http01_challenge(DeleteHttp01ChallengeRequest {
+            key: Some(http01_key(EXACT_HOST, sentinel)),
+        })
+        .await?
+        .into_inner();
+    if !deleted.deleted {
+        return Err("later sentinel must survive manual expiry until explicit cleanup".into());
+    }
+    assert_operator_http01_value(operator, sentinel, None).await
+}
+
+async fn assert_operator_http01_value(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    token: &str,
+    expected: Option<&str>,
+) -> TestResult<()> {
+    let challenge = operator
+        .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
+            key: Some(http01_key(EXACT_HOST, token)),
+        })
+        .await?
+        .into_inner()
+        .challenge;
+    if challenge
+        .as_ref()
+        .map(|record| record.key_authorization.as_str())
+        != expected
+    {
+        return Err(format!(
+            "unexpected operator HTTP-01 value for exact token {token}: {challenge:?}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -840,7 +920,15 @@ fn challenge_path(token: &str) -> String {
 }
 
 fn workload_name(target: &str) -> String {
-    format!("e2e-routing-{target}")
+    // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
+    let suffix = match target {
+        "exact" => "b735c72f",
+        "wildcard" => "989d17dd",
+        "path-api" => "23d08b63",
+        "path-root" => "8556a630",
+        _ => panic!("unknown fixture target {target}"),
+    };
+    format!("e2e-routing-{target}-{suffix}")
 }
 
 fn unix_millis(time: SystemTime) -> TestResult<i64> {

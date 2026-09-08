@@ -1,7 +1,6 @@
 use std::{convert::Infallible, time::Duration};
 
 use bytes::Bytes;
-use control_plane::{BackendEndpoint, BackendGeneration, Generation, InstanceId};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::{channel::Channel, BodyExt, Empty, Full};
@@ -12,6 +11,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use proxy_core::DrainTracker;
+use sleepypods_api::{BackendEndpoint, BackendGeneration, Generation, InstanceId};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_tungstenite::{
     accept_hdr_async, connect_async,

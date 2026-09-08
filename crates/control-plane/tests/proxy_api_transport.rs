@@ -1,3 +1,9 @@
+#[macro_use]
+#[path = "support/unexpected_store.rs"]
+mod unexpected_store;
+mod support;
+use support::TestStore as FakeWakeStore;
+
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -26,13 +32,13 @@ use control_plane::api::{
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
-    rendered_object_ref, AuthConfig, BackendEndpoint, BackendGeneration, CachePolicy, CallerRole,
-    CompleteWakeResult, ControlPlaneAuth, ControlPlaneStore, CreateInstanceResult, Generation,
-    InstanceId, InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientError,
-    KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
-    KubernetesMaterializerClient, MaterializationId, MaterializationRecord, MaterializationState,
-    MaterializationTarget, PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost,
-    RouteIdentity, RouteResolution, StaticBearerTokens, StoreError, StoreFuture, StoreResult,
+    rendered_object_ref, AuthConfig, BackendEndpoint, BackendGeneration, CallerRole,
+    ControlPlaneAuth, ControlPlaneStore, Generation, InstanceId, InstanceRecord,
+    InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
+    KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
+    MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
+    PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    StaticBearerTokens,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -119,7 +125,7 @@ fn generated_api_contains_proxy_wake_shape_without_operator_surface_change() {
 }
 
 #[tokio::test]
-async fn proxy_wake_cold_instance_returns_ready_backend() {
+async fn proxy_wake_cold_instance_accepts_before_driver_publishes_ready_backend() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_instance(domain_instance(
         "instance-cold",
@@ -128,7 +134,7 @@ async fn proxy_wake_cold_instance_returns_ready_backend() {
     ));
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
-    let service = proxy_api(store, client.clone());
+    let service = proxy_api(store.clone(), client.clone());
 
     let response = service
         .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
@@ -140,7 +146,21 @@ async fn proxy_wake_cold_instance_returns_ready_backend() {
         .expect("cold wake succeeds")
         .into_inner();
 
-    let ready = expect_ready(response);
+    let accepted = expect_accepted(response);
+    assert_eq!(accepted.instance_generation, 2);
+    assert_eq!(client.applied_objects_len(), 0);
+    reconcile_proxy_work(store, client.clone(), RouteSubscriptionBroker::new()).await;
+    let ready = expect_ready(
+        service
+            .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
+                instance_id: "instance-cold".to_owned(),
+                expected_generation: 3,
+                backend_generation: None,
+            }))
+            .await
+            .expect("completed wake is queryable")
+            .into_inner(),
+    );
     assert_eq!(ready.instance_id, "instance-cold");
     assert_eq!(ready.instance_generation, 3);
     assert_eq!(
@@ -162,20 +182,20 @@ async fn proxy_wake_unowned_live_ref_blocks_apply() {
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
     client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-51c842a3"));
-    let service = proxy_api(store, client.clone());
+    let service = proxy_api(store.clone(), client.clone());
 
-    let error = service
+    let response = service
         .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
             instance_id: "instance-unowned".to_owned(),
             expected_generation: 1,
             backend_generation: None,
         }))
         .await
-        .expect_err("unowned live ref blocks proxy wake");
+        .expect("wake intent is accepted before Kubernetes inspection")
+        .into_inner();
 
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("projection failed"));
-    assert!(error.message().contains("ownership conflict"));
+    expect_accepted(response);
+    reconcile_proxy_work(store, client.clone(), RouteSubscriptionBroker::new()).await;
     assert_eq!(client.applied_objects_len(), 0);
 }
 
@@ -221,13 +241,12 @@ async fn native_grpc_request_dispatches_to_store_backed_proxy_wake_instance() {
 
     assert_eq!(status, "0");
 
-    let ready = expect_ready(decode_grpc_proxy_wake_response(
+    let accepted = expect_accepted(decode_grpc_proxy_wake_response(
         collected.to_bytes().as_ref(),
     ));
-    assert_eq!(ready.instance_id, "instance-transport");
-    assert_eq!(ready.instance_generation, 3);
-    assert_eq!(ready.backend_generation, 55);
-    assert_eq!(client.applied_objects_len(), 2);
+    assert_eq!(accepted.instance_id, "instance-transport");
+    assert_eq!(accepted.instance_generation, 2);
+    assert_eq!(client.applied_objects_len(), 0);
 }
 
 #[tokio::test]
@@ -317,12 +336,11 @@ async fn native_grpc_proxy_auth_accepts_valid_wake_credentials() {
         .expect("native response body should collect");
     let trailers = collected.trailers().cloned();
     assert_eq!(grpc_status(&headers, trailers.as_ref()), "0");
-    let ready = expect_ready(decode_grpc_proxy_wake_response(
+    let accepted = expect_accepted(decode_grpc_proxy_wake_response(
         collected.to_bytes().as_ref(),
     ));
-    assert_eq!(ready.instance_id, "instance-auth-valid");
-    assert_eq!(ready.backend_generation, 56);
-    assert_eq!(client.applied_objects_len(), 2);
+    assert_eq!(accepted.instance_id, "instance-auth-valid");
+    assert_eq!(client.applied_objects_len(), 0);
 }
 
 #[tokio::test]
@@ -499,9 +517,7 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
     );
     assert_eq!(
         resolved.cache_policy,
-        Some(ProxyCachePolicy {
-            ttl_millis: 300_000
-        })
+        Some(ProxyCachePolicy { ttl_millis: 10_000 })
     );
 }
 
@@ -530,6 +546,35 @@ async fn proxy_subscribe_publishes_backend_only_from_ready_materialization_for_t
     assert_eq!(
         route.backend_uri,
         Some("http://svc-acme.apps.svc.cluster.local:80".to_owned())
+    );
+    assert_eq!(route.backend_generation, Some(7));
+}
+
+#[tokio::test]
+async fn proxy_subscribe_preserves_the_resolver_snapshot_without_a_second_backend_read() {
+    let store = Arc::new(FakeWakeStore::failing_ready_lookup());
+    store.seed_route_resolved(
+        domain_http_identity("snapshot.example.com", None),
+        domain_route_entry(
+            "route-snapshot",
+            "instance-snapshot",
+            DomainInstanceState::Running,
+        ),
+    );
+    store.seed_ready_materialization(ready_materialization("instance-snapshot", 7));
+
+    let resolved = subscribe_resolved_route(
+        store,
+        "request-snapshot",
+        proto_http_identity(RouteHostKind::Exact, "snapshot.example.com", None),
+        proxy_target(),
+    )
+    .await;
+
+    let route = resolved.route.expect("snapshot route entry is returned");
+    assert_eq!(
+        route.backend_uri.as_deref(),
+        Some("http://svc-acme.apps.svc.cluster.local:80")
     );
     assert_eq!(route.backend_generation, Some(7));
 }
@@ -800,6 +845,7 @@ async fn sidecar_report_idle_accepted_invalidates_active_proxy_subscription() {
     // proxies before cleanup relies on cache expiry.
     let response = sidecar
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-idle-active".to_owned(),
             expected_generation: 7,
             active_count: 0,
@@ -838,7 +884,7 @@ async fn proxy_wake_completion_invalidates_active_proxy_subscription() {
             DomainInstanceState::Cold,
         ),
     );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker);
+    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
     let (requests, request_stream) = tokio::sync::mpsc::channel(4);
     let mut responses = proxy
         .subscribe(ReceiverStream::new(request_stream))
@@ -870,7 +916,8 @@ async fn proxy_wake_completion_invalidates_active_proxy_subscription() {
         .await
         .expect("proxy wake succeeds")
         .into_inner();
-    expect_ready(response);
+    expect_accepted(response);
+    reconcile_proxy_work(store, FakeKubernetesClient::default(), broker).await;
 
     let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
     assert_eq!(invalidated.subscription_id, resolved.subscription_id);
@@ -930,18 +977,19 @@ async fn operator_delete_instance_invalidates_active_proxy_subscription() {
         .delete_instance(tonic::Request::new(
             control_plane::api::pb::DeleteInstanceRequest {
                 instance_id: "instance-delete-route-active".to_owned(),
+                expected_generation: Some(7),
             },
         ))
         .await
         .expect("operator delete instance succeeds")
         .into_inner();
-    assert!(deleted.deleted);
+    assert!(deleted.accepted);
 
     let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
     assert_eq!(invalidated.subscription_id, resolved.subscription_id);
     assert_eq!(
         invalidated.reason,
-        ProxyRouteInvalidationReason::RouteRemoved as i32
+        ProxyRouteInvalidationReason::RouteChanged as i32
     );
 }
 
@@ -1355,35 +1403,49 @@ async fn proxy_wake_already_running_returns_ready_backend_without_apply() {
 }
 
 #[tokio::test]
-async fn proxy_wake_after_restart_resumes_waking_generation() {
+async fn accepted_proxy_wake_survives_api_drop_and_completes_in_fresh_driver() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_instance(domain_instance(
         "instance-waking",
-        DomainInstanceState::Waking,
-        6,
+        DomainInstanceState::Cold,
+        5,
     ));
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
-    let service = proxy_api(store, client.clone());
+    let service = proxy_api(store.clone(), client.clone());
 
     let response = service
         .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
             instance_id: "instance-waking".to_owned(),
-            expected_generation: 6,
+            expected_generation: 5,
             backend_generation: None,
         }))
         .await
         .expect("already-waking wake succeeds")
         .into_inner();
 
-    let ready = expect_ready(response);
-    assert_eq!(ready.instance_id, "instance-waking");
-    assert_eq!(ready.instance_generation, 7);
-    assert_eq!(
-        ready.backend_uri,
-        "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
-    );
-    assert_eq!(ready.backend_generation, 6);
+    assert_eq!(expect_accepted(response).instance_generation, 6);
+    assert_eq!(client.applied_objects_len(), 0);
+    drop(service);
+    reconcile_proxy_work(
+        store.clone(),
+        client.clone(),
+        RouteSubscriptionBroker::new(),
+    )
+    .await;
+    let ready = store
+        .load_ready_materialization(
+            control_plane::materialization::LoadReadyMaterializationRequest::new(
+                InstanceId::new("instance-waking").unwrap(),
+                Generation::new(7),
+                proxy_target(),
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("fresh driver completed accepted work");
+    assert_eq!(ready.projection_generation, Generation::new(7));
+    assert_eq!(ready.backend_generation, BackendGeneration::new(6));
     assert_eq!(client.applied_objects_len(), 2);
 }
 
@@ -1497,7 +1559,7 @@ async fn proxy_wake_render_failure_returns_transport_error() {
 }
 
 #[tokio::test]
-async fn proxy_wake_projection_failure_returns_transport_error() {
+async fn accepted_proxy_wake_remains_recoverable_when_readiness_fails() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_instance(domain_instance(
         "instance-projection-failure",
@@ -1505,19 +1567,315 @@ async fn proxy_wake_projection_failure_returns_transport_error() {
         1,
     ));
     store.seed_workload_class(domain_workload_class());
-    let service = proxy_api(store, FakeKubernetesClient::failing_readiness());
+    let client = FakeKubernetesClient::failing_readiness();
+    let service = proxy_api(store.clone(), client.clone());
 
-    let error = service
+    let response = service
         .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
             instance_id: "instance-projection-failure".to_owned(),
             expected_generation: 1,
             backend_generation: None,
         }))
         .await
-        .expect_err("projection failure is a transport error");
+        .expect("acceptance does not wait for readiness")
+        .into_inner();
 
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("projection failed"));
+    expect_accepted(response);
+    assert_eq!(client.applied_objects_len(), 0);
+    reconcile_proxy_work(store.clone(), client, RouteSubscriptionBroker::new()).await;
+    let records = store.materializations();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, MaterializationState::Pending);
+    assert!(records[0].backend.is_none());
+}
+
+#[tokio::test]
+async fn subscriptions_bound_streams_entries_expiry_and_recover() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("bounded.example.com", None),
+        domain_route_entry(
+            "bounded-route",
+            "bounded-instance",
+            DomainInstanceState::Running,
+        ),
+    );
+    let broker = RouteSubscriptionBroker::with_limits(control_plane::api::admission::ApiLimits {
+        subscription_streams: 1,
+        subscriptions_per_stream: 1,
+        subscription_lifetime: Duration::from_millis(80),
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
+    let (requests, incoming) = tokio::sync::mpsc::channel(4);
+    let mut stream = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap()
+        .into_inner();
+    let (_other, incoming) = tokio::sync::mpsc::channel(1);
+    let error = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    requests
+        .send(subscribe_route_request(
+            "first",
+            proto_http_identity(RouteHostKind::Exact, "bounded.example.com", None),
+        ))
+        .await
+        .unwrap();
+    expect_route_resolved(next_subscribe_response(&mut stream).await);
+    requests
+        .send(subscribe_route_request(
+            "second",
+            proto_http_identity(RouteHostKind::Exact, "bounded.example.com", None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stream.message().await.unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        store.resolve_route_requests(),
+        1,
+        "entry cap precedes lookup"
+    );
+    drop(stream);
+    drop(requests);
+    tokio::task::yield_now().await;
+    let (requests, incoming) = tokio::sync::mpsc::channel(1);
+    let mut expired = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), expired.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    drop(expired);
+    drop(requests);
+    tokio::task::yield_now().await;
+    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+    let recovered = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap();
+    drop(recovered);
+}
+
+#[tokio::test]
+async fn oversized_subscription_identity_is_rejected_before_lookup() {
+    let store = Arc::new(FakeWakeStore::default());
+    let mut proxy = proxy_client_with_route_events(store.clone(), RouteSubscriptionBroker::new());
+    let (requests, incoming) = tokio::sync::mpsc::channel(1);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap()
+        .into_inner();
+    requests
+        .send(subscribe_route_request(
+            "oversized",
+            proto_http_identity(RouteHostKind::Exact, &"a".repeat(254), None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        responses.message().await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(store.resolve_route_requests(), 0);
+}
+
+#[tokio::test]
+async fn unrelated_instance_churn_preserves_the_hot_subscription() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("hot.example.com", None),
+        domain_route_entry("hot-route", "hot-instance", DomainInstanceState::Running),
+    );
+    let broker = RouteSubscriptionBroker::new();
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
+    let (requests, incoming) = tokio::sync::mpsc::channel(1);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap()
+        .into_inner();
+    requests
+        .send(subscribe_route_request(
+            "hot",
+            proto_http_identity(RouteHostKind::Exact, "hot.example.com", None),
+        ))
+        .await
+        .unwrap();
+    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    for index in 0..100 {
+        broker.notify_instance_changed(InstanceId::new(format!("unrelated-{index}")).unwrap());
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), responses.message())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.resolve_route_requests(), 1);
+    broker.notify_instance_changed(InstanceId::new("hot-instance").unwrap());
+    assert_eq!(
+        expect_route_invalidated(next_subscribe_response(&mut responses).await).subscription_id,
+        resolved.subscription_id
+    );
+}
+
+#[tokio::test]
+async fn subscription_registers_before_slow_snapshot_and_replays_the_concurrent_change() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("snapshot.example.com", None),
+        domain_route_entry(
+            "snapshot-route",
+            "snapshot-instance",
+            DomainInstanceState::Cold,
+        ),
+    );
+    let gate = Arc::new(tokio::sync::Notify::new());
+    store.set_resolve_gate(gate.clone());
+    let broker = RouteSubscriptionBroker::new();
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
+    let (requests, incoming) = tokio::sync::mpsc::channel(1);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap()
+        .into_inner();
+    requests
+        .send(subscribe_route_request(
+            "snapshot",
+            proto_http_identity(RouteHostKind::Exact, "snapshot.example.com", None),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while store.resolve_route_requests() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    broker.notify_instance_changed(InstanceId::new("snapshot-instance").unwrap());
+    gate.notify_one();
+    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
+    assert_eq!(resolved.subscription_id, invalidated.subscription_id);
+    assert_eq!(store.resolve_route_requests(), 1);
+}
+
+#[tokio::test]
+async fn slow_subscription_lookup_expires_and_releases_owned_capacity() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.set_resolve_gate(Arc::new(tokio::sync::Notify::new()));
+    let broker = RouteSubscriptionBroker::with_limits(control_plane::api::admission::ApiLimits {
+        subscription_streams: 1,
+        lookup_timeout: Duration::from_millis(30),
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
+    let (requests, incoming) = tokio::sync::mpsc::channel(1);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap()
+        .into_inner();
+    requests
+        .send(subscribe_route_request(
+            "slow",
+            proto_http_identity(RouteHostKind::Exact, "slow.example.com", None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), responses.message())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        tonic::Code::DeadlineExceeded
+    );
+    drop(responses);
+    drop(requests);
+    tokio::task::yield_now().await;
+    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+    drop(
+        proxy
+            .subscribe(ReceiverStream::new(incoming))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(store.resolve_route_requests(), 1);
+}
+
+#[tokio::test]
+async fn unconsumed_subscription_output_stops_production_and_recovers_on_drop() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        domain_http_identity("blocked.example.com", None),
+        domain_route_entry(
+            "blocked-route",
+            "blocked-instance",
+            DomainInstanceState::Cold,
+        ),
+    );
+    let broker = RouteSubscriptionBroker::with_limits(control_plane::api::admission::ApiLimits {
+        subscription_streams: 1,
+        response_timeout: Duration::from_millis(30),
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
+    let (requests, incoming) = tokio::sync::mpsc::channel(64);
+    let responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .unwrap();
+    for n in 0..64 {
+        requests
+            .send(subscribe_route_request(
+                &format!("blocked-{n}"),
+                proto_http_identity(RouteHostKind::Exact, "blocked.example.com", None),
+            ))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let count = store.resolve_route_requests();
+    assert!(
+        count <= 18 && count > 0,
+        "bounded output must stop lookups: {count}"
+    );
+    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+    assert_eq!(
+        proxy
+            .subscribe(ReceiverStream::new(incoming))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    drop(responses);
+    drop(requests);
+    tokio::task::yield_now().await;
+    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+    drop(
+        proxy
+            .subscribe(ReceiverStream::new(incoming))
+            .await
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -1817,85 +2175,6 @@ where
     }
 }
 
-#[derive(Default)]
-struct FakeWakeStore {
-    instance: Mutex<Option<InstanceRecord>>,
-    workload_class: Mutex<Option<control_plane::WorkloadClassVersion>>,
-    materializations: Mutex<Vec<MaterializationRecord>>,
-    route_resolution: Mutex<Option<FakeRouteResolution>>,
-    resolve_route_requests: Mutex<usize>,
-}
-
-impl FakeWakeStore {
-    fn seed_instance(&self, instance: InstanceRecord) {
-        *self.instance.lock().expect("fake store lock is available") = Some(instance);
-    }
-
-    fn seed_workload_class(&self, workload_class: control_plane::WorkloadClassVersion) {
-        *self
-            .workload_class
-            .lock()
-            .expect("fake store lock is available") = Some(workload_class);
-    }
-
-    fn seed_ready_materialization(&self, materialization: MaterializationRecord) {
-        self.seed_materialization(materialization);
-    }
-
-    fn seed_materialization(&self, materialization: MaterializationRecord) {
-        self.materializations
-            .lock()
-            .expect("fake store lock is available")
-            .push(materialization);
-    }
-
-    fn seed_route_resolved(&self, matched_identity: RouteIdentity, entry: RouteEntry) {
-        *self
-            .route_resolution
-            .lock()
-            .expect("fake store lock is available") = Some(FakeRouteResolution::Resolved {
-            matched_identity,
-            entry,
-        });
-    }
-
-    fn seed_route_miss(&self, ttl: Duration) {
-        *self
-            .route_resolution
-            .lock()
-            .expect("fake store lock is available") = Some(FakeRouteResolution::Miss {
-            negative_cache: CachePolicy::new(ttl),
-        });
-    }
-
-    fn seed_route_error_unavailable(&self, message: &str) {
-        *self
-            .route_resolution
-            .lock()
-            .expect("fake store lock is available") =
-            Some(FakeRouteResolution::Unavailable(message.to_owned()));
-    }
-
-    fn resolve_route_requests(&self) -> usize {
-        *self
-            .resolve_route_requests
-            .lock()
-            .expect("fake store lock is available")
-    }
-}
-
-#[derive(Clone, Debug)]
-enum FakeRouteResolution {
-    Resolved {
-        matched_identity: RouteIdentity,
-        entry: RouteEntry,
-    },
-    Miss {
-        negative_cache: CachePolicy,
-    },
-    Unavailable(String),
-}
-
 #[derive(Clone, Debug, Default)]
 struct FakeKubernetesClient {
     applied_objects: Arc<Mutex<Vec<control_plane::KubernetesObject>>>,
@@ -1926,6 +2205,11 @@ impl FakeKubernetesClient {
             .insert(
                 object_key(&object),
                 ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    persistent_volume_reclaim_policy: Some("Retain".into()),
+                    identity: control_plane::projection::LiveObjectIdentity {
+                        uid: "test-uid".into(),
+                        resource_version: "1".into(),
+                    },
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     deleting: false,
@@ -1942,426 +2226,25 @@ fn object_key(object: &RenderedObjectRef) -> String {
     )
 }
 
-impl ControlPlaneStore for FakeWakeStore {
-    fn create_instance<'a>(
-        &'a self,
-        _request: control_plane::CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn get_instance<'a>(
-        &'a self,
-        request: control_plane::GetInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .instance
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .filter(|instance| instance.id == request.instance_id)
-                .cloned())
-        })
-    }
-
-    fn delete_instance<'a>(
-        &'a self,
-        request: control_plane::DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let mut instance = self.instance.lock().expect("fake store lock is available");
-            let Some(current) = instance.as_ref() else {
-                return Ok(false);
-            };
-            if current.id != request.instance_id {
-                return Ok(false);
-            }
-            if current.state != DomainInstanceState::Deleting {
-                return Err(StoreError::invalid_argument(
-                    "hard delete requires deleting state",
-                ));
-            }
-
-            *instance = None;
-            self.materializations
-                .lock()
-                .expect("fake store lock is available")
-                .retain(|materialization| materialization.instance_id != request.instance_id);
-            Ok(true)
-        })
-    }
-
-    fn create_workload_class_version<'a>(
-        &'a self,
-        _request: control_plane::CreateWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn load_workload_class_version<'a>(
-        &'a self,
-        request: control_plane::LoadWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::WorkloadClassVersion>>> {
-        Box::pin(async move {
-            Ok(self
-                .workload_class
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .filter(|workload_class| workload_class.reference == request.reference)
-                .cloned())
-        })
-    }
-
-    fn create_route_binding<'a>(
-        &'a self,
-        request: control_plane::CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteBindingRecord>> {
-        Box::pin(async move {
-            Ok(control_plane::RouteBindingRecord {
-                id: request.route_binding_id,
-                instance_id: request.instance_id,
-                identity: request.identity,
-                protocol: request.protocol,
-            })
-        })
-    }
-
-    fn get_route_binding<'a>(
-        &'a self,
-        _request: control_plane::GetRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteBindingRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn delete_route_binding<'a>(
-        &'a self,
-        request: control_plane::DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let deleted = self
-                .route_resolution
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .and_then(|resolution| match resolution {
-                    FakeRouteResolution::Resolved { entry, .. } => Some(entry),
-                    FakeRouteResolution::Miss { .. } | FakeRouteResolution::Unavailable(_) => None,
-                })
-                .is_some_and(|entry| entry.route_binding_id == request.route_binding_id);
-            Ok(deleted)
-        })
-    }
-
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: control_plane::ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
-        Box::pin(async move {
-            let route_binding = self
-                .route_resolution
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .and_then(|resolution| match resolution {
-                    FakeRouteResolution::Resolved {
-                        matched_identity,
-                        entry,
-                    } if entry.instance_id == request.instance_id => {
-                        Some(control_plane::RouteBindingRecord {
-                            id: entry.route_binding_id.clone(),
-                            instance_id: entry.instance_id.clone(),
-                            identity: matched_identity.clone(),
-                            protocol: protocol_for_identity(matched_identity),
-                        })
-                    }
-                    FakeRouteResolution::Resolved { .. }
-                    | FakeRouteResolution::Miss { .. }
-                    | FakeRouteResolution::Unavailable(_) => None,
-                });
-            Ok(route_binding.into_iter().collect())
-        })
-    }
-
-    fn resolve_route<'a>(
-        &'a self,
-        _identity: control_plane::RouteIdentity,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
-        Box::pin(async move {
-            *self
-                .resolve_route_requests
-                .lock()
-                .expect("fake store lock is available") += 1;
-            match self
-                .route_resolution
-                .lock()
-                .expect("fake store lock is available")
-                .clone()
-            {
-                Some(FakeRouteResolution::Resolved {
-                    matched_identity,
-                    entry,
-                }) => Ok(RouteResolution::Resolved {
-                    matched_identity,
-                    entry,
-                }),
-                Some(FakeRouteResolution::Miss { negative_cache }) => {
-                    Ok(RouteResolution::Miss { negative_cache })
-                }
-                Some(FakeRouteResolution::Unavailable(message)) => {
-                    Err(StoreError::unavailable(message))
-                }
-                None => Err(StoreError::internal("fake store method is not implemented")),
-            }
-        })
-    }
-
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: control_plane::CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move {
-            let mut instance = self.instance.lock().expect("fake store lock is available");
-            let instance = instance.as_mut().ok_or(StoreError::NotFound {
-                resource: "instance",
-            })?;
-            if instance.generation != request.expected_generation {
-                return Err(StoreError::GenerationConflict {
-                    expected: request.expected_generation,
-                    actual: instance.generation,
-                });
-            }
-
-            instance.state = request.next_state;
-            instance.generation = request.expected_generation.next();
-            Ok(instance.clone())
-        })
-    }
-
-    fn record_materialization<'a>(
-        &'a self,
-        request: control_plane::RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::MaterializationRecord>> {
-        Box::pin(async move {
-            let record = MaterializationRecord {
-                id: MaterializationId::new(format!(
-                    "{}:{}:{}",
-                    request.instance_id.as_str(),
-                    request.target.cluster_id(),
-                    request.target.namespace()
-                ))
-                .expect("materialization ID is valid"),
-                instance_id: request.instance_id,
-                instance_generation: request.instance_generation,
-                target: request.target,
-                state: request.state,
-                backend: request.backend,
-                backend_generation: request.backend_generation,
-                rendered_objects: request.rendered_objects,
-                exclusivity_keys: request.exclusivity_keys,
-                reconciliation_lease: None,
-            };
-            let mut materializations = self
-                .materializations
-                .lock()
-                .expect("fake store lock is available");
-            materializations.retain(|existing| {
-                !(existing.instance_id == record.instance_id && existing.target == record.target)
-            });
-            materializations.push(record.clone());
-
-            Ok(record)
-        })
-    }
-
-    fn load_ready_materialization<'a>(
-        &'a self,
-        request: control_plane::materialization::LoadReadyMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materializations
-                .lock()
-                .expect("fake store lock is available")
-                .iter()
-                .find(|materialization| {
-                    materialization.instance_id == request.instance_id
-                        && materialization.instance_generation == request.instance_generation
-                        && materialization.target == request.target
-                        && materialization.state == MaterializationState::Ready
-                })
-                .cloned())
-        })
-    }
-
-    fn load_active_materialization<'a>(
-        &'a self,
-        request: control_plane::LoadActiveMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materializations
-                .lock()
-                .expect("fake store lock is available")
-                .iter()
-                .find(|materialization| {
-                    materialization.instance_id == request.instance_id
-                        && materialization.target == request.target
-                        && materialization.state != MaterializationState::Deleted
-                })
-                .cloned())
-        })
-    }
-
-    fn complete_wake<'a>(
-        &'a self,
-        request: control_plane::CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::CompleteWakeResult>> {
-        Box::pin(async move {
-            let instance = {
-                let mut instance = self.instance.lock().expect("fake store lock is available");
-                let instance = instance.as_mut().ok_or(StoreError::NotFound {
-                    resource: "instance",
-                })?;
-                if instance.generation != request.expected_waking_generation {
-                    return Err(StoreError::GenerationConflict {
-                        expected: request.expected_waking_generation,
-                        actual: instance.generation,
-                    });
-                }
-
-                instance.state = DomainInstanceState::Running;
-                instance.generation = request.expected_waking_generation.next();
-                instance.clone()
-            };
-            let materialization = MaterializationRecord {
-                id: MaterializationId::new(format!(
-                    "{}:{}:{}",
-                    request.instance_id.as_str(),
-                    request.target.cluster_id(),
-                    request.target.namespace()
-                ))
-                .expect("materialization ID is valid"),
-                instance_id: request.instance_id,
-                instance_generation: instance.generation,
-                target: request.target,
-                state: MaterializationState::Ready,
-                backend: Some(request.backend),
-                backend_generation: request.backend_generation,
-                rendered_objects: request.rendered_objects,
-                exclusivity_keys: request.exclusivity_keys,
-                reconciliation_lease: None,
-            };
-            self.materializations
-                .lock()
-                .expect("fake store lock is available")
-                .push(materialization.clone());
-
-            Ok(CompleteWakeResult {
-                instance,
-                materialization,
-            })
-        })
-    }
-
-    fn begin_sleep<'a>(
-        &'a self,
-        request: control_plane::BeginSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::BeginSleepResult>> {
-        Box::pin(async move {
-            let instance = {
-                let mut instance = self.instance.lock().expect("fake store lock is available");
-                let instance = instance.as_mut().ok_or(StoreError::NotFound {
-                    resource: "instance",
-                })?;
-                if instance.id != request.instance_id {
-                    return Err(StoreError::NotFound {
-                        resource: "instance",
-                    });
-                }
-                if instance.generation != request.expected_running_generation {
-                    return Err(StoreError::GenerationConflict {
-                        expected: request.expected_running_generation,
-                        actual: instance.generation,
-                    });
-                }
-
-                instance.state = DomainInstanceState::Draining;
-                instance.generation = request.expected_running_generation.next();
-                instance.clone()
-            };
-
-            let materialization = self
-                .materializations
-                .lock()
-                .expect("fake store lock is available")
-                .iter_mut()
-                .find(|materialization| {
-                    materialization.instance_id == request.instance_id
-                        && materialization.target == request.target
-                        && materialization.state != MaterializationState::Deleted
-                })
-                .map(|materialization| {
-                    materialization.state = MaterializationState::Deleting;
-                    materialization.backend = None;
-                    materialization.clone()
-                });
-
-            Ok(control_plane::BeginSleepResult {
-                instance,
-                materialization,
-            })
-        })
-    }
-
-    fn finalize_sleep<'a>(
-        &'a self,
-        _request: control_plane::FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::FinalizeSleepResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        _request: control_plane::RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteDependencySet>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn put_http01_challenge<'a>(
-        &'a self,
-        _request: control_plane::PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn resolve_http01_challenge<'a>(
-        &'a self,
-        _key: control_plane::Http01ChallengeKey,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn delete_http01_challenge<'a>(
-        &'a self,
-        _request: control_plane::DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        _request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-}
-
 impl KubernetesMaterializerClient for FakeKubernetesClient {
+    fn verify_idle_member<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+        identity: &'a control_plane::materializer::IdleMemberIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            if identity.pod_uid == "test-pod" {
+                Ok(())
+            } else {
+                Err(control_plane::KubernetesClientError::new("unknown pod UID"))
+            }
+        })
+    }
+
     fn apply_object<'a>(
         &'a self,
         object: &'a control_plane::KubernetesObject,
+        _precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             let object_ref = rendered_object_ref(object);
@@ -2385,6 +2268,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
     fn delete_object<'a>(
         &'a self,
         object: &'a RenderedObjectRef,
+        _precondition: &'a control_plane::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             self.live_objects
@@ -2430,6 +2314,24 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .cloned()
                 .unwrap_or(ProjectionObjectInspection::Missing))
         })
+    }
+
+    fn ensure_no_descendants<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+        _instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn verify_retained_bindings<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -2488,6 +2390,32 @@ fn proxy_client_with_route_events(
 
 fn proxy_target() -> MaterializationTarget {
     MaterializationTarget::new("cluster-a", "apps").expect("proxy target is valid")
+}
+
+async fn reconcile_proxy_work(
+    store: Arc<FakeWakeStore>,
+    client: FakeKubernetesClient,
+    broker: RouteSubscriptionBroker,
+) {
+    control_plane::MaterializationReconciler::new(
+        store,
+        KubernetesMaterializer::new(client),
+        proxy_target(),
+        Default::default(),
+        sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+    )
+    .with_route_events(broker)
+    .run_once()
+    .await;
+}
+
+fn expect_accepted(
+    response: ProxyWakeInstanceResponse,
+) -> control_plane::api::pb::ProxyWakeStillWakingResult {
+    match response.outcome {
+        Some(proxy_wake_instance_response::Outcome::StillWaking(result)) => result,
+        other => panic!("expected durable wake acceptance, got {other:?}"),
+    }
 }
 
 async fn subscribe_resolved_route(
@@ -2621,6 +2549,7 @@ fn materialization_with_state_and_target(
         .expect("materialization ID is valid"),
         instance_id: InstanceId::new(instance_id).expect("instance ID is valid"),
         instance_generation: Generation::new(generation),
+        projection_generation: Generation::new(generation),
         target,
         state,
         backend: Some(
@@ -2657,13 +2586,6 @@ fn domain_sni_identity(host: &str, kind: RouteHostKind) -> RouteIdentity {
     .expect("route host is valid");
 
     RouteIdentity::Sni { host }
-}
-
-fn protocol_for_identity(identity: &RouteIdentity) -> control_plane::ProtocolRoute {
-    match identity {
-        RouteIdentity::Http { .. } => control_plane::ProtocolRoute::Http,
-        RouteIdentity::Sni { .. } => control_plane::ProtocolRoute::TlsSni,
-    }
 }
 
 fn domain_route_entry(

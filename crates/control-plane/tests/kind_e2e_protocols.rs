@@ -69,13 +69,13 @@ async fn http2_grpc_and_websocket_through_deployed_platform() -> TestResult<()> 
         .await?;
     }
 
-    wait_for_http2_response(
+    http2_response(
         &config,
         "cold HTTP/2 route",
         HTTP2_HOST,
         "/h2?round=cold",
         HTTP2_TARGET,
-        Duration::from_secs(180),
+        Duration::from_secs(140),
     )
     .await?;
     wait_for_instance_state(
@@ -85,7 +85,7 @@ async fn http2_grpc_and_websocket_through_deployed_platform() -> TestResult<()> 
         Duration::from_secs(30),
     )
     .await?;
-    wait_for_http2_response(
+    http2_response(
         &config,
         "hot HTTP/2 route",
         HTTP2_HOST,
@@ -95,13 +95,13 @@ async fn http2_grpc_and_websocket_through_deployed_platform() -> TestResult<()> 
     )
     .await?;
 
-    wait_for_grpc_response(
+    grpc_response(
         &config,
         "cold h2c gRPC-shaped route",
         GRPC_HOST,
         "/grpc.Test/Echo",
         GRPC_TARGET,
-        Duration::from_secs(180),
+        Duration::from_secs(140),
     )
     .await?;
     wait_for_instance_state(
@@ -111,7 +111,7 @@ async fn http2_grpc_and_websocket_through_deployed_platform() -> TestResult<()> 
         Duration::from_secs(30),
     )
     .await?;
-    wait_for_grpc_response(
+    grpc_response(
         &config,
         "hot h2c gRPC-shaped route",
         GRPC_HOST,
@@ -121,15 +121,17 @@ async fn http2_grpc_and_websocket_through_deployed_platform() -> TestResult<()> 
     )
     .await?;
 
-    wait_for_websocket_exchange(
-        &config,
-        "WebSocket route",
-        WEBSOCKET_HOST,
-        "/socket?room=blue",
-        WEBSOCKET_TARGET,
-        Duration::from_secs(180),
+    // The first upgrade must carry the Cold route through readiness on this connection.
+    tokio::time::timeout(
+        Duration::from_secs(140),
+        websocket_exchange(
+            config.frontline_addr,
+            WEBSOCKET_HOST,
+            "/socket?room=blue",
+            WEBSOCKET_TARGET,
+        ),
     )
-    .await?;
+    .await??;
     wait_for_instance_state(
         &mut operator,
         "e2e-protocol-websocket",
@@ -325,7 +327,7 @@ async fn wait_for_instance_state(
     }
 }
 
-async fn wait_for_http2_response(
+async fn http2_response(
     config: &E2eConfig,
     context: &str,
     host: &str,
@@ -333,7 +335,7 @@ async fn wait_for_http2_response(
     target: &str,
     timeout: Duration,
 ) -> TestResult<H2Response> {
-    wait_for_h2_response(
+    checked_h2_response(
         context,
         timeout,
         || {
@@ -351,7 +353,7 @@ async fn wait_for_http2_response(
     .await
 }
 
-async fn wait_for_grpc_response(
+async fn grpc_response(
     config: &E2eConfig,
     context: &str,
     host: &str,
@@ -359,7 +361,7 @@ async fn wait_for_grpc_response(
     target: &str,
     timeout: Duration,
 ) -> TestResult<H2Response> {
-    wait_for_h2_response(
+    checked_h2_response(
         context,
         timeout,
         || {
@@ -377,32 +379,24 @@ async fn wait_for_grpc_response(
     .await
 }
 
-async fn wait_for_h2_response<RequestFuture, MakeRequest, Assert>(
+// Every invocation sends exactly one request, including the first request to each Cold route.
+// The cold-call budget leaves transport margin around the frontline's 130-second route deadline.
+async fn checked_h2_response<RequestFuture, MakeRequest, Assert>(
     context: &str,
     timeout: Duration,
-    mut make_request: MakeRequest,
+    make_request: MakeRequest,
     assert_response: Assert,
 ) -> TestResult<H2Response>
 where
     RequestFuture: std::future::Future<Output = TestResult<H2Response>>,
-    MakeRequest: FnMut() -> RequestFuture,
-    Assert: Fn(&H2Response) -> TestResult<()>,
+    MakeRequest: FnOnce() -> RequestFuture,
+    Assert: FnOnce(&H2Response) -> TestResult<()>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let last_error = match make_request().await {
-            Ok(response) => match assert_response(&response) {
-                Ok(()) => return Ok(response),
-                Err(error) => error.to_string(),
-            },
-            Err(error) => error.to_string(),
-        };
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("timed out waiting for {context}: {last_error}").into());
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
+    let response = tokio::time::timeout(timeout, make_request())
+        .await
+        .map_err(|_| format!("single {context} request exceeded {timeout:?}"))??;
+    assert_response(&response)?;
+    Ok(response)
 }
 
 async fn h2_request(
@@ -416,7 +410,9 @@ async fn h2_request(
     let stream = TcpStream::connect(addr).await?;
     let (mut sender, connection) =
         client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await?;
-    let connection_task = tokio::spawn(async move {
+    // Dropping a timed-out request also cancels its connection driver.
+    let mut connection_tasks = tokio::task::JoinSet::new();
+    connection_tasks.spawn(async move {
         let _ = connection.await;
     });
 
@@ -437,8 +433,7 @@ async fn h2_request(
     let trailers = collected.trailers().cloned();
     let body = collected.to_bytes();
     drop(sender);
-    connection_task.abort();
-    let _ = connection_task.await;
+    connection_tasks.shutdown().await;
 
     Ok(H2Response {
         version,
@@ -561,27 +556,6 @@ fn grpc_payload_text(body: &[u8]) -> TestResult<String> {
     Ok(String::from_utf8(body[5..].to_vec())?)
 }
 
-async fn wait_for_websocket_exchange(
-    config: &E2eConfig,
-    context: &str,
-    host: &str,
-    path: &str,
-    target: &str,
-    timeout: Duration,
-) -> TestResult<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match websocket_exchange(config.frontline_addr, host, path, target).await {
-            Ok(()) => return Ok(()),
-            Err(error) if tokio::time::Instant::now() < deadline => {
-                eprintln!("waiting for {context}: {error}");
-                sleep(Duration::from_secs(1)).await;
-            }
-            Err(error) => return Err(format!("timed out waiting for {context}: {error}").into()),
-        }
-    }
-}
-
 async fn websocket_exchange(
     addr: SocketAddr,
     host: &str,
@@ -612,7 +586,7 @@ async fn websocket_exchange(
         return Err(format!("expected text response, got {text:?}").into());
     };
     assert_body_identifies(&text, "WebSocket text response", target, "websocket")?;
-    if !text.contains("text=frontline text\n") || !text.contains("path=/\n") {
+    if !text.contains("text=frontline text\n") || !text.contains(&format!("path={path}\n")) {
         return Err(format!("unexpected WebSocket text response: {text:?}").into());
     }
 
@@ -628,7 +602,7 @@ async fn websocket_exchange(
     };
     let binary = String::from_utf8(binary.to_vec())?;
     assert_body_identifies(&binary, "WebSocket binary response", target, "websocket")?;
-    if !binary.contains("binary=frontline bytes") || !binary.contains("path=/\n") {
+    if !binary.contains("binary=frontline bytes") || !binary.contains(&format!("path={path}\n")) {
         return Err(format!("unexpected WebSocket binary response: {binary:?}").into());
     }
 
@@ -812,7 +786,14 @@ fn http_route_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
 }
 
 fn workload_name(target: &str) -> String {
-    format!("e2e-protocol-{target}")
+    // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
+    let suffix = match target {
+        "http2" => "ecdc9151",
+        "grpc" => "1e039054",
+        "websocket" => "64dd4c6b",
+        _ => panic!("unknown fixture target {target}"),
+    };
+    format!("e2e-protocol-{target}-{suffix}")
 }
 
 fn literal_text(value: &str) -> TemplateText {

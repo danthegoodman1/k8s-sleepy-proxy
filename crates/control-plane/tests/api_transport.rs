@@ -1,3 +1,9 @@
+#[macro_use]
+#[path = "support/unexpected_store.rs"]
+mod unexpected_store;
+mod support;
+use support::TestStore as FakeInstanceStore;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -37,12 +43,11 @@ use control_plane::projection::{
 };
 use control_plane::{
     AuthConfig, BackendEndpoint, BackendGeneration, CallerRole, ControlPlaneAuth,
-    ControlPlaneStore, CreateInstanceResult, Generation, InstanceId, InstanceRecord,
+    ControlPlaneStore, Generation, InstanceId, InstanceRecord,
     InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
-    RenderedExclusivityKey, RenderedObjectRef, StaticBearerTokens, StoreError, StoreFuture,
-    StoreResult,
+    RenderedExclusivityKey, RenderedObjectRef, StaticBearerTokens,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -70,6 +75,130 @@ fn store_operator_grpc_service(
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         target(),
     )
+}
+
+#[tokio::test]
+async fn manual_http01_expiry_is_deterministic_after_background_collection() {
+    for background_collected in [false, true] {
+        let store = Arc::new(FakeInstanceStore::default());
+        let service = store_operator_api(store.clone());
+        let now = SystemTime::now();
+        let now_millis =
+            i64::try_from(now.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
+        let target_expiry = now_millis + 3_600_000;
+        let key = |token: &str| Http01ChallengeKey {
+            host: "manual-expiry.example.com".into(),
+            token: token.into(),
+        };
+        for (token, expiry) in [
+            ("natural", now_millis + 30_000),
+            ("manual", target_expiry),
+            ("sentinel", target_expiry + 3_600_000),
+        ] {
+            service
+                .put_http01_challenge(tonic::Request::new(PutHttp01ChallengeRequest {
+                    key: Some(key(token)),
+                    key_authorization: token.into(),
+                    expires_at_unix_millis: expiry,
+                }))
+                .await
+                .unwrap();
+        }
+        if background_collected {
+            // Deterministic interleaving of the maintenance operation before
+            // the caller's expiry request at a controlled +60s cutoff.
+            // Inserts remain valid future expiries; no scheduler sleep.
+            assert_eq!(
+                store
+                    .expire_http01_challenges(
+                        control_plane::ExpireHttp01ChallengesRequest::new(
+                            now + Duration::from_secs(60)
+                        )
+                        .with_limit(1024)
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        let natural = service
+            .expire_http01_challenges(tonic::Request::new(ExpireHttp01ChallengesRequest {
+                now_unix_millis: now_millis + 60_000,
+                limit: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Both are valid manual results depending on the background sweep.
+        assert_eq!(natural.expired, if background_collected { 0 } else { 1 });
+        for token in ["manual", "sentinel"] {
+            let record = service
+                .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
+                    key: Some(key(token)),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .challenge
+                .unwrap();
+            assert_eq!(record.key_authorization, token);
+        }
+        let request = ExpireHttp01ChallengesRequest {
+            now_unix_millis: target_expiry,
+            limit: Some(1),
+        };
+        assert_eq!(
+            service
+                .expire_http01_challenges(tonic::Request::new(request))
+                .await
+                .unwrap()
+                .into_inner()
+                .expired,
+            1
+        );
+        for (token, expected) in [("manual", None), ("sentinel", Some("sentinel"))] {
+            let record = service
+                .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
+                    key: Some(key(token)),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .challenge;
+            assert_eq!(
+                record.as_ref().map(|v| v.key_authorization.as_str()),
+                expected
+            );
+        }
+        assert_eq!(
+            service
+                .expire_http01_challenges(tonic::Request::new(request))
+                .await
+                .unwrap()
+                .into_inner()
+                .expired,
+            0
+        );
+        assert!(
+            service
+                .delete_http01_challenge(tonic::Request::new(DeleteHttp01ChallengeRequest {
+                    key: Some(key("sentinel"))
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .deleted
+        );
+        assert!(service
+            .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
+                key: Some(key("sentinel"))
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .challenge
+            .is_none());
+    }
 }
 
 fn auth_config() -> AuthConfig {
@@ -103,6 +232,18 @@ fn operator_materializer(
 
 fn target() -> MaterializationTarget {
     MaterializationTarget::new("cluster-a", "apps").expect("target is valid")
+}
+
+async fn reconcile_operator_work(store: Arc<FakeInstanceStore>, client: FakeKubernetesClient) {
+    control_plane::MaterializationReconciler::new(
+        store,
+        operator_materializer(client),
+        target(),
+        Default::default(),
+        sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+    )
+    .run_once()
+    .await;
 }
 
 fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> InstanceRecord {
@@ -143,6 +284,7 @@ fn materialization(
         .expect("materialization id is valid"),
         instance_id: InstanceId::new(instance_id).expect("instance id is valid"),
         instance_generation: Generation::new(generation),
+        projection_generation: Generation::new(generation),
         target,
         state,
         backend: Some(BackendEndpoint::new("http://example").expect("backend is valid")),
@@ -174,6 +316,11 @@ fn object_key(object: &RenderedObjectRef) -> String {
 
 fn owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata {
     LiveObjectMetadata {
+        persistent_volume_reclaim_policy: Some("Retain".into()),
+        identity: control_plane::projection::LiveObjectIdentity {
+            uid: "test-uid".into(),
+            resource_version: "1".into(),
+        },
         labels: BTreeMap::from([
             (
                 LABEL_MANAGED_BY.to_owned(),
@@ -293,7 +440,7 @@ async fn placeholder_methods_are_explicitly_unimplemented() {
 #[tokio::test]
 async fn store_backed_instance_methods_create_get_and_delete_instances() {
     let store = Arc::new(FakeInstanceStore::default());
-    let service = store_operator_api(store);
+    let service = store_operator_api(store.clone());
 
     let created = service
         .create_instance(tonic::Request::new(CreateInstanceRequest {
@@ -333,11 +480,22 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
     let deleted = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-1".to_owned(),
+            expected_generation: Some(0),
         }))
         .await
         .expect("delete instance succeeds")
         .into_inner();
-    assert!(deleted.deleted);
+    assert!(deleted.accepted);
+    assert!(store.instance_exists("instance-1"));
+    let deleting = service
+        .get_instance(tonic::Request::new(GetInstanceRequest {
+            instance_id: "instance-1".to_owned(),
+        }))
+        .await
+        .expect("accepted deletion remains queryable")
+        .into_inner();
+    assert_eq!(deleting.state, InstanceState::Deleting as i32);
+    reconcile_operator_work(store, FakeKubernetesClient::default()).await;
 
     let missing = service
         .get_instance(tonic::Request::new(GetInstanceRequest {
@@ -371,6 +529,55 @@ async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
 }
 
 #[tokio::test]
+async fn operator_delete_requires_explicit_generation_before_accepting_intent() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "legacy-delete",
+        DomainInstanceState::Cold,
+        0,
+    ));
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(FakeKubernetesClient::default()),
+        target(),
+    );
+    let error = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "legacy-delete".to_owned(),
+            expected_generation: None,
+        }))
+        .await
+        .expect_err("unfenced legacy request is rejected");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(store.delete_requests().is_empty());
+    assert!(store.instance_exists("legacy-delete"));
+}
+
+#[tokio::test]
+async fn operator_delete_rejects_maximum_wire_generation_without_overflow() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "generation-overflow",
+        DomainInstanceState::Deleting,
+        12,
+    ));
+    let service = StoreBackedOperatorApi::new(
+        store.clone(),
+        operator_materializer(FakeKubernetesClient::default()),
+        target(),
+    );
+    let error = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "generation-overflow".to_owned(),
+            expected_generation: Some(u64::MAX),
+        }))
+        .await
+        .expect_err("malformed public revision must never panic or wrap");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(store.delete_requests().is_empty());
+}
+
+#[tokio::test]
 async fn operator_delete_cleans_active_materialization_before_store_delete() {
     let store = Arc::new(FakeInstanceStore::default());
     store.seed_instance(domain_instance(
@@ -391,12 +598,18 @@ async fn operator_delete_cleans_active_materialization_before_store_delete() {
     let response = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-active".to_owned(),
+            expected_generation: Some(7),
         }))
         .await
         .expect("delete instance succeeds")
         .into_inner();
 
-    assert!(response.deleted);
+    assert!(response.accepted);
+    assert!(
+        client.deleted().is_empty(),
+        "acceptance performs no Kubernetes cleanup"
+    );
+    reconcile_operator_work(store.clone(), client.clone()).await;
     assert!(!store.instance_exists("instance-delete-active"));
     assert!(store.materialization().is_none());
     assert_eq!(
@@ -427,28 +640,32 @@ async fn operator_delete_without_active_materialization_deletes_store_only() {
     let response = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-cold".to_owned(),
+            expected_generation: Some(0),
         }))
         .await
         .expect("delete instance succeeds")
         .into_inner();
 
-    assert!(response.deleted);
+    assert!(response.accepted);
+    assert!(store.instance_exists("instance-delete-cold"));
+    reconcile_operator_work(store.clone(), client.clone()).await;
     assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
 
     let missing = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-cold".to_owned(),
+            expected_generation: Some(0),
         }))
         .await
         .expect("missing delete remains idempotent")
         .into_inner();
 
-    assert!(!missing.deleted);
+    assert!(!missing.accepted);
     assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
 }
 
 #[tokio::test]
-async fn operator_delete_ignores_materialization_for_other_target() {
+async fn operator_delete_records_other_target_cleanup_without_touching_kubernetes() {
     let store = Arc::new(FakeInstanceStore::default());
     store.seed_instance(domain_instance(
         "instance-delete-other-target",
@@ -471,13 +688,54 @@ async fn operator_delete_ignores_materialization_for_other_target() {
     let response = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-other-target".to_owned(),
+            expected_generation: Some(3),
         }))
         .await
         .expect("delete instance succeeds")
         .into_inner();
 
-    assert!(response.deleted);
+    assert!(response.accepted);
+    assert!(store.instance_exists("instance-delete-other-target"));
+    assert_eq!(
+        store.materialization().unwrap().state,
+        MaterializationState::Deleting
+    );
+    reconcile_operator_work(store.clone(), client.clone()).await;
+    assert!(store.instance_exists("instance-delete-other-target"));
+    assert_eq!(
+        store.materialization().unwrap().state,
+        MaterializationState::Deleting
+    );
     assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
+}
+
+#[tokio::test]
+async fn operator_delete_rejects_a_stale_generation_before_accepting_intent() {
+    let store = Arc::new(FakeInstanceStore::default());
+    store.seed_instance(domain_instance(
+        "recreated-instance",
+        DomainInstanceState::Cold,
+        12,
+    ));
+    let service = store_operator_api(store.clone());
+    let error = service
+        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
+            instance_id: "recreated-instance".to_owned(),
+            expected_generation: Some(0),
+        }))
+        .await
+        .expect_err("old request cannot delete a newer incarnation");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    let loaded = service
+        .get_instance(tonic::Request::new(GetInstanceRequest {
+            instance_id: "recreated-instance".to_owned(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loaded.state, InstanceState::Cold as i32);
+    assert_eq!(loaded.generation, 12);
+    assert!(store.delete_requests().is_empty());
 }
 
 #[tokio::test]
@@ -501,12 +759,18 @@ async fn operator_delete_cleans_stale_generation_active_materialization_for_targ
     let response = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-stale-generation".to_owned(),
+            expected_generation: Some(9),
         }))
         .await
         .expect("delete instance succeeds")
         .into_inner();
 
-    assert!(response.deleted);
+    assert!(response.accepted);
+    assert!(
+        client.deleted().is_empty(),
+        "acceptance performs no Kubernetes cleanup"
+    );
+    reconcile_operator_work(store.clone(), client.clone()).await;
     assert!(!store.instance_exists("instance-delete-stale-generation"));
     assert!(store.materialization().is_none());
     assert_eq!(
@@ -552,15 +816,18 @@ async fn operator_delete_kubernetes_failure_preserves_store_state_for_retry() {
         target(),
     );
 
-    let error = service
+    let response = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-fails".to_owned(),
+            expected_generation: Some(5),
         }))
         .await
-        .expect_err("Kubernetes cleanup failure rejects delete");
+        .expect("cleanup failure cannot reject durable acceptance")
+        .into_inner();
 
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("delete cleanup failed"));
+    assert!(response.accepted);
+    assert!(client.deleted().is_empty());
+    reconcile_operator_work(store.clone(), client.clone()).await;
     assert!(store.instance_exists("instance-delete-fails"));
     assert_eq!(store.delete_requests(), Vec::new());
     assert_eq!(
@@ -597,15 +864,17 @@ async fn operator_delete_unowned_live_ref_blocks_cleanup_without_delete() {
         target(),
     );
 
-    let error = service
+    let response = service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-unowned".to_owned(),
+            expected_generation: Some(5),
         }))
         .await
-        .expect_err("unowned Kubernetes ref blocks delete cleanup");
+        .expect("delete intent is accepted before cleanup")
+        .into_inner();
 
-    assert_eq!(error.code(), Code::Unavailable);
-    assert!(error.message().contains("ownership conflict"));
+    assert!(response.accepted);
+    reconcile_operator_work(store.clone(), client.clone()).await;
     assert!(store.instance_exists("instance-delete-unowned"));
     assert_eq!(store.delete_requests(), Vec::new());
     assert_eq!(client.deleted(), Vec::<RenderedObjectRef>::new());
@@ -631,32 +900,23 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
     ));
     let failing_service = StoreBackedOperatorApi::new(
         store.clone(),
-        operator_materializer(failing_client),
+        operator_materializer(failing_client.clone()),
         target(),
     );
     failing_service
         .delete_instance(tonic::Request::new(DeleteInstanceRequest {
             instance_id: "instance-delete-retry".to_owned(),
+            expected_generation: Some(8),
         }))
         .await
-        .expect_err("first cleanup attempt fails");
+        .expect("delete intent is accepted");
+    reconcile_operator_work(store.clone(), failing_client).await;
+    assert!(store.instance_exists("instance-delete-retry"));
 
     let retry_client = FakeKubernetesClient::default();
     retry_client.seed_materialization(&materialization);
-    let retry_service = StoreBackedOperatorApi::new(
-        store.clone(),
-        operator_materializer(retry_client.clone()),
-        target(),
-    );
-    let response = retry_service
-        .delete_instance(tonic::Request::new(DeleteInstanceRequest {
-            instance_id: "instance-delete-retry".to_owned(),
-        }))
-        .await
-        .expect("retry cleanup succeeds")
-        .into_inner();
-
-    assert!(response.deleted);
+    // A fresh driver resumes durable work without another operator RPC.
+    reconcile_operator_work(store.clone(), retry_client.clone()).await;
     assert!(!store.instance_exists("instance-delete-retry"));
     assert!(store.materialization().is_none());
     assert_eq!(
@@ -680,6 +940,7 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
 
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            status_only: false,
             materialization_id,
         }))
         .await
@@ -724,6 +985,7 @@ async fn reconcile_materialization_reports_ready_readiness_without_repairing_rea
 
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            status_only: false,
             materialization_id,
         }))
         .await
@@ -779,6 +1041,7 @@ async fn reconcile_materialization_reports_unready_readiness_without_repairing_r
 
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            status_only: false,
             materialization_id,
         }))
         .await
@@ -827,6 +1090,7 @@ async fn reconcile_materialization_reports_ready_metadata_drift_and_finalizers_w
 
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            status_only: false,
             materialization_id,
         }))
         .await
@@ -938,6 +1202,41 @@ async fn force_release_exclusivity_key_returns_scoped_inspect_failed_projection_
             .map(|object| object.name.as_str()),
         Some("instance-force-release-inspect-fails-svc")
     );
+}
+
+#[tokio::test]
+async fn workload_class_api_rejects_zero_and_multiple_replicas() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let service = store_operator_api(store);
+    for kind in [
+        control_plane::api::pb::WorkloadKind::Deployment,
+        control_plane::api::pb::WorkloadKind::StatefulSet,
+    ] {
+        for replicas in [0, 2] {
+            let mut template = stateful_manifest_template_proto();
+            let workload = template.workload.as_mut().unwrap();
+            workload.kind = kind as i32;
+            workload.replicas = Some(replicas);
+            let error = service
+                .create_workload_class_version(tonic::Request::new(
+                    CreateWorkloadClassVersionRequest {
+                        idempotency_key: format!("unsupported-{kind:?}-{replicas}"),
+                        class_id: format!("unsupported-{replicas}"),
+                        version: 1,
+                        default_values: Default::default(),
+                        value_schema: None,
+                        template_generation: 1,
+                        template: Some(template),
+                        sleep_policy: Some(sleep_policy_proto()),
+                        exclusivity_keys: vec![],
+                    },
+                ))
+                .await
+                .expect_err("unsupported replica count rejected by operator API");
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(error.message().contains("exactly one replica"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -1161,6 +1460,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     store.seed_materialization(reconcile_materialization);
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
+            status_only: false,
             materialization_id: reconcile_materialization_id.clone(),
         }))
         .await
@@ -1169,19 +1469,18 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
     assert!(reconciled.found);
     assert!(reconciled.attempted);
     assert_eq!(reconciled.materialization_id, reconcile_materialization_id);
-    assert_eq!(reconciled.state, "Deleted");
-    assert_eq!(reconciled.observed_refs.len(), 0);
-    assert_eq!(reconciled.projection_observations.len(), 0);
-    let claim_owners = store.reconciliation_claim_owners();
-    assert_eq!(claim_owners.len(), 1);
-    assert_ne!(claim_owners[0], "operator-reconcile");
-    assert!(claim_owners[0].starts_with("operator-reconcile-"));
+    assert_eq!(reconciled.state, "Deleting");
+    assert_eq!(reconciled.observed_refs.len(), 2);
+    assert!(
+        store.reconciliation_claim_owners().is_empty(),
+        "admin schedules without creating another driver"
+    );
     assert_eq!(
         store
             .materialization()
-            .expect("materialization remains inspectable")
+            .expect("scheduled work remains")
             .state,
-        MaterializationState::Deleted
+        MaterializationState::Deleting
     );
 
     let force_materialization = materialization(
@@ -1730,6 +2029,7 @@ async fn native_grpc_operator_auth_rejects_missing_and_wrong_role_before_store_m
         .oneshot(grpc_operator_unary_request(
             DeleteInstanceRequest {
                 instance_id: "auth-delete-instance".to_owned(),
+                expected_generation: Some(0),
             },
             "DeleteInstance",
             "application/grpc",
@@ -1747,6 +2047,7 @@ async fn native_grpc_operator_auth_rejects_missing_and_wrong_role_before_store_m
             grpc_operator_unary_request(
                 DeleteInstanceRequest {
                     instance_id: "auth-delete-instance".to_owned(),
+                    expected_generation: Some(0),
                 },
                 "DeleteInstance",
                 "application/grpc",
@@ -1777,6 +2078,7 @@ async fn native_grpc_operator_auth_accepts_valid_operator_credentials() {
             grpc_operator_unary_request(
                 DeleteInstanceRequest {
                     instance_id: "auth-valid-instance".to_owned(),
+                    expected_generation: Some(0),
                 },
                 "DeleteInstance",
                 "application/grpc",
@@ -1790,7 +2092,9 @@ async fn native_grpc_operator_auth_accepts_valid_operator_credentials() {
     assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
 
     let deleted = decode_grpc_message::<DeleteInstanceResponse>(body.as_ref());
-    assert!(deleted.deleted);
+    assert!(deleted.accepted);
+    assert!(store.instance_exists("auth-valid-instance"));
+    reconcile_operator_work(store.clone(), FakeKubernetesClient::default()).await;
     assert!(!store.instance_exists("auth-valid-instance"));
     assert_eq!(store.delete_requests().len(), 1);
 }
@@ -2041,10 +2345,11 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
         "DeleteInstance",
         DeleteInstanceRequest {
             instance_id: "instance-grpc-web".to_owned(),
+            expected_generation: Some(0),
         },
     )
     .await;
-    assert!(deleted_instance.deleted);
+    assert!(deleted_instance.accepted);
 }
 
 #[tokio::test]
@@ -2210,10 +2515,11 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
         "DeleteInstance",
         DeleteInstanceRequest {
             instance_id: "instance-native".to_owned(),
+            expected_generation: Some(0),
         },
     )
     .await;
-    assert!(deleted_instance.deleted);
+    assert!(deleted_instance.accepted);
 }
 
 #[tokio::test]
@@ -3071,61 +3377,6 @@ impl OperatorControlPlane for MetadataCapturingOperatorApi {
     }
 }
 
-#[derive(Default)]
-struct FakeInstanceStore {
-    instances: Mutex<BTreeMap<String, InstanceRecord>>,
-    workload_classes: Mutex<BTreeMap<(String, u64), control_plane::WorkloadClassVersion>>,
-    route_bindings: Mutex<BTreeMap<String, control_plane::RouteBindingRecord>>,
-    materialization: Mutex<Option<MaterializationRecord>>,
-    delete_requests: Mutex<Vec<control_plane::DeleteInstanceRequest>>,
-    http01: Mutex<BTreeMap<(String, String), control_plane::Http01ChallengeRecord>>,
-    reconciliation_claim_owners: Mutex<Vec<String>>,
-}
-
-impl FakeInstanceStore {
-    fn seed_instance(&self, instance: InstanceRecord) {
-        self.instances
-            .lock()
-            .expect("fake store lock is available")
-            .insert(instance.id.as_str().to_owned(), instance);
-    }
-
-    fn seed_materialization(&self, materialization: MaterializationRecord) {
-        *self
-            .materialization
-            .lock()
-            .expect("fake store lock is available") = Some(materialization);
-    }
-
-    fn instance_exists(&self, instance_id: &str) -> bool {
-        self.instances
-            .lock()
-            .expect("fake store lock is available")
-            .contains_key(instance_id)
-    }
-
-    fn delete_requests(&self) -> Vec<control_plane::DeleteInstanceRequest> {
-        self.delete_requests
-            .lock()
-            .expect("fake store lock is available")
-            .clone()
-    }
-
-    fn materialization(&self) -> Option<MaterializationRecord> {
-        self.materialization
-            .lock()
-            .expect("fake store lock is available")
-            .clone()
-    }
-
-    fn reconciliation_claim_owners(&self) -> Vec<String> {
-        self.reconciliation_claim_owners
-            .lock()
-            .expect("fake store lock is available")
-            .clone()
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 struct FakeKubernetesClient {
     deleted: Arc<Mutex<Vec<RenderedObjectRef>>>,
@@ -3156,6 +3407,11 @@ impl FakeKubernetesClient {
             .insert(
                 object_key(&object),
                 ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    persistent_volume_reclaim_policy: Some("Retain".into()),
+                    identity: control_plane::projection::LiveObjectIdentity {
+                        uid: "test-uid".into(),
+                        resource_version: "1".into(),
+                    },
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     deleting: false,
@@ -3214,6 +3470,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
     fn apply_object<'a>(
         &'a self,
         _object: &'a control_plane::KubernetesObject,
+        _precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -3221,6 +3478,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
     fn delete_object<'a>(
         &'a self,
         object: &'a RenderedObjectRef,
+        _precondition: &'a control_plane::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             if self
@@ -3302,486 +3560,22 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .clone())
         })
     }
-}
 
-impl ControlPlaneStore for FakeInstanceStore {
-    fn create_instance<'a>(
+    fn ensure_no_descendants<'a>(
         &'a self,
-        request: control_plane::CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        Box::pin(async move {
-            let instance = InstanceRecord {
-                id: request.instance_id,
-                workload_class: request.workload_class,
-                values: request.values,
-                state: DomainInstanceState::Cold,
-                generation: Generation::new(0),
-            };
-            self.instances
-                .lock()
-                .expect("fake store lock is available")
-                .insert(instance.id.as_str().to_owned(), instance.clone());
-
-            Ok(CreateInstanceResult {
-                instance,
-                route_bindings: Vec::new(),
-                idempotency_replayed: false,
-            })
-        })
+        _objects: &'a [RenderedObjectRef],
+        _instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
     }
 
-    fn get_instance<'a>(
+    fn verify_retained_bindings<'a>(
         &'a self,
-        request: control_plane::GetInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .instances
-                .lock()
-                .expect("fake store lock is available")
-                .get(request.instance_id.as_str())
-                .cloned())
-        })
-    }
-
-    fn delete_instance<'a>(
-        &'a self,
-        request: control_plane::DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            self.delete_requests
-                .lock()
-                .expect("fake store lock is available")
-                .push(request.clone());
-            let deleted = self
-                .instances
-                .lock()
-                .expect("fake store lock is available")
-                .remove(request.instance_id.as_str())
-                .is_some();
-            if deleted {
-                let mut materialization = self
-                    .materialization
-                    .lock()
-                    .expect("fake store lock is available");
-                if materialization.as_ref().is_some_and(|materialization| {
-                    materialization.instance_id == request.instance_id
-                }) {
-                    *materialization = None;
-                }
-            }
-
-            Ok(deleted)
-        })
-    }
-
-    fn create_workload_class_version<'a>(
-        &'a self,
-        request: control_plane::CreateWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
-        Box::pin(async move {
-            let workload_class = request.workload_class_version;
-            let key = (
-                workload_class.reference.class_id.as_str().to_owned(),
-                workload_class.reference.version.get(),
-            );
-            self.workload_classes
-                .lock()
-                .expect("fake store lock is available")
-                .insert(key, workload_class.clone());
-
-            Ok(workload_class)
-        })
-    }
-
-    fn load_workload_class_version<'a>(
-        &'a self,
-        request: control_plane::LoadWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::WorkloadClassVersion>>> {
-        Box::pin(async move {
-            let key = (
-                request.reference.class_id.as_str().to_owned(),
-                request.reference.version.get(),
-            );
-            Ok(self
-                .workload_classes
-                .lock()
-                .expect("fake store lock is available")
-                .get(&key)
-                .cloned())
-        })
-    }
-
-    fn create_route_binding<'a>(
-        &'a self,
-        request: control_plane::CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteBindingRecord>> {
-        Box::pin(async move {
-            let record = control_plane::RouteBindingRecord {
-                id: request.route_binding_id,
-                instance_id: request.instance_id,
-                identity: request.identity,
-                protocol: request.protocol,
-            };
-            self.route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .insert(record.id.as_str().to_owned(), record.clone());
-
-            Ok(record)
-        })
-    }
-
-    fn get_route_binding<'a>(
-        &'a self,
-        request: control_plane::GetRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteBindingRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .get(request.route_binding_id.as_str())
-                .cloned())
-        })
-    }
-
-    fn delete_route_binding<'a>(
-        &'a self,
-        request: control_plane::DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            Ok(self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .remove(request.route_binding_id.as_str())
-                .is_some())
-        })
-    }
-
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: control_plane::ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .values()
-                .filter(|route_binding| route_binding.instance_id == request.instance_id)
-                .cloned()
-                .collect())
-        })
-    }
-
-    fn resolve_route<'a>(
-        &'a self,
-        _identity: control_plane::RouteIdentity,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: control_plane::CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move {
-            let mut instances = self.instances.lock().expect("fake store lock is available");
-            let instance =
-                instances
-                    .get_mut(request.instance_id.as_str())
-                    .ok_or(StoreError::NotFound {
-                        resource: "instance",
-                    })?;
-            if instance.generation != request.expected_generation {
-                return Err(StoreError::GenerationConflict {
-                    expected: request.expected_generation,
-                    actual: instance.generation,
-                });
-            }
-            instance.state = request.next_state;
-            instance.generation = request.expected_generation.next();
-            Ok(instance.clone())
-        })
-    }
-
-    fn record_materialization<'a>(
-        &'a self,
-        _request: control_plane::RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::MaterializationRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn load_ready_materialization<'a>(
-        &'a self,
-        _request: control_plane::materialization::LoadReadyMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn load_active_materialization<'a>(
-        &'a self,
-        request: control_plane::LoadActiveMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materialization
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .filter(|materialization| {
-                    materialization.instance_id == request.instance_id
-                        && materialization.target == request.target
-                        && materialization.state != MaterializationState::Deleted
-                })
-                .cloned())
-        })
-    }
-
-    fn complete_wake<'a>(
-        &'a self,
-        _request: control_plane::CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::CompleteWakeResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn begin_sleep<'a>(
-        &'a self,
-        _request: control_plane::BeginSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::BeginSleepResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn finalize_sleep<'a>(
-        &'a self,
-        _request: control_plane::FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::FinalizeSleepResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        _request: control_plane::RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteDependencySet>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn put_http01_challenge<'a>(
-        &'a self,
-        request: control_plane::PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
-        Box::pin(async move {
-            let record = control_plane::Http01ChallengeRecord::new(
-                request.key().clone(),
-                request.key_authorization().to_owned(),
-                request.expires_at(),
-                UNIX_EPOCH,
-            )
-            .expect("service parsed a valid HTTP-01 challenge");
-            let key = (
-                record.key().host().as_str().to_owned(),
-                record.key().token().to_owned(),
-            );
-            self.http01
-                .lock()
-                .expect("fake store lock is available")
-                .insert(key, record.clone());
-
-            Ok(record)
-        })
-    }
-
-    fn resolve_http01_challenge<'a>(
-        &'a self,
-        key: control_plane::Http01ChallengeKey,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .http01
-                .lock()
-                .expect("fake store lock is available")
-                .get(&(key.host().as_str().to_owned(), key.token().to_owned()))
-                .cloned()
-                .filter(|record| record.expires_at() > SystemTime::now()))
-        })
-    }
-
-    fn delete_http01_challenge<'a>(
-        &'a self,
-        request: control_plane::DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            Ok(self
-                .http01
-                .lock()
-                .expect("fake store lock is available")
-                .remove(&(
-                    request.key().host().as_str().to_owned(),
-                    request.key().token().to_owned(),
-                ))
-                .is_some())
-        })
-    }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async move {
-            let mut records = self.http01.lock().expect("fake store lock is available");
-            let expired_keys = records
-                .iter()
-                .filter(|(_, record)| record.expires_at() <= request.now)
-                .take(request.limit.unwrap_or(usize::MAX))
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            let expired = expired_keys.len();
-            for key in expired_keys {
-                records.remove(&key);
-            }
-
-            Ok(expired)
-        })
-    }
-
-    fn force_delete_materialization<'a>(
-        &'a self,
-        request: control_plane::ForceDeleteMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            let mut materialization = self
-                .materialization
-                .lock()
-                .expect("fake store lock is available");
-            let existing = materialization
-                .as_ref()
-                .filter(|record| record.id == request.materialization_id)
-                .cloned();
-            if existing.is_some() {
-                *materialization = None;
-            }
-            Ok(existing)
-        })
-    }
-
-    fn load_materialization<'a>(
-        &'a self,
-        request: control_plane::LoadMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materialization
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .filter(|record| record.id == request.materialization_id)
-                .cloned())
-        })
-    }
-
-    fn claim_materialization_reconciliation<'a>(
-        &'a self,
-        request: control_plane::ClaimMaterializationReconciliationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            let mut materialization = self
-                .materialization
-                .lock()
-                .expect("fake store lock is available");
-            let Some(record) = materialization.as_mut() else {
-                return Ok(None);
-            };
-            if record.id != request.materialization_id {
-                return Ok(None);
-            }
-            self.reconciliation_claim_owners
-                .lock()
-                .expect("fake store lock is available")
-                .push(request.owner.clone());
-            record.reconciliation_lease = Some(control_plane::MaterializationReconciliationLease {
-                owner: request.owner,
-                expires_at: request.lease_expires_at,
-                attempt: 1,
-            });
-            Ok(Some(record.clone()))
-        })
-    }
-
-    fn renew_materialization_reconciliation_lease<'a>(
-        &'a self,
-        _request: control_plane::RenewMaterializationReconciliationLeaseRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Ok(true) })
-    }
-
-    fn finalize_sleep_reconciliation<'a>(
-        &'a self,
-        _request: control_plane::FinalizeSleepReconciliationRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::FinalizeSleepResult>> {
-        Box::pin(async move {
-            let mut materialization = self
-                .materialization
-                .lock()
-                .expect("fake store lock is available");
-            let record = materialization.as_mut().ok_or(StoreError::NotFound {
-                resource: "materialization",
-            })?;
-            record.state = MaterializationState::Deleted;
-            record.rendered_objects.clear();
-            record.exclusivity_keys.clear();
-            record.reconciliation_lease = None;
-            let mut instance = self
-                .instances
-                .lock()
-                .expect("fake store lock is available")
-                .get(record.instance_id.as_str())
-                .cloned()
-                .ok_or(StoreError::NotFound {
-                    resource: "instance",
-                })?;
-            instance.state = DomainInstanceState::Cold;
-            Ok(control_plane::FinalizeSleepResult {
-                instance,
-                materialization: Some(record.clone()),
-            })
-        })
-    }
-
-    fn force_release_exclusivity_key<'a>(
-        &'a self,
-        request: control_plane::ForceReleaseExclusivityKeyRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::ForceReleaseExclusivityKeyResult>> {
-        Box::pin(async move {
-            let mut materialization = self
-                .materialization
-                .lock()
-                .expect("fake store lock is available");
-            let affected = materialization
-                .as_ref()
-                .filter(|record| {
-                    record.target == request.target
-                        && record.state != MaterializationState::Deleted
-                        && record.exclusivity_keys.iter().any(|key| {
-                            key.name == request.key_name && key.value == request.key_value
-                        })
-                })
-                .cloned()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if !affected.is_empty() {
-                let record = materialization
-                    .as_mut()
-                    .expect("affected materialization exists");
-                record.exclusivity_keys.retain(|key| {
-                    !(key.name == request.key_name && key.value == request.key_value)
-                });
-            }
-            Ok(control_plane::ForceReleaseExclusivityKeyResult {
-                updated_materializations: affected.len(),
-                affected_materializations: affected,
-            })
-        })
+        _objects: &'a [RenderedObjectRef],
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async { Ok(()) })
     }
 }

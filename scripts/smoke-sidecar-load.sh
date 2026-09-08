@@ -205,6 +205,7 @@ docker run -d \
   --env "SLEEPYPODS_APP_PORT=${backend_container_port}" \
   --env "SLEEPYPODS_INSTANCE_ID=sidecar-load-smoke" \
   --env "SLEEPYPODS_INSTANCE_GENERATION=1" \
+  --env SLEEPYPODS_POD_UID=standalone-smoke \
   --env "SLEEPYPODS_CONTROL_PLANE_ENDPOINT=http://127.0.0.1:${control_plane_container_port}" \
   --env "SLEEPYPODS_IDLE_TIMEOUT_MS=600000" \
   --env "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS=1000" \

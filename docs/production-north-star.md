@@ -34,8 +34,20 @@ contracts.
 local app ports.
 - Volume templates, including provider, mount path, access mode, reclaim
 behavior, and whether PV/PVC objects are materialized only while awake.
-- Scaling and sleep policy, including min/max replicas and idle timeout bounds.
+- One replica for both Deployment and StatefulSet automatic sleep, with idle
+  timeout bounds. Deployment uses Recreate; multi-replica sleep requires a future
+  membership-aware activity protocol and is outside the supported contract.
 - A schema for allowed instance `values`.
+
+Idle observations are scoped to a Pod UID and active materialization. The control
+plane checks all observed instance Pods, including terminating and unready Pods,
+before accepting the single member's idle report. Missing/stale observations
+and detected replica drift keep the instance awake. Kubernetes membership and
+Postgres intent cannot be checked atomically: managed workload mutation is
+reserved to the control plane, and node failure/forced Pod deletion cannot carry
+a graceful stream-preservation guarantee. Replacement fencing across that
+observation window requires a fresh activation before admitting replacement
+traffic. See the operator guide for migration of existing classes and sidecars.
 
 `WorkloadClass` is the right name because it matches Kubernetes concepts like
 `StorageClass`, `IngressClass`, and `RuntimeClass`: a reusable class of runtime
@@ -115,8 +127,8 @@ Example APIs:
 
 ```text
 CreateInstance(workload_class, values, routes)
-DeleteInstance(instance_id)
-WakeInstance(instance_id)
+DeleteInstance(instance_id, expected_generation) -> accepted
+WakeInstance(instance_id, expected_generation) -> StillWaking | Ready
 ReportIdle(instance_id, generation, sidecar_observation)
 PutHTTP01Challenge(host, token, key_authorization, expires_at)
 ResolveHTTP01Challenge(host, token)
@@ -181,17 +193,17 @@ Host or TLS SNI, plus optional HTTP path prefix. Hosts may be exact names or
 wildcard suffixes. Richer compound identity such as headers, ALPN, and
 protocol-specific fields can be added later after this path is solid.
 
-The proxy keeps a bounded local cache of resolved route entries. Local route
-lookup maps exact keys, wildcard host rules, and ordered path-prefix rules to
-cache entries:
+The proxy keeps a bounded local cache of answers for **exact canonical queried
+identities**. A wildcard or prefix in the returned match is metadata: it never
+authorizes reuse for an unseen host, path, or SNI name. The control plane owns
+exact-host, wildcard-specificity and longest-path ranking. Separate positive and
+negative FIFO budgets bound scanner traffic without mutating order on every hit.
 
 ```text
-local route key or match rule
-  -> subscription ID
-  -> route ID
-  -> instance ID
-  -> state/generation
-  -> backend if currently materialized
+exact queried host + full path, or SNI
+  -> opaque subscription ID
+  -> matched route rule (metadata)
+  -> route ID / instance ID / state / generation / backend
 ```
 
 Request flow:
@@ -199,8 +211,8 @@ Request flow:
 ```text
 client request
   -> proxy extracts Host/SNI and optional path
-  -> proxy canonicalizes identity into an exact route key or match candidate
-  -> proxy resolves route key/rule from local cache
+  -> proxy canonicalizes identity into an exact request identity
+  -> proxy resolves that exact identity from local cache
   -> if missing: send SubscribeRoute(request ID, identity) on Subscribe stream
   -> control plane returns RouteResolved or RouteMiss for that request ID
   -> if route is unknown: reject
@@ -215,14 +227,37 @@ subscriptions when an instance sleeps, drains, changes route ownership, or is
 deleted. TTL-only cache invalidation is not sufficient for production, but TTLs
 remain useful as a safety net if a proxy misses an invalidation.
 
-Exact custom domains and SNI names should be simple cache keys. Wildcards and
-path routing need deterministic local match rules. Use exact host first, then
-wildcard suffix candidates, and choose the longest matching path prefix within
-the selected host rule. Negative resolutions should be cached briefly to protect
-the control plane from arbitrary Host/SNI scans.
+Every canonical host/path and SNI identity is independently resolved. A cache
+containing only a broad wildcard or root route cannot hide an exact-host or
+longer-path exception. Negative resolutions are cached briefly without creating
+subscriptions.
 
-`SubscribeRoute` is the authoritative cache-miss path. It atomically resolves the
-identity and creates an active subscription before returning `RouteResolved`.
+Invalidations and stream loss progress independently of cold requests. The
+production coordinator polls its event queue every 10ms; the frontend processing
+target is 100ms after an event reaches that queue under supported load.
+Commit-to-cache delivery also includes the control plane's 250ms polling interval,
+database/runtime scheduling and any backlog, as described in the
+[delivery bounds](operator-guide.md#runtime-failure-and-delivery-bounds).
+A bounded queue overflow
+closes the subscription stream and clears all cached authority. Reconnection
+never erases this barrier. Responses crossing a consumed invalidation are
+re-resolved, preventing an invalidation-before-install race.
+
+Cold requests share up to 64 identity flights with at most 256 waiting callers.
+Wake acceptance is not readiness: the frontline waits for Running under
+`SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` (130000ms by default), refreshing the
+authoritative answer every 100ms while waiting. The wake RPC retains its separate
+`SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS` deadline (5000ms by default).
+Frontline also rejects configuration where the route timeout plus the greater of
+setup and upstream HTTP header idle timeouts exceeds 190 seconds. Defaults are
+`130 + max(10, 60) = 190` seconds. This ceiling matches the activation handoff
+window described in the [proxy protocol contract](proxy-protocol-contract.md#activation-and-automatic-idle-sleep);
+these setup deadlines do not limit the duration of an established stream.
+
+`SubscribeRoute` is the authoritative cache-miss path. The producer observes
+dependency events before resolving the identity and installs active subscription
+state before returning `RouteResolved`, so a concurrent change cannot be lost
+between resolution and subscription setup.
 That response includes the current route entry, cache policy, and an opaque
 `subscription_id`. The proxy stores that ID with the local cache entry and uses
 it only to apply later stream messages; it must not parse the ID or assume it is
@@ -256,11 +291,13 @@ scans should get short negative caching without creating unbounded control-plane
 subscription state. `Unsubscribe` should be idempotent because cache eviction,
 stream reconnect, and invalidation handling can race.
 
-For V1, the active subscription registry can be in-memory in the control-plane
-process that owns the proxy's `Subscribe` stream. Missed updates are bounded by
-cache TTLs and instance generation checks. Multi-replica fanout can be added
-later with a shared bus or provider-backed change feed without changing the
-proxy cache-miss model.
+The active subscription registry is in-memory in the control-plane process that
+owns the proxy's `Subscribe` stream. Every replica independently reads durable
+transactional change history from PostgreSQL and targets its own subscribers;
+one replica does not consume another's events. Retention gaps or dispatcher read
+failures reset subscriptions. Positive and negative TTLs provide a bounded
+fallback. See the [operator guide](operator-guide.md#runtime-failure-and-delivery-bounds)
+for the delivery and admission limits.
 
 Polling loops, provider change streams, versions, watch cursors, and ordering
 tokens are entirely internal to the control plane and store provider. The proxy
@@ -320,16 +357,27 @@ used to configure the sidecar's local upstream.
 
 Supported workload kinds:
 
-- `Deployment` for stateless or horizontally scalable workloads.
-- `StatefulSet` for stable identity, per-replica storage, and stateful services.
-For V1, StatefulSet scale above one is out of scope.
+- Single-replica `Deployment` for stateless workloads, using Recreate.
+- Single-replica `StatefulSet` for stable identity, storage, and stateful services.
+
+For V1, both kinds reject explicit zero or multiple replicas. Automatic sleep
+requires the supported single-member activity and ownership checks above. It
+also requires the current generation's persisted Ready age to reach
+`max(190 seconds, resolved class idle timeout)`, alongside the sidecar's full
+quiet interval. The unconditional activation floor protects pending first
+requests even after another request finishes; a control-plane restart does not
+extend it. A wake with no application traffic still becomes eligible after this
+finite interval, and the default 300-second class idle timeout continues to
+dominate. The internal explicit `BeginSleep` operation can bypass the automatic
+floor; there is no deployed operator Sleep RPC. See the
+[activation contract](proxy-protocol-contract.md#activation-and-automatic-idle-sleep).
 
 Other Kubernetes workload types are out of scope until these two are robust.
 
 On sleep, the control plane should first stop new routing by publishing a
 draining generation. Existing requests/connections get a configurable grace
-period before Kubernetes objects are deleted. Use 60 seconds as the default
-drain grace period, with per-class override and a hard maximum. If active
+period before Kubernetes objects are deleted. The pinned workload class supplies
+the drain grace period, and sleep acceptance persists its fixed deadline. If active
 traffic remains after the grace period, the materialization is deleted anyway and
 the old backend generation is invalidated.
 
@@ -342,11 +390,11 @@ Cold
   WakeInstance -> Waking
 
 Waking
-  materialization ready -> Running
+  materialization ready -> Running (persist Ready transition time)
   timeout/error -> Failed
 
 Running
-  ReportIdle -> Draining
+  ReportIdle with full quiet interval and Ready age >= max(190s, class idle) -> Draining
   DeleteInstance -> Deleting
 
 Draining

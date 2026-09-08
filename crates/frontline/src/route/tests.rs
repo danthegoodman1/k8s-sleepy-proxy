@@ -5,13 +5,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use control_plane::{
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
-    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
-};
 use proxy_core::observability::{
     metrics::RUNTIME_CONTROL_PLANE_CALLS_TOTAL_NAME,
     recorder::{InMemoryObservability, ObservabilityEvent},
+};
+use sleepypods_api::{
+    BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
+    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
 };
 
 use super::{
@@ -90,7 +90,7 @@ impl RouteSubscriptionClient for FakeRouteClient {
         &mut self,
         request_id: RouteRequestId,
         identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'_, SubscribeControlPlaneOutput, Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
         self.calls.push(RouteClientCall::Subscribe {
             request_id,
             identity,
@@ -105,7 +105,7 @@ impl RouteSubscriptionClient for FakeRouteClient {
     fn unsubscribe(
         &mut self,
         subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
         self.calls
             .push(RouteClientCall::Unsubscribe { subscription_id });
         Box::pin(async { Ok(()) })
@@ -162,7 +162,7 @@ impl RouteSubscriptionClient for BlockingRouteClient {
         &mut self,
         request_id: RouteRequestId,
         identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'_, SubscribeControlPlaneOutput, Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
         self.calls
             .lock()
             .expect("blocking route calls lock")
@@ -182,7 +182,7 @@ impl RouteSubscriptionClient for BlockingRouteClient {
     fn unsubscribe(
         &mut self,
         subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
         self.calls
             .lock()
             .expect("blocking route calls lock")
@@ -249,7 +249,7 @@ impl WakeClient for BlockingWakeClient {
     fn wake_instance(
         &mut self,
         request: WakeInstanceRequest,
-    ) -> WakeClientFuture<'_, WakeInstanceResponse, Self::Error> {
+    ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
         self.calls
             .lock()
             .expect("blocking wake calls lock")
@@ -271,7 +271,7 @@ impl WakeClient for FakeWakeClient {
     fn wake_instance(
         &mut self,
         request: WakeInstanceRequest,
-    ) -> WakeClientFuture<'_, WakeInstanceResponse, Self::Error> {
+    ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
         self.calls.push(request);
         let response = self.responses.pop_front().expect("queued wake response");
         Box::pin(async move { response })
@@ -460,7 +460,8 @@ async fn running_backend_cached_returns_ready_without_subscribe_or_wake() {
     let started_at = now();
     let request = http_request("app.example.com", "/api/users");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -754,7 +755,8 @@ async fn running_route_without_backend_triggers_wake() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -781,7 +783,8 @@ async fn waking_route_without_local_pending_wake_resumes_via_control_plane() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -822,7 +825,8 @@ async fn waking_route_with_local_pending_wake_waits_without_second_wake_call() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -853,7 +857,8 @@ async fn deleting_and_deleted_routes_are_unavailable_without_wake_call() {
         let now = now();
         let request = http_request("app.example.com", "/");
         let mut subscription_state = SubscriptionState::new(4);
-        subscription_state.apply_control_plane_message(
+        subscription_state.apply_resolved_response(
+            request.clone(),
             resolved_response(
                 request_id("initial"),
                 subscription_id("sub-1"),
@@ -879,11 +884,12 @@ async fn deleting_and_deleted_routes_are_unavailable_without_wake_call() {
 }
 
 #[tokio::test]
-async fn duplicate_pending_wake_waits_without_second_wake_call() {
+async fn accepted_wake_response_releases_rpc_tracker() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -904,17 +910,7 @@ async fn duplicate_pending_wake_waits_without_second_wake_call() {
         .await
         .expect("wake starts");
     assert!(matches!(first, FrontlineRouteOutcome::Waking { .. }));
-    assert_eq!(coordinator.wake_tracker().pending_len(), 1);
-
-    let second = coordinator
-        .route(request, now)
-        .await
-        .expect("duplicate waits");
-
-    let FrontlineRouteOutcome::Waiting(wait) = second else {
-        panic!("expected waiting outcome");
-    };
-    assert_eq!(wait.reason, WakeWaitReason::DuplicatePendingWake);
+    assert_eq!(coordinator.wake_tracker().pending_len(), 0);
     assert_eq!(coordinator.wake_client().calls.len(), 1);
 }
 
@@ -923,7 +919,8 @@ async fn stale_wake_response_is_rejected_clears_pending_and_does_not_update_cach
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -974,7 +971,8 @@ async fn stale_cold_wake_conflict_then_refreshed_waking_route_resumes_wake() {
     let request = http_request("app.example.com", "/");
     let matched_identity = http_rule("example.com", None);
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -1082,7 +1080,8 @@ async fn wake_failed_unavailable_and_generation_conflict_map_to_typed_outcomes()
         let now = now();
         let request = http_request("app.example.com", "/");
         let mut state = SubscriptionState::new(4);
-        state.apply_control_plane_message(
+        state.apply_resolved_response(
+            request.clone(),
             resolved_response(
                 request_id("initial"),
                 subscription_id("sub-1"),
@@ -1127,7 +1126,8 @@ async fn wake_client_error_surfaces_and_clears_pending_for_retry() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-1"),
@@ -1227,7 +1227,8 @@ async fn route_after_stream_loss_lazily_resubscribes_and_rebuilds_cache() {
     let now = now();
     let request = http_request("app.example.com", "/");
     let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
+    state.apply_resolved_response(
+        request.clone(),
         resolved_response(
             request_id("initial"),
             subscription_id("sub-old"),
@@ -1308,4 +1309,975 @@ async fn route_resolver_error_surfaces_without_wake_call() {
 
     assert!(matches!(error, FrontlineRouteCoordinatorError::Resolve(_)));
     assert!(coordinator.wake_client().calls.is_empty());
+}
+
+#[tokio::test]
+async fn review_probe_wildcard_cache_must_not_hide_preexisting_exact_route() {
+    let mut client = FakeRouteClient::default();
+    client.push_subscribe_response(resolved_response(
+        request_id("req:1"),
+        subscription_id("broad"),
+        http_rule("example.com", None),
+        route_entry(InstanceState::Running, 7, Some(1)),
+    ));
+    client.push_subscribe_response(resolved_response(
+        request_id("req:2"),
+        subscription_id("exact"),
+        http_request("private.example.com", "/"),
+        route_entry(InstanceState::Running, 7, Some(2)),
+    ));
+    let mut coordinator =
+        coordinator_with_state(SubscriptionState::new(8), client, FakeWakeClient::default());
+    coordinator
+        .route(http_request("public.example.com", "/"), now())
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .route(http_request("private.example.com", "/"), now())
+        .await
+        .unwrap();
+    let FrontlineRouteOutcome::Ready(actual) = outcome else {
+        panic!("expected ready");
+    };
+    assert_eq!(
+        actual.backend,
+        backend(2),
+        "the control plane has an exact route, but the broad cache suppresses its lookup"
+    );
+}
+
+#[tokio::test]
+async fn review_probe_root_path_cache_must_not_hide_preexisting_specific_route() {
+    let mut client = FakeRouteClient::default();
+    client.push_subscribe_response(resolved_response(
+        request_id("req:1"),
+        subscription_id("root"),
+        http_request("app.example.com", "/"),
+        route_entry(InstanceState::Running, 7, Some(1)),
+    ));
+    client.push_subscribe_response(resolved_response(
+        request_id("req:2"),
+        subscription_id("private"),
+        http_request("app.example.com", "/private"),
+        route_entry(InstanceState::Running, 7, Some(2)),
+    ));
+    let mut coordinator =
+        coordinator_with_state(SubscriptionState::new(8), client, FakeWakeClient::default());
+    coordinator
+        .route(http_request("app.example.com", "/"), now())
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .route(http_request("app.example.com", "/private"), now())
+        .await
+        .unwrap();
+    let FrontlineRouteOutcome::Ready(actual) = outcome else {
+        panic!("expected ready");
+    };
+    assert_eq!(
+        actual.backend,
+        backend(2),
+        "the root cache suppresses the more specific path lookup"
+    );
+}
+
+#[derive(Clone)]
+struct ReviewEventClient {
+    events: Arc<Mutex<Vec<crate::RouteSubscriptionEvent>>>,
+}
+impl RouteSubscriptionClient for ReviewEventClient {
+    type Error = TestRouteClientError;
+    fn subscribe_route(
+        &mut self,
+        id: RouteRequestId,
+        identity: RouteIdentity,
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
+        Box::pin(async move { Ok(miss_response(id, identity)) })
+    }
+    fn unsubscribe(
+        &mut self,
+        _: SubscriptionId,
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+    fn drain_subscription_events(
+        &mut self,
+    ) -> RouteSubscriptionFuture<'static, Vec<crate::RouteSubscriptionEvent>, Self::Error> {
+        let events = std::mem::take(&mut *self.events.lock().unwrap());
+        Box::pin(async move { Ok(events) })
+    }
+}
+
+#[tokio::test]
+async fn review_probe_hot_invalidation_progresses_during_cold_wake() {
+    let mut state = SubscriptionState::new(8);
+    let hot = http_request("hot.example.com", "/");
+    let cold = http_request("cold.example.com", "/");
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("hot"),
+            subscription_id("sub-hot"),
+            hot.clone(),
+            route_entry(InstanceState::Running, 7, Some(3)),
+        ),
+        now(),
+    );
+    state.apply_control_plane_message(
+        resolved_response(
+            request_id("cold"),
+            subscription_id("sub-cold"),
+            cold.clone(),
+            route_entry(InstanceState::Cold, 8, None),
+        ),
+        now(),
+    );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let client = ReviewEventClient {
+        events: events.clone(),
+    };
+    let wake = BlockingWakeClient::default();
+    let _release = wake.push_response_channel();
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::from_parts(state, client),
+        WakeTracker::new(),
+        wake.clone(),
+    )
+    .into_shared();
+    let cold_shared = shared.clone();
+    let _cold_task = tokio::spawn(async move { cold_shared.route(cold, now()).await });
+    tokio::time::timeout(Duration::from_secs(1), wake.wait_for_call_count(1))
+        .await
+        .unwrap();
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::Update(Box::new(
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id: subscription_id("sub-hot"),
+                reason: InvalidationReason::RouteRemoved,
+            },
+        )));
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let outcome = tokio::time::timeout(Duration::from_millis(100), shared.route(hot, now()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!matches!(outcome, FrontlineRouteOutcome::Ready(_)), "hot backend remains routable after invalidation because the actor is waiting on another wake");
+}
+
+#[derive(Clone)]
+struct CompleteAuthority {
+    routes: Arc<Mutex<Vec<(RouteIdentity, RouteEntry)>>>,
+    events: Arc<Mutex<Vec<crate::RouteSubscriptionEvent>>>,
+}
+impl RouteSubscriptionClient for CompleteAuthority {
+    type Error = TestRouteClientError;
+    fn subscribe_route(
+        &mut self,
+        id: RouteRequestId,
+        identity: RouteIdentity,
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
+        let matched = self
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(rule, entry)| {
+                crate::matcher::rank_match(&identity, rule)
+                    .map(|rank| (rank, rule.clone(), entry.clone()))
+            })
+            .max_by_key(|(rank, _, _)| *rank);
+        let response = match matched {
+            Some((_, matched, entry)) => resolved_response(
+                id.clone(),
+                subscription_id(&format!("sub-{}", id.as_str())),
+                matched,
+                entry,
+            ),
+            None => miss_response(id, identity),
+        };
+        Box::pin(async move { Ok(response) })
+    }
+    fn unsubscribe(
+        &mut self,
+        _: SubscriptionId,
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+    fn drain_subscription_events(
+        &mut self,
+    ) -> RouteSubscriptionFuture<'static, Vec<crate::RouteSubscriptionEvent>, Self::Error> {
+        let events = std::mem::take(&mut *self.events.lock().unwrap());
+        Box::pin(async move { Ok(events) })
+    }
+}
+#[tokio::test]
+async fn partial_cache_matches_complete_authority_for_http_sni_and_eviction_orders() {
+    let cases = [
+        (http_rule("example.com", None), 1),
+        (http_request("private.example.com", "/"), 2),
+        (http_request("app.example.com", "/"), 3),
+        (http_request("app.example.com", "/private"), 4),
+        (
+            RouteIdentity::Sni {
+                host: RouteHost::wildcard_suffix("example.com").unwrap(),
+            },
+            5,
+        ),
+        (
+            RouteIdentity::Sni {
+                host: RouteHost::exact("db.example.com").unwrap(),
+            },
+            6,
+        ),
+        (
+            RouteIdentity::Sni {
+                host: RouteHost::wildcard_suffix("nested.example.com").unwrap(),
+            },
+            7,
+        ),
+    ];
+    let requests = [
+        (http_request("public.example.com", "/"), 1),
+        (http_request("private.example.com", "/"), 2),
+        (http_request("app.example.com", "/public"), 3),
+        (http_request("app.example.com", "/private/x"), 4),
+        (
+            RouteIdentity::Sni {
+                host: RouteHost::exact("public.example.com").unwrap(),
+            },
+            5,
+        ),
+        (
+            RouteIdentity::Sni {
+                host: RouteHost::exact("db.example.com").unwrap(),
+            },
+            6,
+        ),
+        (
+            RouteIdentity::Sni {
+                host: RouteHost::exact("db.nested.example.com").unwrap(),
+            },
+            7,
+        ),
+    ];
+    for capacity in [1, 3, 16] {
+        let client = CompleteAuthority {
+            routes: Arc::new(Mutex::new(
+                cases
+                    .iter()
+                    .map(|(identity, b)| {
+                        (
+                            identity.clone(),
+                            route_entry(InstanceState::Running, 7, Some(*b)),
+                        )
+                    })
+                    .collect(),
+            )),
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let shared = FrontlineRouteCoordinator::new(
+            FrontlineRouteResolver::new(capacity, client),
+            WakeTracker::new(),
+            FakeWakeClient::default(),
+        )
+        .into_shared();
+        // Coprime strides exercise different warmup/eviction permutations.
+        for stride in [1, 3, 5] {
+            for index in 0..requests.len() * 3 {
+                let (identity, expected) = &requests[(index * stride) % requests.len()];
+                let FrontlineRouteOutcome::Ready(actual) =
+                    shared.route(identity.clone(), now()).await.unwrap()
+                else {
+                    panic!("expected ready")
+                };
+                assert_eq!(actual.backend, backend(*expected));
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn new_specific_route_after_warmup_invalidates_the_original_query() {
+    let rules = Arc::new(Mutex::new(vec![(
+        http_rule("example.com", None),
+        route_entry(InstanceState::Running, 7, Some(1)),
+    )]));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let client = CompleteAuthority {
+        routes: rules.clone(),
+        events: events.clone(),
+    };
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(8, client),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let identity = http_request("private.example.com", "/");
+    shared.route(identity.clone(), now()).await.unwrap();
+    rules.lock().unwrap().push((
+        identity.clone(),
+        route_entry(InstanceState::Running, 7, Some(2)),
+    ));
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::Update(Box::new(
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id: subscription_id("sub-req:1"),
+                reason: InvalidationReason::RouteChanged,
+            },
+        )));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let FrontlineRouteOutcome::Ready(actual) = shared.route(identity, now()).await.unwrap() else {
+        panic!("ready")
+    };
+    assert_eq!(actual.backend, backend(2));
+}
+#[tokio::test]
+async fn distinct_flights_are_admitted_before_spawn_and_shutdown_aborts_work() {
+    let client = BlockingRouteClient::default();
+    let mut replies = Vec::new();
+    for _ in 0..super::MAX_ROUTE_FLIGHTS {
+        replies.push(client.push_subscribe_response_channel());
+    }
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(8, client.clone()),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let mut callers = Vec::new();
+    for index in 0..super::MAX_ROUTE_FLIGHTS {
+        let shared = shared.clone();
+        callers.push(tokio::spawn(async move {
+            shared
+                .route(
+                    http_request(&format!("host{index}.example.com"), "/"),
+                    now(),
+                )
+                .await
+        }));
+    }
+    client.wait_for_call_count(super::MAX_ROUTE_FLIGHTS).await;
+    let overloaded = shared
+        .route(http_request("overflow.example.com", "/"), now())
+        .await;
+    assert!(matches!(
+        overloaded,
+        Err(FrontlineRouteCoordinatorError::Saturated)
+    ));
+    assert_eq!(shared.flights.lock().await.len(), super::MAX_ROUTE_FLIGHTS);
+    for caller in callers {
+        caller.abort();
+        let _ = caller.await;
+    }
+    let actor = shared._task.0.abort_handle();
+    drop(shared);
+    tokio::task::yield_now().await;
+    assert!(actor.is_finished());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while replies.iter().any(|reply| !reply.is_closed()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown cancels all outstanding subscribe futures");
+}
+#[tokio::test]
+async fn accepted_wake_waits_for_authoritative_readiness_and_releases_tracker() {
+    let client = BlockingRouteClient::default();
+    let first = client.push_subscribe_response_channel();
+    let second = client.push_subscribe_response_channel();
+    let mut wake = FakeWakeClient::default();
+    wake.push_response(WakeInstanceResponse::WakeStarted {
+        instance_id: instance_id("instance-a"),
+        generation: Generation::new(8),
+    });
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(8, client.clone()),
+        WakeTracker::new(),
+        wake,
+    )
+    .into_shared();
+    let identity = http_request("cold.example.com", "/");
+    let caller = {
+        let shared = shared.clone();
+        let identity = identity.clone();
+        tokio::spawn(async move { shared.route(identity, now()).await })
+    };
+    client.wait_for_call_count(1).await;
+    first
+        .send(Ok(resolved_response(
+            generated_request_id(1),
+            subscription_id("cold"),
+            identity.clone(),
+            route_entry(InstanceState::Cold, 7, None),
+        )))
+        .unwrap();
+    client.wait_for_call_count(3).await; // subscribe + unsubscribe + refresh subscribe
+    assert!(
+        !caller.is_finished(),
+        "Accepted must not end the cold request"
+    );
+    second
+        .send(Ok(resolved_response(
+            generated_request_id(2),
+            subscription_id("ready"),
+            identity,
+            route_entry(InstanceState::Running, 8, Some(2)),
+        )))
+        .unwrap();
+    assert!(matches!(
+        caller.await.unwrap().unwrap(),
+        FrontlineRouteOutcome::Ready(_)
+    ));
+}
+
+#[derive(Clone)]
+struct BlockingEventClient {
+    client: BlockingRouteClient,
+    events: Arc<Mutex<Vec<crate::RouteSubscriptionEvent>>>,
+}
+impl RouteSubscriptionClient for BlockingEventClient {
+    type Error = TestRouteClientError;
+    fn subscribe_route(
+        &mut self,
+        id: RouteRequestId,
+        identity: RouteIdentity,
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
+        self.client.subscribe_route(id, identity)
+    }
+    fn unsubscribe(
+        &mut self,
+        id: SubscriptionId,
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
+        self.client.unsubscribe(id)
+    }
+    fn drain_subscription_events(
+        &mut self,
+    ) -> RouteSubscriptionFuture<'static, Vec<crate::RouteSubscriptionEvent>, Self::Error> {
+        let events = std::mem::take(&mut *self.events.lock().unwrap());
+        Box::pin(async move { Ok(events) })
+    }
+}
+#[tokio::test]
+async fn invalidation_progresses_during_a_blocked_subscribe() {
+    let client = BlockingRouteClient::default();
+    let _blocked = client.push_subscribe_response_channel();
+    let hot_reply = client.push_subscribe_response_channel();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hot = http_request("hot.example.com", "/");
+    let mut state = SubscriptionState::new(4);
+    state.cache_mut().insert_positive(
+        subscription_id("hot"),
+        hot.clone(),
+        route_entry(InstanceState::Running, 7, Some(1)),
+        ttl(30),
+        now(),
+    );
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::from_parts(
+            state,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let blocked = {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            shared
+                .route(http_request("blocked.example.com", "/"), now())
+                .await
+        })
+    };
+    client.wait_for_call_count(1).await;
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::Update(Box::new(
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id: subscription_id("hot"),
+                reason: InvalidationReason::RouteRemoved,
+            },
+        )));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    hot_reply
+        .send(Ok(miss_response(generated_request_id(2), hot.clone())))
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_millis(100), shared.route(hot, now()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, FrontlineRouteOutcome::Miss(_)));
+    blocked.abort();
+}
+#[tokio::test]
+async fn invalidation_before_response_install_cannot_resurrect_backend() {
+    let client = BlockingRouteClient::default();
+    let old = client.push_subscribe_response_channel();
+    let new = client.push_subscribe_response_channel();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(
+            4,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let identity = http_request("app.example.com", "/");
+    let task = {
+        let shared = shared.clone();
+        let identity = identity.clone();
+        tokio::spawn(async move { shared.route(identity, now()).await })
+    };
+    client.wait_for_call_count(1).await;
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::Update(Box::new(
+            SubscribeControlPlaneOutput::RouteInvalidated {
+                subscription_id: subscription_id("old"),
+                reason: InvalidationReason::RouteChanged,
+            },
+        )));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    old.send(Ok(resolved_response(
+        generated_request_id(1),
+        subscription_id("old"),
+        identity.clone(),
+        route_entry(InstanceState::Running, 7, Some(1)),
+    )))
+    .unwrap();
+    client.wait_for_call_count(3).await;
+    assert!(
+        client.calls().contains(&RouteClientCall::Unsubscribe {
+            subscription_id: subscription_id("old"),
+        }),
+        "discarded successful subscription is reclaimed"
+    );
+    assert!(!task.is_finished());
+    assert!(shared.local_route(&identity, now()).await.is_none());
+    new.send(Ok(resolved_response(
+        generated_request_id(2),
+        subscription_id("new"),
+        identity,
+        route_entry(InstanceState::Running, 7, Some(2)),
+    )))
+    .unwrap();
+    let FrontlineRouteOutcome::Ready(ready) = task.await.unwrap().unwrap() else {
+        panic!("ready")
+    };
+    assert_eq!(ready.backend, backend(2));
+}
+#[tokio::test(start_paused = true)]
+async fn readiness_deadline_bounds_cancelled_flights_and_pending_actor_tasks() {
+    let client = BlockingRouteClient::default();
+    let mut replies = Vec::new();
+    for _ in 0..super::MAX_ROUTE_FLIGHTS {
+        replies.push(client.push_subscribe_response_channel());
+    }
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(4, client.clone()),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .with_route_deadline(Duration::from_millis(1))
+    .into_shared();
+    for index in 0..super::MAX_ROUTE_FLIGHTS {
+        let result = shared
+            .route(
+                http_request(&format!("deadline{index}.example.com"), "/"),
+                now(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(FrontlineRouteCoordinatorError::RouteDeadline)
+        ));
+    }
+    let result = shared
+        .route(http_request("excess.example.com", "/"), now())
+        .await;
+    assert!(matches!(
+        result,
+        Err(FrontlineRouteCoordinatorError::Saturated)
+    ));
+    assert_eq!(client.calls().len(), super::MAX_ROUTE_FLIGHTS);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while replies.iter().any(|reply| !reply.is_closed()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("subscribe deadlines release all pending work");
+}
+
+#[tokio::test]
+async fn same_identity_waiters_are_bounded_and_recover_after_cancellation() {
+    let client = BlockingRouteClient::default();
+    let reply = client.push_subscribe_response_channel();
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(4, client.clone()),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let identity = http_request("waiters.example.com", "/");
+    let mut callers = Vec::new();
+    for _ in 0..super::MAX_ROUTE_WAITERS {
+        let shared = shared.clone();
+        let identity = identity.clone();
+        callers.push(tokio::spawn(
+            async move { shared.route(identity, now()).await },
+        ));
+    }
+    client.wait_for_call_count(1).await;
+    wait_for_shared_flight_ref_count(&shared, &identity, super::MAX_ROUTE_WAITERS + 2).await;
+    assert!(matches!(
+        shared.route(identity.clone(), now()).await,
+        Err(FrontlineRouteCoordinatorError::Saturated)
+    ));
+    assert_eq!(client.calls().len(), 1);
+    for caller in callers {
+        caller.abort();
+        let _ = caller.await;
+    }
+    reply
+        .send(Ok(resolved_response(
+            generated_request_id(1),
+            subscription_id("ready"),
+            identity.clone(),
+            route_entry(InstanceState::Running, 7, Some(3)),
+        )))
+        .unwrap();
+    assert!(matches!(
+        shared.route(identity, now()).await.unwrap(),
+        FrontlineRouteOutcome::Ready(_)
+    ));
+}
+
+#[tokio::test]
+async fn cold_resolution_progresses_through_sustained_unrelated_updates() {
+    let client = BlockingRouteClient::default();
+    let reply = client.push_subscribe_response_channel();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(
+            4,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .with_route_deadline(Duration::from_secs(1))
+    .into_shared();
+    let identity = http_request("cold.example.com", "/");
+    let task = {
+        let shared = shared.clone();
+        let identity = identity.clone();
+        tokio::spawn(async move { shared.route(identity, now()).await })
+    };
+    client.wait_for_call_count(1).await;
+    // Keep delivering distinct unrelated events while the cold RPC is pending.
+    // Any stream-wide event counter would reject its one configured response.
+    for batch in 0..20 {
+        for index in 0..64 {
+            events
+                .lock()
+                .unwrap()
+                .push(crate::RouteSubscriptionEvent::Update(Box::new(
+                    SubscribeControlPlaneOutput::RouteInvalidated {
+                        subscription_id: subscription_id(&format!(
+                            "unrelated-{}",
+                            batch * 64 + index
+                        )),
+                        reason: InvalidationReason::BackendChanged,
+                    },
+                )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    reply
+        .send(Ok(resolved_response(
+            generated_request_id(1),
+            subscription_id("cold"),
+            identity,
+            route_entry(InstanceState::Running, 7, Some(2)),
+        )))
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        FrontlineRouteOutcome::Ready(_),
+    ));
+    assert_eq!(client.calls().len(), 1);
+}
+
+#[test]
+fn subscription_observation_history_is_bounded_pruned_and_session_scoped() {
+    let mut observations = super::RouteObservations::default();
+    let old = observations.begin();
+    for index in 0..super::MAX_OBSERVED_SUBSCRIPTIONS {
+        assert!(observations.record(&subscription_id(&format!("sub-{index}"))));
+    }
+    assert!(!observations.record(&subscription_id("overflow")));
+    assert_eq!(
+        observations.subscriptions.len(),
+        super::MAX_OBSERVED_SUBSCRIPTIONS
+    );
+    assert!(observations.finish(old, Some(&subscription_id("unrelated-cold"))));
+    assert!(observations.subscriptions.is_empty());
+    let old = observations.begin();
+    observations.reset();
+    let new = observations.begin();
+    assert!(!observations.finish(old, Some(&subscription_id("reused"))));
+    assert!(observations.finish(new, Some(&subscription_id("reused"))));
+    assert!(observations.active.is_empty());
+}
+
+#[tokio::test]
+async fn discarded_reply_from_old_stream_does_not_unsubscribe_reused_id() {
+    let client = BlockingRouteClient::default();
+    let old_reply = client.push_subscribe_response_channel();
+    let new_reply = client.push_subscribe_response_channel();
+    let retry_reply = client.push_subscribe_response_channel();
+    let refreshed_reply = client.push_subscribe_response_channel();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(
+            4,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let old_identity = http_request("old.example.com", "/");
+    let new_identity = http_request("new.example.com", "/");
+    let old = {
+        let shared = shared.clone();
+        let identity = old_identity.clone();
+        tokio::spawn(async move { shared.route(identity, now()).await })
+    };
+    client.wait_for_call_count(1).await;
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::StreamClosed);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    new_reply
+        .send(Ok(resolved_response(
+            generated_request_id(2),
+            subscription_id("reused"),
+            new_identity.clone(),
+            route_entry(InstanceState::Running, 7, Some(2)),
+        )))
+        .unwrap();
+    assert!(matches!(
+        shared.route(new_identity.clone(), now()).await.unwrap(),
+        FrontlineRouteOutcome::Ready(_)
+    ));
+    old_reply
+        .send(Ok(resolved_response(
+            generated_request_id(1),
+            subscription_id("reused"),
+            old_identity.clone(),
+            route_entry(InstanceState::Running, 7, Some(1)),
+        )))
+        .unwrap();
+    client.wait_for_call_count(3).await;
+    retry_reply
+        .send(Ok(miss_response(generated_request_id(3), old_identity)))
+        .unwrap();
+    assert!(matches!(
+        old.await.unwrap().unwrap(),
+        FrontlineRouteOutcome::Miss(_)
+    ));
+    assert!(
+        shared.local_route(&new_identity, now()).await.is_none(),
+        "ambiguous session cleanup flushes authority together with subscriptions"
+    );
+    refreshed_reply
+        .send(Ok(resolved_response(
+            generated_request_id(4),
+            subscription_id("reused"),
+            new_identity.clone(),
+            route_entry(InstanceState::Running, 7, Some(2)),
+        )))
+        .unwrap();
+    assert!(matches!(
+        shared.route(new_identity, now()).await.unwrap(),
+        FrontlineRouteOutcome::Ready(_)
+    ));
+    assert!(!client
+        .calls()
+        .iter()
+        .any(|call| matches!(call, RouteClientCall::Unsubscribe { .. })));
+}
+
+#[derive(Default)]
+struct FailedCleanupClient {
+    resets: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl RouteSubscriptionClient for FailedCleanupClient {
+    type Error = TestRouteClientError;
+    fn subscribe_route(
+        &mut self,
+        _: RouteRequestId,
+        _: RouteIdentity,
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
+        panic!("cleanup must not subscribe")
+    }
+    fn unsubscribe(
+        &mut self,
+        _: SubscriptionId,
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
+        Box::pin(async { Err(TestRouteClientError::SubscribeFailed) })
+    }
+    fn reset_subscription(&mut self) -> RouteSubscriptionFuture<'static, (), Self::Error> {
+        self.resets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn failed_or_saturated_discard_cleanup_resets_session_and_authority() {
+    let mut client = FailedCleanupClient::default();
+    let mut initial = SubscriptionState::new(4);
+    initial.cache_mut().insert_positive(
+        subscription_id("cached"),
+        http_request("cached.example.com", "/"),
+        route_entry(InstanceState::Running, 7, Some(1)),
+        ttl(30),
+        now(),
+    );
+    let state = tokio::sync::RwLock::new(initial);
+    let mut observations = super::RouteObservations::default();
+    let observation = observations.begin();
+    let mut cleanups = tokio::task::JoinSet::new();
+    super::defer_unsubscribes(
+        vec![subscription_id("discarded")],
+        &mut client,
+        &state,
+        &mut observations,
+        &mut cleanups,
+    )
+    .await;
+    tokio::task::yield_now().await;
+    super::defer_unsubscribes(
+        Vec::new(),
+        &mut client,
+        &state,
+        &mut observations,
+        &mut cleanups,
+    )
+    .await;
+    assert_eq!(client.resets.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(!observations.finish(observation, None));
+    assert!(matches!(
+        state
+            .read()
+            .await
+            .cache()
+            .lookup(&http_request("cached.example.com", "/"), now()),
+        crate::CacheLookup::Absent
+    ));
+    super::defer_unsubscribes(
+        (0..=super::MAX_ROUTE_FLIGHTS)
+            .map(|i| subscription_id(&format!("discarded-{i}")))
+            .collect(),
+        &mut client,
+        &state,
+        &mut observations,
+        &mut cleanups,
+    )
+    .await;
+    assert_eq!(client.resets.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert!(cleanups.len() <= 1);
+}
+
+#[tokio::test]
+async fn shared_wake_completion_checks_only_its_affected_subscription() {
+    for affected in [false, true] {
+        let identity = http_request("cold.example.com", "/");
+        let mut state = SubscriptionState::new(4);
+        state.cache_mut().insert_positive(
+            subscription_id("cold"),
+            identity.clone(),
+            route_entry(InstanceState::Cold, 12, None),
+            ttl(30),
+            now(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let wake = BlockingWakeClient::default();
+        let reply = wake.push_response_channel();
+        let shared = FrontlineRouteCoordinator::new(
+            FrontlineRouteResolver::from_parts(
+                state,
+                ReviewEventClient {
+                    events: events.clone(),
+                },
+            ),
+            WakeTracker::new(),
+            wake.clone(),
+        )
+        .into_shared();
+        let task = {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.route(identity, now()).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), wake.wait_for_call_count(1))
+            .await
+            .unwrap();
+        events
+            .lock()
+            .unwrap()
+            .push(crate::RouteSubscriptionEvent::Update(Box::new(
+                SubscribeControlPlaneOutput::RouteInvalidated {
+                    subscription_id: subscription_id(if affected { "cold" } else { "unrelated" }),
+                    reason: InvalidationReason::RouteRemoved,
+                },
+            )));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        reply.send(Ok(ready_wake_response(12, 7))).unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if affected {
+            assert!(
+                matches!(result, FrontlineRouteOutcome::Miss(_)),
+                "invalidated wake cannot return its stale Ready backend"
+            );
+        } else {
+            assert!(
+                matches!(result, FrontlineRouteOutcome::Ready(_)),
+                "unrelated updates must not reject a valid wake completion"
+            );
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use control_plane::{PathPrefix, RouteHost, RouteIdentity};
+use sleepypods_api::{PathPrefix, RouteHost, RouteIdentity};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteRequestIdentity {
@@ -106,7 +106,7 @@ fn canonical_request_path(path: Option<&str>) -> Result<PathPrefix, RequestIdent
 
 #[cfg(test)]
 mod tests {
-    use control_plane::RouteIdentity;
+    use sleepypods_api::RouteIdentity;
 
     use super::{RequestIdentityError, RouteRequestIdentity};
 

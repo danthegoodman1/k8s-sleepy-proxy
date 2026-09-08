@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use control_plane::{
+use sleepypods_api::{
     BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState, PathPrefix,
     RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
 };
@@ -74,7 +74,8 @@ fn http_rule(host: &str, path: Option<&str>) -> RouteIdentity {
 fn route_resolved_inserts_positive_cache_with_subscription_id() {
     let now = now();
     let mut state = SubscriptionState::new(4);
-    let outcome = state.apply_control_plane_message(
+    let outcome = state.apply_resolved_response(
+        http_request("app.example.com", "/api/users"),
         SubscribeControlPlaneOutput::RouteResolved {
             request_id: request_id("req-1"),
             subscription_id: subscription_id("sub-1"),

@@ -1,12 +1,5 @@
 use std::{error::Error, process, time::Duration};
 
-use control_plane::{
-    api::pb::{
-        operator_control_plane_client::OperatorControlPlaneClient,
-        proxy_control_plane_client::ProxyControlPlaneClient,
-    },
-    OptionalBearerTokenInterceptor,
-};
 use frontline::{
     serve_frontline, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
     FrontlineRouteResolver, FrontlineTlsAdapter, GrpcOperatorHttp01Resolver,
@@ -24,30 +17,71 @@ use proxy_core::{
     },
     DrainTracker, Shutdown,
 };
+use sleepypods_api::{
+    pb::{
+        operator_control_plane_client::OperatorControlPlaneClient,
+        proxy_control_plane_client::ProxyControlPlaneClient,
+    },
+    OptionalBearerTokenInterceptor,
+};
 use tokio::time::{sleep, Instant};
 use tonic::transport::Endpoint;
 
 const CONTROL_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_PLANE_CONNECT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = run_with_runtime(run()) {
         eprintln!("frontline runtime failed: {error}");
         process::exit(1);
     }
 }
 
+// run() completes owned listener/drain and signal-task cleanup before this
+// runtime boundary. A blocking OS DNS lookup may outlive its canceled async
+// handle; do not let Tokio's default blocking-worker join pin process shutdown.
+fn run_with_runtime(
+    future: impl std::future::Future<Output = Result<(), Box<dyn Error + Send + Sync>>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(future);
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    control_plane::install_rustls_crypto_provider();
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let env = FrontlineEnvConfig::from_env()?;
     let prometheus = install_runtime_observability(env.metrics_listen_addr().is_some());
     let observability = ObservabilityRecorder::global();
     let tls_certificates = env
         .load_tls_certificate_store()?
         .unwrap_or_else(TlsCertificateStore::new);
+    let shutdown = Shutdown::new();
+    let shutdown_task = spawn_shutdown_signal(shutdown.clone())?;
+    let result =
+        run_with_shutdown(env, prometheus, observability, tls_certificates, shutdown).await;
+    shutdown_task.abort();
+    let _ = shutdown_task.await;
+    result
+}
+
+async fn run_with_shutdown(
+    env: FrontlineEnvConfig,
+    prometheus: Option<PrometheusMetricsSink>,
+    observability: ObservabilityRecorder,
+    tls_certificates: TlsCertificateStore,
+    shutdown: Shutdown,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let endpoint = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?;
-    let channel = connect_control_plane(endpoint, env.control_plane_endpoint()).await?;
+    let Some(channel) =
+        connect_control_plane(endpoint, env.control_plane_endpoint(), &shutdown).await?
+    else {
+        return Ok(());
+    };
     let proxy_interceptor = OptionalBearerTokenInterceptor::new(env.control_plane_proxy_token())?;
     let operator_interceptor =
         OptionalBearerTokenInterceptor::new(env.control_plane_operator_token())?;
@@ -73,7 +107,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         wake_client,
         observability.clone(),
     )
-    .with_wake_deadline(env.wake_instance_timeout());
+    .with_wake_deadline(env.wake_instance_timeout())
+    .with_route_deadline(env.route_timeout());
     let drain = DrainTracker::with_observability(env.drain_grace_timeout(), observability.clone());
     let active_streams = RuntimeActiveStreamsCollector::default();
     active_streams.attach(drain.clone());
@@ -83,17 +118,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         drain,
         observability,
     );
-    let shutdown = Shutdown::new();
-
-    tokio::spawn({
-        let shutdown = shutdown.clone();
-        async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                shutdown.shutdown();
-            }
-        }
-    });
-
     if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr(), prometheus) {
         let metrics_shutdown = shutdown.clone();
         tokio::try_join!(
@@ -160,16 +184,93 @@ fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetr
 async fn connect_control_plane(
     endpoint: Endpoint,
     endpoint_label: &str,
-) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    shutdown: &Shutdown,
+) -> Result<Option<tonic::transport::Channel>, Box<dyn Error + Send + Sync>> {
+    connect_control_plane_with(endpoint_label, shutdown, || endpoint.connect()).await
+}
+
+// Only initial Channel setup is retried. The injected attempt keeps deadline and
+// cancellation tests deterministic without moving request retries into startup.
+async fn connect_control_plane_with<F, Fut>(
+    endpoint_label: &str,
+    shutdown: &Shutdown,
+    mut connect: F,
+) -> Result<Option<tonic::transport::Channel>, Box<dyn Error + Send + Sync>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<tonic::transport::Channel, tonic::transport::Error>>,
+{
     let deadline = Instant::now() + CONTROL_PLANE_CONNECT_TIMEOUT;
-    loop {
-        match endpoint.clone().connect().await {
-            Ok(channel) => return Ok(channel),
-            Err(error) if Instant::now() < deadline => {
-                eprintln!("frontline waiting for control-plane endpoint {endpoint_label}: {error}");
-                sleep(CONTROL_PLANE_CONNECT_RETRY_BACKOFF).await;
+    let retry = async {
+        loop {
+            if shutdown.is_shutdown() {
+                return Ok(None);
             }
-            Err(error) => return Err(error),
+            if Instant::now() >= deadline {
+                return Err(startup_timeout());
+            }
+            let result = connect().await;
+            // An attempt can finish on the deadline (or fail to yield while it
+            // passes). Never accept a late success or begin another retry sleep.
+            if shutdown.is_shutdown() {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                return Err(startup_timeout());
+            }
+            match result {
+                Ok(channel) => return Ok(Some(channel)),
+                Err(error) => {
+                    eprintln!(
+                        "frontline waiting for control-plane endpoint {endpoint_label}: {error}"
+                    );
+                    sleep(CONTROL_PLANE_CONNECT_RETRY_BACKOFF).await;
+                }
+            }
         }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(None),
+        _ = tokio::time::sleep_until(deadline) => Err(startup_timeout()),
+        result = retry => result,
     }
 }
+
+fn startup_timeout() -> Box<dyn Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "frontline control-plane startup exceeded 60 seconds",
+    ))
+}
+
+#[cfg(unix)]
+fn spawn_shutdown_signal(shutdown: Shutdown) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    // Register SIGTERM before starting Channel.connect, so an unready process
+    // observes Kubernetes termination while it is still in startup.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => shutdown.shutdown(),
+            _ = terminate.recv() => shutdown.shutdown(),
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn spawn_shutdown_signal(shutdown: Shutdown) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    Ok(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.shutdown();
+        }
+    }))
+}
+
+#[cfg(test)]
+#[path = "frontline/startup_tests.rs"]
+mod startup_tests;
+
+#[cfg(test)]
+#[path = "../../../../tests/support/runtime_shutdown.rs"]
+mod runtime_shutdown_tests;

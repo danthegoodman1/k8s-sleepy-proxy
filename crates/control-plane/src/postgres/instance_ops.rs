@@ -46,6 +46,7 @@ pub(crate) async fn create_instance(
     let fingerprint = idempotency::create_instance_fingerprint(&request)?;
     let idempotency_key = request.idempotency_key.as_str();
     let instance_id = request.instance_id.as_str();
+    idempotency::expire_key(&transaction, idempotency_key).await?;
     let inserted = transaction
         .execute(
             "
@@ -53,9 +54,10 @@ pub(crate) async fn create_instance(
                 idempotency_key,
                 operation,
                 request_fingerprint,
-                resource_id
+                resource_id,
+                expires_at_unix_millis
             )
-            VALUES ($1, $2, $3, $4)
+            VALUES ($1, $2, $3, $4, (extract(epoch from clock_timestamp()) * 1000)::bigint + $5::bigint)
             ON CONFLICT (idempotency_key) DO NOTHING
             ",
             &[
@@ -63,6 +65,7 @@ pub(crate) async fn create_instance(
                 &CREATE_INSTANCE_OPERATION,
                 &fingerprint,
                 &instance_id,
+                &store.idempotency_retention_millis,
             ],
         )
         .await
@@ -133,14 +136,11 @@ pub(crate) async fn create_workload_class_version(
         .await
         .map_err(map_postgres_error)?;
 
-    let stored = load_workload_class_version(
-        store,
-        LoadWorkloadClassVersionRequest::new(desired.reference.clone()),
-    )
-    .await?
-    .ok_or(StoreError::NotFound {
-        resource: "workload class version",
-    })?;
+    let stored = load_workload_class_version_from_client(&client, &desired.reference)
+        .await?
+        .ok_or(StoreError::NotFound {
+            resource: "workload class version",
+        })?;
 
     if inserted == 0 && stored != desired {
         return Err(StoreError::AlreadyExists {
@@ -199,6 +199,9 @@ pub(crate) async fn delete_instance(
         ));
     }
 
+    if transaction.query_one("SELECT EXISTS(SELECT 1 FROM materializations WHERE instance_id = $1 AND state <> 'deleted')", &[&instance_id]).await.map_err(map_postgres_error)?.get::<_,bool>(0) {
+        return Err(StoreError::invalid_argument("instance deletion requires completed materialization cleanup"));
+    }
     let deleted = transaction
         .execute(
             "DELETE FROM instances WHERE instance_id = $1 AND state = 'deleting'",
@@ -295,22 +298,35 @@ async fn replay_create_instance(
     fingerprint: &Value,
 ) -> StoreResult<CreateInstanceResult> {
     let row = client
-        .query_one(
+        .query_opt(
             "
-            SELECT operation, request_fingerprint, resource_id
+            SELECT operation, request_fingerprint, resource_id, resource_deleted_at_unix_millis
             FROM idempotency_records
             WHERE idempotency_key = $1
+            FOR UPDATE
             ",
             &[&idempotency_key],
         )
         .await
-        .map_err(map_postgres_error)?;
+        .map_err(map_postgres_error)?
+        .ok_or_else(|| {
+            StoreError::unavailable("idempotency key expired during replay; retry request")
+        })?;
     let operation: String = row.get("operation");
     let stored_fingerprint: Value = row.get("request_fingerprint");
     let resource_id: String = row.get("resource_id");
 
     if operation != CREATE_INSTANCE_OPERATION || stored_fingerprint != *fingerprint {
         return Err(idempotency::idempotency_conflict());
+    }
+
+    if row
+        .get::<_, Option<i64>>("resource_deleted_at_unix_millis")
+        .is_some()
+    {
+        return Err(StoreError::IdempotencyResourceDeleted {
+            resource: "instance",
+        });
     }
 
     load_create_instance_result(client, &resource_id, true).await

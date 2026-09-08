@@ -1,12 +1,14 @@
 # SleepyPods
 
-This repository is being reset from a Kubernetes proof of concept toward a
-production-oriented, local-first implementation of SleepyPods.
+SleepyPods is a Rust control plane and proxy system that materializes Kubernetes
+workloads on demand. The review and remediation plan tracks current implementation
+evidence and remaining production gates.
 
 Start here:
 
 - [Production north star](docs/production-north-star.md)
 - [Development plan](docs/development-plan.md)
+- [Codebase review and remediation plan](docs/review-remediation-plan.md)
 - [Operator guide](docs/operator-guide.md)
 - [Operator runbook](docs/operator-runbook.md)
 - [Contributor and agent guide](docs/contributor-guide.md)

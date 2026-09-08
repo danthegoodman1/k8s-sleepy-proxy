@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use proxy_core::observability::{
+use sleepypods_observability::{
     metrics::{
         EXCLUSIVITY_KEYS_HELD, MATERIALIZATIONS_NONTERMINAL,
         MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS,
@@ -24,7 +24,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     api::{
-        operator_grpc_service_with_store_and_route_events, operator_grpc_web_server_builder,
+        operator_grpc_service_with_store_and_route_events,
         proxy_grpc_service_with_store_and_route_events,
         sidecar_grpc_service_with_store_and_route_events, RouteSubscriptionBroker,
     },
@@ -55,8 +55,13 @@ pub const AUTH_PROXY_TOKEN_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
 pub const AUTH_SIDECAR_TOKEN_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN";
 pub const METRICS_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR";
 
-pub type NativeControlPlaneRouter = Router<Identity>;
-pub type OperatorGrpcWebRouter = Router<Stack<tonic_web::GrpcWebLayer, Stack<CorsLayer, Identity>>>;
+pub type NativeControlPlaneRouter =
+    Router<Stack<crate::api::admission::RpcAdmissionLayer, Identity>>;
+pub type OperatorGrpcWebLayers = Stack<
+    tonic_web::GrpcWebLayer,
+    Stack<crate::api::admission::RpcAdmissionLayer, Stack<CorsLayer, Identity>>,
+>;
+pub type OperatorGrpcWebRouter = Router<OperatorGrpcWebLayers>;
 pub type RuntimeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +71,7 @@ pub struct RuntimeConfig {
     pub metrics_listen_addr: Option<SocketAddr>,
     pub control_plane: ControlPlaneConfig,
     pub target: MaterializationTarget,
+    pub api_limits: crate::api::admission::ApiLimits,
 }
 
 #[derive(Debug)]
@@ -82,6 +88,9 @@ pub enum RuntimeConfigError {
         value: String,
     },
     InvalidPostgresConfig(crate::ids::EmptyStringError),
+    InvalidPostgresSetting {
+        name: &'static str,
+    },
     InvalidMaterializationTarget(InvalidMaterializationTarget),
     InvalidAuthMode {
         value: String,
@@ -117,10 +126,48 @@ impl RuntimeConfig {
         })? {
             StoreProviderName::Postgres => {
                 let url = required_value(&values, POSTGRES_URL_ENV)?;
-                StoreProviderConfig::Postgres(
-                    PostgresStoreConfig::new(url)
-                        .map_err(RuntimeConfigError::InvalidPostgresConfig)?,
-                )
+                let mut config = PostgresStoreConfig::new(url)
+                    .map_err(RuntimeConfigError::InvalidPostgresConfig)?;
+                if let Some(value) =
+                    postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS")?
+                {
+                    config.max_connections = usize::try_from(value).map_err(|_| {
+                        RuntimeConfigError::InvalidPostgresSetting {
+                            name: "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS",
+                        }
+                    })?;
+                }
+                for (name, setting) in [
+                    (
+                        "SLEEPYPODS_OPERATION_TIMEOUT_MS",
+                        &mut config.operation_timeout,
+                    ),
+                    (
+                        "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
+                        &mut config.pool_wait_timeout,
+                    ),
+                    (
+                        "SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS",
+                        &mut config.connection_timeout,
+                    ),
+                    (
+                        "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
+                        &mut config.statement_timeout,
+                    ),
+                ] {
+                    if let Some(value) = postgres_positive_integer(&values, name)? {
+                        *setting = std::time::Duration::from_millis(value);
+                    }
+                }
+                config.idempotency_retention = postgres_positive_integer(
+                    &values,
+                    "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
+                )?
+                .map(std::time::Duration::from_millis);
+                config
+                    .validate_limits()
+                    .map_err(|name| RuntimeConfigError::InvalidPostgresSetting { name })?;
+                StoreProviderConfig::Postgres(config)
             }
         };
         let auth = parse_auth_config(&values)?;
@@ -130,7 +177,71 @@ impl RuntimeConfig {
         )
         .map_err(RuntimeConfigError::InvalidMaterializationTarget)?;
 
+        let mut api_limits = crate::api::admission::ApiLimits::default();
+        for (name, setting, maximum) in [
+            (
+                "SLEEPYPODS_CONTROL_PLANE_MAX_CONNECTIONS",
+                &mut api_limits.accepted_connections,
+                4096,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_MAX_RPCS",
+                &mut api_limits.rpc_concurrency,
+                4096,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_MAX_SUBSCRIPTION_STREAMS",
+                &mut api_limits.subscription_streams,
+                1024,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_MAX_SUBSCRIPTIONS_PER_STREAM",
+                &mut api_limits.subscriptions_per_stream,
+                4096,
+            ),
+        ] {
+            if let Some(value) = postgres_positive_integer(&values, name)? {
+                if value > maximum {
+                    return Err(RuntimeConfigError::InvalidPostgresSetting { name });
+                }
+                *setting = value as usize;
+            }
+        }
+        for (name, setting) in [
+            (
+                "SLEEPYPODS_CONTROL_PLANE_UNARY_DELIVERY_TIMEOUT_MS",
+                &mut api_limits.unary_delivery_timeout,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_SETUP_TIMEOUT_MS",
+                &mut api_limits.setup_timeout,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_WRITE_TIMEOUT_MS",
+                &mut api_limits.write_timeout,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS",
+                &mut api_limits.subscription_lifetime,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_LOOKUP_TIMEOUT_MS",
+                &mut api_limits.lookup_timeout,
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_RESPONSE_TIMEOUT_MS",
+                &mut api_limits.response_timeout,
+            ),
+        ] {
+            if let Some(value) = postgres_positive_integer(&values, name)? {
+                if value > 60000 {
+                    return Err(RuntimeConfigError::InvalidPostgresSetting { name });
+                }
+                *setting = std::time::Duration::from_millis(value);
+            }
+        }
         Ok(Self {
+            api_limits,
             listen_addr,
             operator_grpc_web_listen_addr,
             metrics_listen_addr,
@@ -170,6 +281,11 @@ where
 {
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
     tonic::transport::Server::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .max_concurrent_streams(32)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
+        .layer(route_events.admission.clone())
         .add_service(tonic::service::interceptor::InterceptedService::new(
             operator_grpc_service_with_store_and_route_events(
                 Arc::clone(&store),
@@ -236,8 +352,12 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
-    operator_grpc_web_server_builder().add_service(
-        tonic::service::interceptor::InterceptedService::new(
+    admitted_grpc_web_server_builder(route_events.admission.clone())
+        .timeout(std::time::Duration::from_secs(10))
+        .max_concurrent_streams(32)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
             operator_grpc_service_with_store_and_route_events(
                 store,
                 materializer,
@@ -248,8 +368,19 @@ where
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
             ),
-        ),
-    )
+        ))
+}
+
+// CORS adds headers only; admission must wrap the gRPC-web body transformation,
+// including its newly allocated base64 output, to retain final delivery ownership.
+pub(crate) fn admitted_grpc_web_server_builder(
+    admission: crate::api::admission::RpcAdmissionLayer,
+) -> tonic::transport::Server<OperatorGrpcWebLayers> {
+    tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(crate::api::server::operator_grpc_web_cors_layer())
+        .layer(admission)
+        .layer(tonic_web::GrpcWebLayer::new())
 }
 
 pub async fn run_from_env() -> RuntimeResult<()> {
@@ -275,8 +406,31 @@ pub async fn serve<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    let sockets = Arc::new(tokio::sync::Semaphore::new(
+        config.api_limits.accepted_connections,
+    ));
+    let native_incoming = crate::runtime_io::BoundedIncoming::bind(
+        config.listen_addr,
+        sockets.clone(),
+        config.api_limits.setup_timeout,
+        config.api_limits.write_timeout,
+    )
+    .await?;
+    let web_incoming = if let Some(address) = config.operator_grpc_web_listen_addr {
+        Some(
+            crate::runtime_io::BoundedIncoming::bind(
+                address,
+                sockets,
+                config.api_limits.setup_timeout,
+                config.api_limits.write_timeout,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let materializer = materializer_with_runtime_auth(materializer, &config.control_plane.auth);
-    let route_events = RouteSubscriptionBroker::new();
+    let route_events = RouteSubscriptionBroker::with_limits(config.api_limits.clone());
     let native_router = native_control_plane_router_with_route_events(
         Arc::clone(&store),
         materializer.clone(),
@@ -290,44 +444,50 @@ where
     let reconciler = MaterializationReconciler::new(
         Arc::clone(&store),
         materializer.clone(),
+        config.target.clone(),
         MaterializationReconcilerConfig::default(),
         ObservabilityRecorder::global(),
     )
     .with_route_events(route_events.clone());
-    tokio::spawn(async move {
-        reconciler.run_until_shutdown(reconciler_shutdown).await;
-    });
-
-    let shutdown_for_signal = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_for_signal.send(true);
-    });
-
     let mut listeners = JoinSet::new();
+    listeners.spawn(async move {
+        reconciler
+            .run_until_shutdown(reconciler_shutdown)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+    });
+    let dispatcher_store = store.clone();
+    let dispatcher_events = route_events.clone();
+    let dispatcher_shutdown = shutdown_tx.subscribe();
+    listeners.spawn(async move {
+        dispatch_route_changes(dispatcher_store, dispatcher_events, dispatcher_shutdown).await
+    });
+    let maintenance_store = store.clone();
+    let maintenance_shutdown = shutdown_tx.subscribe();
+    listeners.spawn(async move { maintain_runtime(maintenance_store, maintenance_shutdown).await });
     listeners.spawn({
         let native_shutdown = native_shutdown.clone();
         async move {
             native_router
-                .serve_with_shutdown(config.listen_addr, wait_for_shutdown(native_shutdown))
+                .serve_with_incoming_shutdown(native_incoming, wait_for_shutdown(native_shutdown))
                 .await
                 .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
         }
     });
 
-    if let Some(operator_grpc_web_addr) = config.operator_grpc_web_listen_addr {
+    if let Some(web_incoming) = web_incoming {
         let operator_grpc_web_router = operator_grpc_web_router_with_route_events(
             Arc::clone(&store),
             materializer.clone(),
             config.target.clone(),
             config.control_plane.auth.clone(),
-            route_events,
+            route_events.clone(),
         );
         let operator_grpc_web_shutdown = native_shutdown.clone();
         listeners.spawn(async move {
             operator_grpc_web_router
-                .serve_with_shutdown(
-                    operator_grpc_web_addr,
+                .serve_with_incoming_shutdown(
+                    web_incoming,
                     wait_for_shutdown(operator_grpc_web_shutdown),
                 )
                 .await
@@ -356,26 +516,118 @@ where
         });
     }
 
-    let mut first_error = None;
-    while let Some(result) = listeners.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let _ = shutdown_tx.send(true);
-                if first_error.is_none() {
-                    first_error = Some(error);
+    let result = supervise_runtime(
+        listeners,
+        shutdown_tx,
+        route_events.clone(),
+        shutdown_signal(),
+    )
+    .await;
+    route_events.shutdown();
+    result
+}
+
+async fn supervise_runtime(
+    mut tasks: JoinSet<RuntimeResult<()>>,
+    shutdown: watch::Sender<bool>,
+    route_events: RouteSubscriptionBroker,
+    signal: impl std::future::Future<Output = ()>,
+) -> RuntimeResult<()> {
+    tokio::pin!(signal);
+    let mut first_error = tokio::select! {
+        _ = &mut signal => None,
+        result = tasks.join_next() => Some(match result {
+            Some(Ok(Err(error))) => error,
+            Some(Err(error)) => Box::new(error) as Box<dyn Error + Send + Sync>,
+            _ => Box::new(std::io::Error::other("critical runtime task exited unexpectedly")) as Box<dyn Error + Send + Sync>,
+        }),
+    };
+    route_events.shutdown();
+    shutdown.send_replace(true);
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
                 }
-            }
-            Err(error) => {
-                let _ = shutdown_tx.send(true);
-                if first_error.is_none() {
-                    first_error = Some(Box::new(error) as Box<dyn Error + Send + Sync>);
+                Err(error) => {
+                    first_error.get_or_insert_with(|| Box::new(error));
                 }
             }
         }
+    })
+    .await;
+    if drained.is_err() {
+        first_error.get_or_insert_with(|| {
+            Box::new(std::io::Error::other("runtime shutdown deadline exceeded"))
+        });
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
-
     first_error.map_or(Ok(()), Err)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+pub async fn dispatch_route_changes(
+    store: Arc<dyn ControlPlaneStore>,
+    events: RouteSubscriptionBroker,
+    mut shutdown: watch::Receiver<bool>,
+) -> RuntimeResult<()> {
+    let mut cursor = 0;
+    let mut failures = 0;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => { events.shutdown(); return Ok(()); },
+            _ = interval.tick() => {
+                let batch = match store.load_route_changes(cursor, 1024).await {
+                    Ok(batch) => { failures = 0; batch },
+                    Err(error) => {
+                        events.reset(); failures += 1;
+                        if failures >= 5 { return Err(Box::new(error)); }
+                        continue;
+                    }
+                };
+                if batch.reset { events.reset(); }
+                for event in batch.events { events.publish_durable(&event)?; }
+                cursor = batch.cursor;
+            }
+        }
+    }
+}
+
+async fn maintain_runtime(
+    store: Arc<dyn ControlPlaneStore>,
+    mut shutdown: watch::Receiver<bool>,
+) -> RuntimeResult<()> {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failures = 0;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            _ = interval.tick() => match store.maintain_runtime_records(1024).await {
+                Ok(_) => failures = 0,
+                Err(error) => { failures += 1; if failures >= 5 { return Err(Box::new(error)); } }
+            }
+        }
+    }
 }
 
 fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
@@ -428,6 +680,15 @@ async fn record_materialization_operational_metrics(
         return;
     };
 
+    use sleepypods_observability::metrics::{
+        MATERIALIZATION_EFFECTS_UNCERTAIN, MATERIALIZATION_FAILURES_BLOCKED,
+    };
+    for (descriptor, count) in [
+        (MATERIALIZATION_EFFECTS_UNCERTAIN, metrics.uncertain_effects),
+        (MATERIALIZATION_FAILURES_BLOCKED, metrics.blocked_failures),
+    ] {
+        sink.record_observation(MetricObservation::new(descriptor, vec![], count as f64));
+    }
     for state in metrics.backlog_states {
         let label = state.state.metric_label();
         sink.record_observation(MetricObservation::new(
@@ -498,6 +759,22 @@ fn required_value<'a>(
         .ok_or(RuntimeConfigError::MissingEnv { name })
 }
 
+fn postgres_positive_integer(
+    values: &HashMap<String, String>,
+    name: &'static str,
+) -> Result<Option<u64>, RuntimeConfigError> {
+    values
+        .get(name)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+                .ok_or(RuntimeConfigError::InvalidPostgresSetting { name })
+        })
+        .transpose()
+}
+
 fn parse_required_socket_addr(
     values: &HashMap<String, String>,
     name: &'static str,
@@ -566,6 +843,10 @@ impl fmt::Display for RuntimeConfigError {
                 write!(f, "{STORE_PROVIDER_ENV} value {value:?} is not supported")
             }
             Self::InvalidPostgresConfig(source) => source.fmt(f),
+            Self::InvalidPostgresSetting { name } => write!(
+                f,
+                "{name} must be a positive integer within the documented Postgres setting limits"
+            ),
             Self::InvalidMaterializationTarget(source) => source.fmt(f),
             Self::InvalidAuthMode { value } => {
                 write!(f, "{AUTH_MODE_ENV} value {value:?} is not supported")
@@ -583,6 +864,7 @@ impl Error for RuntimeConfigError {
             Self::InvalidMaterializationTarget(source) => Some(source),
             Self::InvalidAuthConfig(source) => Some(source),
             Self::MissingEnv { .. }
+            | Self::InvalidPostgresSetting { .. }
             | Self::InvalidStoreProvider { .. }
             | Self::InvalidAuthMode { .. } => None,
         }
@@ -613,7 +895,7 @@ mod tests {
         materializer::{KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer},
         route::{
             CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-            RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteIdentity,
+            ResolveRouteRequest, RouteBindingRecord, RouteDependencyLookup, RouteDependencySet,
             RouteResolution,
         },
         store::{StoreError, StoreFuture, StoreResult},
@@ -625,6 +907,88 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn postgres_runtime_settings_are_explicit_and_positive() {
+        let mut env = valid_env();
+        env.extend([
+            ("SLEEPYPODS_POSTGRES_MAX_CONNECTIONS", "1"),
+            ("SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS", "123"),
+            ("SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS", "456"),
+            ("SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS", "789"),
+            ("SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS", "60000"),
+        ]);
+        let config = RuntimeConfig::from_key_values(env).unwrap();
+        let StoreProviderConfig::Postgres(config) = config.control_plane.store;
+        assert_eq!(config.max_connections, 1);
+        assert_eq!(config.pool_wait_timeout.as_millis(), 123);
+        assert_eq!(config.connection_timeout.as_millis(), 456);
+        assert_eq!(config.statement_timeout.as_millis(), 789);
+        assert_eq!(config.idempotency_retention.unwrap().as_millis(), 60000);
+        for invalid in ["0", "-1", "abc", "18446744073709551615"] {
+            let mut env = valid_env();
+            env.push(("SLEEPYPODS_POSTGRES_MAX_CONNECTIONS", invalid));
+            assert!(matches!(
+                RuntimeConfig::from_key_values(env),
+                Err(RuntimeConfigError::InvalidPostgresSetting { .. })
+            ));
+        }
+        let config = RuntimeConfig::from_key_values(valid_env()).unwrap();
+        let StoreProviderConfig::Postgres(config) = config.control_plane.store;
+        assert_eq!(config.idempotency_retention, None);
+    }
+
+    #[test]
+    fn postgres_runtime_settings_enforce_the_programmatic_limits() {
+        for (name, maximum) in [
+            (
+                "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS",
+                PostgresStoreConfig::MAX_CONNECTIONS as u128,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
+                PostgresStoreConfig::MAX_TIMEOUT.as_millis(),
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS",
+                PostgresStoreConfig::MAX_TIMEOUT.as_millis(),
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
+                PostgresStoreConfig::MAX_TIMEOUT.as_millis(),
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
+                PostgresStoreConfig::MAX_IDEMPOTENCY_RETENTION.as_millis(),
+            ),
+        ] {
+            for value in [1, maximum] {
+                let value = value.to_string();
+                let mut env = valid_env();
+                env.push((name, &value));
+                assert!(
+                    RuntimeConfig::from_key_values(env).is_ok(),
+                    "{name}={value}"
+                );
+            }
+            for value in [
+                "0".to_owned(),
+                "-1".to_owned(),
+                "1.5".to_owned(),
+                (maximum + 1).to_string(),
+                i64::MAX.to_string(),
+                u64::MAX.to_string(),
+            ] {
+                let mut env = valid_env();
+                env.push((name, &value));
+                assert!(
+                    matches!(RuntimeConfig::from_key_values(env),
+                    Err(RuntimeConfigError::InvalidPostgresSetting { name: actual }) if actual == name),
+                    "{name}={value}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn env_config_requires_listen_addr() {
@@ -997,12 +1361,13 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct NoopKubernetesClient;
+    pub(super) struct NoopKubernetesClient;
 
     impl KubernetesMaterializerClient for NoopKubernetesClient {
         fn apply_object<'a>(
             &'a self,
             _object: &'a KubernetesObject,
+            _precondition: Option<&'a crate::projection::LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -1010,6 +1375,7 @@ mod tests {
         fn delete_object<'a>(
             &'a self,
             _object: &'a RenderedObjectRef,
+            _precondition: &'a crate::projection::LiveObjectIdentity,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -1031,15 +1397,103 @@ mod tests {
                     .map_err(|error| crate::KubernetesClientError::new(error.to_string()))
             })
         }
+
+        fn ensure_no_descendants<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+            _instance_id: &'a str,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn inspect_object<'a>(
+            &'a self,
+            _object: &'a RenderedObjectRef,
+        ) -> KubernetesClientFuture<
+            'a,
+            KubernetesClientResult<crate::projection::ProjectionObjectInspection>,
+        > {
+            Box::pin(async {
+                Ok(crate::projection::ProjectionObjectInspection::Present(
+                    crate::projection::LiveObjectMetadata {
+                        persistent_volume_reclaim_policy: Some("Retain".into()),
+                        identity: crate::projection::LiveObjectIdentity {
+                            uid: "test-uid".into(),
+                            resource_version: "1".into(),
+                        },
+                        labels: Default::default(),
+                        annotations: Default::default(),
+                        deleting: false,
+                        finalizers: Vec::new(),
+                    },
+                ))
+            })
+        }
+
+        fn verify_retained_bindings<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+        ) -> crate::materializer::KubernetesClientFuture<
+            'a,
+            crate::materializer::KubernetesClientResult<()>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[derive(Debug)]
-    struct NoopStore;
+    pub(super) struct NoopStore;
 
     #[derive(Debug)]
     struct OperationalMetricsStore;
 
     impl ControlPlaneStore for OperationalMetricsStore {
+        unexpected_store_methods!(
+            load_route_changes,
+            load_route_change_revision,
+            load_materialization_work_status,
+            record_materialization_failure,
+            enqueue_materialization,
+            maintain_runtime_records,
+            accept_wake,
+            request_instance_deletion,
+            finalize_instance_deletions,
+            create_instance,
+            get_instance,
+            delete_instance,
+            create_workload_class_version,
+            load_workload_class_version,
+            create_route_binding,
+            get_route_binding,
+            delete_route_binding,
+            list_route_bindings_for_instance,
+            resolve_route,
+            compare_and_swap_instance_state,
+            record_materialization,
+            load_ready_materialization,
+            load_active_materialization,
+            load_materialization,
+            complete_wake,
+            begin_sleep,
+            finalize_sleep,
+            list_materialization_reconciliation_candidates,
+            claim_materialization_reconciliation,
+            begin_materialization_effect,
+            acknowledge_materialization_effect,
+            renew_materialization_reconciliation_lease,
+            release_materialization_reconciliation_lease,
+            complete_wake_reconciliation,
+            finalize_sleep_reconciliation,
+            delete_materialization_reconciliation,
+            force_delete_materialization,
+            force_release_exclusivity_key,
+            lookup_route_dependencies,
+            put_http01_challenge,
+            resolve_http01_challenge,
+            delete_http01_challenge,
+            expire_http01_challenges
+        );
+
         fn load_materialization_operational_metrics<'a>(
             &'a self,
             _request: LoadMaterializationOperationalMetricsRequest,
@@ -1074,6 +1528,32 @@ mod tests {
     }
 
     impl ControlPlaneStore for NoopStore {
+        unexpected_store_methods!(
+            load_route_changes,
+            load_route_change_revision,
+            load_materialization_work_status,
+            record_materialization_failure,
+            enqueue_materialization,
+            maintain_runtime_records,
+            accept_wake,
+            request_instance_deletion,
+            finalize_instance_deletions,
+            list_route_bindings_for_instance,
+            load_materialization,
+            list_materialization_reconciliation_candidates,
+            load_materialization_operational_metrics,
+            claim_materialization_reconciliation,
+            begin_materialization_effect,
+            acknowledge_materialization_effect,
+            renew_materialization_reconciliation_lease,
+            release_materialization_reconciliation_lease,
+            complete_wake_reconciliation,
+            finalize_sleep_reconciliation,
+            delete_materialization_reconciliation,
+            force_delete_materialization,
+            force_release_exclusivity_key
+        );
+
         fn create_instance<'a>(
             &'a self,
             _request: CreateInstanceRequest,
@@ -1132,7 +1612,7 @@ mod tests {
 
         fn resolve_route<'a>(
             &'a self,
-            _identity: RouteIdentity,
+            _request: ResolveRouteRequest,
         ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
             not_implemented()
         }
@@ -1224,5 +1704,174 @@ mod tests {
 
     fn not_implemented<'a, T>() -> StoreFuture<'a, StoreResult<T>> {
         Box::pin(async { Err(StoreError::internal("not implemented")) })
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+    #[tokio::test]
+    async fn critical_failure_cancels_and_awaits_other_owned_tasks() {
+        let (shutdown, mut receiver) = watch::channel(false);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = finished.clone();
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async move {
+            let _ = receiver.changed().await;
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        jobs.spawn(async {
+            Err(
+                Box::new(std::io::Error::other("critical dispatcher failure"))
+                    as Box<dyn Error + Send + Sync>,
+            )
+        });
+        let error = supervise_runtime(
+            jobs,
+            shutdown,
+            RouteSubscriptionBroker::new(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("critical dispatcher"));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_child_failure_and_still_drains_other_tasks() {
+        let (shutdown, mut first) = watch::channel(false);
+        let mut second = first.clone();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = finished.clone();
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async move {
+            first.changed().await.unwrap();
+            Err(Box::new(std::io::Error::other("failure while draining"))
+                as Box<dyn Error + Send + Sync>)
+        });
+        jobs.spawn(async move {
+            second.changed().await.unwrap();
+            tokio::task::yield_now().await;
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let error = supervise_runtime(jobs, shutdown, RouteSubscriptionBroker::new(), async {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failure while draining"));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn failed_dispatcher_cancels_active_subscription_before_listener_drain() {
+        use crate::api::pb::proxy_control_plane_client::ProxyControlPlaneClient;
+        use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+        let broker = RouteSubscriptionBroker::new();
+        let incoming = crate::runtime_io::BoundedIncoming::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(tokio::sync::Semaphore::new(2)),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let address = incoming.local_addr().unwrap();
+        let (shutdown, receiver) = watch::channel(false);
+        let service = crate::api::proxy_grpc_service_with_store_and_route_events(
+            Arc::new(tests::NoopStore),
+            KubernetesMaterializer::new(tests::NoopKubernetesClient),
+            MaterializationTarget::new("cluster-a", "apps").unwrap(),
+            broker.clone(),
+        );
+        let admission = broker.admission.clone();
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(admission)
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, wait_for_shutdown(receiver))
+                .await?;
+            Ok(())
+        });
+        let mut client = ProxyControlPlaneClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+        let mut responses = client
+            .subscribe(ReceiverStream::new(incoming))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(broker.streams.available_permits(), 63);
+        jobs.spawn(async {
+            Err(Box::new(std::io::Error::other("dispatcher exited"))
+                as Box<dyn Error + Send + Sync>)
+        });
+        let supervisor = tokio::spawn(supervise_runtime(
+            jobs,
+            shutdown,
+            broker.clone(),
+            std::future::pending(),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), responses.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("dispatcher exited"));
+        assert!(broker.cancellation.is_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_handles_sigterm() {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::supervision_tests::sigterm_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        while lines.next().unwrap().unwrap() != "sigterm-ready" {}
+        assert!(std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let status = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(status.success());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess fixture for process_handles_sigterm"]
+    async fn sigterm_fixture() {
+        let signal = shutdown_signal();
+        tokio::pin!(signal);
+        tokio::select! { _ = &mut signal => panic!("unexpected signal"), _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {} }
+        println!("sigterm-ready");
+        signal.await;
     }
 }

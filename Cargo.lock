@@ -341,26 +341,25 @@ dependencies = [
  "deadpool-postgres",
  "futures-util",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
  "k8s-openapi",
  "kube",
  "prost",
- "protoc-bin-vendored",
- "proxy-core",
  "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
+ "sleepypods-api",
+ "sleepypods-observability",
  "sleepypods-types",
  "tokio",
  "tokio-postgres",
  "tokio-tungstenite",
  "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tonic-web",
  "tower",
  "tower-http 0.7.0",
@@ -705,7 +704,6 @@ name = "frontline"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "control-plane",
  "criterion",
  "futures-util",
  "http",
@@ -716,6 +714,8 @@ dependencies = [
  "proxy-core",
  "rcgen",
  "rustls-pemfile",
+ "sidecar",
+ "sleepypods-api",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1877,11 +1877,13 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pin-project-lite",
+ "sleepypods-observability",
  "socket2",
  "tls-parser",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tower-service",
 ]
 
 [[package]]
@@ -2342,7 +2344,6 @@ name = "sidecar"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "control-plane",
  "futures-util",
  "http",
  "http-body",
@@ -2350,6 +2351,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proxy-core",
+ "sleepypods-api",
  "sleepypods-types",
  "tokio",
  "tokio-tungstenite",
@@ -2377,6 +2379,30 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "sleepypods-api"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "protoc-bin-vendored",
+ "sleepypods-types",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "sleepypods-observability"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tokio",
+]
 
 [[package]]
 name = "sleepypods-types"

@@ -27,12 +27,81 @@ pub struct ManifestTemplate {
     pub raw_objects: Vec<RawKubernetesManifestTemplate>,
 }
 
+impl ManifestTemplate {
+    pub fn validate_storage_retention(&self) -> Result<(), ManifestRenderError> {
+        if self
+            .volumes
+            .iter()
+            .any(|volume| volume.reclaim_policy != PersistentVolumeReclaimPolicy::Retain)
+        {
+            return Err(ManifestRenderError::InvalidField { field: "volumes.reclaim_policy", message: "managed static volumes require Retain; provider-volume deletion is outside the lifecycle contract".into() });
+        }
+        for raw in &self.raw_objects {
+            let literal = raw
+                .manifest
+                .parts
+                .iter()
+                .try_fold(String::new(), |mut text, part| match part {
+                    TemplateTextPart::Literal(value) => {
+                        text.push_str(value);
+                        Some(text)
+                    }
+                    TemplateTextPart::InstanceValue(_) => None,
+                });
+            if let Some(literal) = literal {
+                if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(&literal) {
+                    if value["kind"] == "PersistentVolume"
+                        && value
+                            .pointer("/spec/persistentVolumeReclaimPolicy")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("Retain")
+                    {
+                        return Err(ManifestRenderError::InvalidField {
+                            field: "volumes.reclaim_policy",
+                            message: "raw managed static PVs require explicit Retain".into(),
+                        });
+                    }
+                    if value["kind"] == "PersistentVolumeClaim"
+                        && value
+                            .pointer("/spec/volumeName")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(str::is_empty)
+                    {
+                        return Err(ManifestRenderError::InvalidField {
+                            field: "volumes.static_binding",
+                            message:
+                                "raw PVCs require explicit static bindings in managed inventory"
+                                    .into(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadTemplate {
     pub kind: WorkloadKind,
     pub name: TemplateText,
     pub replicas: Option<u32>,
     pub app_container: ContainerTemplate,
+}
+
+impl WorkloadTemplate {
+    /// Every sidecar observation must describe the whole supported workload.
+    pub fn validate_replicas(&self) -> Result<(), ManifestRenderError> {
+        let replicas = self.replicas.unwrap_or(1);
+        if replicas != 1 {
+            return Err(ManifestRenderError::InvalidReplicas {
+                kind: self.kind,
+                replicas,
+                message: "automatic sleep requires exactly one replica".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

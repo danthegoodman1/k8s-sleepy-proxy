@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, time::Instant};
 
-use proxy_core::observability::{
+use sleepypods_observability::{
     metrics::{RUNTIME_MATERIALIZATION_FAILURES_TOTAL, RUNTIME_WAKE_LATENCY_SECONDS},
     recorder::{
         LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
@@ -11,21 +11,16 @@ use proxy_core::observability::{
 
 use crate::{
     ids::{BackendGeneration, Generation, InstanceId},
-    instance::{
-        CompareAndSwapInstanceStateRequest, GetInstanceRequest, InstanceRecord, InstanceState,
-        StateTransitionReason,
-    },
+    instance::{GetInstanceRequest, InstanceRecord, InstanceState},
     manifest::{
         render_manifests_with_options, ManifestRenderError, RenderManifestOptions,
         RenderManifestRequest,
     },
     materialization::{
-        CompleteWakeRequest, CompleteWakeResult, FinalizeSleepRequest,
         LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
         MaterializationState, MaterializationTarget, RecordMaterializationRequest,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
-    projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
     sleep_policy::SleepPolicyError,
     store::{ControlPlaneStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
@@ -41,14 +36,10 @@ pub struct WakeInstanceRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeInstanceResult {
-    Completed {
-        result: CompleteWakeResult,
-    },
     AlreadyRunning {
         instance: InstanceRecord,
-        materialization: MaterializationRecord,
+        materialization: Box<MaterializationRecord>,
     },
-    #[allow(dead_code)]
     AlreadyWaking {
         instance: InstanceRecord,
     },
@@ -91,10 +82,6 @@ pub enum WakeInstanceError {
         instance: InstanceRecord,
         source: MaterializerError,
     },
-    Projection {
-        instance: InstanceRecord,
-        source: ProjectionError,
-    },
 }
 
 pub async fn wake_instance_with_observability<S, C>(
@@ -128,511 +115,141 @@ where
     S: ControlPlaneStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
-    let mut instance = store
+    let instance = store
         .get_instance(GetInstanceRequest::new(request.instance_id.clone()))
         .await
         .map_err(map_store_error)?
         .ok_or(WakeInstanceError::NotFound)?;
-
     if instance.generation != request.expected_generation {
         return Err(WakeInstanceError::GenerationConflict {
             expected: request.expected_generation,
             actual: instance.generation,
         });
     }
-
-    let should_consider_active_backend_generation = request.backend_generation.is_none()
-        && matches!(
-            instance.state,
-            InstanceState::Waking | InstanceState::Failed
-        );
-
-    let waking = match instance.state {
+    match instance.state {
         InstanceState::Running => {
-            let target = request.target.clone();
             let materialization = store
                 .load_ready_materialization(LoadReadyMaterializationRequest::new(
                     request.instance_id,
                     instance.generation,
-                    request.target,
+                    request.target.clone(),
                 ))
                 .await
                 .map_err(map_store_error)?
                 .ok_or_else(|| WakeInstanceError::ReadyMaterializationNotFound {
                     instance: instance.clone(),
-                    target,
+                    target: request.target,
                 })?;
-
             return Ok(WakeInstanceResult::AlreadyRunning {
                 instance,
-                materialization,
+                materialization: Box::new(materialization),
             });
         }
-        InstanceState::Waking => Some(instance.clone()),
-        InstanceState::Deleting => {
-            return Err(WakeInstanceError::Unavailable {
-                instance,
-                reason: WakeUnavailableReason::Deleting,
-            });
-        }
-        InstanceState::Deleted => {
-            return Err(WakeInstanceError::Unavailable {
-                instance,
-                reason: WakeUnavailableReason::Deleted,
-            });
-        }
-        InstanceState::Draining => {
-            if let Some(materialization) = store
+        InstanceState::Waking => {
+            let pending = store
                 .load_active_materialization(LoadActiveMaterializationRequest::new(
-                    request.instance_id.clone(),
-                    request.target.clone(),
+                    instance.id.clone(),
+                    request.target,
                 ))
                 .await
-                .map_err(map_store_error)?
-            {
-                if materialization.state == MaterializationState::Deleting {
-                    instance = resume_deleting_sleep(
-                        store,
-                        materializer,
-                        request.target.clone(),
-                        instance,
-                        materialization,
-                    )
-                    .await?;
-                }
+                .map_err(map_store_error)?;
+            if !pending.is_some_and(|m| {
+                m.state == MaterializationState::Pending
+                    && m.instance_generation == instance.generation
+            }) {
+                return Err(WakeInstanceError::Store(StoreError::invalid_argument(
+                    "no accepted wake exists for this target",
+                )));
             }
-
-            None
+            return Ok(WakeInstanceResult::AlreadyWaking { instance });
         }
-        InstanceState::Cold | InstanceState::Failed => None,
-    };
-
-    let waking = if let Some(waking) = waking {
-        waking
-    } else {
-        store
-            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                request.instance_id.clone(),
-                instance.generation,
-                InstanceState::Waking,
-                StateTransitionReason::WakeRequested,
-            ))
-            .await
-            .map_err(map_store_error)?
-    };
-
-    let workload_class = match store
-        .load_workload_class_version(LoadWorkloadClassVersionRequest::new(
-            waking.workload_class.clone(),
-        ))
-        .await
-    {
-        Ok(Some(workload_class)) => workload_class,
-        Ok(None) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::WorkloadClassNotFound {
-                    instance: waking.clone(),
-                },
-            )
-            .await);
-        }
-        Err(error) => return Err(fail_waking_with_store_error(store, &waking, error).await),
-    };
-
-    let sleep_policy = match workload_class.sleep_policy.resolve(&waking.values) {
-        Ok(policy) => policy,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::SleepPolicy {
-                    instance: waking.clone(),
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
-
-    let manifest = match render_manifests_with_options(
-        RenderManifestRequest {
-            template: &workload_class.template,
-            instance: &waking,
-            sleep_policy,
-            namespace: request.target.namespace(),
-            template_generation: Some(workload_class.template_generation),
-        },
-        RenderManifestOptions {
-            sidecar_control_plane_token: materializer.sidecar_control_plane_token(),
-        },
-    ) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Render {
-                    instance: waking.clone(),
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
-
-    let rendered_objects = match materializer.rendered_object_refs(&manifest) {
-        Ok(rendered_objects) => rendered_objects,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Materializer {
-                    instance: waking.clone(),
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
-
-    let mut projected_instance = waking.clone();
-    projected_instance.state = InstanceState::Running;
-    projected_instance.generation = waking.generation.next();
-    let projected_manifest = match render_manifests_with_options(
-        RenderManifestRequest {
-            template: &workload_class.template,
-            instance: &projected_instance,
-            sleep_policy,
-            namespace: request.target.namespace(),
-            template_generation: Some(workload_class.template_generation),
-        },
-        RenderManifestOptions {
-            sidecar_control_plane_token: materializer.sidecar_control_plane_token(),
-        },
-    ) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Render {
-                    instance: projected_instance,
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
-    let projected_rendered_objects = match materializer.rendered_object_refs(&projected_manifest) {
-        Ok(rendered_objects) => rendered_objects,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Materializer {
-                    instance: projected_instance,
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
-    if projected_rendered_objects != rendered_objects {
-        return Err(fail_waking(
-            store,
-            &waking,
-            WakeInstanceError::Materializer {
-                instance: projected_instance,
-                source: MaterializerError::InvalidManifest {
-                    message: "rendered object refs must remain stable between waking and running generations"
-                        .to_owned(),
-                },
-            },
-        )
-        .await);
-    }
-
-    let exclusivity_keys = match workload_class.render_exclusivity_keys(&waking.values) {
-        Ok(exclusivity_keys) => exclusivity_keys,
-        Err(error) => {
-            return Err(fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Render {
-                    instance: waking.clone(),
-                    source: error,
-                },
-            )
-            .await);
-        }
-    };
-
-    let backend_generation = match request.backend_generation {
-        Some(backend_generation) => backend_generation,
-        None => {
-            let default = BackendGeneration::new(waking.generation.get());
-            if should_consider_active_backend_generation {
-                match store
-                    .load_active_materialization(LoadActiveMaterializationRequest::new(
-                        request.instance_id.clone(),
-                        request.target.clone(),
-                    ))
-                    .await
-                {
-                    Ok(Some(materialization)) => {
-                        std::cmp::max(default, materialization.backend_generation)
-                    }
-                    Ok(None) => default,
-                    Err(error) => {
-                        return Err(fail_waking_with_store_error(store, &waking, error).await);
-                    }
-                }
+        InstanceState::Deleting | InstanceState::Deleted => {
+            let reason = if instance.state == InstanceState::Deleting {
+                WakeUnavailableReason::Deleting
             } else {
-                default
-            }
+                WakeUnavailableReason::Deleted
+            };
+            return Err(WakeInstanceError::Unavailable { instance, reason });
         }
-    };
-    let mut pending = RecordMaterializationRequest::new(
-        request.instance_id.clone(),
-        waking.generation,
-        request.target.clone(),
-        MaterializationState::Pending,
-        backend_generation,
-    );
-    pending.rendered_objects = rendered_objects.clone();
-    pending.exclusivity_keys = exclusivity_keys.clone();
-    let pending_materialization = match store.record_materialization(pending).await {
-        Ok(materialization) => materialization,
-        Err(error) => {
-            return Err(fail_waking_with_store_error(store, &waking, error).await);
-        }
-    };
-    let mut projected_materialization = pending_materialization.clone();
-    projected_materialization.instance_generation = projected_instance.generation;
-    let projection_plan =
-        match ProjectionPlan::from_manifest(&projected_materialization, &projected_manifest) {
-            Ok(plan) => plan,
-            Err(error) => {
-                return Err(fail_waking(
-                    store,
-                    &waking,
-                    WakeInstanceError::Materializer {
-                        instance: waking.clone(),
-                        source: error,
-                    },
-                )
-                .await);
-            }
-        };
-
-    let projection_reconciler = ProjectionReconciler::new(materializer);
-    if let Err(error) = projection_reconciler.apply(&projection_plan).await {
-        let no_objects_applied = projection_error_has_no_applied_objects(&error);
-        if no_objects_applied {
-            release_pending_materialization_after_no_apply_failure(
-                store,
-                &waking,
-                &request.target,
-                backend_generation,
-            )
-            .await;
-        }
-        return Err(fail_waking(
-            store,
-            &waking,
-            WakeInstanceError::Projection {
-                instance: waking.clone(),
-                source: error,
-            },
-        )
-        .await);
+        InstanceState::Cold | InstanceState::Failed | InstanceState::Draining => {}
     }
-
-    let backend = match projection_reconciler
-        .wait_for_readiness(&projection_plan)
-        .await
-    {
-        Ok(backend) => backend,
-        Err(error) => {
-            let original = fail_waking(
-                store,
-                &waking,
-                WakeInstanceError::Projection {
-                    instance: waking.clone(),
-                    source: error,
-                },
-            )
-            .await;
-            cleanup_rendered_objects_if_instance_missing_or_terminal(
-                store,
-                materializer,
-                &projected_materialization,
-            )
-            .await;
-            return Err(original);
-        }
-    };
-
-    let mut complete = CompleteWakeRequest::new(
-        request.instance_id,
-        waking.generation,
-        request.target,
-        backend,
-        backend_generation,
-    );
-    complete.rendered_objects = projected_rendered_objects;
-    complete.exclusivity_keys = exclusivity_keys;
-
-    match store.complete_wake(complete).await {
-        Ok(result) => Ok(WakeInstanceResult::Completed { result }),
-        Err(error) => {
-            // The reconciler drives pending materializations concurrently
-            // with this RPC, so a completion conflict can mean the same wake
-            // already finished under the other driver; that is success, not
-            // an error the proxy should retry.
-            if matches!(error, StoreError::GenerationConflict { .. }) {
-                if let Some(result) =
-                    load_wake_completed_by_other_driver(store, &projected_materialization).await
-                {
-                    return Ok(result);
-                }
-            }
-            cleanup_rendered_objects_if_instance_missing_or_terminal(
-                store,
-                materializer,
-                &projected_materialization,
-            )
-            .await;
-            Err(map_store_error(error))
-        }
-    }
-}
-
-async fn load_wake_completed_by_other_driver<S>(
-    store: &S,
-    projected: &MaterializationRecord,
-) -> Option<WakeInstanceResult>
-where
-    S: ControlPlaneStore + ?Sized,
-{
-    let instance = store
-        .get_instance(GetInstanceRequest::new(projected.instance_id.clone()))
-        .await
-        .ok()??;
-    if instance.state != InstanceState::Running
-        || instance.generation != projected.instance_generation
-    {
-        return None;
-    }
-    let materialization = store
-        .load_ready_materialization(LoadReadyMaterializationRequest::new(
-            projected.instance_id.clone(),
-            projected.instance_generation,
-            projected.target.clone(),
+    let class = store
+        .load_workload_class_version(LoadWorkloadClassVersionRequest::new(
+            instance.workload_class.clone(),
         ))
         .await
-        .ok()??;
-
-    Some(WakeInstanceResult::AlreadyRunning {
-        instance,
-        materialization,
-    })
-}
-
-async fn cleanup_rendered_objects_if_instance_missing_or_terminal<S, C>(
-    store: &S,
-    materializer: &KubernetesMaterializer<C>,
-    materialization: &MaterializationRecord,
-) where
-    S: ControlPlaneStore + ?Sized,
-    C: KubernetesMaterializerClient,
-{
-    let should_cleanup = match store
-        .get_instance(GetInstanceRequest::new(materialization.instance_id.clone()))
-        .await
-    {
-        Ok(None) => true,
-        Ok(Some(instance)) => matches!(
-            instance.state,
-            InstanceState::Deleting | InstanceState::Deleted
-        ),
-        Err(_) => false,
-    };
-
-    if should_cleanup {
-        let plan = ProjectionPlan::from_recorded_refs(materialization);
-        let _ = ProjectionReconciler::new(materializer)
-            .delete_owned(&plan)
-            .await;
-    }
-}
-
-fn materializer_error_has_no_applied_objects(error: &MaterializerError) -> bool {
-    matches!(
-        error.applied_objects_before_failure(),
-        Some(applied_objects) if applied_objects.is_empty()
-    )
-}
-
-fn projection_error_has_no_applied_objects(error: &ProjectionError) -> bool {
-    match error {
-        ProjectionError::Apply { source, .. } => materializer_error_has_no_applied_objects(source),
-        _ => false,
-    }
-}
-
-async fn release_pending_materialization_after_no_apply_failure<S>(
-    store: &S,
-    waking: &InstanceRecord,
-    target: &MaterializationTarget,
-    backend_generation: BackendGeneration,
-) where
-    S: ControlPlaneStore + ?Sized,
-{
-    let mut request = RecordMaterializationRequest::new(
-        waking.id.clone(),
-        waking.generation,
-        target.clone(),
-        MaterializationState::Deleted,
-        backend_generation,
-    );
-    request.rendered_objects = Vec::new();
-    request.exclusivity_keys = Vec::new();
-
-    let _ = store.record_materialization(request).await;
-}
-
-async fn resume_deleting_sleep<S, C>(
-    store: &S,
-    materializer: &KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-    instance: InstanceRecord,
-    materialization: MaterializationRecord,
-) -> Result<InstanceRecord, WakeInstanceError>
-where
-    S: ControlPlaneStore + ?Sized,
-    C: KubernetesMaterializerClient,
-{
-    let plan = ProjectionPlan::from_recorded_refs(&materialization);
-    ProjectionReconciler::new(materializer)
-        .delete_owned(&plan)
-        .await
-        .map_err(|source| WakeInstanceError::Projection {
+        .map_err(map_store_error)?
+        .ok_or_else(|| WakeInstanceError::WorkloadClassNotFound {
+            instance: instance.clone(),
+        })?;
+    class
+        .validate()
+        .map_err(|e| WakeInstanceError::Store(StoreError::invalid_argument(e.to_string())))?;
+    let policy = class
+        .sleep_policy
+        .resolve(&instance.values)
+        .map_err(|source| WakeInstanceError::SleepPolicy {
             instance: instance.clone(),
             source,
         })?;
-
-    store
-        .finalize_sleep(FinalizeSleepRequest::new(
-            instance.id,
-            instance.generation,
-            target,
-        ))
+    let waking_generation = if instance.state == InstanceState::Draining {
+        instance.generation.next().next()
+    } else {
+        instance.generation.next()
+    };
+    // Select an immutable projected incarnation before committing any intent.
+    // Rendering is pure; neither readiness nor Kubernetes I/O occurs in this API.
+    let mut projected = instance.clone();
+    projected.state = InstanceState::Running;
+    projected.generation = waking_generation.next();
+    let manifest = render_manifests_with_options(
+        RenderManifestRequest {
+            template: &class.template,
+            instance: &projected,
+            sleep_policy: policy,
+            namespace: request.target.namespace(),
+            template_generation: Some(class.template_generation),
+        },
+        RenderManifestOptions {
+            sidecar_control_plane_token: materializer.sidecar_control_plane_token(),
+        },
+    )
+    .map_err(|source| WakeInstanceError::Render {
+        instance: instance.clone(),
+        source,
+    })?;
+    let refs = materializer
+        .rendered_object_refs(&manifest)
+        .map_err(|source| WakeInstanceError::Materializer {
+            instance: instance.clone(),
+            source,
+        })?;
+    let keys = class
+        .render_exclusivity_keys(&instance.values)
+        .map_err(|source| WakeInstanceError::Render {
+            instance: instance.clone(),
+            source,
+        })?;
+    let backend_generation = request
+        .backend_generation
+        .unwrap_or_else(|| BackendGeneration::new(waking_generation.get()));
+    let mut pending = RecordMaterializationRequest::new(
+        instance.id.clone(),
+        waking_generation,
+        request.target,
+        MaterializationState::Pending,
+        backend_generation,
+    );
+    pending.rendered_objects = refs;
+    pending.exclusivity_keys = keys;
+    let accepted = store
+        .accept_wake(crate::materialization::AcceptWakeRequest {
+            expected_generation: instance.generation,
+            pending,
+        })
         .await
-        .map(|result| result.instance)
-        .map_err(map_store_error)
+        .map_err(map_store_error)?;
+    Ok(WakeInstanceResult::AlreadyWaking { instance: accepted })
 }
 
 fn record_wake_observation(
@@ -642,7 +259,6 @@ fn record_wake_observation(
     result: &Result<WakeInstanceResult, WakeInstanceError>,
 ) {
     let outcome = match result {
-        Ok(WakeInstanceResult::Completed { .. }) => Outcome::Success,
         Ok(WakeInstanceResult::AlreadyRunning { .. }) => Outcome::AlreadyRunning,
         Ok(WakeInstanceResult::AlreadyWaking { .. }) => Outcome::AlreadyWaking,
         Err(WakeInstanceError::GenerationConflict { .. })
@@ -657,9 +273,6 @@ fn record_wake_observation(
 
     let mut fields = request_fields.to_vec();
     match result {
-        Ok(WakeInstanceResult::Completed { result }) => {
-            append_acquired_exclusivity_fields(&mut fields, &result.materialization);
-        }
         Ok(WakeInstanceResult::AlreadyRunning {
             materialization, ..
         }) => {
@@ -675,9 +288,6 @@ fn record_wake_observation(
 
     let materialization_failure = match result {
         Err(WakeInstanceError::Materializer { source, instance }) => {
-            Some((instance, source.to_string()))
-        }
-        Err(WakeInstanceError::Projection { source, instance }) => {
             Some((instance, source.to_string()))
         }
         _ => None,
@@ -714,7 +324,6 @@ fn wake_error_reason(error: &WakeInstanceError) -> &'static str {
         WakeInstanceError::Render { .. } => "render",
         WakeInstanceError::SleepPolicy { .. } => "sleep_policy",
         WakeInstanceError::Materializer { .. } => "materializer",
-        WakeInstanceError::Projection { .. } => "projection",
     }
 }
 
@@ -773,27 +382,6 @@ impl WakeInstanceRequest {
     }
 }
 
-impl WakeInstanceResult {
-    #[cfg(test)]
-    pub fn instance(&self) -> &InstanceRecord {
-        match self {
-            Self::Completed { result } => &result.instance,
-            Self::AlreadyRunning { instance, .. } | Self::AlreadyWaking { instance } => instance,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn rendered_objects(&self) -> &[crate::materialization::RenderedObjectRef] {
-        match self {
-            Self::Completed { result } => &result.materialization.rendered_objects,
-            Self::AlreadyRunning {
-                materialization, ..
-            } => &materialization.rendered_objects,
-            Self::AlreadyWaking { .. } => &[],
-        }
-    }
-}
-
 fn map_store_error(error: StoreError) -> WakeInstanceError {
     match error {
         StoreError::NotFound {
@@ -803,72 +391,6 @@ fn map_store_error(error: StoreError) -> WakeInstanceError {
             WakeInstanceError::GenerationConflict { expected, actual }
         }
         other => WakeInstanceError::Store(other),
-    }
-}
-
-async fn fail_waking<S>(
-    store: &S,
-    waking: &InstanceRecord,
-    original: WakeInstanceError,
-) -> WakeInstanceError
-where
-    S: ControlPlaneStore + ?Sized,
-{
-    best_effort_mark_failed(store, waking, failure_message(&original)).await;
-    original
-}
-
-async fn fail_waking_with_store_error<S>(
-    store: &S,
-    waking: &InstanceRecord,
-    error: StoreError,
-) -> WakeInstanceError
-where
-    S: ControlPlaneStore + ?Sized,
-{
-    let mapped = map_store_error(error);
-    fail_waking(store, waking, mapped).await
-}
-
-async fn best_effort_mark_failed<S>(store: &S, waking: &InstanceRecord, message: String)
-where
-    S: ControlPlaneStore + ?Sized,
-{
-    let request = CompareAndSwapInstanceStateRequest::new(
-        waking.id.clone(),
-        waking.generation,
-        InstanceState::Failed,
-        StateTransitionReason::FailureReported(message),
-    );
-    let _ = store.compare_and_swap_instance_state(request).await;
-}
-
-fn failure_message(error: &WakeInstanceError) -> String {
-    match error {
-        WakeInstanceError::WorkloadClassNotFound { .. } => {
-            "workload class version not found".to_owned()
-        }
-        WakeInstanceError::Render { source, .. } => format!("manifest render failed: {source}"),
-        WakeInstanceError::SleepPolicy { source, .. } => {
-            format!("sleep policy resolution failed: {source}")
-        }
-        WakeInstanceError::Materializer { source, .. } => {
-            format!("materialization failed: {source}")
-        }
-        WakeInstanceError::Projection { source, .. } => format!("projection failed: {source}"),
-        WakeInstanceError::Store(error) => format!("store operation failed: {error}"),
-        WakeInstanceError::NotFound => "instance not found".to_owned(),
-        WakeInstanceError::GenerationConflict { expected, actual } => {
-            format!("generation conflict: expected {expected}, actual {actual}")
-        }
-        WakeInstanceError::Unavailable { reason, .. } => {
-            format!("instance is unavailable for wake: {reason:?}")
-        }
-        WakeInstanceError::ReadyMaterializationNotFound { target, .. } => format!(
-            "ready materialization not found for target {}/{}",
-            target.cluster_id(),
-            target.namespace()
-        ),
     }
 }
 
@@ -900,7 +422,6 @@ impl fmt::Display for WakeInstanceError {
             Self::Materializer { source, .. } => {
                 write!(f, "wake materializer failed: {source}")
             }
-            Self::Projection { source, .. } => write!(f, "wake projection failed: {source}"),
         }
     }
 }
@@ -912,7 +433,6 @@ impl Error for WakeInstanceError {
             Self::Render { source, .. } => Some(source),
             Self::SleepPolicy { source, .. } => Some(source),
             Self::Materializer { source, .. } => Some(source),
-            Self::Projection { source, .. } => Some(source),
             Self::NotFound
             | Self::GenerationConflict { .. }
             | Self::Unavailable { .. }

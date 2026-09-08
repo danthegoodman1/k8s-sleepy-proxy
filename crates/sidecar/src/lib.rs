@@ -2,6 +2,7 @@
 
 pub mod control_plane_transport;
 pub mod idle;
+pub mod readiness;
 pub mod runtime;
 
 use std::{
@@ -27,12 +28,8 @@ pub use idle::{
 use proxy_core::{
     DrainError, DrainTracker, HttpProxy, HttpProxyError, Shutdown, TcpProxy, TcpProxyConfig,
     TcpProxyError, TcpProxyStats, TrackedBody, WebSocketProxy, WebSocketProxyError,
-    WebSocketProxyStats,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-};
+use tokio::net::TcpStream;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -43,6 +40,7 @@ pub struct SidecarProxyConfig {
     websocket_upstream_url: String,
     tcp_upstream_addr: SocketAddr,
     tcp_connect_timeout: Duration,
+    resources: proxy_core::ProxyResourceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +79,14 @@ impl SidecarProxyConfig {
             websocket_upstream_url,
             tcp_upstream_addr,
             tcp_connect_timeout,
+            resources: proxy_core::ProxyResourceConfig::default(),
         })
+    }
+
+    pub fn with_resource_config(mut self, config: proxy_core::ProxyResourceConfig) -> Self {
+        self.resources = config;
+        self.tcp_connect_timeout = config.setup_timeout();
+        self
     }
 
     pub fn app_port(&self) -> u16 {
@@ -107,12 +112,20 @@ impl SidecarProxyConfig {
 
 impl SidecarProxy {
     pub fn new(config: SidecarProxyConfig, drain: DrainTracker) -> Self {
-        let http = HttpProxy::new(drain.clone());
-        let websocket = WebSocketProxy::new(drain.clone());
+        let http = HttpProxy::with_config(drain.clone(), config.resources);
+        let websocket = WebSocketProxy::with_config(
+            drain.clone(),
+            proxy_core::WebSocketProxyConfig {
+                handshake_timeout: config.resources.setup_timeout(),
+                write_timeout: config.resources.write_idle_timeout(),
+                ..proxy_core::WebSocketProxyConfig::default()
+            },
+        );
         let tcp = TcpProxy::new(
             drain.clone(),
             TcpProxyConfig {
                 connect_timeout: config.tcp_connect_timeout(),
+                write_idle_timeout: config.resources.write_idle_timeout(),
                 ..TcpProxyConfig::default()
             },
         );
@@ -182,16 +195,23 @@ impl SidecarProxy {
             .await
     }
 
-    pub async fn forward_websocket<Client>(
+    pub async fn prepare_websocket_upgrade<B>(
         &self,
-        client: Client,
-    ) -> Result<WebSocketProxyStats, WebSocketProxyError>
-    where
-        Client: AsyncRead + AsyncWrite + Unpin,
-    {
-        self.websocket
-            .accept_and_proxy(client, self.config.websocket_upstream_url())
-            .await
+        request: &mut Request<B>,
+    ) -> Result<
+        (
+            Response<http_body_util::Full<Bytes>>,
+            proxy_core::WebSocketUpgrade,
+        ),
+        WebSocketProxyError,
+    > {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or("/");
+        let url = format!("{}{path}", self.config.websocket_upstream_url());
+        self.websocket.prepare_upgrade(request, &url).await
     }
 }
 

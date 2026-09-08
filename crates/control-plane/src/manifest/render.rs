@@ -23,11 +23,11 @@ use super::{
     LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
-const SIDECAR_PORT_NAME: &str = "sleepypods";
 const CONTROL_PLANE_SERVICE_NAME: &str = "sleepypods-control-plane";
 const CONTROL_PLANE_GRPC_PORT: u16 = 50051;
 const ENV_LISTEN_PORT: &str = "SLEEPYPODS_LISTEN_PORT";
 const ENV_SIDECAR_LISTEN_ADDR: &str = "SLEEPYPODS_SIDECAR_LISTEN_ADDR";
+const ENV_SIDECAR_READINESS_LISTEN_ADDR: &str = "SLEEPYPODS_SIDECAR_READINESS_LISTEN_ADDR";
 const ENV_APP_PORT: &str = "SLEEPYPODS_APP_PORT";
 const ENV_INSTANCE_ID: &str = "SLEEPYPODS_INSTANCE_ID";
 const ENV_INSTANCE_GENERATION: &str = "SLEEPYPODS_INSTANCE_GENERATION";
@@ -50,6 +50,8 @@ pub(crate) fn render_manifests_with_options(
     request: RenderManifestRequest<'_>,
     options: super::RenderManifestOptions<'_>,
 ) -> Result<RenderedManifest, ManifestRenderError> {
+    request.template.workload.validate_replicas()?;
+    request.template.validate_storage_retention()?;
     validate_namespace(request.namespace)?;
 
     let workload_name = render_object_name(
@@ -224,13 +226,6 @@ pub(crate) fn render_manifests_with_options(
             });
         }
         WorkloadKind::StatefulSet => {
-            if replicas > 1 {
-                return Err(ManifestRenderError::InvalidReplicas {
-                    kind: WorkloadKind::StatefulSet,
-                    replicas,
-                    message: "StatefulSet replicas above one are not supported in V1".to_owned(),
-                });
-            }
             let service_name = service_name.ok_or_else(|| ManifestRenderError::InvalidField {
                 field: "stateful_set.service_name",
                 message: "StatefulSet rendering requires a service template".to_owned(),
@@ -257,18 +252,21 @@ pub(crate) fn render_manifests_with_options(
         }
     }
 
+    let mut auxiliary_labels = metadata_labels.clone();
+    auxiliary_labels.remove(LABEL_WORKLOAD_NAME);
     for raw in &request.template.raw_objects {
         objects.push(render_raw_object(
             raw,
             request.instance,
             request.namespace,
-            &metadata_labels,
+            &auxiliary_labels,
             &annotations,
         )?);
     }
 
     objects.sort_by_key(|object| object.apply_order);
     validate_unique_rendered_refs(&objects)?;
+    validate_retained_static_inventory(&objects)?;
 
     Ok(RenderedManifest {
         instance_generation: request.instance.generation,
@@ -290,6 +288,7 @@ fn render_raw_object(
             field: "raw_objects.manifest",
             message: format!("manifest must be valid YAML or JSON: {error}"),
         })?;
+    reject_raw_primary_selector(&value)?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| ManifestRenderError::InvalidField {
@@ -366,6 +365,41 @@ fn render_raw_object(
             value,
         }),
     })
+}
+
+// The generated Service selector is reserved for the structured primary workload.
+// Raw auxiliaries keep instance ownership for cleanup, but may not join that Service.
+fn reject_raw_primary_selector(value: &Value) -> Result<(), ManifestRenderError> {
+    let explicit_label = [
+        "/metadata/labels",
+        "/spec/template/metadata/labels",
+        "/spec/selector",
+        "/spec/selector/matchLabels",
+    ]
+    .iter()
+    .any(|path| {
+        value
+            .pointer(path)
+            .and_then(|labels| labels.get(LABEL_WORKLOAD_NAME))
+            .is_some()
+    });
+    let expression = value
+        .pointer("/spec/selector/matchExpressions")
+        .and_then(Value::as_array)
+        .is_some_and(|expressions| {
+            expressions.iter().any(|expression| {
+                expression.get("key").and_then(Value::as_str) == Some(LABEL_WORKLOAD_NAME)
+            })
+        });
+    if explicit_label || expression {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest",
+            message: format!(
+                "{LABEL_WORKLOAD_NAME} is reserved for the primary workload and Service selector"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn required_string_field(
@@ -619,7 +653,9 @@ struct RenderedVolume {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SidecarRenderConfig {
     listen_port: u16,
+    proxy_port_name: Option<String>,
     app_port: u16,
+    readiness_port: u16,
     mode: Option<String>,
 }
 
@@ -674,9 +710,55 @@ fn render_sidecar_config(
 
     Ok(SidecarRenderConfig {
         listen_port: template.sidecar.listen_port,
+        proxy_port_name: (!app_ports
+            .iter()
+            .any(|port| port.name.as_deref() == Some("sleepypods")))
+        .then(|| "sleepypods".to_owned()),
         app_port,
+        readiness_port: readiness_port(template, instance)?,
         mode: template.sidecar.mode.clone(),
     })
+}
+
+fn readiness_port(
+    template: &ManifestTemplate,
+    instance: &InstanceRecord,
+) -> Result<u16, ManifestRenderError> {
+    let mut occupied = template
+        .workload
+        .app_container
+        .ports
+        .iter()
+        .map(|port| port.container_port)
+        .collect::<BTreeSet<_>>();
+    occupied.insert(template.sidecar.listen_port);
+    for env in &template.workload.app_container.env {
+        if matches!(
+            env.name.as_str(),
+            "SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR"
+                | "SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR"
+                | "SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR"
+        ) {
+            let value = env.value.render(&instance.values)?;
+            if value.is_empty() {
+                continue;
+            }
+            let addr = value.parse::<std::net::SocketAddr>().map_err(|_| {
+                ManifestRenderError::InvalidField {
+                    field: "container.env.metrics_listen_addr",
+                    message: format!("{} must be a socket address", env.name),
+                }
+            })?;
+            occupied.insert(addr.port());
+        }
+    }
+    (15001..=u16::MAX)
+        .chain(1024..15001)
+        .find(|port| !occupied.contains(port))
+        .ok_or_else(|| ManifestRenderError::InvalidField {
+            field: "sidecar.readiness_port",
+            message: "no unused unprivileged port remains for sidecar readiness".to_owned(),
+        })
 }
 
 fn render_volume(
@@ -874,6 +956,7 @@ fn render_app_container(
                 mount_path: volume.mount_path.clone(),
             })
             .collect(),
+        readiness_probe: None,
     })
 }
 
@@ -887,6 +970,11 @@ fn render_sidecar_container(
 ) -> Result<Container, ManifestRenderError> {
     let mut env = vec![
         EnvVar {
+            name: "SLEEPYPODS_POD_UID".to_owned(),
+            value: String::new(),
+            value_from: Some(super::EnvVarSource::FieldRef { field_path: "metadata.uid".to_owned() }),
+        },
+        EnvVar {
             name: ENV_LISTEN_PORT.to_owned(),
             value: config.listen_port.to_string(),
             value_from: None,
@@ -894,6 +982,11 @@ fn render_sidecar_container(
         EnvVar {
             name: ENV_SIDECAR_LISTEN_ADDR.to_owned(),
             value: format!("0.0.0.0:{}", config.listen_port),
+            value_from: None,
+        },
+        EnvVar {
+            name: ENV_SIDECAR_READINESS_LISTEN_ADDR.to_owned(),
+            value: format!("0.0.0.0:{}", config.readiness_port),
             value_from: None,
         },
         EnvVar {
@@ -945,24 +1038,35 @@ fn render_sidecar_container(
         env.push(EnvVar {
             name: ENV_CONTROL_PLANE_SIDECAR_TOKEN.to_owned(),
             value: String::new(),
-            value_from: Some(super::EnvVarSource {
-                secret_key_ref: SecretKeyRef {
-                    name: secret_name.to_owned(),
-                    key: SIDECAR_TOKEN_SECRET_KEY.to_owned(),
-                },
-            }),
+            value_from: Some(super::EnvVarSource::SecretKeyRef(SecretKeyRef {
+                name: secret_name.to_owned(),
+                key: SIDECAR_TOKEN_SECRET_KEY.to_owned(),
+            })),
         });
     }
 
     Ok(Container {
         name: template.name.clone(),
         image: render_non_empty("sidecar.image", &template.image, instance)?,
-        ports: vec![ContainerPort {
-            name: Some(SIDECAR_PORT_NAME.to_owned()),
-            container_port: config.listen_port,
-        }],
+        ports: vec![
+            ContainerPort {
+                name: config.proxy_port_name.clone(),
+                container_port: config.listen_port,
+            },
+            ContainerPort {
+                name: None,
+                container_port: config.readiness_port,
+            },
+        ],
         env,
         volume_mounts: Vec::new(),
+        readiness_probe: Some(super::HttpReadinessProbe {
+            path: "/ready".to_owned(),
+            port: config.readiness_port,
+            period_seconds: 1,
+            timeout_seconds: 1,
+            failure_threshold: 1,
+        }),
     })
 }
 
@@ -1109,4 +1213,45 @@ fn metadata_annotations(request: &RenderManifestRequest<'_>) -> BTreeMap<String,
             )])
         })
         .unwrap_or_default()
+}
+
+fn validate_retained_static_inventory(
+    objects: &[RenderedManifestObject],
+) -> Result<(), ManifestRenderError> {
+    let values = objects
+        .iter()
+        .map(|object| object.object.to_kubernetes_json())
+        .collect::<Vec<_>>();
+    for value in &values {
+        match value["kind"].as_str() {
+            Some("PersistentVolume")
+                if value
+                    .pointer("/spec/persistentVolumeReclaimPolicy")
+                    .and_then(Value::as_str)
+                    != Some("Retain") =>
+            {
+                return Err(ManifestRenderError::InvalidField {
+                    field: "volumes.reclaim_policy",
+                    message: "all managed static PVs, including raw PVs, require explicit Retain"
+                        .into(),
+                })
+            }
+            Some("PersistentVolumeClaim") => {
+                let volume_name = value
+                    .pointer("/spec/volumeName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                if volume_name.is_none()
+                    || !values.iter().any(|pv| {
+                        pv["kind"] == "PersistentVolume"
+                            && pv["metadata"]["name"].as_str() == volume_name
+                    })
+                {
+                    return Err(ManifestRenderError::InvalidField { field: "volumes.static_binding", message: "PVC must explicitly bind a retained PV in the same managed inventory; dynamic/external bindings are unsupported".into() });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

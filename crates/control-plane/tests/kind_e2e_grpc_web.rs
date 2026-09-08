@@ -153,11 +153,27 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "DeleteInstance",
         DeleteInstanceRequest {
+            expected_generation: Some(loaded_instance.generation),
             instance_id: INSTANCE_ID.to_owned(),
         },
     )?;
-    assert!(deleted.deleted);
+    assert!(deleted.accepted);
 
+    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while grpc_web_unary::<Instance, _>(
+        &endpoint,
+        "GetInstance",
+        GetInstanceRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+        },
+    )
+    .is_ok()
+    {
+        if std::time::Instant::now() >= cleanup_deadline {
+            return Err("deletion did not converge".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let missing = grpc_web_unary_expect_status::<Instance, _>(
         &endpoint,
         "GetInstance",

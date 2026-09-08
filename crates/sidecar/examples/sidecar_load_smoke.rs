@@ -14,14 +14,14 @@ use std::{
 };
 
 use bytes::Bytes;
-use control_plane::api::pb::{
-    self,
-    sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
-};
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
 use http_body_util::Full;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use sleepypods_api::pb::{
+    self,
+    sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},

@@ -278,11 +278,17 @@ metadata:
     sleepypods.io/kind-e2e: metrics
 rules:
   - apiGroups: [""]
-    resources: ["services"]
+    resources: ["services", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -471,6 +477,10 @@ spec:
               value: "8081"
             - name: SLEEPYPODS_INSTANCE_ID
               value: metrics-sidecar
+            - name: SLEEPYPODS_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: SLEEPYPODS_INSTANCE_GENERATION
               value: "1"
             - name: SLEEPYPODS_CONTROL_PLANE_ENDPOINT

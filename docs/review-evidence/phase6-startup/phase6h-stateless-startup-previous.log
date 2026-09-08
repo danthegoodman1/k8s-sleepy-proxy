@@ -1,0 +1,2 @@
+[pod/sleepypods-frontline-b6dc9f84-wxfp5/frontline] frontline runtime failed: transport error
+Error from server (BadRequest): previous terminated container "frontline" in pod "sleepypods-frontline-dfd9989dc-6d4h7" not found

@@ -13,7 +13,7 @@ use std::{
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use control_plane::{BearerToken, InvalidBearerToken};
+use sleepypods_api::{BearerToken, InvalidBearerToken};
 
 use crate::{
     FrontlineHttpListenerConfig, FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
@@ -24,6 +24,8 @@ use crate::{
 const DEFAULT_ROUTE_CACHE_CAPACITY: usize = 1024;
 const DEFAULT_DRAIN_GRACE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WAKE_INSTANCE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_ROUTE_TIMEOUT_MS: u64 = 130_000;
+const ROUTE_TIMEOUT_MS: &str = "SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS";
 const FRONTLINE_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_LISTEN_ADDR";
 const CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
 const CONTROL_PLANE_PROXY_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
@@ -46,6 +48,7 @@ pub struct FrontlineEnvConfig {
     route_cache_capacity: usize,
     drain_grace_timeout: Duration,
     wake_instance_timeout: Duration,
+    route_timeout: Duration,
     metrics_listen_addr: Option<SocketAddr>,
 }
 
@@ -58,6 +61,8 @@ pub struct FrontlineTlsCertificateConfig {
 
 #[derive(Debug)]
 pub enum FrontlineEnvConfigError {
+    InitialActivationBudgetExceeded,
+    InvalidProxyResources(proxy_core::InvalidProxyResourceConfig),
     Missing {
         name: &'static str,
     },
@@ -157,6 +162,8 @@ impl FrontlineEnvConfig {
             WAKE_INSTANCE_TIMEOUT_MS,
             DEFAULT_WAKE_INSTANCE_TIMEOUT_MS,
         )?;
+        let route_timeout =
+            optional_duration_ms(&vars, ROUTE_TIMEOUT_MS, DEFAULT_ROUTE_TIMEOUT_MS)?;
         let tls_termination =
             optional_tls_termination_listener_config(&vars, TLS_TERMINATION_LISTEN_ADDR)?;
         let tls_passthrough = optional_listener_config(&vars, TLS_PASSTHROUGH_LISTEN_ADDR)?
@@ -164,10 +171,19 @@ impl FrontlineEnvConfig {
         let metrics_listen_addr = optional_listener_config(&vars, METRICS_LISTEN_ADDR)?
             .map(|listener| listener.listen_addr());
         let tls_certificates = optional_tls_certificates(&vars, tls_termination.is_some())?;
-        let listeners =
-            FrontlineListenersConfig::new(FrontlineHttpListenerConfig::new(listen_addr))
-                .with_tls_termination(tls_termination)
-                .with_tls_passthrough(tls_passthrough);
+        let listeners = FrontlineListenersConfig::new(
+            FrontlineHttpListenerConfig::new(listen_addr).with_resource_config(
+                proxy_core::ProxyResourceConfig::from_vars(|name| vars.get(name).cloned())
+                    .map_err(FrontlineEnvConfigError::InvalidProxyResources)?,
+            ),
+        )
+        .with_tls_termination(tls_termination)
+        .with_tls_passthrough(tls_passthrough);
+
+        let resources = listeners.http().resource_config();
+        if !initial_activation_budget_valid(route_timeout, resources) {
+            return Err(FrontlineEnvConfigError::InitialActivationBudgetExceeded);
+        }
 
         Ok(Self {
             listeners,
@@ -178,6 +194,7 @@ impl FrontlineEnvConfig {
             route_cache_capacity,
             drain_grace_timeout,
             wake_instance_timeout,
+            route_timeout,
             metrics_listen_addr,
         })
     }
@@ -244,6 +261,10 @@ impl FrontlineEnvConfig {
 
     pub fn drain_grace_timeout(&self) -> Duration {
         self.drain_grace_timeout
+    }
+
+    pub fn route_timeout(&self) -> Duration {
+        self.route_timeout
     }
 
     pub fn wake_instance_timeout(&self) -> Duration {
@@ -476,6 +497,10 @@ fn load_private_key(
 impl fmt::Display for FrontlineEnvConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InitialActivationBudgetExceeded => f.write_str(
+                "frontline route timeout + max(proxy setup timeout, upstream header idle timeout) must not exceed the 190000 ms initial activation budget"
+            ),
+            Self::InvalidProxyResources(error) => write!(f, "{error}"),
             Self::Missing { name } => write!(f, "{name} is required"),
             Self::InvalidSocketAddr { name, value, .. } => {
                 write!(f, "{name} must be a socket address, got {value:?}")
@@ -537,12 +562,15 @@ impl fmt::Display for FrontlineTlsCertificateLoadError {
 impl Error for FrontlineEnvConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidProxyResources(error) => Some(error),
             Self::InvalidSocketAddr { source, .. } => Some(source),
             Self::InvalidUsize { source, .. } | Self::InvalidDurationMs { source, .. } => {
                 Some(source)
             }
             Self::InvalidControlPlaneBearerToken { source, .. } => Some(source),
-            Self::Missing { .. } | Self::InvalidTlsCertificates { .. } => None,
+            Self::InitialActivationBudgetExceeded
+            | Self::Missing { .. }
+            | Self::InvalidTlsCertificates { .. } => None,
         }
     }
 }
@@ -560,6 +588,20 @@ impl Error for FrontlineTlsCertificateLoadError {
     }
 }
 
+/// Validated by both environment parsing and every production listener entry.
+pub(crate) fn initial_activation_budget_valid(
+    route: Duration,
+    resources: proxy_core::ProxyResourceConfig,
+) -> bool {
+    route
+        .checked_add(
+            resources
+                .setup_timeout()
+                .max(resources.upstream_header_idle_timeout()),
+        )
+        .is_some_and(|total| total <= sleepypods_api::INITIAL_ACTIVATION_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +609,37 @@ mod tests {
         fs,
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    #[test]
+    fn initial_activation_budget_checks_route_and_both_setup_bounds() {
+        let parse = |route: &str, setup: &str, header: &str| {
+            FrontlineEnvConfig::from_vars([
+                (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
+                (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
+                (ROUTE_TIMEOUT_MS, route),
+                ("SLEEPYPODS_PROXY_SETUP_TIMEOUT_MS", setup),
+                ("SLEEPYPODS_PROXY_UPSTREAM_HEADER_IDLE_TIMEOUT_MS", header),
+            ])
+        };
+        assert!(parse("130000", "10000", "60000").is_ok());
+        assert!(parse("100000", "90000", "50000").is_ok());
+        for (route, setup, header) in [
+            ("130001", "10000", "60000"),
+            ("100000", "90001", "50000"),
+            ("100000", "10000", "90001"),
+            ("18446744073709551615", "10000", "60000"),
+        ] {
+            let error = parse(route, setup, header).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    FrontlineEnvConfigError::InitialActivationBudgetExceeded
+                ),
+                "{error}"
+            );
+            assert!(error.to_string().contains("190000 ms"));
+        }
+    }
 
     #[test]
     fn required_values_parse_with_defaults() {

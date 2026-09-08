@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/control-plane", "crates/frontline", "crates/proxy-core", "crates/sidecar", "crates/sleepypods-types"]
+members = ["crates/control-plane", "crates/frontline", "crates/proxy-core", "crates/sidecar", "crates/sleepypods-api", "crates/sleepypods-observability", "crates/sleepypods-types"]
 resolver = "2"
 
 [workspace.package]
@@ -8,7 +8,6 @@ license = "MIT"
 
 [workspace.dependencies]
 bytes = { version = "1.12.0", default-features = false }
-control-plane = { version = "0.1.0", path = "crates/control-plane" }
 criterion = { version = "0.8.2", default-features = false }
 futures-util = { version = "0.3.32", default-features = false }
 http = { version = "1.4.2", default-features = false }

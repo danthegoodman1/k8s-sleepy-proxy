@@ -1,11 +1,11 @@
+#[path = "support/deletion_observation.rs"]
+mod deletion_observation;
+
+#[path = "support/http_once.rs"]
+mod http_once;
+
 use std::{
-    collections::HashMap,
-    env,
-    error::Error,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
-    process::Command,
-    time::Duration,
+    collections::HashMap, env, error::Error, net::SocketAddr, process::Command, time::Duration,
 };
 
 use control_plane::api::pb::{
@@ -19,10 +19,10 @@ use control_plane::api::pb::{
     InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
     PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute,
     ProxyRouteInvalidationReason, ProxySubscribeRequest, ProxySubscribeRouteRequest,
-    ProxyWakeInstanceRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
-    ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueFieldRule, WorkloadValueSchema,
+    ProxyWakeInstanceRequest, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate,
+    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
+    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
@@ -38,6 +38,9 @@ use tonic::{
     codegen::tokio_stream::{wrappers::ReceiverStream, StreamExt},
     transport::{Channel, Endpoint},
 };
+
+#[path = "support/ready_age_fixture.rs"]
+mod ready_age_fixture;
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -161,6 +164,9 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
     eprintln!("==> lifecycle race E2E: stale sidecar ReportIdle");
     stale_sidecar_report_is_rejected(&mut operator, kube.clone(), &config).await?;
 
+    eprintln!("==> lifecycle race E2E: idle member UID and external replica drift");
+    idle_report_requires_current_single_member(&mut operator, kube.clone(), &config).await?;
+
     eprintln!("==> lifecycle race E2E: route reassignment subscription invalidation");
     route_reassignment_invalidates_active_subscription(&mut operator, kube, &config).await?;
 
@@ -253,18 +259,24 @@ async fn concurrent_wake_calls_converge(
         }));
     }
 
-    let mut ready = 0;
+    let mut accepted = 0;
     let mut conflicts = 0;
     for task in tasks {
         match task.await??.outcome {
             Some(proxy_wake_instance_response::Outcome::Ready(result)) => {
-                ready += 1;
+                accepted += 1;
                 if result.instance_generation <= created.generation {
                     return Err(format!(
                         "concurrent wake returned non-advanced generation {}",
                         result.instance_generation
                     )
                     .into());
+                }
+            }
+            Some(proxy_wake_instance_response::Outcome::StillWaking(result)) => {
+                accepted += 1;
+                if result.instance_generation <= created.generation {
+                    return Err("accepted wake must advance the generation".into());
                 }
             }
             Some(proxy_wake_instance_response::Outcome::GenerationConflict(conflict)) => {
@@ -280,9 +292,9 @@ async fn concurrent_wake_calls_converge(
             other => return Err(format!("unexpected concurrent wake outcome: {other:?}").into()),
         }
     }
-    if ready != 1 || conflicts != 3 {
+    if accepted == 0 || accepted + conflicts != 4 {
         return Err(format!(
-            "expected one ready wake and three conflicts, got {ready}/{conflicts}"
+            "expected accepted wakes and optional generation conflicts, got {accepted}/{conflicts}"
         )
         .into());
     }
@@ -353,6 +365,8 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
     let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
     let stale = sidecar
         .report_idle(SidecarReportIdleRequest {
+            // Waking instances reject idle observations before membership inspection.
+            pod_uid: "waking-non-member".to_owned(),
             instance_id: "lifecycle-sleep-waking".to_owned(),
             expected_generation: waking.generation,
             active_count: 0,
@@ -508,40 +522,163 @@ async fn delete_while_draining_cleans_deleting_materialization(
     )
     .await?;
 
-    set_control_plane_statefulset_delete_permission(kube.clone(), &config.namespace, false).await?;
-    sleep(Duration::from_secs(2)).await;
-    let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
-    let idle_response = sidecar
-        .report_idle(SidecarReportIdleRequest {
-            instance_id: "lifecycle-delete-draining".to_owned(),
-            expected_generation: running.generation,
-            active_count: 0,
+    let workloads: Api<StatefulSet> = Api::namespaced(kube.clone(), &config.namespace);
+    let workload = workloads.get("lifecycle-delete-draining-3cf19f0e").await?;
+    let materialization_id = workload
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("sleepypods.io/materialization-id"))
+        .ok_or("current StatefulSet has no materialization identity")?
+        .clone();
+    let mut removed_delete_permission = false;
+    let blocked_result: TestResult<()> = async {
+        // Record the owned change before dispatch so an ambiguous Role update
+        // still reaches restoration; never add a permission absent beforehand.
+        set_control_plane_statefulset_delete_permission(
+            kube.clone(),
+            &config.namespace,
+            false,
+            &mut removed_delete_permission,
+        )
+        .await?;
+        if !removed_delete_permission {
+            return Err("fixture requires the original StatefulSet delete permission".into());
+        }
+        sleep(Duration::from_secs(2)).await;
+        let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+        let (pod_uid, pod_generation) =
+            current_idle_member(kube.clone(), &config.namespace, "lifecycle-delete-draining")
+                .await?;
+        age_ready_for_controlled_lifecycle_case(
+            config,
+            "lifecycle-delete-draining",
+            running.generation,
+            pod_generation,
+        )
+        .await?;
+        let idle_response = sidecar
+            .report_idle(SidecarReportIdleRequest {
+                pod_uid,
+                instance_id: "lifecycle-delete-draining".to_owned(),
+                expected_generation: pod_generation,
+                active_count: 0,
+            })
+            .await?
+            .into_inner();
+        if !matches!(
+            idle_response.outcome,
+            Some(sidecar_report_idle_response::Outcome::Accepted(_))
+        ) {
+            return Err(format!("ReportIdle while draining returned {idle_response:?}").into());
+        }
+        let draining = wait_for_instance_state(
+            operator,
+            "lifecycle-delete-draining",
+            PbInstanceState::Draining,
+            30,
+        )
+        .await?;
+        if draining.generation <= running.generation {
+            return Err("idle acceptance did not advance the generation".into());
+        }
+        let deletion = operator
+            .delete_instance(DeleteInstanceRequest {
+                instance_id: "lifecycle-delete-draining".to_owned(),
+                expected_generation: Some(draining.generation),
+            })
+            .await?
+            .into_inner();
+        if !deletion.accepted {
+            return Err("delete while cleanup is blocked must be durably accepted".into());
+        }
+        let deleting = wait_for_instance_state(
+            operator,
+            "lifecycle-delete-draining",
+            PbInstanceState::Deleting,
+            30,
+        )
+        .await?;
+        if deleting.generation != draining.generation + 1 {
+            return Err("Delete acceptance must advance the draining generation once".into());
+        }
+        // A definite forbidden delete is permanent until an operator corrects
+        // permissions and explicitly enqueues recovery. Wait until no old denied
+        // attempt can publish a later failure over that recovery enqueue.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = operator
+                .reconcile_materialization(ReconcileMaterializationRequest {
+                    materialization_id: materialization_id.clone(),
+                    status_only: true,
+                })
+                .await?
+                .into_inner();
+            if status.found
+                && status.state == "Deleting"
+                && status.failure_kind == "permanent"
+                && status.lease_owner.is_empty()
+                && status.uncertain_effect.is_none()
+                && !status.observed_refs.is_empty()
+            {
+                let message = status.failure_message.to_ascii_lowercase();
+                if !message.contains("failed to delete statefulset")
+                    || !message.contains("lifecycle-delete-draining-3cf19f0e")
+                    || !(message.contains("forbidden") || message.contains("403"))
+                {
+                    return Err(format!(
+                        "terminal cleanup failed for an unexpected reason: {}",
+                        status.failure_message
+                    )
+                    .into());
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "denied cleanup did not settle with retained inventory: {status:?}"
+                )
+                .into());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+    .await;
+    let restoration = if removed_delete_permission {
+        set_control_plane_statefulset_delete_permission(
+            kube.clone(),
+            &config.namespace,
+            true,
+            &mut false,
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    match (blocked_result, restoration) {
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+        (Err(error), Err(restore)) => {
+            return Err(format!(
+                "blocked deletion failed: {error}; RBAC restoration failed: {restore}"
+            )
+            .into());
+        }
+    }
+    // Resume the permanent permission failure through the ordinary scheduler,
+    // then observe completion without replaying DeleteInstance.
+    let recovery = operator
+        .reconcile_materialization(ReconcileMaterializationRequest {
+            materialization_id,
+            status_only: false,
         })
         .await?
         .into_inner();
-    set_control_plane_statefulset_delete_permission(kube.clone(), &config.namespace, true).await?;
-    if !matches!(
-        idle_response.outcome,
-        Some(sidecar_report_idle_response::Outcome::Accepted(_))
-    ) {
-        return Err(format!("ReportIdle while draining returned {idle_response:?}").into());
+    if !recovery.attempted {
+        return Err("corrected permanent cleanup failure must accept scheduler recovery".into());
     }
-    let draining = wait_for_instance_state(
-        operator,
-        "lifecycle-delete-draining",
-        PbInstanceState::Draining,
-        30,
-    )
-    .await?;
-    if draining.generation <= running.generation {
-        return Err(format!(
-            "delete-draining generation {} did not advance beyond running generation {}",
-            draining.generation, running.generation
-        )
-        .into());
-    }
-
-    delete_instance_until_deleted(operator, "lifecycle-delete-draining", 60).await?;
+    wait_for_instance_deleted(operator, "lifecycle-delete-draining", 60).await?;
     assert_instance_not_found(operator, "lifecycle-delete-draining").await?;
     wait_for_stateful_objects_absent(
         kube,
@@ -682,10 +819,20 @@ async fn stale_sidecar_report_is_rejected(
     )
     .await?;
     let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+    let (first_pod_uid, first_pod_generation) =
+        current_idle_member(kube.clone(), &config.namespace, "lifecycle-stale-sidecar").await?;
+    age_ready_for_controlled_lifecycle_case(
+        config,
+        "lifecycle-stale-sidecar",
+        first_running.generation,
+        first_pod_generation,
+    )
+    .await?;
     sidecar
         .report_idle(SidecarReportIdleRequest {
+            pod_uid: first_pod_uid.clone(),
             instance_id: "lifecycle-stale-sidecar".to_owned(),
-            expected_generation: first_running.generation,
+            expected_generation: first_pod_generation,
             active_count: 0,
         })
         .await?;
@@ -722,8 +869,9 @@ async fn stale_sidecar_report_is_rejected(
 
     let stale = sidecar
         .report_idle(SidecarReportIdleRequest {
+            pod_uid: first_pod_uid,
             instance_id: "lifecycle-stale-sidecar".to_owned(),
-            expected_generation: first_running.generation,
+            expected_generation: first_pod_generation,
             active_count: 0,
         })
         .await?
@@ -746,6 +894,185 @@ async fn stale_sidecar_report_is_rejected(
 
     Ok(())
 }
+
+async fn idle_report_requires_current_single_member(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    kube: Client,
+    config: &E2eConfig,
+) -> TestResult<()> {
+    let instance_id = "lifecycle-membership";
+    create_instance_and_route(
+        operator,
+        NORMAL_CLASS_ID,
+        instance_id,
+        "lifecycle-membership-route",
+        "membership.lifecycle.sleepypods.test",
+        "membership",
+        "membership",
+    )
+    .await?;
+    wait_for_instance_response(
+        config,
+        "idle membership wake",
+        "membership.lifecycle.sleepypods.test",
+        "/",
+        "membership",
+        180,
+    )
+    .await?;
+    let running =
+        wait_for_instance_state(operator, instance_id, PbInstanceState::Running, 30).await?;
+    let (pod_uid, pod_generation) =
+        current_idle_member(kube.clone(), &config.namespace, instance_id).await?;
+    let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+    let report = SidecarReportIdleRequest {
+        instance_id: instance_id.to_owned(),
+        expected_generation: pod_generation,
+        active_count: 0,
+        pod_uid,
+    };
+    age_ready_for_controlled_lifecycle_case(
+        config,
+        instance_id,
+        running.generation,
+        pod_generation,
+    )
+    .await?;
+    let mut stale = report.clone();
+    stale.pod_uid = "replaced-pod-uid".to_owned();
+    let rejected = sidecar
+        .report_idle(stale)
+        .await
+        .expect_err("a non-current Pod UID cannot initiate sleep");
+    assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+    if rejected
+        .metadata()
+        .contains_key(sleepypods_api::IDLE_RETRY_AFTER_METADATA)
+    {
+        return Err("controlled membership check was still deferred by activation age".into());
+    }
+
+    // This mutation deliberately violates the managed workload contract. Detection
+    // must keep the current workload awake even if the new peer is not ready yet.
+    let deployments: Api<Deployment> = Api::namespaced(kube, &config.namespace);
+    let controllers = deployments
+        .list(&ListParams::default().labels(&format!("sleepypods.io/instance-id={instance_id}")))
+        .await?;
+    let [controller] = controllers.items.as_slice() else {
+        return Err("expected exactly one managed Deployment".into());
+    };
+    let name = controller
+        .metadata
+        .name
+        .as_deref()
+        .ok_or("Deployment name is missing")?;
+    let uid = controller
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or("Deployment UID is missing")?;
+    let materialization_id = controller
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("sleepypods.io/materialization-id"))
+        .filter(|id| !id.is_empty())
+        .ok_or("current Deployment has no materialization identity")?;
+    set_fixture_deployment_replicas(&deployments, name, uid, 2).await?;
+    let rejected = sidecar
+        .report_idle(report)
+        .await
+        .expect_err("external replica drift cannot authorize sleep");
+    assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+    if rejected
+        .metadata()
+        .contains_key(sleepypods_api::IDLE_RETRY_AFTER_METADATA)
+    {
+        return Err("controlled membership check was still deferred by activation age".into());
+    }
+    let after = get_instance(operator, instance_id).await?;
+    assert_state(&after, PbInstanceState::Running)?;
+    assert_eq!(after.generation, running.generation);
+
+    set_fixture_deployment_replicas(&deployments, name, uid, 1).await?;
+    // Terminating descendants can miss a cleanup scan, leaving the next real
+    // backoff after 60s. Observe the same accepted operation's persisted deadline.
+    deletion_observation::delete_with_original_deadline(
+        operator,
+        &after,
+        materialization_id,
+        Duration::from_secs(90),
+    )
+    .await?;
+    Ok(())
+}
+
+// The Deployment controller may update status between GET and PATCH. Retry only
+// a definite conflict, retaining the initially selected incarnation and changing
+// no field other than replicas. The same fence applies to restoring one replica.
+async fn set_fixture_deployment_replicas(
+    deployments: &Api<Deployment>,
+    name: &str,
+    expected_uid: &str,
+    replicas: i32,
+) -> TestResult<()> {
+    let operation = async {
+        if expected_uid.is_empty() {
+            return Err("original Deployment UID is missing".into());
+        }
+        for attempt in 0..8 {
+            let current = deployments.get(name).await?;
+            if current.metadata.uid.as_deref() != Some(expected_uid) {
+                return Err("Deployment UID changed or is missing".into());
+            }
+            let resource_version = current
+                .metadata
+                .resource_version
+                .as_deref()
+                .filter(|version| !version.is_empty())
+                .ok_or("Deployment resourceVersion is missing")?;
+            let patch = serde_json::json!({
+                "metadata": {"uid": expected_uid, "resourceVersion": resource_version},
+                "spec": {"replicas": replicas},
+            });
+            match deployments
+                .patch(
+                    name,
+                    &kube::api::PatchParams::default(),
+                    &kube::api::Patch::Merge(patch),
+                )
+                .await
+            {
+                Ok(updated) => {
+                    if updated.metadata.uid.as_deref() != Some(expected_uid)
+                        || updated.spec.as_ref().and_then(|spec| spec.replicas) != Some(replicas)
+                    {
+                        return Err(
+                            "Deployment patch response did not confirm UID and replicas".into()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(KubeError::Api(error)) if error.code == 409 && attempt < 7 => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("the final patch attempt returns its result")
+    };
+    let result: TestResult<()> = match timeout(Duration::from_secs(5), operation).await {
+        Ok(result) => result,
+        Err(_) => Err("replica mutation exceeded total5s fixture deadline".into()),
+    };
+    result.map_err(|error| {
+        format!("fixture Deployment {name} set replicas={replicas} failed: {error}").into()
+    })
+}
+
+#[path = "kind_e2e_lifecycle_races/replica_fixture_tests.rs"]
+mod replica_fixture_tests;
 
 async fn route_reassignment_invalidates_active_subscription(
     operator: &mut OperatorControlPlaneClient<Channel>,
@@ -776,17 +1103,63 @@ async fn route_reassignment_invalidates_active_subscription(
         "reassign-old",
     )
     .await?;
-    wait_for_instance_response(
-        config,
-        "route reassignment old",
-        "reassign.lifecycle.sleepypods.test",
-        "/",
-        "old",
-        180,
-    )
-    .await?;
-
+    let aliases = [
+        (
+            "lifecycle-reassign-old-alias-route",
+            "lifecycle-reassign-old",
+            "old-setup.lifecycle.sleepypods.test",
+            "old",
+        ),
+        (
+            "lifecycle-reassign-new-alias-route",
+            "lifecycle-reassign-new",
+            "new-setup.lifecycle.sleepypods.test",
+            "new",
+        ),
+    ];
+    for (route_id, instance_id, host, _) in aliases {
+        create_route(operator, route_id, instance_id, host, route_id).await?;
+    }
+    // Prewarm through durable acceptance and read-only state observation. Never
+    // resolve this frontend host until both backends can already serve traffic.
     let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    for instance_id in ["lifecycle-reassign-old", "lifecycle-reassign-new"] {
+        let instance = get_instance(operator, instance_id).await?;
+        let wake = proxy
+            .wake_instance(ProxyWakeInstanceRequest {
+                instance_id: instance_id.to_owned(),
+                expected_generation: instance.generation,
+                backend_generation: None,
+            })
+            .await?
+            .into_inner();
+        if !matches!(
+            wake.outcome,
+            Some(
+                proxy_wake_instance_response::Outcome::StillWaking(_)
+                    | proxy_wake_instance_response::Outcome::Ready(_)
+            )
+        ) {
+            return Err(format!("reassignment prewarm was not accepted: {wake:?}").into());
+        }
+        wait_for_instance_state(operator, instance_id, PbInstanceState::Running, 180).await?;
+    }
+    // Running does not establish a frontend subscription or Service connection.
+    // Complete both paths through distinct exact identities before starting the
+    // untouched proof key's cache-age clock. One request per alias; any failure
+    // is fatal. These aliases cannot populate a different exact cache key.
+    for (_, _, host, target) in aliases {
+        let response = tokio::time::timeout(
+            Duration::from_secs(140),
+            http_get_with_timeout(config.frontline_addr, host, "/", Duration::from_secs(130)),
+        )
+        .await
+        .map_err(|_| {
+            format!("reassignment alias setup for {host} exceeded its readiness/setup budget")
+        })??;
+        assert_response_identifies(&response, target)?;
+    }
+    sleep(Duration::from_secs(1)).await;
     let (requests, request_stream) = tokio::sync::mpsc::channel(4);
     let mut responses = proxy
         .subscribe(ReceiverStream::new(request_stream))
@@ -808,52 +1181,111 @@ async fn route_reassignment_invalidates_active_subscription(
         return Err(format!("active subscription did not resolve old route: {resolved:?}").into());
     }
 
-    operator
-        .delete_route_binding(DeleteRouteBindingRequest {
-            route_binding_id: "lifecycle-reassign-old-route".to_owned(),
-        })
-        .await?;
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await?);
-    if invalidated.subscription_id != resolved.subscription_id
-        || invalidated.reason != ProxyRouteInvalidationReason::RouteRemoved as i32
-    {
-        return Err(format!("unexpected route invalidation: {invalidated:?}").into());
-    }
-
-    create_route(
-        operator,
-        "lifecycle-reassign-new-route",
-        "lifecycle-reassign-new",
-        "reassign.lifecycle.sleepypods.test",
-        "reassign-new",
-    )
-    .await?;
-    requests
-        .send(subscribe_route_request(
-            "lifecycle-reassign-new-subscribe",
+    let cached_at = Instant::now();
+    let old = timeout(
+        Duration::from_secs(1),
+        http_get_with_timeout(
+            config.frontline_addr,
             "reassign.lifecycle.sleepypods.test",
-        ))
-        .await?;
-    let new_resolved = expect_route_resolved(next_subscribe_response(&mut responses).await?);
-    if new_resolved
-        .route
-        .as_ref()
-        .map(|route| route.instance_id.as_str())
-        != Some("lifecycle-reassign-new")
-    {
-        return Err(format!("new subscription did not resolve new route: {new_resolved:?}").into());
-    }
-    wait_for_instance_response_rejecting_stale(
-        config,
-        "route reassignment new",
-        "reassign.lifecycle.sleepypods.test",
-        "/",
-        "new",
-        &["old"],
-        180,
+            "/",
+            Duration::from_secs(1),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| "initial frontend cache warmup exceeded total1s fixture budget")??;
+    assert_response_identifies(&old, "old")?;
+    timeout(Duration::from_secs(1), async {
+        let deleted = operator
+            .delete_route_binding(DeleteRouteBindingRequest {
+                route_binding_id: "lifecycle-reassign-old-route".to_owned(),
+            })
+            .await?
+            .into_inner();
+        if !deleted.deleted {
+            return Err("route cutover did not delete the old binding".into());
+        }
+        create_route(
+            operator,
+            "lifecycle-reassign-new-route",
+            "lifecycle-reassign-new",
+            "reassign.lifecycle.sleepypods.test",
+            "reassign-new",
+        )
+        .await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|_| "healthy route cutover commits exceeded1s fixture budget")??;
 
+    // Direct subscription delivery and the independently delivered frontend
+    // invalidation share a bounded window; one does not imply the other arrived.
+    timeout(Duration::from_secs(3), async {
+        let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await?);
+        if invalidated.subscription_id != resolved.subscription_id
+            || invalidated.reason != ProxyRouteInvalidationReason::RouteRemoved as i32
+        {
+            return Err(format!("unexpected route invalidation: {invalidated:?}").into());
+        }
+        requests
+            .send(subscribe_route_request(
+                "lifecycle-reassign-new-subscribe",
+                "reassign.lifecycle.sleepypods.test",
+            ))
+            .await?;
+        let new_resolved = expect_route_resolved(next_subscribe_response(&mut responses).await?);
+        if new_resolved
+            .route
+            .as_ref()
+            .map(|route| route.instance_id.as_str())
+            != Some("lifecycle-reassign-new")
+        {
+            return Err(
+                format!("new subscription did not resolve new route: {new_resolved:?}").into(),
+            );
+        }
+        loop {
+            let response = http_get_with_timeout(
+                config.frontline_addr,
+                "reassign.lifecycle.sleepypods.test",
+                "/",
+                Duration::from_millis(500),
+            )
+            .await?;
+            if response_body_identifies(&response, "new") {
+                assert_response_identifies(&response, "new")?;
+                break;
+            }
+            if !response_body_identifies(&response, "old") {
+                return Err(
+                    format!("cutover returned unknown or failed response: {response:?}").into(),
+                );
+            }
+            assert_response_identifies(&response, "old")?;
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|_| "route notification did not converge within3s (before10s TTL)")??;
+    if cached_at.elapsed() >= Duration::from_secs(5) {
+        return Err("route freshness proof exceeded its pre-TTL fixture budget".into());
+    }
+    timeout(Duration::from_secs(2), async {
+        for _ in 0..10 {
+            let response = http_get_with_timeout(
+                config.frontline_addr,
+                "reassign.lifecycle.sleepypods.test",
+                "/",
+                Duration::from_millis(500),
+            )
+            .await?;
+            assert_response_identifies(&response, "new")?;
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|_| "post-freshness checks exceeded2s fixture budget")??;
     Ok(())
 }
 
@@ -1034,31 +1466,32 @@ async fn delete_instance_until_deleted(
     instance_id: &str,
     timeout_secs: u64,
 ) -> TestResult<()> {
+    let current = get_instance(operator, instance_id).await?;
+    operator
+        .delete_instance(DeleteInstanceRequest {
+            instance_id: instance_id.to_owned(),
+            expected_generation: Some(current.generation),
+        })
+        .await?;
+    wait_for_instance_deleted(operator, instance_id, timeout_secs).await
+}
+
+async fn wait_for_instance_deleted(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    instance_id: &str,
+    timeout_secs: u64,
+) -> TestResult<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         match operator
-            .delete_instance(DeleteInstanceRequest {
+            .get_instance(control_plane::api::pb::GetInstanceRequest {
                 instance_id: instance_id.to_owned(),
             })
             .await
         {
-            Ok(response) => {
-                if response.into_inner().deleted {
-                    return Ok(());
-                }
-                return Err(format!("delete {instance_id} returned deleted=false").into());
-            }
-            Err(error) if error.code() == tonic::Code::Unavailable && Instant::now() < deadline => {
-                sleep(Duration::from_secs(1)).await;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "delete {instance_id} failed with {:?}: {}",
-                    error.code(),
-                    error.message()
-                )
-                .into());
-            }
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(()),
+            Ok(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+            other => return Err(format!("accepted deletion did not complete: {other:?}").into()),
         }
     }
 }
@@ -1220,41 +1653,10 @@ async fn http_get_with_timeout(
     path: &str,
     request_timeout: Duration,
 ) -> TestResult<HttpResponse> {
-    let host = host.to_owned();
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || http_get_blocking(addr, &host, &path, request_timeout))
-        .await
-        .map_err(|error| format!("HTTP request task failed: {error}"))?
-}
-
-fn http_get_blocking(
-    addr: SocketAddr,
-    host: &str,
-    path: &str,
-    request_timeout: Duration,
-) -> TestResult<HttpResponse> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(request_timeout))?;
-    stream.set_write_timeout(Some(request_timeout))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    )?;
-    stream.flush()?;
-
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes)?;
-    let raw = String::from_utf8_lossy(&bytes);
-    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| format!("HTTP response from {addr} did not include a status line"))?
-        .parse::<u16>()?;
+    let response = http_once::get_once(addr, host, path, request_timeout).await?;
     Ok(HttpResponse {
-        status,
-        body: body.to_owned(),
+        status: response.status().as_u16(),
+        body: response.into_body(),
     })
 }
 
@@ -1351,6 +1753,7 @@ async fn set_control_plane_statefulset_delete_permission(
     kube: Client,
     namespace: &str,
     allow: bool,
+    changed: &mut bool,
 ) -> TestResult<()> {
     let roles: Api<Role> = Api::namespaced(kube, namespace);
     let mut role = roles.get("sleepypods-control-plane").await?;
@@ -1370,6 +1773,11 @@ async fn set_control_plane_statefulset_delete_permission(
         })
         .ok_or("sleepypods-control-plane Role has no StatefulSet rule")?;
 
+    let had_permission = rule.verbs.iter().any(|verb| verb == "delete");
+    if had_permission == allow {
+        return Ok(());
+    }
+    *changed = true;
     if allow {
         if !rule.verbs.iter().any(|verb| verb == "delete") {
             rule.verbs.push("delete".to_owned());
@@ -1626,4 +2034,103 @@ fn target_text(prefix: &str, suffix: &str) -> TemplateText {
             },
         ],
     }
+}
+
+// The three synthetic ReportIdle cases exercise Kubernetes membership and
+// lifecycle interleavings, not elapsed idle policy. Only their exact current
+// Ready record is aged; stateless/stateful/restart gates retain real time.
+async fn age_ready_for_controlled_lifecycle_case(
+    config: &E2eConfig,
+    instance: &str,
+    generation: u64,
+    projection_generation: u64,
+) -> TestResult<()> {
+    let sql = ready_age_fixture::age_ready_sql(
+        "kind-e2e-lifecycle-races",
+        &config.namespace,
+        instance,
+        generation,
+        projection_generation,
+    )?;
+    let namespace = config.namespace.clone();
+    let output = tokio::task::spawn_blocking(move || -> TestResult<_> {
+        let mut child = Command::new("kubectl")
+            .args([
+                "--request-timeout=10s",
+                "-n",
+                &namespace,
+                "exec",
+                "deployment/sleepypods-postgres",
+                "-c",
+                "postgres",
+                "--",
+                "env",
+                "PGOPTIONS=-c statement_timeout=5000",
+                "psql",
+                "-X",
+                "-qAt",
+                "-U",
+                "sleepypods",
+                "-d",
+                "sleepypods",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                &sql,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while child.try_wait()?.is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("controlled Ready-age fixture command timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(child.wait_with_output()?)
+    })
+    .await??;
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != "aged-ready:1"
+    {
+        return Err(format!(
+            "controlled Ready-age update failed: status={}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    eprintln!(
+        "lifecycle fixture: controlled Ready age >300s for {instance}, instance generation{generation}, projection generation{projection_generation}"
+    );
+    Ok(())
+}
+
+async fn current_idle_member(
+    kube: Client,
+    namespace: &str,
+    instance_id: &str,
+) -> TestResult<(String, u64)> {
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(kube, namespace);
+    let pods = pods
+        .list(
+            &kube::api::ListParams::default()
+                .labels(&format!("sleepypods.io/instance-id={instance_id}")),
+        )
+        .await?;
+    let [pod] = pods.items.as_slice() else {
+        return Err("expected exactly one workload pod".into());
+    };
+    let uid = pod.metadata.uid.clone().ok_or("pod UID is missing")?;
+    let generation = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("sleepypods.io/instance-generation"))
+        .ok_or("pod generation is missing")?
+        .parse()?;
+    Ok((uid, generation))
 }

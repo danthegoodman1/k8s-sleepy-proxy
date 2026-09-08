@@ -14,17 +14,19 @@ use control_plane::api::pb::{
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance, InstanceState as PbInstanceState,
     ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSourceTemplate, ProtocolRoute, ProxyWakeInstanceRequest, RouteHost,
-    RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueSchema,
+    PersistentVolumeSourceTemplate, ProtocolRoute, ProxyWakeInstanceRequest,
+    RawKubernetesManifestTemplate, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
-    core::v1::{PersistentVolume, PersistentVolumeClaim, Service},
+    core::v1::{Event, PersistentVolume, PersistentVolumeClaim, Service},
     discovery::v1::EndpointSlice,
 };
 use kube::{api::ListParams, Api, Client, Error as KubeError};
+use serde_json::json;
 use tokio::time::{sleep, Instant};
 use tonic::{
     transport::{Channel, Endpoint},
@@ -56,7 +58,11 @@ const UNBOUND_WORKLOAD_NAME: &str = "failure-unbound-app";
 const UNBOUND_PV_NAME: &str = "failure-unbound-pv";
 const UNBOUND_FIRST_PVC_NAME: &str = "failure-unbound-a-pvc";
 const UNBOUND_SECOND_PVC_NAME: &str = "failure-unbound-b-pvc";
+// Explicit test-owned stale reservation, never the UID of a live claim.
+const UNBOUND_PREVIOUS_CLAIM_UID: &str = "00000000-0000-4000-8000-000000000001";
 
+const DUPLICATE_VOLUME_CLASS_ID: &str = "failure-duplicate-volume";
+const DUPLICATE_VOLUME_INSTANCE_ID: &str = "failure-duplicate-volume";
 const INVALID_VOLUME_CLASS_ID: &str = "failure-invalid-volume";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
@@ -81,6 +87,8 @@ async fn failure_paths_through_deployed_platform() -> TestResult<()> {
     bad_route_misses_without_materializing_unrelated_instance(&mut operator, kube.clone(), &config)
         .await?;
     invalid_volume_template_is_rejected_by_operator_api(&mut operator, kube.clone(), &config)
+        .await?;
+    duplicate_volume_inventory_is_rejected_before_acceptance(&mut operator, kube.clone(), &config)
         .await?;
     wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
         &mut operator,
@@ -144,6 +152,7 @@ async fn bad_route_misses_without_materializing_unrelated_instance(
             sidecar_image: &config.sidecar_image,
             workload_kind: WorkloadKind::Deployment,
             volumes: Vec::new(),
+            raw_objects: Vec::new(),
         },
         "good",
     )
@@ -274,6 +283,7 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
             sidecar_image: &config.sidecar_image,
             workload_kind: WorkloadKind::Deployment,
             volumes: Vec::new(),
+            raw_objects: Vec::new(),
         },
         "readiness",
     )
@@ -363,6 +373,90 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
     Ok(())
 }
 
+async fn duplicate_volume_inventory_is_rejected_before_acceptance(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    kube: Client,
+    config: &E2eConfig,
+) -> TestResult<()> {
+    create_class_instance_and_route(
+        operator,
+        ClassInstanceRoute {
+            class_id: DUPLICATE_VOLUME_CLASS_ID,
+            instance_id: DUPLICATE_VOLUME_INSTANCE_ID,
+            route_id: "failure-duplicate-volume-route",
+            route_host: "duplicate.failure.sleepypods.test",
+            workload_name: "failure-duplicate-volume-app",
+            app_image: &config.app_image,
+            sidecar_image: &config.sidecar_image,
+            workload_kind: WorkloadKind::StatefulSet,
+            volumes: duplicate_pv_volume_templates(),
+            raw_objects: Vec::new(),
+        },
+        "duplicate-volume",
+    )
+    .await?;
+    let created = get_instance(operator, DUPLICATE_VOLUME_INSTANCE_ID).await?;
+    assert_state(&created, PbInstanceState::Cold)?;
+    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let error = proxy
+        .wake_instance(ProxyWakeInstanceRequest {
+            instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
+            expected_generation: created.generation,
+            backend_generation: None,
+        })
+        .await
+        .expect_err("duplicate rendered inventory must be rejected before wake acceptance");
+    if error.code() != Code::Internal
+        || !error
+            .message()
+            .contains("duplicate rendered Kubernetes object ref v1 PersistentVolume")
+    {
+        return Err(format!("expected duplicate PV render rejection, got {error}").into());
+    }
+    let after = get_instance(operator, DUPLICATE_VOLUME_INSTANCE_ID).await?;
+    assert_state(&after, PbInstanceState::Cold)?;
+    if after.generation != created.generation {
+        return Err("invalid duplicate inventory advanced instance generation".into());
+    }
+    let status = operator
+        .reconcile_materialization(ReconcileMaterializationRequest {
+            materialization_id: format!(
+                "{DUPLICATE_VOLUME_INSTANCE_ID}:kind-e2e-failures:{}",
+                config.namespace
+            ),
+            status_only: true,
+        })
+        .await?
+        .into_inner();
+    if status.found {
+        return Err("duplicate inventory left a durable materialization despite rejection".into());
+    }
+    let selector = ListParams::default().labels(&instance_selector(DUPLICATE_VOLUME_INSTANCE_ID));
+    assert_no_labeled_objects(
+        "PersistentVolume",
+        DUPLICATE_VOLUME_INSTANCE_ID,
+        Api::<PersistentVolume>::all(kube.clone())
+            .list(&selector)
+            .await?,
+    )?;
+    assert_no_labeled_objects(
+        "PersistentVolumeClaim",
+        DUPLICATE_VOLUME_INSTANCE_ID,
+        Api::<PersistentVolumeClaim>::namespaced(kube.clone(), &config.namespace)
+            .list(&selector)
+            .await?,
+    )?;
+    assert_no_labeled_objects(
+        "StatefulSet",
+        DUPLICATE_VOLUME_INSTANCE_ID,
+        Api::<StatefulSet>::namespaced(kube.clone(), &config.namespace)
+            .list(&selector)
+            .await?,
+    )?;
+    assert_deployment_and_service_absent(kube, &config.namespace, DUPLICATE_VOLUME_INSTANCE_ID)
+        .await
+}
+
 async fn missing_pvc_binding_fails_materialization_without_ready_backend(
     operator: &mut OperatorControlPlaneClient<Channel>,
     kube: Client,
@@ -379,7 +473,8 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
             app_image: &config.app_image,
             sidecar_image: &config.sidecar_image,
             workload_kind: WorkloadKind::StatefulSet,
-            volumes: duplicate_pv_volume_templates(),
+            volumes: Vec::new(),
+            raw_objects: unbound_static_inventory(&config.namespace),
         },
         "unbound",
     )
@@ -392,18 +487,47 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
     )
     .await?;
 
-    let failed_response = wait_for_frontline_status(
-        config,
-        UNBOUND_ROUTE_HOST,
-        "/",
-        503,
-        Duration::from_secs(180),
+    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let started = Instant::now();
+    let accepted = proxy
+        .wake_instance(ProxyWakeInstanceRequest {
+            instance_id: UNBOUND_INSTANCE_ID.to_owned(),
+            expected_generation: created.generation,
+            backend_generation: None,
+        })
+        .await?
+        .into_inner();
+    let Some(proxy_wake_instance_response::Outcome::StillWaking(accepted)) = accepted.outcome
+    else {
+        return Err("valid unbound inventory must receive durable wake acceptance".into());
+    };
+    if accepted.instance_id != UNBOUND_INSTANCE_ID
+        || Some(accepted.instance_generation) != created.generation.checked_add(1)
+    {
+        return Err(format!("accepted unbound wake must identify exactly the next Waking generation: Cold={}, accepted={accepted:?}", created.generation).into());
+    }
+    // Observe a real Kubernetes Pending claim before terminal cleanup can remove it.
+    wait_for_stale_claim_inventory(
+        kube.clone(),
+        &config.namespace,
+        accepted.instance_generation,
     )
     .await?;
-    if failed_response.body.contains(APP_RESPONSE) {
-        return Err("unbound PVC failure unexpectedly returned backend response body".into());
-    }
+    assert_no_stateful_backend(kube.clone(), &config.namespace).await?;
 
+    // One request waits on the accepted wake; it must never receive a ready backend.
+    let failed_response = tokio::time::timeout(
+        Duration::from_secs(60),
+        http_get(config.frontline_addr, UNBOUND_ROUTE_HOST, "/"),
+    )
+    .await??;
+    if failed_response.status != 503 || failed_response.body.contains(APP_RESPONSE) {
+        return Err(format!(
+            "unbound PVC must return HTTP 503 without backend body, got {} {:?}",
+            failed_response.status, failed_response.body
+        )
+        .into());
+    }
     let failed = wait_for_instance_state(
         operator,
         UNBOUND_INSTANCE_ID,
@@ -411,14 +535,15 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
         Duration::from_secs(30),
     )
     .await?;
-    if failed.generation <= created.generation {
-        return Err(format!(
-            "expected missing PVC binding failure to advance generation beyond {}, got {}",
-            created.generation, failed.generation
-        )
-        .into());
+    if failed.generation < accepted.instance_generation
+        || started.elapsed() > Duration::from_secs(90)
+    {
+        return Err(
+            "accepted PVC binding failure did not reach Failed within the bounded gate".into(),
+        );
     }
-    assert_first_pvc_unbound_and_no_stateful_backend(kube, &config.namespace).await?;
+    assert_no_stateful_backend(kube.clone(), &config.namespace).await?;
+    wait_for_unbound_inventory_cleanup(kube, &config.namespace).await?;
 
     Ok(())
 }
@@ -434,6 +559,7 @@ struct ClassInstanceRoute<'a> {
     sidecar_image: &'a str,
     workload_kind: WorkloadKind,
     volumes: Vec<VolumeTemplate>,
+    raw_objects: Vec<RawKubernetesManifestTemplate>,
 }
 
 async fn create_class_instance_and_route(
@@ -466,7 +592,7 @@ async fn create_class_instance_and_route(
                 }),
                 service: Some(service_template(spec.workload_name)),
                 volumes: spec.volumes,
-                raw_objects: vec![],
+                raw_objects: spec.raw_objects,
             }),
             sleep_policy: Some(sleep_policy()),
             exclusivity_keys: vec![],
@@ -722,20 +848,22 @@ async fn assert_deployment_service_no_ready_backend(
     let services: Api<Service> = Api::namespaced(kube.clone(), namespace);
     let endpoint_slices: Api<EndpointSlice> = Api::namespaced(kube, namespace);
     let selector = instance_selector(instance_id);
-    single_labeled_object(
-        "Deployment",
-        instance_id,
-        deployments
-            .list(&ListParams::default().labels(&selector))
-            .await?,
-    )?;
-    let service = single_labeled_object(
-        "Service",
-        instance_id,
-        services
-            .list(&ListParams::default().labels(&selector))
-            .await?,
-    )?;
+    // Failed wake cleanup is autonomous: either the partial projection remains
+    // without a ready backend, or safe cleanup has already removed it.
+    let deployment_items = deployments
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    let service_items = services
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    if deployment_items.len() > 1 || service_items.len() > 1 {
+        return Err("failed wake produced duplicate projection objects".into());
+    }
+    let Some(service) = service_items.into_iter().next() else {
+        return Ok(());
+    };
     let service_name = service
         .metadata
         .name
@@ -753,99 +881,166 @@ async fn assert_deployment_service_no_ready_backend(
     Ok(())
 }
 
-async fn assert_first_pvc_unbound_and_no_stateful_backend(
+async fn wait_for_stale_claim_inventory(
     kube: Client,
     namespace: &str,
+    generation: u64,
 ) -> TestResult<()> {
     let pvs: Api<PersistentVolume> = Api::all(kube.clone());
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube.clone(), namespace);
-    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube.clone(), namespace);
-    let services: Api<Service> = Api::namespaced(kube, namespace);
-
-    let selector = instance_selector(UNBOUND_INSTANCE_ID);
-    let pv_items = pvs
-        .list(&ListParams::default().labels(&selector))
-        .await?
-        .items;
-    if pv_items.len() > 1 {
-        return Err(format!(
-            "multiple PersistentVolume objects found for instance {UNBOUND_INSTANCE_ID}"
-        )
-        .into());
-    }
-    let pvc_items = pvcs
-        .list(&ListParams::default().labels(&selector))
-        .await?
-        .items;
-    if let Some(first_pvc) = pvc_items
-        .iter()
-        .find(|pvc| object_name_starts_with(&pvc.metadata.name, UNBOUND_FIRST_PVC_NAME))
-    {
-        let first_pvc_name = first_pvc
-            .metadata
-            .name
-            .as_deref()
-            .ok_or("first unbound PVC is missing metadata.name")?;
-        let phase = first_pvc
-            .status
-            .as_ref()
-            .and_then(|status| status.phase.as_deref());
-        if phase == Some("Bound") {
-            return Err(format!("PVC {namespace}/{first_pvc_name} unexpectedly bound").into());
-        }
-        if let Some(pv) = pv_items.first() {
-            let pv_name = pv
-                .metadata
-                .name
-                .as_deref()
-                .ok_or("unbound PV is missing metadata.name")?;
-            let claim_name = pv
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.claim_ref.as_ref())
-                .and_then(|claim| claim.name.as_deref());
-            if claim_name == Some(first_pvc_name) {
-                return Err(
-                    format!("PV {pv_name} unexpectedly claims first PVC {first_pvc_name}").into(),
-                );
+    let events: Api<Event> = Api::namespaced(kube, namespace);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let (Some(pv), Some(pvc)) = (
+            pvs.get_opt(UNBOUND_PV_NAME).await?,
+            pvcs.get_opt(UNBOUND_FIRST_PVC_NAME).await?,
+        ) {
+            assert_stale_claim_reservation(&pv, &pvc, namespace)?;
+            for (kind, metadata) in [("PV", &pv.metadata), ("PVC", &pvc.metadata)] {
+                assert_inventory_ownership_for_accepted_wake(kind, metadata, generation)?;
+            }
+            let phase = pvc.status.as_ref().and_then(|v| v.phase.as_deref());
+            if phase == Some("Pending") {
+                // An initial Pending snapshot alone is not proof of a binding
+                // fault. Require the real controller's rejection for this UID.
+                let uid = pvc.metadata.uid.as_deref().ok_or("live PVC missing UID")?;
+                let selector = ListParams::default().fields(&format!("involvedObject.uid={uid}"));
+                if events.list(&selector).await?.items.iter().any(|event| {
+                    event.reason.as_deref() == Some("FailedBinding")
+                        && event.involved_object.uid.as_deref() == Some(uid)
+                        && event.message.as_deref().is_some_and(|message| {
+                            message.contains(UNBOUND_PV_NAME)
+                                && message.contains("already bound to a different claim")
+                        })
+                }) {
+                    eprintln!("confirmed stale claim reservation: pv={UNBOUND_PV_NAME} previous_uid={UNBOUND_PREVIOUS_CLAIM_UID} current_pvc_uid={uid} phase=Pending reason=FailedBinding");
+                    return Ok(());
+                }
+            }
+            if phase == Some("Bound") {
+                return Err("PVC reserved to another claim UID unexpectedly became Bound".into());
             }
         }
+        if Instant::now() >= deadline {
+            return Err(
+                "did not observe current-UID Pending PVC and stale-reservation FailedBinding before the wake deadline"
+                    .into(),
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn assert_stale_claim_reservation(
+    pv: &PersistentVolume,
+    pvc: &PersistentVolumeClaim,
+    namespace: &str,
+) -> TestResult<()> {
+    let pv_spec = pv.spec.as_ref().ok_or("unbound PV missing spec")?;
+    let pvc_spec = pvc.spec.as_ref().ok_or("unbound PVC missing spec")?;
+    let claim = pv_spec.claim_ref.as_ref().ok_or("PV missing claimRef")?;
+    let current_uid = pvc
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or("PVC missing current UID")?;
+    if pv.metadata.name.as_deref() != Some(UNBOUND_PV_NAME)
+        || pvc.metadata.name.as_deref() != Some(UNBOUND_FIRST_PVC_NAME)
+        || pvc.metadata.namespace.as_deref() != Some(namespace)
+        || pv_spec.persistent_volume_reclaim_policy.as_deref() != Some("Retain")
+        || pv_spec
+            .capacity
+            .as_ref()
+            .and_then(|v| v.get("storage"))
+            .map(|v| v.0.as_str())
+            != Some("1Mi")
+        || claim.name.as_deref() != Some(UNBOUND_FIRST_PVC_NAME)
+        || claim.namespace.as_deref() != Some(namespace)
+        || claim.uid.as_deref() != Some(UNBOUND_PREVIOUS_CLAIM_UID)
+        || current_uid.is_empty()
+        || current_uid == UNBOUND_PREVIOUS_CLAIM_UID
+        || pvc_spec.volume_name.as_deref() != Some(UNBOUND_PV_NAME)
+        || pvc_spec
+            .resources
+            .as_ref()
+            .and_then(|v| v.requests.as_ref())
+            .and_then(|v| v.get("storage"))
+            .map(|v| v.0.as_str())
+            != Some("1Mi")
+    {
+        return Err("PV/PVC do not match the exact retained stale-claim-UID reservation".into());
+    }
+    Ok(())
+}
+
+fn assert_inventory_ownership_for_accepted_wake(
+    kind: &str,
+    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    accepted_generation: u64,
+) -> TestResult<()> {
+    // Waking is the accepted instance CAS revision. Kubernetes ownership uses
+    // the immutable projected Running incarnation selected before acceptance.
+    let projection_generation = accepted_generation
+        .checked_add(1)
+        .ok_or("accepted wake generation cannot have a projected successor")?;
+    let labels = metadata
+        .labels
+        .as_ref()
+        .ok_or("unbound inventory missing ownership labels")?;
+    if labels.get(INSTANCE_ID_LABEL).map(String::as_str) != Some(UNBOUND_INSTANCE_ID)
+        || labels.get("sleepypods.io/instance-generation")
+            != Some(&projection_generation.to_string())
+        || labels
+            .get("app.kubernetes.io/managed-by")
+            .map(String::as_str)
+            != Some("sleepypods")
+    {
+        return Err(format!(
+            "{kind} ownership mismatch: accepted Waking generation={accepted_generation}, expected projection generation={projection_generation}, actual labels={labels:?}"
+        ).into());
+    }
+    Ok(())
+}
+
+async fn assert_no_stateful_backend(kube: Client, namespace: &str) -> TestResult<()> {
+    let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
     assert_no_labeled_objects(
         "StatefulSet",
         UNBOUND_INSTANCE_ID,
-        stateful_sets
-            .list(&ListParams::default().labels(&selector))
+        Api::<StatefulSet>::namespaced(kube.clone(), namespace)
+            .list(&selector)
             .await?,
     )?;
     assert_no_labeled_objects(
         "Service",
         UNBOUND_INSTANCE_ID,
-        services
-            .list(&ListParams::default().labels(&selector))
+        Api::<Service>::namespaced(kube, namespace)
+            .list(&selector)
             .await?,
     )?;
     Ok(())
 }
 
-fn instance_selector(instance_id: &str) -> String {
-    format!("{INSTANCE_ID_LABEL}={instance_id}")
+async fn wait_for_unbound_inventory_cleanup(kube: Client, namespace: &str) -> TestResult<()> {
+    let pvs: Api<PersistentVolume> = Api::all(kube.clone());
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube, namespace);
+    let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if pvs.list(&selector).await?.items.is_empty()
+            && pvcs.list(&selector).await?.items.is_empty()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("failed unbound inventory did not finish safe object cleanup".into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
 }
 
-fn single_labeled_object<K: Clone>(
-    kind: &str,
-    instance_id: &str,
-    objects: kube::api::ObjectList<K>,
-) -> TestResult<K> {
-    let mut items = objects.items.into_iter();
-    let object = items
-        .next()
-        .ok_or_else(|| format!("no {kind} found for instance {instance_id}"))?;
-    if items.next().is_some() {
-        return Err(format!("multiple {kind} objects found for instance {instance_id}").into());
-    }
-
-    Ok(object)
+fn instance_selector(instance_id: &str) -> String {
+    format!("{INSTANCE_ID_LABEL}={instance_id}")
 }
 
 fn assert_no_labeled_objects<K: Clone>(
@@ -858,11 +1053,6 @@ fn assert_no_labeled_objects<K: Clone>(
     }
 
     Ok(())
-}
-
-fn object_name_starts_with(name: &Option<String>, prefix: &str) -> bool {
-    name.as_deref()
-        .is_some_and(|name| name == prefix || name.starts_with(&format!("{prefix}-")))
 }
 
 fn endpoint_slice_has_ready_endpoint(slice: &EndpointSlice) -> bool {
@@ -923,6 +1113,239 @@ fn sleep_policy() -> WorkloadSleepPolicy {
         drain_grace_timeout_ms: 500,
         idle_timeout_override: None,
     }
+}
+
+fn unbound_static_inventory(namespace: &str) -> Vec<RawKubernetesManifestTemplate> {
+    // A capacity mismatch is insufficient: Kubernetes finishes matching
+    // prebindings without that check. Reserve this task-owned Retain PV to an
+    // explicit prior claim incarnation, keeping exact recorded names and equal
+    // capacities. The current claim must stay Pending until the wake deadline.
+    [
+        json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": { "name": UNBOUND_PV_NAME },
+            "spec": {
+                "capacity": { "storage": "1Mi" },
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem", "storageClassName": "sleepypods-kind-static",
+                "persistentVolumeReclaimPolicy": "Retain",
+                "claimRef": { "namespace": namespace, "name": UNBOUND_FIRST_PVC_NAME, "uid": UNBOUND_PREVIOUS_CLAIM_UID },
+                "hostPath": { "path": "/tmp/sleepypods-kind-e2e-failures/unbound", "type": "DirectoryOrCreate" }
+            }
+        }),
+        json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": { "name": UNBOUND_FIRST_PVC_NAME, "namespace": namespace },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem", "storageClassName": "sleepypods-kind-static",
+                "volumeName": UNBOUND_PV_NAME,
+                "resources": { "requests": { "storage": "1Mi" } }
+            }
+        }),
+    ].into_iter().map(|value| RawKubernetesManifestTemplate {
+        manifest: Some(literal_text(&value.to_string())),
+    }).collect()
+}
+
+// Run the same raw inventory through the real renderer without requiring a cluster.
+// This prevents another pre-accept template rejection from masquerading as a PVC wait test.
+#[test]
+fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
+    use control_plane as domain;
+    let namespace = "sleepypods-e2e-failures";
+    let raw_objects = unbound_static_inventory(namespace)
+        .into_iter()
+        .map(|raw| {
+            let text = raw.manifest.expect("fixture raw manifest exists");
+            let [TemplateTextPart {
+                kind: Some(template_text_part::Kind::Literal(text)),
+            }] = text.parts.as_slice()
+            else {
+                panic!("fixture raw manifest is literal");
+            };
+            domain::manifest::RawKubernetesManifestTemplate {
+                manifest: domain::TemplateText::literal(text),
+            }
+        })
+        .collect();
+    let template = domain::ManifestTemplate {
+        workload: domain::WorkloadTemplate {
+            kind: domain::WorkloadKind::StatefulSet,
+            name: domain::TemplateText::literal(UNBOUND_WORKLOAD_NAME),
+            replicas: Some(1),
+            app_container: domain::ContainerTemplate {
+                name: "app".into(),
+                image: domain::TemplateText::literal("fixture-app"),
+                ports: vec![domain::ContainerPortTemplate {
+                    name: Some("http".into()),
+                    container_port: APP_PORT as u16,
+                }],
+                env: Vec::new(),
+            },
+        },
+        sidecar: domain::SidecarTemplate {
+            name: "sleepypods-sidecar".into(),
+            image: domain::TemplateText::literal("fixture-sidecar"),
+            listen_port: SIDECAR_PORT as u16,
+            mode: None,
+        },
+        service: Some(domain::ServiceTemplate {
+            name: domain::TemplateText::literal(UNBOUND_WORKLOAD_NAME),
+            ports: vec![domain::ServicePortTemplate {
+                name: Some("http".into()),
+                port: APP_PORT as u16,
+                target_port: APP_PORT as u16,
+            }],
+        }),
+        volumes: Vec::new(),
+        raw_objects,
+    };
+    let accepted_generation = domain::Generation::new(1);
+    let pending = domain::RecordMaterializationRequest::new(
+        domain::InstanceId::new(UNBOUND_INSTANCE_ID)?,
+        accepted_generation,
+        domain::MaterializationTarget::new("kind-e2e-failures", namespace)?,
+        domain::MaterializationState::Pending,
+        domain::BackendGeneration::new(1),
+    );
+    assert_eq!(pending.projection_generation.get(), 2);
+    let instance = domain::InstanceRecord {
+        id: domain::InstanceId::new(UNBOUND_INSTANCE_ID)?,
+        workload_class: domain::WorkloadClassVersionRef {
+            class_id: domain::WorkloadClassId::new(UNBOUND_CLASS_ID)?,
+            version: domain::Generation::new(1),
+        },
+        values: Default::default(),
+        state: domain::InstanceState::Running,
+        generation: pending.projection_generation,
+    };
+    let rendered = domain::render_manifests(domain::RenderManifestRequest {
+        template: &template,
+        instance: &instance,
+        sleep_policy: domain::ResolvedSleepPolicy {
+            idle_timeout_ms: 300_000,
+            idle_retry_backoff_ms: 500,
+            drain_grace_timeout_ms: 500,
+        },
+        namespace,
+        template_generation: Some(domain::Generation::new(1)),
+    })?;
+    // The projection plan adds the same final managed-by/ownership stamps used
+    // by the production reconciler; the pure renderer alone does not add them.
+    let materialization = domain::MaterializationRecord {
+        id: domain::MaterializationId::new("fixture-unbound")?,
+        instance_id: pending.instance_id,
+        instance_generation: pending.instance_generation,
+        projection_generation: pending.projection_generation,
+        target: pending.target,
+        state: pending.state,
+        backend: pending.backend,
+        backend_generation: pending.backend_generation,
+        rendered_objects: pending.rendered_objects,
+        exclusivity_keys: pending.exclusivity_keys,
+        reconciliation_lease: None,
+    };
+    let plan = domain::projection::ProjectionPlan::from_manifest(&materialization, &rendered)?;
+    let rendered = plan
+        .manifest()
+        .expect("projection includes rendered manifest");
+    let objects = rendered
+        .objects
+        .iter()
+        .map(|object| object.object.to_kubernetes_json())
+        .collect::<Vec<_>>();
+    let pv: PersistentVolume = serde_json::from_value(
+        objects
+            .iter()
+            .find(|object| object["kind"] == "PersistentVolume")
+            .expect("rendered PV")
+            .clone(),
+    )?;
+    let mut pvc: PersistentVolumeClaim = serde_json::from_value(
+        objects
+            .iter()
+            .find(|object| object["kind"] == "PersistentVolumeClaim")
+            .expect("rendered PVC")
+            .clone(),
+    )?;
+    for (kind, metadata) in [("PV", &pv.metadata), ("PVC", &pvc.metadata)] {
+        assert_inventory_ownership_for_accepted_wake(kind, metadata, accepted_generation.get())?;
+        for wrong_generation in [0, accepted_generation.get(), 3] {
+            let mut wrong = metadata.clone();
+            wrong.labels.as_mut().unwrap().insert(
+                "sleepypods.io/instance-generation".into(),
+                wrong_generation.to_string(),
+            );
+            assert!(assert_inventory_ownership_for_accepted_wake(
+                kind,
+                &wrong,
+                accepted_generation.get()
+            )
+            .is_err());
+        }
+        for (key, value) in [
+            (INSTANCE_ID_LABEL, "another-instance"),
+            ("app.kubernetes.io/managed-by", "another-controller"),
+        ] {
+            let mut wrong = metadata.clone();
+            wrong
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert(key.into(), value.into());
+            assert!(assert_inventory_ownership_for_accepted_wake(
+                kind,
+                &wrong,
+                accepted_generation.get()
+            )
+            .is_err());
+        }
+    }
+    // Kubernetes assigns the current UID after render; exercise the exact live
+    // shape assertion with a distinct UID, then prove losing the reservation
+    // or accidentally reserving this incarnation is rejected.
+    pvc.metadata.uid = Some("00000000-0000-4000-8000-000000000002".into());
+    assert_stale_claim_reservation(&pv, &pvc, namespace)?;
+    for uid in [None, pvc.metadata.uid.clone()] {
+        let mut broken = pv.clone();
+        broken
+            .spec
+            .as_mut()
+            .unwrap()
+            .claim_ref
+            .as_mut()
+            .unwrap()
+            .uid = uid;
+        assert!(assert_stale_claim_reservation(&broken, &pvc, namespace).is_err());
+    }
+    let mut same_incarnation = pvc.clone();
+    same_incarnation.metadata.uid = Some(UNBOUND_PREVIOUS_CLAIM_UID.into());
+    assert!(assert_stale_claim_reservation(&pv, &same_incarnation, namespace).is_err());
+    let pv_spec = pv.spec.expect("PV spec");
+    let pvc_spec = pvc.spec.expect("PVC spec");
+    assert_eq!(pv.metadata.name.as_deref(), Some(UNBOUND_PV_NAME));
+    assert_eq!(pvc.metadata.name.as_deref(), Some(UNBOUND_FIRST_PVC_NAME));
+    assert_eq!(
+        pv_spec.persistent_volume_reclaim_policy.as_deref(),
+        Some("Retain")
+    );
+    assert_eq!(
+        pv_spec.claim_ref.expect("explicit claim").name.as_deref(),
+        Some(UNBOUND_FIRST_PVC_NAME)
+    );
+    assert_eq!(pvc_spec.volume_name.as_deref(), Some(UNBOUND_PV_NAME));
+    assert_eq!(pv_spec.capacity.expect("PV capacity")["storage"].0, "1Mi");
+    assert_eq!(
+        pvc_spec
+            .resources
+            .expect("PVC resources")
+            .requests
+            .expect("PVC request")["storage"]
+            .0,
+        "1Mi"
+    );
+    Ok(())
 }
 
 fn duplicate_pv_volume_templates() -> Vec<VolumeTemplate> {

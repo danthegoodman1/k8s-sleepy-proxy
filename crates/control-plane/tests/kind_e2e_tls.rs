@@ -74,7 +74,7 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
     )
     .await?;
 
-    let response = wait_for_tls_response(
+    let response = cold_tls_response(
         config.tls_termination_addr,
         TlsResponseExpectation {
             context: "TLS termination",
@@ -84,7 +84,6 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
             target: TERMINATION_TARGET,
             mode: "http",
         },
-        Duration::from_secs(180),
     )
     .await?;
     assert_instance_response(&response, TERMINATION_TARGET, "http", &[TERMINATION_TARGET])?;
@@ -126,7 +125,7 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
         .await?;
     }
 
-    let exact = wait_for_tls_response(
+    let exact = cold_tls_response(
         config.tls_passthrough_addr,
         TlsResponseExpectation {
             context: "exact SNI passthrough",
@@ -136,12 +135,11 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
             target: "sni-exact",
             mode: "tls",
         },
-        Duration::from_secs(180),
     )
     .await?;
     assert_instance_response(&exact, "sni-exact", "tls", PASSTHROUGH_TARGETS)?;
 
-    let wildcard = wait_for_tls_response(
+    let wildcard = cold_tls_response(
         config.tls_passthrough_addr,
         TlsResponseExpectation {
             context: "wildcard SNI passthrough",
@@ -151,7 +149,6 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
             target: "sni-wildcard",
             mode: "tls",
         },
-        Duration::from_secs(180),
     )
     .await?;
     assert_instance_response(&wildcard, "sni-wildcard", "tls", PASSTHROUGH_TARGETS)?;
@@ -422,44 +419,27 @@ struct TlsResponseExpectation<'a> {
     mode: &'a str,
 }
 
-async fn wait_for_tls_response(
+async fn cold_tls_response(
     addr: SocketAddr,
     expectation: TlsResponseExpectation<'_>,
-    timeout: Duration,
 ) -> TestResult<HttpResponse> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let last_error =
-            match tls_get(addr, expectation.sni, expectation.host, expectation.path).await {
-                Ok(response)
-                    if response.status == 200
-                        && response_body_identifies(&response, expectation.target)
-                        && response
-                            .body
-                            .contains(&format!("mode={}\n", expectation.mode)) =>
-                {
-                    return Ok(response);
-                }
-                Ok(response) => format!(
-                    "frontline returned HTTP {} with body {:?}",
-                    response.status, response.body
-                ),
-                Err(error) => error.to_string(),
-            };
-
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for {} response for SNI {} host {} path {}: {}",
-                expectation.context,
-                expectation.sni,
-                expectation.host,
-                expectation.path,
-                last_error
-            )
-            .into());
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
+    // SNI routing can delay the TLS handshake while the Cold workload starts. Keep one
+    // connection alive for the complete 130-second route deadline plus transport margin.
+    let budget = Duration::from_secs(140);
+    let response = tokio::time::timeout(
+        budget,
+        tls_get(
+            addr,
+            expectation.sni,
+            expectation.host,
+            expectation.path,
+            budget,
+        ),
+    )
+    .await
+    .map_err(|_| format!("single {} request exceeded {budget:?}", expectation.context))??;
+    assert_instance_response(&response, expectation.target, expectation.mode, &[])?;
+    Ok(response)
 }
 
 async fn assert_tls_route_miss(
@@ -471,7 +451,7 @@ async fn assert_tls_route_miss(
 ) -> TestResult<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        match tls_get(addr, sni, host, "/miss").await {
+        match tls_get(addr, sni, host, "/miss", Duration::from_secs(15)).await {
             Ok(response) => {
                 return Err(format!(
                     "{context} unexpectedly completed TLS/HTTP for SNI {sni}: HTTP {} {:?}",
@@ -503,11 +483,17 @@ fn is_expected_route_miss_error(error: &str) -> bool {
             || lower.contains("closed connection"))
 }
 
-async fn tls_get(addr: SocketAddr, sni: &str, host: &str, path: &str) -> TestResult<HttpResponse> {
+async fn tls_get(
+    addr: SocketAddr,
+    sni: &str,
+    host: &str,
+    path: &str,
+    io_timeout: Duration,
+) -> TestResult<HttpResponse> {
     let sni = sni.to_owned();
     let host = host.to_owned();
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || tls_get_blocking(addr, &sni, &host, &path))
+    tokio::task::spawn_blocking(move || tls_get_blocking(addr, &sni, &host, &path, io_timeout))
         .await
         .map_err(|error| format!("TLS request task failed: {error}"))?
 }
@@ -517,15 +503,17 @@ fn tls_get_blocking(
     sni: &str,
     host: &str,
     path: &str,
+    timeout: Duration,
 ) -> TestResult<HttpResponse> {
-    let timeout = Duration::from_secs(15);
+    let started = Instant::now();
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from_pem_slice(TEST_CERT_PEM)?)?;
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let server_name = ServerName::try_from(sni.to_owned())?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|error| format!("TLS TCP connect to {addr} for SNI {sni} failed: {error:?}"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let conn = ClientConnection::new(Arc::new(config), server_name)?;
@@ -534,14 +522,30 @@ fn tls_get_blocking(
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    )?;
-    stream.flush()?;
+    )
+    .map_err(|error| {
+        format!(
+            "TLS request write to {addr} for SNI {sni} failed after {:?}; handshaking={}, protocol={:?}: {error:?} ({error})",
+            started.elapsed(), stream.conn.is_handshaking(), stream.conn.protocol_version()
+        )
+    })?;
+    stream.flush().map_err(|error| {
+        format!(
+            "TLS request flush to {addr} for SNI {sni} failed after {:?}; handshaking={}, protocol={:?}: {error:?} ({error})",
+            started.elapsed(), stream.conn.is_handshaking(), stream.conn.protocol_version()
+        )
+    })?;
 
     let mut bytes = Vec::new();
     match stream.read_to_end(&mut bytes) {
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::UnexpectedEof && !bytes.is_empty() => {}
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(format!(
+                "TLS response read from {addr} for SNI {sni} failed after {:?}; received_plaintext_bytes={}, handshaking={}, protocol={:?}: {error:?} ({error})",
+                started.elapsed(), bytes.len(), stream.conn.is_handshaking(), stream.conn.protocol_version()
+            ).into());
+        }
     }
     let raw = String::from_utf8_lossy(&bytes);
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
@@ -794,7 +798,14 @@ fn sni_route_identity(host_kind: i32, host: &str) -> RouteIdentity {
 }
 
 fn workload_name(target: &str) -> String {
-    format!("e2e-tls-{target}")
+    // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
+    let suffix = match target {
+        "termination" => "f589b132",
+        "sni-exact" => "24c750bd",
+        "sni-wildcard" => "df3d5390",
+        _ => panic!("unknown fixture target {target}"),
+    };
+    format!("e2e-tls-{target}-{suffix}")
 }
 
 fn literal_text(value: &str) -> TemplateText {

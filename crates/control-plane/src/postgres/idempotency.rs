@@ -94,6 +94,53 @@ pub(crate) fn idempotency_conflict() -> StoreError {
     StoreError::IdempotencyConflict
 }
 
+/// Expiry is opt-in per key. Deleting only committed expired records preserves
+/// all permanent keys and all keys whose original replay window remains open.
+pub(crate) async fn expire_records(
+    store: &super::connection::PostgresStore,
+    limit: u32,
+) -> StoreResult<u64> {
+    if limit == 0 || limit > 10_000 {
+        return Err(StoreError::invalid_argument(
+            "idempotency GC batch must be between 1 and 10000",
+        ));
+    }
+    let client = store.client().await?;
+    client
+        .execute(
+            "
+        WITH expired AS (
+            SELECT idempotency_key FROM idempotency_records
+            WHERE expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+            ORDER BY expires_at_unix_millis, idempotency_key
+            LIMIT $1 FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM idempotency_records USING expired
+        WHERE idempotency_records.idempotency_key = expired.idempotency_key
+    ",
+            &[&i64::from(limit)],
+        )
+        .await
+        .map_err(super::error::map_postgres_error)
+}
+
+pub(crate) async fn expire_key(
+    client: &impl deadpool_postgres::GenericClient,
+    key: &str,
+) -> StoreResult<()> {
+    client
+        .execute(
+            "
+        DELETE FROM idempotency_records WHERE idempotency_key = $1
+            AND expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+    ",
+            &[&key],
+        )
+        .await
+        .map_err(super::error::map_postgres_error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{create_instance_fingerprint, create_route_binding_fingerprint};

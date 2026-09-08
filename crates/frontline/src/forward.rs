@@ -3,14 +3,13 @@ use std::{error::Error, fmt, net::IpAddr};
 use bytes::Bytes;
 use http::{
     uri::{InvalidUri, InvalidUriParts, PathAndQuery},
-    HeaderMap, Request, Response, Uri,
+    Request, Response, Uri,
 };
 use http_body::Body;
 use hyper::body::Incoming;
 use proxy_core::{
-    apply_forwarded_header_policy, forwarded_headers, AcceptedWebSocketUpstream, DrainTracker,
-    HttpProxy, HttpProxyError, TrackedBody, WebSocketProxy, WebSocketProxyError,
-    WebSocketProxyStats,
+    apply_forwarded_header_policy, DrainTracker, HttpProxy, HttpProxyError, TrackedBody,
+    WebSocketProxy, WebSocketProxyError, WebSocketProxyStats,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -62,6 +61,20 @@ impl FrontlineForwarder {
         }
     }
 
+    pub fn with_resource_config(mut self, config: proxy_core::ProxyResourceConfig) -> Self {
+        let drain = self.http.drain_tracker().clone();
+        self.http = HttpProxy::with_config(drain.clone(), config);
+        self.websocket = WebSocketProxy::with_config(
+            drain,
+            proxy_core::WebSocketProxyConfig {
+                handshake_timeout: config.setup_timeout(),
+                write_timeout: config.write_idle_timeout(),
+                ..proxy_core::WebSocketProxyConfig::default()
+            },
+        );
+        self
+    }
+
     pub async fn forward_http<B>(
         &self,
         ready: &ReadyBackend,
@@ -99,7 +112,7 @@ impl FrontlineForwarder {
         upstream_path_and_query: &str,
     ) -> Result<WebSocketProxyStats, FrontlineForwardError>
     where
-        Client: AsyncRead + AsyncWrite + Unpin,
+        Client: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
         self.websocket
@@ -108,62 +121,27 @@ impl FrontlineForwarder {
             .map_err(FrontlineForwardError::WebSocket)
     }
 
-    pub async fn forward_accepted_websocket<Client>(
+    pub async fn prepare_websocket_upgrade<B>(
         &self,
         ready: &ReadyBackend,
-        client: Client,
-        upstream_path_and_query: &str,
-    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
-    where
-        Client: AsyncRead + AsyncWrite + Unpin,
-    {
-        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
+        request: &mut Request<B>,
+        context: FrontlineForwardContext,
+    ) -> Result<
+        (
+            Response<http_body_util::Full<Bytes>>,
+            proxy_core::WebSocketUpgrade,
+        ),
+        FrontlineForwardError,
+    > {
+        context.apply_to_request(request);
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or("/");
+        let upstream_url = websocket_upstream_url(ready, path)?;
         self.websocket
-            .proxy_accepted_upgrade(client, &upstream_url)
-            .await
-            .map_err(FrontlineForwardError::WebSocket)
-    }
-
-    pub async fn forward_accepted_websocket_with_headers<Client>(
-        &self,
-        ready: &ReadyBackend,
-        client: Client,
-        upstream_path_and_query: &str,
-        upstream_headers: &HeaderMap,
-    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
-    where
-        Client: AsyncRead + AsyncWrite + Unpin,
-    {
-        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
-        self.websocket
-            .proxy_accepted_upgrade_with_upstream_headers(client, &upstream_url, upstream_headers)
-            .await
-            .map_err(FrontlineForwardError::WebSocket)
-    }
-
-    pub async fn connect_accepted_websocket_upstream_with_headers(
-        &self,
-        ready: &ReadyBackend,
-        upstream_path_and_query: &str,
-        upstream_headers: &HeaderMap,
-    ) -> Result<AcceptedWebSocketUpstream, FrontlineForwardError> {
-        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
-        self.websocket
-            .connect_accepted_upstream_with_headers(&upstream_url, upstream_headers)
-            .await
-            .map_err(FrontlineForwardError::WebSocket)
-    }
-
-    pub async fn forward_connected_accepted_websocket<Client>(
-        &self,
-        client: Client,
-        upstream: AcceptedWebSocketUpstream,
-    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
-    where
-        Client: AsyncRead + AsyncWrite + Unpin,
-    {
-        self.websocket
-            .proxy_accepted_upgrade_with_upstream(client, upstream)
+            .prepare_upgrade(request, &upstream_url)
             .await
             .map_err(FrontlineForwardError::WebSocket)
     }
@@ -186,11 +164,6 @@ impl FrontlineForwardContext {
 
     pub fn apply_to_request<B>(&self, request: &mut Request<B>) {
         apply_forwarded_header_policy(request, self.peer_ip, self.proto.as_str());
-    }
-
-    pub fn headers_for_request<B>(&self, request: &mut Request<B>) -> HeaderMap {
-        self.apply_to_request(request);
-        forwarded_headers(request.headers())
     }
 }
 

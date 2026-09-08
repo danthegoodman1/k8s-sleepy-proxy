@@ -31,6 +31,10 @@ impl Shutdown {
         self.token.is_cancelled()
     }
 
+    pub(crate) fn cancelled_owned(self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.token.cancelled_owned()
+    }
+
     pub async fn cancelled(&self) {
         self.token.cancelled().await;
     }

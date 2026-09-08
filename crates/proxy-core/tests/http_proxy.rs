@@ -1143,3 +1143,172 @@ fn decode_single_chunk(body: &[u8]) -> Result<&[u8], Box<dyn Error + Send + Sync
 
     Ok(&body[chunk_start..chunk_end])
 }
+
+#[tokio::test(start_paused = true)]
+async fn shared_http_server_bounds_silent_partial_http1_and_partial_h2_setup() {
+    for prefix in [
+        b"".as_slice(),
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n".as_slice(),
+        b"PRI * HTTP/2.0\r\n".as_slice(),
+    ] {
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::io::AsyncWriteExt::write_all(&mut client, prefix)
+            .await
+            .unwrap();
+        let task = tokio::spawn(proxy_core::serve_http_connection(
+            server,
+            proxy_core::Shutdown::new(),
+            |_| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    bytes::Bytes::new(),
+                )))
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shared_http_server_does_not_apply_setup_deadline_to_an_active_request() {
+    let (client, server) = tokio::io::duplex(4096);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let released = release.clone();
+    let task = tokio::spawn(proxy_core::serve_http_connection(
+        server,
+        proxy_core::Shutdown::new(),
+        move |_| {
+            let started = started.clone();
+            let released = released.clone();
+            async move {
+                started.lock().unwrap().take().unwrap().send(()).unwrap();
+                released.notified().await;
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    bytes::Bytes::from_static(b"completed"),
+                )))
+            }
+        },
+    ));
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(client))
+            .await
+            .unwrap();
+    let client_task = tokio::spawn(connection);
+    let request = tokio::spawn(async move {
+        sender
+            .send_request(http::Request::new(http_body_util::Full::new(
+                bytes::Bytes::new(),
+            )))
+            .await
+    });
+    started_rx.await.unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    assert!(!request.is_finished());
+    release.notify_one();
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "completed"
+    );
+    client_task.abort();
+    task.abort();
+}
+
+#[tokio::test]
+async fn upstream_pool_bounds_origin_churn_preserves_reuse_and_evicts_idle_sockets() {
+    let mut origins = Vec::new();
+    let mut tasks = Vec::new();
+    let connections = Arc::new(AtomicUsize::new(0));
+    for _ in 0..3 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        origins.push(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse::<Uri>()
+                .unwrap(),
+        );
+        let connections = connections.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                connections.fetch_add(1, Ordering::Relaxed);
+                while sessions.try_join_next().is_some() {}
+                sessions.spawn(proxy_core::serve_http_connection(
+                    stream,
+                    proxy_core::Shutdown::new(),
+                    |_| async {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    },
+                ));
+            }
+        }));
+    }
+    let config = proxy_core::ProxyResourceConfig::default()
+        .with_upstream_pool(2, 1, Duration::from_millis(100))
+        .unwrap();
+    let proxy = HttpProxy::with_config(DrainTracker::new(Duration::from_secs(1)), config);
+    let request = || {
+        Request::builder()
+            .uri("/")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    for _ in 0..2 {
+        proxy
+            .proxy(request(), &origins[0])
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        connections.load(Ordering::Relaxed),
+        1,
+        "same-origin keepalive remains pooled"
+    );
+    proxy
+        .proxy(request(), &origins[1])
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(proxy.upstream_connections().in_flight(), 2);
+    assert!(matches!(
+        proxy.proxy(request(), &origins[2]).await.unwrap_err(),
+        HttpProxyError::UpstreamSaturated
+    ));
+    timeout(
+        TEST_TIMEOUT,
+        proxy.upstream_connections().wait_for_in_flight(0),
+    )
+    .await
+    .unwrap();
+    proxy
+        .proxy(request(), &origins[2])
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        connections.load(Ordering::Relaxed),
+        3,
+        "new origin recovers after timed idle eviction"
+    );
+    drop(proxy);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+}

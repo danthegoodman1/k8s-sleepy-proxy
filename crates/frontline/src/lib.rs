@@ -49,9 +49,9 @@ pub use http01::{
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use listener::{
-    serve_frontline, serve_http, serve_http_listener, FrontlineHttpListenerConfig,
-    FrontlineHttpListenerError, FrontlineListenerError, FrontlineListenerKind,
-    FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
+    serve_frontline, serve_http, serve_http_listener, serve_http_listener_with_admission,
+    FrontlineHttpListenerConfig, FrontlineHttpListenerError, FrontlineListenerError,
+    FrontlineListenerKind, FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
     FrontlineTlsTerminationListenerConfig,
 };
 pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};

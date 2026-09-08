@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use control_plane::{
-    api::pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId,
-    InstanceState, PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteHostKind, RouteIdentity,
+use sleepypods_api::{
+    pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, InstanceId, InstanceState,
+    PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteHostKind, RouteIdentity,
 };
 
 use super::{

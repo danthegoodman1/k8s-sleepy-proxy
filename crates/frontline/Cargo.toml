@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 bytes = { workspace = true, default-features = false }
-control-plane = { workspace = true }
 http = { workspace = true, default-features = false, features = ["std"] }
 http-body = { workspace = true, default-features = false }
 http-body-util = { workspace = true, default-features = false, features = ["full"] }
@@ -14,9 +13,10 @@ hyper = { workspace = true, default-features = false, features = ["http1", "http
 hyper-util = { workspace = true, default-features = false, features = ["tokio", "http1", "http2", "server-auto"] }
 proxy-core = { workspace = true }
 rustls-pemfile = "2.2.0"
+sleepypods-api = { version = "0.1.0", path = "../sleepypods-api" }
 tokio = { workspace = true, default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-tonic = { workspace = true, default-features = false, features = ["transport"] }
+tonic = { workspace = true, features = ["channel", "codegen"] }
 
 [dev-dependencies]
 criterion = { workspace = true, default-features = false }
@@ -25,8 +25,10 @@ http-body-util = { workspace = true, default-features = false, features = ["chan
 hyper = { workspace = true, default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { workspace = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
+sidecar = { path = "../sidecar" }
 tokio = { workspace = true, default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
+tonic = { workspace = true, features = ["server", "router"] }
 
 [[bench]]
 name = "route_lookup"

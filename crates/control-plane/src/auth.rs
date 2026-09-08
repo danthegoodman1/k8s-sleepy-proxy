@@ -1,13 +1,11 @@
+pub use sleepypods_api::auth::{BearerToken, InvalidBearerToken, OptionalBearerTokenInterceptor};
+
 use std::{error::Error, fmt, sync::Arc};
 
-use proxy_core::observability::recorder::{
+use sleepypods_observability::recorder::{
     LifecycleLogEvent, LogField, ObservabilityRecorder, EVENT_CONTROL_PLANE_AUTH,
 };
-use tonic::{
-    metadata::{AsciiMetadataValue, MetadataMap},
-    service::Interceptor,
-    Request, Status,
-};
+use tonic::{metadata::MetadataMap, service::Interceptor, Request, Status};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallerRole {
@@ -27,19 +25,6 @@ pub struct StaticBearerTokens {
     operator: BearerToken,
     proxy: BearerToken,
     sidecar: BearerToken,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct BearerToken {
-    value: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InvalidBearerToken {
-    Empty { field: &'static str },
-    ContainsNonAscii { field: &'static str },
-    ContainsWhitespace { field: &'static str },
-    ContainsControl { field: &'static str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,11 +76,6 @@ pub struct ControlPlaneAuthInterceptor {
     auth: ControlPlaneAuth,
     service_name: &'static str,
     required_role: CallerRole,
-}
-
-#[derive(Clone, Debug)]
-pub struct OptionalBearerTokenInterceptor {
-    authorization: Option<AsciiMetadataValue>,
 }
 
 #[derive(Debug)]
@@ -179,38 +159,6 @@ impl StaticBearerTokens {
             CallerRole::Proxy => &self.proxy,
             CallerRole::Sidecar => &self.sidecar,
         }
-    }
-}
-
-impl BearerToken {
-    pub fn new(field: &'static str, value: impl Into<String>) -> Result<Self, InvalidBearerToken> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(InvalidBearerToken::Empty { field });
-        }
-        if !value.is_ascii() {
-            return Err(InvalidBearerToken::ContainsNonAscii { field });
-        }
-        if value.chars().any(char::is_whitespace) {
-            return Err(InvalidBearerToken::ContainsWhitespace { field });
-        }
-        if value.chars().any(char::is_control) {
-            return Err(InvalidBearerToken::ContainsControl { field });
-        }
-
-        Ok(Self { value })
-    }
-
-    pub fn authorization_header_value(&self) -> Result<AsciiMetadataValue, InvalidBearerToken> {
-        format!("Bearer {}", self.value)
-            .parse()
-            .map_err(|_| InvalidBearerToken::ContainsControl {
-                field: "authorization",
-            })
-    }
-
-    pub(crate) fn as_secret_str(&self) -> &str {
-        &self.value
     }
 }
 
@@ -312,28 +260,6 @@ impl Interceptor for ControlPlaneAuthInterceptor {
     }
 }
 
-impl OptionalBearerTokenInterceptor {
-    pub fn new(token: Option<&BearerToken>) -> Result<Self, InvalidBearerToken> {
-        let authorization = token
-            .map(BearerToken::authorization_header_value)
-            .transpose()?;
-
-        Ok(Self { authorization })
-    }
-}
-
-impl Interceptor for OptionalBearerTokenInterceptor {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(authorization) = self.authorization.clone() {
-            request
-                .metadata_mut()
-                .insert("authorization", authorization);
-        }
-
-        Ok(request)
-    }
-}
-
 impl StaticBearerAuthProvider {
     pub fn new(tokens: StaticBearerTokens) -> Self {
         Self { tokens }
@@ -347,7 +273,7 @@ impl AuthProvider for StaticBearerAuthProvider {
         for role in CallerRole::ALL {
             if token_eq(
                 credential.as_bytes(),
-                self.tokens.token_for(*role).value.as_bytes(),
+                self.tokens.token_for(*role).as_secret_str().as_bytes(),
             ) {
                 return Ok(*role);
             }
@@ -400,7 +326,10 @@ fn ensure_distinct(
     first: CallerRole,
     second: CallerRole,
 ) -> Result<(), InvalidStaticBearerTokens> {
-    if token_eq(first_token.value.as_bytes(), second_token.value.as_bytes()) {
+    if token_eq(
+        first_token.as_secret_str().as_bytes(),
+        second_token.as_secret_str().as_bytes(),
+    ) {
         Err(InvalidStaticBearerTokens::DuplicateToken { first, second })
     } else {
         Ok(())
@@ -424,12 +353,6 @@ fn auth_failure_to_status(reason: AuthorizationFailureReason) -> Status {
     }
 }
 
-impl fmt::Debug for BearerToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("BearerToken([redacted])")
-    }
-}
-
 impl fmt::Debug for ControlPlaneAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ControlPlaneAuth").finish_non_exhaustive()
@@ -439,19 +362,6 @@ impl fmt::Debug for ControlPlaneAuth {
 impl fmt::Display for CallerRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl fmt::Display for InvalidBearerToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty { field } => write!(f, "{field} must not be empty"),
-            Self::ContainsNonAscii { field } => write!(f, "{field} must contain only ASCII"),
-            Self::ContainsWhitespace { field } => write!(f, "{field} must not contain whitespace"),
-            Self::ContainsControl { field } => {
-                write!(f, "{field} must not contain control characters")
-            }
-        }
     }
 }
 
@@ -468,8 +378,6 @@ impl fmt::Display for InvalidStaticBearerTokens {
     }
 }
 
-impl Error for InvalidBearerToken {}
-
 impl Error for InvalidStaticBearerTokens {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -481,7 +389,7 @@ impl Error for InvalidStaticBearerTokens {
 
 #[cfg(test)]
 mod tests {
-    use proxy_core::observability::recorder::{
+    use sleepypods_observability::recorder::{
         InMemoryObservability, ObservabilityEvent, FIELD_AUTH_CALLER_ROLE, FIELD_AUTH_DECISION,
         FIELD_AUTH_REASON, FIELD_AUTH_REQUIRED_ROLE, FIELD_GRPC_SERVICE,
     };

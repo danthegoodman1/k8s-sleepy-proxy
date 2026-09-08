@@ -57,7 +57,10 @@ fn observability_label_helpers_do_not_allocate() {
         for value in ProxyState::ALL {
             black_box(value.as_str());
         }
-        black_box(TlsClientHelloOutcome::from_result(black_box(&Err(
+        black_box(TlsClientHelloOutcome::from_result(black_box(&Result::<
+            proxy_core::TlsClientHelloSni,
+            _,
+        >::Err(
             TlsClientHelloError::Malformed,
         ))));
     });

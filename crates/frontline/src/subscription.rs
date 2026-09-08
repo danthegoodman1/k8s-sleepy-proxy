@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, time::Instant};
 
-use control_plane::{BackendGeneration, CachePolicy, Generation, RouteEntry, RouteIdentity};
+use sleepypods_api::{BackendGeneration, CachePolicy, Generation, RouteEntry, RouteIdentity};
 
 use crate::{
     cache::{stale_route_entry, CacheInsertResult, StaleRouteEntry},
@@ -8,7 +8,12 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SubscriptionId(String);
+pub struct SubscriptionId {
+    value: String,
+    // Local transport ownership is never sent over the wire. Including it in
+    // equality and hashing prevents reused server IDs aliasing across sessions.
+    session: Option<u64>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RouteRequestId(String);
@@ -107,11 +112,23 @@ impl SubscriptionId {
             });
         }
 
-        Ok(Self(value))
+        Ok(Self {
+            value,
+            session: None,
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
+    }
+
+    pub(crate) fn with_session(mut self, session: u64) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    pub(crate) fn session(&self) -> Option<u64> {
+        self.session
     }
 }
 
@@ -177,6 +194,37 @@ impl SubscriptionState {
                     UnsubscribeOutcome::AlreadyAbsent
                 }
             }
+        }
+    }
+
+    pub fn apply_resolved_response(
+        &mut self,
+        request_identity: RouteIdentity,
+        message: SubscribeControlPlaneOutput,
+        now: Instant,
+    ) -> ApplyControlPlaneMessageOutcome {
+        match message {
+            SubscribeControlPlaneOutput::RouteResolved {
+                subscription_id,
+                matched_identity,
+                entry,
+                cache_policy,
+                ..
+            } => {
+                let positive = crate::PositiveCacheEntry::new(
+                    subscription_id,
+                    matched_identity,
+                    entry,
+                    cache_policy,
+                    now,
+                );
+                ApplyControlPlaneMessageOutcome::Resolved(self.cache.insert_resolved(
+                    request_identity,
+                    positive,
+                    now,
+                ))
+            }
+            other => self.apply_control_plane_message(other, now),
         }
     }
 
@@ -262,14 +310,6 @@ impl SubscriptionState {
 
         if let Some(stale) = stale_route_entry(&current.entry, &entry) {
             return stale_update_outcome(stale);
-        }
-
-        if let Some(conflicting) = self.cache.positive_by_matched_identity(&matched_identity) {
-            if &conflicting.subscription_id != subscription_id {
-                if let Some(stale) = stale_route_entry(&conflicting.entry, &entry) {
-                    return stale_update_outcome(stale);
-                }
-            }
         }
 
         let result = self.cache.replace_subscription(

@@ -1,3 +1,8 @@
+#[cfg(test)]
+mod conditional_tests;
+
+mod idle_membership;
+
 use std::{error::Error, fmt, time::Duration};
 
 use k8s_openapi::api::{
@@ -5,7 +10,10 @@ use k8s_openapi::api::{
     discovery::v1::EndpointSlice,
 };
 use kube::{
-    api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams},
+    api::{
+        Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
+        Preconditions,
+    },
     Client, Error as KubeError,
 };
 use tokio::time::{sleep, timeout, Instant};
@@ -86,43 +94,127 @@ impl KubeMaterializerClient {
 }
 
 impl KubernetesMaterializerClient for KubeMaterializerClient {
+    fn verify_idle_member<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        identity: &'a crate::materializer::IdleMemberIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            timeout(
+                self.config.readiness_timeout,
+                self.verify_idle_member_snapshot(objects, identity),
+            )
+            .await
+            .map_err(|_| KubernetesClientError::transient("idle membership inspection timed out"))?
+        })
+    }
+
     fn apply_object<'a>(
         &'a self,
         object: &'a KubernetesObject,
+        precondition: Option<&'a crate::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             let object_ref = rendered_object_ref(object);
             let api = self.dynamic_api(&object_ref)?;
-            let params = PatchParams::apply(&self.config.field_manager);
-            let body = object.to_kubernetes_json();
-            api.patch(&object_ref.name, &params, &Patch::Apply(&body))
+            let mut body = object.to_kubernetes_json();
+            let operation = async {
+                match precondition {
+                    None => {
+                        let object: DynamicObject = serde_json::from_value(body)
+                            .map_err(|error| KubernetesClientError::new(error.to_string()))?;
+                        api.create(
+                            &PostParams {
+                                field_manager: Some(self.config.field_manager.clone()),
+                                ..PostParams::default()
+                            },
+                            &object,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(mutation_error)
+                    }
+                    Some(identity) => {
+                        validate_identity(identity)?;
+                        body["metadata"]["uid"] = identity.uid.clone().into();
+                        body["metadata"]["resourceVersion"] =
+                            identity.resource_version.clone().into();
+                        let params = PatchParams {
+                            field_manager: Some(self.config.field_manager.clone()),
+                            ..PatchParams::default()
+                        };
+                        api.patch(&object_ref.name, &params, &Patch::Merge(&body))
+                            .await
+                            .map(|_| ())
+                            .map_err(mutation_error)
+                    }
+                }
+            };
+            timeout(self.config.delete_timeout, operation)
                 .await
-                .map(|_| ())
-                .map_err(kube_error)
+                .map_err(|_| {
+                    KubernetesClientError::uncertain(
+                        "Kubernetes mutation timed out; effect outcome is unknown",
+                    )
+                })?
         })
     }
 
     fn delete_object<'a>(
         &'a self,
         object: &'a RenderedObjectRef,
+        precondition: &'a crate::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
+            validate_identity(precondition)?;
             let api = self.dynamic_api(object)?;
-            let delete = timeout(
+            if object.kind == "PersistentVolume" {
+                let live = match timeout(self.config.delete_timeout, api.get(&object.name))
+                    .await
+                    .map_err(|_| {
+                        KubernetesClientError::transient("PV retention inspection timed out")
+                    })? {
+                    Ok(live) => live,
+                    Err(error) if is_not_found(&error) => return Ok(()),
+                    Err(error) => return Err(kube_error(error)),
+                };
+                if live.metadata.uid.as_deref() != Some(precondition.uid.as_str())
+                    || live.metadata.resource_version.as_deref()
+                        != Some(precondition.resource_version.as_str())
+                {
+                    return Err(KubernetesClientError::transient(
+                        "PV changed since ownership/retention inspection",
+                    ));
+                }
+                if live
+                    .data
+                    .pointer("/spec/persistentVolumeReclaimPolicy")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("Retain")
+                {
+                    return Err(KubernetesClientError::new("managed static PV requires Retain before automatic cleanup; operator correction required"));
+                }
+            }
+            let params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(precondition.uid.clone()),
+                    resource_version: Some(precondition.resource_version.clone()),
+                }),
+                ..DeleteParams::foreground()
+            };
+            match timeout(
                 self.config.delete_timeout,
-                api.delete(&object.name, &DeleteParams::default()),
+                api.delete(&object.name, &params),
             )
             .await
             .map_err(|_| {
-                KubernetesClientError::transient(format!(
-                    "timed out deleting Kubernetes object {} {} {}/{}",
-                    object.api_version, object.kind, object.namespace, object.name
-                ))
-            })?;
-            match delete {
+                KubernetesClientError::uncertain(
+                    "Kubernetes delete timed out; effect outcome is unknown",
+                )
+            })? {
                 Ok(_) => Ok(()),
                 Err(error) if is_not_found(&error) => Ok(()),
-                Err(error) => Err(kube_error(error)),
+                Err(error) => Err(mutation_error(error)),
             }
         })
     }
@@ -133,6 +225,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         name: &'a str,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
+            timeout(self.config.pvc_bound_timeout, async move {
             let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
             let deadline = Instant::now() + self.config.pvc_bound_timeout;
 
@@ -149,6 +242,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
                 )
                 .await?;
             }
+            }).await.map_err(|_| KubernetesClientError::transient("Kubernetes read/wait timed out"))?
         })
     }
 
@@ -157,36 +251,43 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         objects: &'a [RenderedObjectRef],
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
         Box::pin(async move {
-            let service_ref = rendered_service_ref(objects)?;
-            let services: Api<Service> =
-                Api::namespaced(self.client.clone(), &service_ref.namespace);
-            let endpoint_slices: Api<EndpointSlice> =
-                Api::namespaced(self.client.clone(), &service_ref.namespace);
-            let deadline = Instant::now() + self.config.readiness_timeout;
+            timeout(self.config.readiness_timeout, async move {
+                let service_ref = rendered_service_ref(objects)?;
+                let services: Api<Service> =
+                    Api::namespaced(self.client.clone(), &service_ref.namespace);
+                let endpoint_slices: Api<EndpointSlice> =
+                    Api::namespaced(self.client.clone(), &service_ref.namespace);
+                let deadline = Instant::now() + self.config.readiness_timeout;
 
-            loop {
-                let service = services.get(&service_ref.name).await.map_err(kube_error)?;
-                let backend = backend_endpoint_for_service(&service, &self.config)?;
-                let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
-                let slices = endpoint_slices
-                    .list(&ListParams::default().labels(&selector))
-                    .await
-                    .map_err(kube_error)?;
+                loop {
+                    let service = services.get(&service_ref.name).await.map_err(kube_error)?;
+                    let backend = backend_endpoint_for_service(&service, &self.config)?;
+                    let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
+                    let slices = endpoint_slices
+                        .list(&ListParams::default().labels(&selector))
+                        .await
+                        .map_err(kube_error)?;
 
-                if slices.iter().any(endpoint_slice_has_ready_endpoint) {
-                    return Ok(backend);
+                    if slices
+                        .iter()
+                        .any(|slice| endpoint_slice_has_ready_endpoint(&service, slice))
+                    {
+                        return Ok(backend);
+                    }
+
+                    sleep_until_next_poll(
+                        deadline,
+                        self.config.poll_interval,
+                        format!(
+                            "timed out waiting for ready EndpointSlice endpoints for Service {}/{}",
+                            service_ref.namespace, service_ref.name
+                        ),
+                    )
+                    .await?;
                 }
-
-                sleep_until_next_poll(
-                    deadline,
-                    self.config.poll_interval,
-                    format!(
-                        "timed out waiting for ready EndpointSlice endpoints for Service {}/{}",
-                        service_ref.namespace, service_ref.name
-                    ),
-                )
-                .await?;
-            }
+            })
+            .await
+            .map_err(|_| KubernetesClientError::transient("Kubernetes read/wait timed out"))?
         })
     }
 
@@ -196,8 +297,26 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
         Box::pin(async move {
             let api = self.dynamic_api(object)?;
-            match api.get(&object.name).await {
+            match timeout(self.config.delete_timeout, api.get(&object.name))
+                .await
+                .map_err(|_| KubernetesClientError::transient("Kubernetes inspection timed out"))?
+            {
                 Ok(live) => Ok(ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    persistent_volume_reclaim_policy: live
+                        .data
+                        .pointer("/spec/persistentVolumeReclaimPolicy")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    identity: crate::projection::LiveObjectIdentity {
+                        uid: live.metadata.uid.ok_or_else(|| {
+                            KubernetesClientError::new("live Kubernetes object has no UID")
+                        })?,
+                        resource_version: live.metadata.resource_version.ok_or_else(|| {
+                            KubernetesClientError::new(
+                                "live Kubernetes object has no resourceVersion",
+                            )
+                        })?,
+                    },
                     labels: live.metadata.labels.unwrap_or_default(),
                     annotations: live.metadata.annotations.unwrap_or_default(),
                     deleting: live.metadata.deletion_timestamp.is_some(),
@@ -209,36 +328,150 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         })
     }
 
+    fn verify_retained_bindings<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            timeout(self.config.delete_timeout, async {
+                let pvs: Api<k8s_openapi::api::core::v1::PersistentVolume> =
+                    Api::all(self.client.clone());
+                for object in objects
+                    .iter()
+                    .filter(|object| object.kind == "PersistentVolumeClaim")
+                {
+                    let pvcs: Api<PersistentVolumeClaim> =
+                        Api::namespaced(self.client.clone(), &object.namespace);
+                    let pvc = match pvcs.get(&object.name).await {
+                        Ok(pvc) => pvc,
+                        Err(error) if is_not_found(&error) => continue,
+                        Err(error) => return Err(kube_error(error)),
+                    };
+                    let volume_name = pvc
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| spec.volume_name.as_deref())
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            KubernetesClientError::new(
+                            "PVC has no proven static volume binding; automatic cleanup refused",
+                        )
+                        })?;
+                    if !objects.iter().any(|recorded| {
+                        recorded.kind == "PersistentVolume"
+                            && recorded.name == volume_name
+                            && recorded.namespace.is_empty()
+                    }) {
+                        return Err(KubernetesClientError::new(
+                            "PVC binds a PV outside recorded inventory; automatic cleanup refused",
+                        ));
+                    }
+                    let pv = pvs.get(volume_name).await.map_err(kube_error)?;
+                    if pv
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| spec.persistent_volume_reclaim_policy.as_deref())
+                        != Some("Retain")
+                    {
+                        return Err(KubernetesClientError::new(
+                            "PVC backing PV requires Retain before any automatic cleanup",
+                        ));
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| {
+                KubernetesClientError::transient("retained static binding inspection timed out")
+            })?
+        })
+    }
+
+    fn ensure_no_descendants<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            timeout(self.config.delete_timeout, async {
+                let namespaces = objects
+                    .iter()
+                    .map(|object| object.namespace.as_str())
+                    .filter(|namespace| !namespace.is_empty())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let selector = format!("{}={instance_id}", crate::manifest::LABEL_INSTANCE_ID);
+                let params = ListParams::default().labels(&selector);
+                for namespace in namespaces {
+                    let pods: Api<k8s_openapi::api::core::v1::Pod> =
+                        Api::namespaced(self.client.clone(), namespace);
+                    if !pods
+                        .list(&params)
+                        .await
+                        .map_err(kube_error)?
+                        .items
+                        .is_empty()
+                    {
+                        return Err(KubernetesClientError::transient(
+                            "projection Pods still exist, including terminating members",
+                        ));
+                    }
+                    let replica_sets: Api<k8s_openapi::api::apps::v1::ReplicaSet> =
+                        Api::namespaced(self.client.clone(), namespace);
+                    if !replica_sets
+                        .list(&params)
+                        .await
+                        .map_err(kube_error)?
+                        .items
+                        .is_empty()
+                    {
+                        return Err(KubernetesClientError::transient(
+                            "projection ReplicaSets still exist",
+                        ));
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| {
+                KubernetesClientError::transient("descendant absence inspection timed out")
+            })?
+        })
+    }
+
     fn inspect_readiness<'a>(
         &'a self,
         objects: &'a [RenderedObjectRef],
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>> {
         Box::pin(async move {
-            let service_ref = match rendered_service_ref(objects) {
-                Ok(service_ref) => service_ref,
-                Err(_) => return Ok(ProjectionReadinessInspection::NotObserved),
-            };
-            let services: Api<Service> =
-                Api::namespaced(self.client.clone(), &service_ref.namespace);
-            let service = match services.get(&service_ref.name).await {
-                Ok(service) => service,
-                Err(error) if is_not_found(&error) => {
-                    return Ok(ProjectionReadinessInspection::Unready {
-                        reason: "service_missing".to_owned(),
-                    });
-                }
-                Err(error) => return Err(kube_error(error)),
-            };
+            timeout(self.config.delete_timeout, async move {
+                let service_ref = match rendered_service_ref(objects) {
+                    Ok(service_ref) => service_ref,
+                    Err(_) => return Ok(ProjectionReadinessInspection::NotObserved),
+                };
+                let services: Api<Service> =
+                    Api::namespaced(self.client.clone(), &service_ref.namespace);
+                let service = match services.get(&service_ref.name).await {
+                    Ok(service) => service,
+                    Err(error) if is_not_found(&error) => {
+                        return Ok(ProjectionReadinessInspection::Unready {
+                            reason: "service_missing".to_owned(),
+                        });
+                    }
+                    Err(error) => return Err(kube_error(error)),
+                };
 
-            let endpoint_slices: Api<EndpointSlice> =
-                Api::namespaced(self.client.clone(), &service_ref.namespace);
-            let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
-            let slices = endpoint_slices
-                .list(&ListParams::default().labels(&selector))
-                .await
-                .map_err(kube_error)?;
+                let endpoint_slices: Api<EndpointSlice> =
+                    Api::namespaced(self.client.clone(), &service_ref.namespace);
+                let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
+                let slices = endpoint_slices
+                    .list(&ListParams::default().labels(&selector))
+                    .await
+                    .map_err(kube_error)?;
 
-            readiness_inspection_for_service(&service, &slices.items, &self.config)
+                readiness_inspection_for_service(&service, &slices.items, &self.config)
+            })
+            .await
+            .map_err(|_| KubernetesClientError::transient("Kubernetes read/wait timed out"))?
         })
     }
 }
@@ -393,13 +626,45 @@ fn backend_scheme_for_service<'a>(
     Ok(&config.backend_scheme)
 }
 
-fn endpoint_slice_has_ready_endpoint(slice: &EndpointSlice) -> bool {
-    slice.endpoints.iter().any(|endpoint| {
-        endpoint
-            .conditions
+fn endpoint_slice_has_ready_endpoint(service: &Service, slice: &EndpointSlice) -> bool {
+    let Some(uid) = service
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+    else {
+        return false;
+    };
+    if service.metadata.deletion_timestamp.is_some()
+        || slice.metadata.deletion_timestamp.is_some()
+        || !slice
+            .metadata
+            .owner_references
             .as_ref()
-            .and_then(|conditions| conditions.ready)
-            .unwrap_or(true)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.api_version == "v1"
+                        && owner.kind == "Service"
+                        && owner.uid == uid
+                        && Some(owner.name.as_str()) == service.metadata.name.as_deref()
+                        && owner.controller == Some(true)
+                })
+            })
+    {
+        return false;
+    }
+    slice.endpoints.iter().any(|endpoint| {
+        !endpoint.addresses.is_empty()
+            && endpoint
+                .conditions
+                .as_ref()
+                .and_then(|conditions| conditions.terminating)
+                != Some(true)
+            && endpoint
+                .conditions
+                .as_ref()
+                .and_then(|conditions| conditions.ready)
+                .unwrap_or(true)
     })
 }
 
@@ -416,7 +681,10 @@ fn readiness_inspection_for_service(
             });
         }
     };
-    if slices.iter().any(endpoint_slice_has_ready_endpoint) {
+    if slices
+        .iter()
+        .any(|slice| endpoint_slice_has_ready_endpoint(service, slice))
+    {
         Ok(ProjectionReadinessInspection::Ready(backend))
     } else {
         Ok(ProjectionReadinessInspection::Unready {
@@ -507,6 +775,27 @@ fn is_transient_kube_error(error: &KubeError) -> bool {
         }
         KubeError::HyperError(_) | KubeError::Service(_) | KubeError::ReadEvents(_) => true,
         _ => false,
+    }
+}
+
+fn validate_identity(
+    identity: &crate::projection::LiveObjectIdentity,
+) -> KubernetesClientResult<()> {
+    if identity.uid.is_empty() || identity.resource_version.is_empty() {
+        return Err(KubernetesClientError::new(
+            "conditional mutation requires UID and resourceVersion",
+        ));
+    }
+    Ok(())
+}
+
+fn mutation_error(error: KubeError) -> KubernetesClientError {
+    match &error {
+        KubeError::Api(status) if status.code < 500 => kube_error(error),
+        KubeError::BuildRequest(_) | KubeError::HttpError(_) | KubeError::Auth(_) => {
+            KubernetesClientError::new(error.to_string())
+        }
+        _ => KubernetesClientError::uncertain(error.to_string()),
     }
 }
 
@@ -636,13 +925,19 @@ mod tests {
 
     #[test]
     fn endpoint_slice_ready_defaults_match_kubernetes_semantics() {
-        assert!(endpoint_slice_has_ready_endpoint(&endpoint_slice([None])));
-        assert!(endpoint_slice_has_ready_endpoint(&endpoint_slice([Some(
-            true
-        )])));
-        assert!(!endpoint_slice_has_ready_endpoint(&endpoint_slice([Some(
-            false
-        )])));
+        let service = service("api", "apps", [80]);
+        assert!(endpoint_slice_has_ready_endpoint(
+            &service,
+            &endpoint_slice([None])
+        ));
+        assert!(endpoint_slice_has_ready_endpoint(
+            &service,
+            &endpoint_slice([Some(true)])
+        ));
+        assert!(!endpoint_slice_has_ready_endpoint(
+            &service,
+            &endpoint_slice([Some(false)])
+        ));
     }
 
     #[test]
@@ -795,6 +1090,7 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some(name.to_owned()),
                 namespace: Some(namespace.to_owned()),
+                uid: Some("current-service".to_owned()),
                 ..ObjectMeta::default()
             },
             spec: Some(ServiceSpec {
@@ -815,9 +1111,23 @@ mod tests {
 
     fn endpoint_slice<const N: usize>(ready_values: [Option<bool>; N]) -> EndpointSlice {
         EndpointSlice {
+            metadata: ObjectMeta {
+                owner_references: Some(vec![
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".to_owned(),
+                        kind: "Service".to_owned(),
+                        name: "api".to_owned(),
+                        uid: "current-service".to_owned(),
+                        controller: Some(true),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
             endpoints: ready_values
                 .into_iter()
                 .map(|ready| Endpoint {
+                    addresses: vec!["10.0.0.1".to_owned()],
                     conditions: Some(EndpointConditions {
                         ready,
                         ..EndpointConditions::default()

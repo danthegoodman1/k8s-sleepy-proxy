@@ -35,19 +35,21 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_proxy_operation_duration_seconds` | histogram | `protocol`, `operation`, `outcome` | Bounded proxy primitive duration. |
 | `sleepypods_proxy_tls_client_hello_total` | counter | `protocol`, `outcome` | TLS ClientHello/SNI parser outcomes. |
 | `sleepypods_runtime_control_plane_calls_total` | counter | `operation`, `outcome` | Runtime calls such as subscribe, wake, unsubscribe, report idle. |
-| `sleepypods_runtime_active_streams` | gauge | none | Protocol-neutral drain permit count. |
+| `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
 | `sleepypods_runtime_materialization_failures_total` | counter | `operation`, `outcome` | Kubernetes/materialization failure path. |
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline route-cache hit/miss results. |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream close/update/invalidation events. |
 | `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Control-plane wake latency. |
-| `sleepypods_reconciler_runs_total` | counter | `outcome` | Materialization reconciler loop runs. |
-| `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one materialization reconciler pass. |
+| `sleepypods_reconciler_runs_total` | counter | `outcome` | Materialization discovery/scheduling scans. |
+| `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one discovery/scheduling scan. |
 | `sleepypods_reconciler_candidates_total` | counter | `state` | Rows selected for reconciliation. |
 | `sleepypods_reconciler_claims_total` | counter | `state`, `outcome` | Reconciliation lease claim outcomes. |
 | `sleepypods_reconciler_lease_renewals_total` | counter | `outcome` | Lease renewal success, error, and lease-loss outcomes. |
 | `sleepypods_materializations_nonterminal` | gauge | `state` | Current pending/deleting materialization backlog by state. |
+| `sleepypods_materialization_effects_uncertain` | gauge | none | Materializations with unresolved Kubernetes effect barriers. |
+| `sleepypods_materialization_failures_blocked` | gauge | none | Materializations with blocked failure status. |
 | `sleepypods_materialization_oldest_nonterminal_age_seconds` | gauge | `state` | Oldest pending/deleting materialization age by state. |
 | `sleepypods_exclusivity_keys_held` | gauge | `state` | Held rendered exclusivity keys by non-deleted materialization state. |
 | `sleepypods_kubernetes_operations_total` | counter | `operation`, `outcome` | Controller apply/delete/readiness operation outcomes. |
@@ -127,12 +129,17 @@ Build dashboards from the exact names above:
 - Reconciler health: rate of `sleepypods_reconciler_runs_total`,
   p95/p99 over `sleepypods_reconciler_run_duration_seconds`, and
   `sleepypods_reconciler_claims_total` by `state,outcome`. Alert when runs stop
-  or claim errors/rejections spike across replicas.
+  or claim errors/rejections spike across replicas. Run duration measures the
+  discovery/scheduling scan; use Kubernetes operation metrics for worker latency.
 - Materialization backlog and locks:
   `sleepypods_materializations_nonterminal`,
   `sleepypods_materialization_oldest_nonterminal_age_seconds`, and
   `sleepypods_exclusivity_keys_held` by `state`. Page on old pending/deleting
   work or held keys that do not fall after sleep cleanup.
+- Blocked recovery: alert on nonzero `sleepypods_materialization_effects_uncertain`
+  or sustained `sleepypods_materialization_failures_blocked`. Inspect status and
+  follow the [uncertain-effect recovery procedure](projection-safety.md); do not
+  automatically release reservations to clear an alert.
 - Kubernetes controller operations: rate and latency for
   `sleepypods_kubernetes_operations_total` and
   `sleepypods_kubernetes_operation_duration_seconds` by `operation,outcome`.
@@ -183,8 +190,9 @@ Rendered object name collision:
 2. The wake failed before Kubernetes apply; inspect the failed instance and the
    owner instance named in the error.
 3. Use DNS-label-safe `instance_id` values and readable base templates. The
-   control plane appends `-<instance-id-prefix>` to final object names and
-   truncates the base first.
+   control plane appends the first eight lowercase hexadecimal characters of
+   SHA-256 over the complete instance ID, prefixed by `-`, to final object names
+   and truncates the base first.
 4. Retry after changing the naming template or deleting/finalizing the
    conflicting active materialization.
 
@@ -199,8 +207,8 @@ Workload exclusivity key conflict:
 4. If cleanup is stuck, resolve Kubernetes deletion errors first. Do not wake a
    second same-key instance until the first materialization has safely finalized
    or an operator has deliberately changed the workload values/key declaration.
-5. If cleanup was externally verified but the database row remains non-terminal,
-   use `ForceDeleteMaterialization` with the materialization id, operator, and
+5. If cleanup was externally verified and the old process/request path has been
+   fenced so no delayed mutation can take effect, use `ForceDeleteMaterialization` with the materialization id, operator, and
    reason. If only the lock must be released, use `ForceReleaseExclusivityKey`
    with the exact target, key name, and key value. Both force responses include
    best-effort projection observations for scoped refs, but treat key release as
@@ -211,13 +219,16 @@ Non-terminal materialization is stuck:
 
 1. Search `runtime.materialization.reconciliation` for `operation=claim`,
    `operation=reconcile`, `operation=lease_lost`, and `outcome=error`.
-2. Call `ReconcileMaterialization` with the materialization id. The response
-   reports current state, lease metadata, recorded refs, and projection
-   observations, and attempts one reconciliation pass for `Pending` or
-   `Deleting` rows.
-3. Treat `missing` observations during `Deleting` as safe cleanup progress. A
-   materialization can finalize only after every recorded ref is missing or
-   otherwise proven safe by the projection layer.
+2. Call `ReconcileMaterialization` with the materialization id. It enqueues
+   eligible work through the shared scheduler; `attempted` means enqueue accepted.
+   Use `status_only=true` for read-only inspection. The response includes state,
+   lease metadata, recorded refs, projection observations, failure details,
+   scheduling deadline and any unresolved effect identity.
+3. Treat `missing` observations as cleanup progress only when no unresolved
+   effect barrier remains. Finalization requires all refs and old Pod/ReplicaSet
+   members absent. Check [effect diagnostics](projection-safety.md) when a lease
+   expired but no new controller can claim the row; name absence cannot resolve
+   an old dispatched create.
 4. Treat `present_unowned` and `deleting_unowned` as unsafe conflicts. Do not
    force-release exclusivity keys or delete the object through SleepyPods; first
    identify why the live object no longer carries the current SleepyPods
@@ -229,9 +240,11 @@ Non-terminal materialization is stuck:
    operation response. Fix Kubernetes API connectivity, RBAC, discovery, or
    namespace access first; the control plane has not proven whether that ref is
    missing, owned, unowned, or finalizer-blocked.
-7. If an operator has manually removed every recorded ref and verified no
-   singleton resource can be attached by the old workload, call
-   `ForceDeleteMaterialization`. Record a specific reason.
+7. Before `ForceDeleteMaterialization`, fence the old process and request path,
+   establish that old accepted API mutations can no longer take effect, inspect
+   every ref/descendant, and verify no singleton resource can be attached by the
+   old workload. Record this evidence in the audit reason. An absent name or a
+   stopped process alone is insufficient; keep the barrier if proof is unavailable.
 
 Hot routes are missing or unexpectedly cold:
 
@@ -255,6 +268,11 @@ A route change still reaches the old backend:
 
 Idle sleep is not happening:
 
+Automatic sleep is ineligible until the persisted Ready age reaches the greater
+of 190 seconds and the resolved class idle timeout. This expected activation
+deferral does not indicate stuck drain work; the sidecar also requires its full
+quiet interval after actual traffic.
+
 1. Check `sleepypods_runtime_active_streams` and
    `sleepypods_proxy_active_streams` for stuck work.
 2. Search `runtime.idle_report.event` for `active.count` and `generation`.
@@ -269,7 +287,7 @@ Delete cleanup is stuck or objects leak:
 2. Search `runtime.materialization.failure` and `runtime.wake.event` for cleanup
    `error.reason`.
 3. Check Kubernetes delete permissions for StatefulSet, Deployment, Service,
-   PVC, and PV objects and whether finalizers block deletion.
+   Secret, PVC and PV objects, plus Pod/ReplicaSet list permissions and whether finalizers block deletion.
 4. Compare leaked objects' SleepyPods labels and annotations with
    `ReconcileMaterialization` projection observations. Current-owned objects
    carry `managed-by=sleepypods`, materialization id, instance id, instance
@@ -278,8 +296,9 @@ Delete cleanup is stuck or objects leak:
    delete it. Resolve the name collision or manually remove the object only
    after confirming its real owner.
 6. After manual cleanup, prefer waiting for materialization reconciliation to
-   finalize. Use `ForceDeleteMaterialization` only when cleanup has been proven
-   and reconciliation cannot make progress.
+   finalize. Use `ForceDeleteMaterialization` only after the old process/request
+   path is fenced, delayed effects are excluded, and cleanup is proven. Follow
+   the [uncertain-effect recovery procedure](projection-safety.md).
 
 HTTP-01 challenge fails:
 
@@ -350,3 +369,15 @@ Image or container startup failures:
    `SLEEPYPODS_SIDECAR_MODE`.
 4. For workload startup, check app container readiness before blaming the
    sidecar or frontline.
+
+## Startup and process shutdown timing
+
+Frontline initial control-plane Channel setup has a 60-second total budget,
+including retry waits, and can be canceled by SIGINT or SIGTERM before it binds
+public listeners. The control plane retains its 25-second async shutdown cap;
+data-plane listeners retain their configured drain grace periods. After owned
+async cleanup finishes, all three binaries allow up to one additional second
+for final Tokio runtime teardown. Account for that separate allowance when
+interpreting process exit times and configuring termination grace. It prevents
+a blocking DNS worker left behind by a canceled future from pinning process
+exit; it does not shorten active-work drain or projection cleanup.

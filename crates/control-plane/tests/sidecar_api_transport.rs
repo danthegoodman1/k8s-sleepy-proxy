@@ -1,3 +1,88 @@
+#[macro_use]
+#[path = "support/unexpected_store.rs"]
+mod unexpected_store;
+mod support;
+use support::TestStore as FakeSidecarStore;
+
+#[tokio::test]
+async fn known_activation_hold_defers_before_kubernetes_membership_calls() {
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+    store.seed_instance(domain_instance(
+        "activation-advisory",
+        DomainInstanceState::Running,
+        7,
+    ));
+    store.seed_materialization(ready_materialization("activation-advisory", 7));
+    store.set_ready_age(std::time::Duration::from_secs(1));
+    let kube = FakeKubernetesClient::default();
+    *kube.membership_error.lock().unwrap() =
+        Some("unexpected Kubernetes membership call during known hold".into());
+    let service = sidecar_api(store.clone(), kube);
+    let status = service
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".into(),
+            instance_id: "activation-advisory".into(),
+            expected_generation: 7,
+            active_count: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        status.message().starts_with("automatic sleep deferred"),
+        "{status}"
+    );
+    assert_eq!(
+        status
+            .metadata()
+            .get(sleepypods_api::IDLE_RETRY_AFTER_METADATA)
+            .unwrap(),
+        "189000"
+    );
+    assert!(
+        store.sleep_requests().is_empty(),
+        "advisory check avoids both Kube and the final mutation attempt"
+    );
+}
+
+#[tokio::test]
+async fn report_idle_supplies_atomic_floor_and_maps_expected_deferral_with_retry_hint() {
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+    store.seed_instance(domain_instance(
+        "activation-pending",
+        DomainInstanceState::Running,
+        7,
+    ));
+    let materialization = ready_materialization("activation-pending", 7);
+    store.seed_materialization(materialization.clone());
+    store.defer_sleep_for(std::time::Duration::from_secs(185));
+    let kube = FakeKubernetesClient::default();
+    kube.seed_materialization(&materialization);
+    let service = sidecar_api(store.clone(), kube);
+    let status = service
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".into(),
+            instance_id: "activation-pending".into(),
+            expected_generation: 7,
+            active_count: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        status
+            .metadata()
+            .get(sleepypods_api::IDLE_RETRY_AFTER_METADATA)
+            .unwrap(),
+        "185000"
+    );
+    assert_eq!(store.instance().state, DomainInstanceState::Running);
+    assert_eq!(
+        store.sleep_requests()[0].minimum_ready_age,
+        Some(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT)
+    );
+}
+use support::{workload_class as fake_workload_class, FakeStoreError};
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -17,13 +102,11 @@ use control_plane::projection::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
 };
 use control_plane::{
-    AuthConfig, BackendEndpoint, BeginSleepRequest, BeginSleepResult, CallerRole, ControlPlaneAuth,
-    ControlPlaneStore, FinalizeSleepRequest, FinalizeSleepResult, Generation, InstanceId,
-    InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientFuture,
+    AuthConfig, BackendEndpoint, CallerRole, ControlPlaneAuth, ControlPlaneStore, Generation,
+    InstanceId, InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
-    RenderedObjectRef, StateTransitionReason, StaticBearerTokens, StoreError, StoreFuture,
-    StoreResult,
+    RenderedObjectRef, StateTransitionReason, StaticBearerTokens,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -60,6 +143,7 @@ fn authenticated_sidecar_service(
 #[test]
 fn generated_api_contains_sidecar_report_idle_shape_without_operator_surface_change() {
     let request = SidecarReportIdleRequest {
+        pod_uid: "test-pod".to_owned(),
         instance_id: "instance-1".to_owned(),
         expected_generation: 7,
         active_count: 0,
@@ -88,8 +172,68 @@ fn generated_api_contains_sidecar_report_idle_shape_without_operator_surface_cha
 }
 
 #[tokio::test]
+async fn report_idle_legacy_identity_or_unsupported_membership_never_starts_sleep() {
+    for reason in [
+        "legacy",
+        "replicas",
+        "membership",
+        "stale_uid",
+        "missing_materialization",
+        "unready_materialization",
+        "stale_materialization",
+    ] {
+        let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+        store.seed_instance(domain_instance(
+            "instance-running",
+            DomainInstanceState::Running,
+            7,
+        ));
+        if reason != "missing_materialization" {
+            let mut materialization = ready_materialization("instance-running", 7);
+            if reason == "unready_materialization" {
+                materialization.state = MaterializationState::Pending;
+            }
+            if reason == "stale_materialization" {
+                materialization.instance_generation = Generation::new(6);
+            }
+            store.seed_materialization(materialization);
+        }
+        let client = FakeKubernetesClient::default();
+        if reason == "replicas" {
+            store.set_replicas(Some(2));
+        }
+        if reason == "membership" {
+            *client.membership_error.lock().unwrap() = Some("observed two pods".to_owned());
+        }
+        let service = sidecar_api(store.clone(), client.clone());
+        let error = service
+            .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+                instance_id: "instance-running".to_owned(),
+                expected_generation: 7,
+                active_count: 0,
+                pod_uid: match reason {
+                    "legacy" => "",
+                    "stale_uid" => "deleted-pod",
+                    _ => "test-pod",
+                }
+                .to_owned(),
+            }))
+            .await
+            .expect_err("unsupported report must fail closed");
+        assert_eq!(error.code(), Code::FailedPrecondition, "{reason}");
+        assert_eq!(
+            store.instance().state,
+            DomainInstanceState::Running,
+            "{reason}"
+        );
+        assert!(store.transition_requests().is_empty());
+        assert!(client.deleted_objects().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn report_idle_running_instance_transitions_to_draining() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-running",
         DomainInstanceState::Running,
@@ -103,6 +247,7 @@ async fn report_idle_running_instance_transitions_to_draining() {
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-running".to_owned(),
             expected_generation: 7,
             active_count: 0,
@@ -140,14 +285,15 @@ async fn report_idle_running_instance_transitions_to_draining() {
 }
 
 #[tokio::test]
-async fn report_idle_from_rendered_waking_generation_sleeps_current_running_instance() {
-    let store = Arc::new(FakeSidecarStore::default());
+async fn report_idle_uses_exact_persisted_projection_independent_of_cas_revision() {
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-rendered-generation",
         DomainInstanceState::Running,
         8,
     ));
-    let materialization = ready_materialization("instance-rendered-generation", 8);
+    let mut materialization = ready_materialization("instance-rendered-generation", 8);
+    materialization.projection_generation = Generation::new(7);
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -155,6 +301,7 @@ async fn report_idle_from_rendered_waking_generation_sleeps_current_running_inst
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-rendered-generation".to_owned(),
             expected_generation: 7,
             active_count: 0,
@@ -176,8 +323,56 @@ async fn report_idle_from_rendered_waking_generation_sleeps_current_running_inst
 }
 
 #[tokio::test]
+async fn report_idle_never_infers_an_older_projection_from_revision_arithmetic() {
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+    store.seed_instance(domain_instance(
+        "exact-projection",
+        DomainInstanceState::Running,
+        8,
+    ));
+    store.seed_materialization(ready_materialization("exact-projection", 8));
+    let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
+    let response = service
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
+            instance_id: "exact-projection".to_owned(),
+            expected_generation: 7,
+            active_count: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let conflict = expect_generation_conflict(response);
+    assert_eq!(conflict.actual_generation, 8);
+    assert!(store.transition_requests().is_empty());
+}
+
+#[tokio::test]
+async fn report_idle_untrusted_maximum_generation_does_not_overflow_drain_replay() {
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+    store.seed_instance(domain_instance(
+        "idle-overflow",
+        DomainInstanceState::Draining,
+        8,
+    ));
+    let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
+    let response = service
+        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
+            instance_id: "idle-overflow".to_owned(),
+            expected_generation: u64::MAX,
+            active_count: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(expect_generation_conflict(response).actual_generation, 8);
+    assert!(store.transition_requests().is_empty());
+}
+
+#[tokio::test]
 async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-delete-retry",
         DomainInstanceState::Running,
@@ -189,6 +384,7 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
     client.seed_materialization(&materialization);
     let service = sidecar_api(store.clone(), client.clone());
     let request = SidecarReportIdleRequest {
+        pod_uid: "test-pod".to_owned(),
         instance_id: "instance-delete-retry".to_owned(),
         expected_generation: 7,
         active_count: 0,
@@ -223,7 +419,7 @@ async fn report_idle_restart_during_sleep_resumes_cleanup_from_store_state() {
 
 #[tokio::test]
 async fn report_idle_unowned_live_ref_blocks_cleanup_without_delete() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-unowned",
         DomainInstanceState::Running,
@@ -241,6 +437,7 @@ async fn report_idle_unowned_live_ref_blocks_cleanup_without_delete() {
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-unowned".to_owned(),
             expected_generation: 7,
             active_count: 0,
@@ -262,7 +459,7 @@ async fn report_idle_unowned_live_ref_blocks_cleanup_without_delete() {
 
 #[tokio::test]
 async fn report_idle_nonzero_active_count_returns_failed_precondition_without_mutation() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-active",
         DomainInstanceState::Running,
@@ -272,6 +469,7 @@ async fn report_idle_nonzero_active_count_returns_failed_precondition_without_mu
 
     let error = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-active".to_owned(),
             expected_generation: 7,
             active_count: 1,
@@ -289,7 +487,7 @@ async fn report_idle_nonzero_active_count_returns_failed_precondition_without_mu
 
 #[tokio::test]
 async fn report_idle_duplicate_at_next_draining_generation_is_idempotent() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-draining",
         DomainInstanceState::Draining,
@@ -299,6 +497,7 @@ async fn report_idle_duplicate_at_next_draining_generation_is_idempotent() {
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-draining".to_owned(),
             expected_generation: 7,
             active_count: 0,
@@ -317,7 +516,7 @@ async fn report_idle_duplicate_at_next_draining_generation_is_idempotent() {
 
 #[tokio::test]
 async fn report_idle_stale_generation_conflict_is_structured_response() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-conflict",
         DomainInstanceState::Draining,
@@ -327,6 +526,7 @@ async fn report_idle_stale_generation_conflict_is_structured_response() {
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-conflict".to_owned(),
             expected_generation: 6,
             active_count: 0,
@@ -344,7 +544,7 @@ async fn report_idle_stale_generation_conflict_is_structured_response() {
 
 #[tokio::test]
 async fn report_idle_non_running_matching_generation_returns_unavailable() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-waking",
         DomainInstanceState::Waking,
@@ -354,6 +554,7 @@ async fn report_idle_non_running_matching_generation_returns_unavailable() {
 
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-waking".to_owned(),
             expected_generation: 4,
             active_count: 0,
@@ -376,12 +577,13 @@ async fn report_idle_non_running_matching_generation_returns_unavailable() {
 #[tokio::test]
 async fn report_idle_invalid_instance_id_returns_invalid_argument() {
     let service = sidecar_api(
-        Arc::new(FakeSidecarStore::default()),
+        Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class())),
         FakeKubernetesClient::default(),
     );
 
     let error = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "".to_owned(),
             expected_generation: 1,
             active_count: 0,
@@ -395,12 +597,13 @@ async fn report_idle_invalid_instance_id_returns_invalid_argument() {
 
 #[tokio::test]
 async fn report_idle_store_unavailable_returns_grpc_unavailable() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.fail_get_with(FakeStoreError::Unavailable("database is down"));
     let service = sidecar_api(store, FakeKubernetesClient::default());
 
     let error = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-store-error".to_owned(),
             expected_generation: 1,
             active_count: 0,
@@ -414,12 +617,13 @@ async fn report_idle_store_unavailable_returns_grpc_unavailable() {
 
 #[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-transport",
         DomainInstanceState::Running,
         2,
     ));
+    store.seed_materialization(ready_materialization("instance-transport", 2));
 
     let response = sidecar_grpc_service_with_store(
         store.clone(),
@@ -428,6 +632,7 @@ async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
     )
     .oneshot(grpc_sidecar_report_idle_request(
         SidecarReportIdleRequest {
+            pod_uid: "test-pod".to_owned(),
             instance_id: "instance-transport".to_owned(),
             expected_generation: 2,
             active_count: 0,
@@ -461,7 +666,7 @@ async fn native_grpc_request_dispatches_to_store_backed_sidecar_report_idle() {
 
 #[tokio::test]
 async fn native_grpc_sidecar_auth_rejects_report_idle_before_sleep_logic() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-auth-idle",
         DomainInstanceState::Running,
@@ -477,6 +682,7 @@ async fn native_grpc_sidecar_auth_rejects_report_idle_before_sleep_logic() {
         )
         .oneshot(grpc_sidecar_report_idle_request(
             SidecarReportIdleRequest {
+                pod_uid: "test-pod".to_owned(),
                 instance_id: "instance-auth-idle".to_owned(),
                 expected_generation: 7,
                 active_count: 0,
@@ -497,6 +703,7 @@ async fn native_grpc_sidecar_auth_rejects_report_idle_before_sleep_logic() {
             .oneshot(with_authorization(
                 grpc_sidecar_report_idle_request(
                     SidecarReportIdleRequest {
+                        pod_uid: "test-pod".to_owned(),
                         instance_id: "instance-auth-idle".to_owned(),
                         expected_generation: 7,
                         active_count: 0,
@@ -517,7 +724,7 @@ async fn native_grpc_sidecar_auth_rejects_report_idle_before_sleep_logic() {
 
 #[tokio::test]
 async fn native_grpc_sidecar_auth_accepts_valid_report_idle_credentials() {
-    let store = Arc::new(FakeSidecarStore::default());
+    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "instance-auth-valid-idle",
         DomainInstanceState::Running,
@@ -533,6 +740,7 @@ async fn native_grpc_sidecar_auth_accepts_valid_report_idle_credentials() {
         .oneshot(with_authorization(
             grpc_sidecar_report_idle_request(
                 SidecarReportIdleRequest {
+                    pod_uid: "test-pod".to_owned(),
                     instance_id: "instance-auth-valid-idle".to_owned(),
                     expected_generation: 7,
                     active_count: 0,
@@ -672,16 +880,12 @@ fn expect_unavailable(
     unavailable
 }
 
-#[derive(Clone, Copy)]
-enum FakeStoreError {
-    Unavailable(&'static str),
-}
-
 #[derive(Clone, Debug, Default)]
 struct FakeKubernetesClient {
     deleted_objects: Arc<Mutex<Vec<RenderedObjectRef>>>,
     failing_deletes: Arc<Mutex<usize>>,
     live_objects: Arc<Mutex<BTreeMap<String, ProjectionObjectInspection>>>,
+    membership_error: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeKubernetesClient {
@@ -690,6 +894,7 @@ impl FakeKubernetesClient {
             deleted_objects: Arc::new(Mutex::new(Vec::new())),
             failing_deletes: Arc::new(Mutex::new(count)),
             live_objects: Arc::new(Mutex::new(BTreeMap::new())),
+            membership_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -713,6 +918,11 @@ impl FakeKubernetesClient {
             .insert(
                 object_key(&object),
                 ProjectionObjectInspection::Present(LiveObjectMetadata {
+                    persistent_volume_reclaim_policy: Some("Retain".into()),
+                    identity: control_plane::projection::LiveObjectIdentity {
+                        uid: "test-uid".into(),
+                        resource_version: "1".into(),
+                    },
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     deleting: false,
@@ -730,9 +940,26 @@ impl FakeKubernetesClient {
 }
 
 impl KubernetesMaterializerClient for FakeKubernetesClient {
+    fn verify_idle_member<'a>(
+        &'a self,
+        _objects: &'a [RenderedObjectRef],
+        identity: &'a control_plane::materializer::IdleMemberIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            if let Some(error) = self.membership_error.lock().unwrap().as_ref() {
+                return Err(control_plane::KubernetesClientError::new(error));
+            }
+            if identity.pod_uid != "test-pod" {
+                return Err(control_plane::KubernetesClientError::new("unknown pod UID"));
+            }
+            Ok(())
+        })
+    }
+
     fn apply_object<'a>(
         &'a self,
         _object: &'a control_plane::KubernetesObject,
+        _precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -740,6 +967,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
     fn delete_object<'a>(
         &'a self,
         object: &'a RenderedObjectRef,
+        _precondition: &'a control_plane::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             let mut failing_deletes = self
@@ -798,380 +1026,23 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .unwrap_or(ProjectionObjectInspection::Missing))
         })
     }
-}
 
-#[derive(Default)]
-struct FakeSidecarStore {
-    instance: Mutex<Option<InstanceRecord>>,
-    materialization: Mutex<Option<MaterializationRecord>>,
-    transition_requests: Mutex<Vec<control_plane::CompareAndSwapInstanceStateRequest>>,
-    get_error: Mutex<Option<FakeStoreError>>,
-}
-
-impl FakeSidecarStore {
-    fn seed_instance(&self, instance: InstanceRecord) {
-        *self.instance.lock().expect("fake store lock is available") = Some(instance);
-    }
-
-    fn seed_materialization(&self, materialization: MaterializationRecord) {
-        *self
-            .materialization
-            .lock()
-            .expect("fake store lock is available") = Some(materialization);
-    }
-
-    fn fail_get_with(&self, error: FakeStoreError) {
-        *self.get_error.lock().expect("fake store lock is available") = Some(error);
-    }
-
-    fn instance(&self) -> InstanceRecord {
-        self.instance
-            .lock()
-            .expect("fake store lock is available")
-            .clone()
-            .expect("fake instance is present")
-    }
-
-    fn transition_requests(&self) -> Vec<control_plane::CompareAndSwapInstanceStateRequest> {
-        self.transition_requests
-            .lock()
-            .expect("fake store lock is available")
-            .clone()
-    }
-
-    fn materialization(&self) -> Option<MaterializationRecord> {
-        self.materialization
-            .lock()
-            .expect("fake store lock is available")
-            .clone()
-    }
-
-    fn transition_instance(
-        &self,
-        instance_id: InstanceId,
-        expected_generation: Generation,
-        next_state: DomainInstanceState,
-        reason: StateTransitionReason,
-    ) -> StoreResult<InstanceRecord> {
-        let mut instance = self.instance.lock().expect("fake store lock is available");
-        let instance = instance.as_mut().ok_or(StoreError::NotFound {
-            resource: "instance",
-        })?;
-        if instance.id != instance_id {
-            return Err(StoreError::NotFound {
-                resource: "instance",
-            });
-        }
-        if instance.generation != expected_generation {
-            return Err(StoreError::GenerationConflict {
-                expected: expected_generation,
-                actual: instance.generation,
-            });
-        }
-
-        control_plane::instance::validate_instance_state_transition(
-            instance.state,
-            next_state,
-            &reason,
-        )
-        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
-
-        self.transition_requests
-            .lock()
-            .expect("fake store lock is available")
-            .push(control_plane::CompareAndSwapInstanceStateRequest {
-                instance_id,
-                expected_generation,
-                next_state,
-                reason,
-            });
-        instance.state = next_state;
-        instance.generation = expected_generation.next();
-        Ok(instance.clone())
-    }
-
-    fn mark_materialization(
-        &self,
-        instance_id: InstanceId,
-        target: MaterializationTarget,
-        state: MaterializationState,
-        instance_generation: Option<Generation>,
-        rendered_objects: Option<Vec<RenderedObjectRef>>,
-    ) -> Option<MaterializationRecord> {
-        let mut materialization = self
-            .materialization
-            .lock()
-            .expect("fake store lock is available");
-        let materialization = materialization.as_mut().filter(|materialization| {
-            materialization.instance_id == instance_id
-                && materialization.target == target
-                && materialization.state != MaterializationState::Deleted
-        })?;
-
-        materialization.state = state;
-        materialization.backend = None;
-        if let Some(instance_generation) = instance_generation {
-            materialization.instance_generation = instance_generation;
-        }
-        if let Some(rendered_objects) = rendered_objects {
-            materialization.rendered_objects = rendered_objects;
-        }
-
-        Some(materialization.clone())
-    }
-}
-
-impl ControlPlaneStore for FakeSidecarStore {
-    fn create_instance<'a>(
+    fn ensure_no_descendants<'a>(
         &'a self,
-        _request: control_plane::CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::CreateInstanceResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        _objects: &'a [RenderedObjectRef],
+        _instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async { Ok(()) })
     }
 
-    fn get_instance<'a>(
+    fn verify_retained_bindings<'a>(
         &'a self,
-        request: control_plane::GetInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
-        Box::pin(async move {
-            if let Some(error) = *self.get_error.lock().expect("fake store lock is available") {
-                return Err(match error {
-                    FakeStoreError::Unavailable(message) => StoreError::unavailable(message),
-                });
-            }
-
-            Ok(self
-                .instance
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .filter(|instance| instance.id == request.instance_id)
-                .cloned())
-        })
-    }
-
-    fn delete_instance<'a>(
-        &'a self,
-        _request: control_plane::DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn create_workload_class_version<'a>(
-        &'a self,
-        _request: control_plane::CreateWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn load_workload_class_version<'a>(
-        &'a self,
-        request: control_plane::LoadWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::WorkloadClassVersion>>> {
-        Box::pin(async move {
-            let workload_class = fake_workload_class();
-            Ok((workload_class.reference == request.reference).then_some(workload_class))
-        })
-    }
-
-    fn create_route_binding<'a>(
-        &'a self,
-        _request: control_plane::CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteBindingRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn get_route_binding<'a>(
-        &'a self,
-        _request: control_plane::GetRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteBindingRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn delete_route_binding<'a>(
-        &'a self,
-        _request: control_plane::DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        _request: control_plane::ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn resolve_route<'a>(
-        &'a self,
-        _identity: control_plane::RouteIdentity,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: control_plane::CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move {
-            let mut instance = self.instance.lock().expect("fake store lock is available");
-            let instance = instance.as_mut().ok_or(StoreError::NotFound {
-                resource: "instance",
-            })?;
-            if instance.id != request.instance_id {
-                return Err(StoreError::NotFound {
-                    resource: "instance",
-                });
-            }
-            if instance.generation != request.expected_generation {
-                return Err(StoreError::GenerationConflict {
-                    expected: request.expected_generation,
-                    actual: instance.generation,
-                });
-            }
-
-            control_plane::instance::validate_instance_state_transition(
-                instance.state,
-                request.next_state,
-                &request.reason,
-            )
-            .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
-
-            self.transition_requests
-                .lock()
-                .expect("fake store lock is available")
-                .push(request.clone());
-            instance.state = request.next_state;
-            instance.generation = request.expected_generation.next();
-            Ok(instance.clone())
-        })
-    }
-
-    fn record_materialization<'a>(
-        &'a self,
-        _request: control_plane::RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::MaterializationRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn load_ready_materialization<'a>(
-        &'a self,
-        _request: control_plane::materialization::LoadReadyMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn load_active_materialization<'a>(
-        &'a self,
-        request: control_plane::LoadActiveMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materialization
-                .lock()
-                .expect("fake store lock is available")
-                .as_ref()
-                .filter(|materialization| {
-                    materialization.instance_id == request.instance_id
-                        && materialization.target == request.target
-                        && materialization.state != MaterializationState::Deleted
-                })
-                .cloned())
-        })
-    }
-
-    fn complete_wake<'a>(
-        &'a self,
-        _request: control_plane::CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::CompleteWakeResult>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn begin_sleep<'a>(
-        &'a self,
-        request: BeginSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
-        Box::pin(async move {
-            let updated = self.transition_instance(
-                request.instance_id.clone(),
-                request.expected_running_generation,
-                DomainInstanceState::Draining,
-                StateTransitionReason::IdleReported,
-            )?;
-            let materialization = self.mark_materialization(
-                request.instance_id,
-                request.target,
-                MaterializationState::Deleting,
-                None,
-                None,
-            );
-
-            Ok(BeginSleepResult {
-                instance: updated,
-                materialization,
-            })
-        })
-    }
-
-    fn finalize_sleep<'a>(
-        &'a self,
-        request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        Box::pin(async move {
-            let updated = self.transition_instance(
-                request.instance_id.clone(),
-                request.expected_draining_generation,
-                DomainInstanceState::Cold,
-                StateTransitionReason::DrainCompleted,
-            )?;
-            let materialization = self.mark_materialization(
-                request.instance_id,
-                request.target,
-                MaterializationState::Deleted,
-                Some(updated.generation),
-                Some(Vec::new()),
-            );
-
-            Ok(FinalizeSleepResult {
-                instance: updated,
-                materialization,
-            })
-        })
-    }
-
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        _request: control_plane::RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteDependencySet>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn put_http01_challenge<'a>(
-        &'a self,
-        _request: control_plane::PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn resolve_http01_challenge<'a>(
-        &'a self,
-        _key: control_plane::Http01ChallengeKey,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn delete_http01_challenge<'a>(
-        &'a self,
-        _request: control_plane::DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
-    }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        _request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async { Err(StoreError::internal("fake store method is not implemented")) })
+        _objects: &'a [RenderedObjectRef],
+    ) -> control_plane::materializer::KubernetesClientFuture<
+        'a,
+        control_plane::materializer::KubernetesClientResult<()>,
+    > {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -1188,59 +1059,13 @@ fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> Ins
     }
 }
 
-fn fake_workload_class() -> control_plane::WorkloadClassVersion {
-    control_plane::WorkloadClassVersion {
-        reference: control_plane::WorkloadClassVersionRef::new(
-            control_plane::WorkloadClassId::new("class-1").expect("class id is valid"),
-            Generation::new(1),
-        ),
-        template_generation: Generation::new(1),
-        template: control_plane::ManifestTemplate {
-            workload: control_plane::WorkloadTemplate {
-                kind: control_plane::WorkloadKind::Deployment,
-                name: control_plane::TemplateText::literal("app"),
-                replicas: None,
-                app_container: control_plane::ContainerTemplate {
-                    name: "app".to_owned(),
-                    image: control_plane::TemplateText::literal("example/app:1"),
-                    ports: vec![control_plane::ContainerPortTemplate {
-                        name: Some("http".to_owned()),
-                        container_port: 8080,
-                    }],
-                    env: Vec::new(),
-                },
-            },
-            service: Some(control_plane::ServiceTemplate {
-                name: control_plane::TemplateText::literal("svc"),
-                ports: vec![control_plane::ServicePortTemplate {
-                    name: Some("http".to_owned()),
-                    port: 80,
-                    target_port: 8080,
-                }],
-            }),
-            sidecar: control_plane::SidecarTemplate {
-                name: "sleepypods-sidecar".to_owned(),
-                image: control_plane::TemplateText::literal("sleepypods/sidecar:test"),
-                listen_port: 15000,
-                mode: None,
-            },
-            volumes: Vec::new(),
-            raw_objects: Vec::new(),
-        },
-        default_values: BTreeMap::new(),
-        value_schema: control_plane::WorkloadValueSchema::new(true),
-        sleep_policy: control_plane::WorkloadSleepPolicy::new(120_000, 5_000, 30_000)
-            .expect("sleep policy is valid"),
-        exclusivity_keys: Vec::new(),
-    }
-}
-
 fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationRecord {
     MaterializationRecord {
         id: MaterializationId::new(format!("{}:cluster-a:apps", instance_id))
             .expect("materialization id is valid"),
         instance_id: InstanceId::new(instance_id).expect("instance id is valid"),
         instance_generation: Generation::new(generation),
+        projection_generation: Generation::new(generation),
         target: target(),
         state: MaterializationState::Ready,
         backend: Some(BackendEndpoint::new("http://example").expect("backend is valid")),
@@ -1273,6 +1098,11 @@ fn object_key(object: &RenderedObjectRef) -> String {
 
 fn owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata {
     LiveObjectMetadata {
+        persistent_volume_reclaim_policy: Some("Retain".into()),
+        identity: control_plane::projection::LiveObjectIdentity {
+            uid: "test-uid".into(),
+            resource_version: "1".into(),
+        },
         labels: BTreeMap::from([
             (
                 LABEL_MANAGED_BY.to_owned(),
@@ -1284,7 +1114,7 @@ fn owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata
             ),
             (
                 "sleepypods.io/instance-generation".to_owned(),
-                materialization.instance_generation.to_string(),
+                materialization.projection_generation.to_string(),
             ),
         ]),
         annotations: BTreeMap::from([(

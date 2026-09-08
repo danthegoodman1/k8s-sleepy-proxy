@@ -6,7 +6,7 @@ status when a documented gap actually closes.
 
 ## Repo Map
 
-- `crates/control-plane`: protobuf API, durable store trait, Postgres provider,
+- `crates/control-plane`: API service implementations, durable store trait, Postgres provider,
   route resolver, wake/sleep/delete state machines, manifest rendering,
   Kubernetes materializer, native gRPC, and gRPC-Web operator transport.
 - `crates/frontline`: always-on proxy runtime, route cache and matcher, lazy
@@ -15,8 +15,11 @@ status when a documented gap actually closes.
 - `crates/sidecar`: workload-local HTTP/TCP proxy, drain/idle detection,
   `ReportIdle` client, and sidecar load-smoke helper.
 - `crates/proxy-core`: shared proxy primitives, TLS ClientHello/SNI parsing,
-  accounting, drain, shutdown, timeout, observability descriptors, and hot-path
-  benches.
+  accounting, drain, shutdown, timeout, proxy-specific metrics adapters, and hot-path benches.
+- `crates/sleepypods-api`: generated protobuf clients/services, shared routing and
+  HTTP-01 contracts, state/backend/target values, and client bearer authentication.
+- `crates/sleepypods-observability`: metric and tracing vocabulary, the single
+  process-wide recorder, sinks, and Prometheus exporter.
 - `crates/sleepypods-types`: shared ID/value types.
 - `scripts`: production-image smokes, kind E2E gates, soak gates, load-budget
   helpers, and Criterion regression checker.
@@ -25,16 +28,17 @@ status when a documented gap actually closes.
 
 ## Source Of Truth
 
-- API/proto: `crates/control-plane/proto/sleepypods/controlplane/v1/control_plane.proto`
-- Code generation: `crates/control-plane/build.rs`
+- API/proto: `crates/sleepypods-api/proto/sleepypods/controlplane/v1/control_plane.proto`
+- Code generation: `crates/sleepypods-api/build.rs`
 - Store contract: `crates/control-plane/src/store.rs`
 - Postgres provider: `crates/control-plane/src/postgres/`
 - Manifest rendering: `crates/control-plane/src/manifest/`
 - Kubernetes materialization: `crates/control-plane/src/kube_materializer.rs`
   and `crates/control-plane/src/materializer.rs`
 - Resource/lifecycle semantics: `crates/control-plane/src/workload.rs`,
-  `instance.rs`, `route.rs`, `http01.rs`, `wake.rs`, `idle.rs`,
-  `sleep_policy.rs`, and `materialization.rs`
+  `instance.rs`, `wake.rs`, `idle.rs`,
+  `sleep_policy.rs`, and `materialization.rs`; shared route and HTTP-01 contracts
+  are in `crates/sleepypods-api/src/{route,http01}.rs`.
 - Operator/proxy/sidecar services:
   `crates/control-plane/src/api/server.rs`, `api/proxy.rs`, `api/sidecar.rs`
 - Frontline route cache/resolver:
@@ -42,8 +46,8 @@ status when a documented gap actually closes.
   `subscription.rs`
 - Sidecar idle: `crates/sidecar/src/idle.rs` and
   `crates/sidecar/src/idle/control_plane.rs`
-- Observability: `crates/proxy-core/src/observability/metrics.rs`,
-  `recorder.rs`, and `mod.rs`
+- Observability: `crates/sleepypods-observability/src/metrics.rs`,
+  `recorder.rs`, and `lib.rs`; proxy adapters stay in `crates/proxy-core/src/observability/`.
 - Hot-path/load gates: `docs/proxy-hot-path-budgets.md`,
   `crates/proxy-core/benches/proxy_primitives.rs`,
   `crates/frontline/benches/route_lookup.rs`, and `scripts/smoke-*-load.sh`
@@ -52,7 +56,7 @@ status when a documented gap actually closes.
 
 ## Generated Files
 
-`crates/control-plane/build.rs` uses vendored `protoc` through
+`crates/sleepypods-api/build.rs` uses vendored `protoc` through
 `tonic_prost_build` to compile the protobuf at build time. Generated Rust lives
 under Cargo build output, not checked into the repo.
 
@@ -77,11 +81,13 @@ or cross-component contracts move.
 | Frontline route/cache/listener | `cargo test -p frontline`; route lookup changes also run `cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Control-plane API/store/lifecycle | `cargo test -p control-plane`; Postgres-backed store work also run `./scripts/test-postgres-store.sh` |
 | Sidecar runtime/idle | `cargo test -p sidecar` |
+| API/observability crate boundaries | `./scripts/test-dependency-boundaries.py`, `cargo test -p sleepypods-api -p sleepypods-observability -p proxy-core -p frontline -p sidecar` |
 | Production images | `./scripts/smoke-images.sh` |
 | Load-budget logic | `./scripts/test-load-budget.sh`, `./scripts/test-criterion-regressions.py`, and the relevant `./scripts/smoke-*-load.sh` |
 | Benchmark regression review | `./scripts/check-criterion-regressions.py` after collecting local Criterion baselines |
 | Kubernetes materializer | `./scripts/test-kind-materializer.sh` |
 | Full platform behavior | the targeted `./scripts/test-kind-e2e-*.sh` gate |
+| Soak inventory reader/polling | `python3 scripts/test-full-wake-sleep-inventory.py` (mocked Kubernetes; no cluster) |
 | Repeated wake/sleep leaks | `./scripts/soak-kind-full-wake-sleep.sh` or `./scripts/soak-kind-materializer.sh` |
 
 No cargo tests are required for docs-only changes unless the docs edit also
@@ -120,11 +126,11 @@ Targeted gates live in `scripts/`:
   unbounded allocation, and per-request client construction.
 - Route cache subscription IDs are opaque. Do not parse them or make them part
   of public resource identity.
-- StatefulSet replicas above one are not supported in V1.
+- Deployment and StatefulSet automatic sleep require exactly one replica and a current Pod UID; unknown or overlapping membership fails closed.
 - HTTP/3, multi-cluster remote forwarding, and rich route predicates are
   deferred.
 - Observability metric names and log event fields must match
-  `proxy-core/src/observability`; update operator docs when they change.
+  `sleepypods-observability/src`; update operator docs when they change.
 - Add dependencies through the ecosystem command (`cargo add`, `npm install`,
   etc.) unless there is no suitable command or an exact manual constraint is
   required. Inspect manifest and lockfile diffs afterward.

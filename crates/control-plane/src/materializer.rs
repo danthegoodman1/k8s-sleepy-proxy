@@ -22,15 +22,40 @@ pub type KubernetesClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send +
 pub type KubernetesClientResult<T> = Result<T, KubernetesClientError>;
 type ObjectMetadataMaps<'a> = (&'a BTreeMap<String, String>, &'a BTreeMap<String, String>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdleMemberIdentity {
+    pub instance_id: crate::ids::InstanceId,
+    pub instance_generation: crate::ids::Generation,
+    pub materialization_id: crate::ids::MaterializationId,
+    pub pod_uid: String,
+}
+
 pub trait KubernetesMaterializerClient: Send + Sync {
+    /// Verify one ready, non-terminating member belongs to this active projection.
+    /// Unknown membership must fail closed, including clients without inspection support.
+    fn verify_idle_member<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        identity: &'a IdleMemberIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        let _ = (objects, identity);
+        Box::pin(async {
+            Err(KubernetesClientError::new(
+                "idle membership inspection is not implemented by this client",
+            ))
+        })
+    }
+
     fn apply_object<'a>(
         &'a self,
         object: &'a KubernetesObject,
+        precondition: Option<&'a crate::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>>;
 
     fn delete_object<'a>(
         &'a self,
         object: &'a RenderedObjectRef,
+        precondition: &'a crate::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>>;
 
     fn wait_for_pvc_bound<'a>(
@@ -52,6 +77,36 @@ pub trait KubernetesMaterializerClient: Send + Sync {
         Box::pin(async {
             Err(KubernetesClientError::new(
                 "Kubernetes object inspection is not implemented by this client",
+            ))
+        })
+    }
+
+    fn verify_retained_bindings<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            if objects
+                .iter()
+                .any(|object| object.kind == "PersistentVolumeClaim")
+            {
+                return Err(KubernetesClientError::new(
+                    "retained static binding inspection is not implemented by this client",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn ensure_no_descendants<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        let _ = (objects, instance_id);
+        Box::pin(async {
+            Err(KubernetesClientError::new(
+                "descendant absence inspection is not implemented by this client",
             ))
         })
     }
@@ -81,6 +136,7 @@ pub struct RetryingKubernetesMaterializerClient<C> {
 pub struct KubernetesClientError {
     message: String,
     retryable: bool,
+    outcome_uncertain: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,8 +219,34 @@ where
         &self,
         manifest: &RenderedManifest,
     ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
-        let rendered_objects = rendered_object_refs(manifest)?;
+        let mut observations = Vec::new();
+        for object_ref in rendered_object_refs(manifest)? {
+            let mut observation =
+                crate::projection::ProjectionObservation::missing(object_ref.clone());
+            if let ProjectionObjectInspection::Present(live) = self
+                .client
+                .inspect_object(&object_ref)
+                .await
+                .map_err(|source| MaterializerError::Apply {
+                    object: Box::new(object_ref.clone()),
+                    applied_objects: Vec::new(),
+                    source,
+                })?
+            {
+                observation.identity = Some(live.identity);
+            }
+            observations.push(observation);
+        }
+        self.apply_manifest_with_preconditions(manifest, &observations)
+            .await
+    }
 
+    pub(crate) async fn apply_manifest_with_preconditions(
+        &self,
+        manifest: &RenderedManifest,
+        observations: &[crate::projection::ProjectionObservation],
+    ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
+        let rendered_objects = rendered_object_refs(manifest)?;
         let objects = ordered_objects(manifest);
         let mut applied_refs = Vec::with_capacity(objects.len());
 
@@ -172,11 +254,9 @@ where
             .iter()
             .filter(|object| object.apply_order == ApplyOrder::PersistentVolume)
         {
-            match self.apply_object(&object.object).await {
+            match self.apply_object(&object.object, observations).await {
                 Ok(object_ref) => applied_refs.push(object_ref),
                 Err(error) => {
-                    self.delete_rendered_objects_best_effort(&applied_refs)
-                        .await;
                     return Err(error.with_applied_objects(&applied_refs));
                 }
             }
@@ -187,11 +267,9 @@ where
             .iter()
             .filter(|object| object.apply_order == ApplyOrder::PersistentVolumeClaim)
         {
-            let object_ref = match self.apply_object(&object.object).await {
+            let object_ref = match self.apply_object(&object.object, observations).await {
                 Ok(object_ref) => object_ref,
                 Err(error) => {
-                    self.delete_rendered_objects_best_effort(&applied_refs)
-                        .await;
                     return Err(error.with_applied_objects(&applied_refs));
                 }
             };
@@ -201,22 +279,22 @@ where
 
         for pvc in pvc_refs {
             if let Err(error) = self.wait_for_pvc_bound(&pvc).await {
-                self.delete_rendered_objects_best_effort(&applied_refs)
-                    .await;
                 return Err(error.with_applied_objects(&applied_refs));
             }
         }
 
-        for apply_order in [ApplyOrder::Service, ApplyOrder::Workload] {
+        for apply_order in [
+            ApplyOrder::Secret,
+            ApplyOrder::Service,
+            ApplyOrder::Workload,
+        ] {
             for object in objects
                 .iter()
                 .filter(|object| object.apply_order == apply_order)
             {
-                match self.apply_object(&object.object).await {
+                match self.apply_object(&object.object, observations).await {
                     Ok(object_ref) => applied_refs.push(object_ref),
                     Err(error) => {
-                        self.delete_rendered_objects_best_effort(&applied_refs)
-                            .await;
                         return Err(error.with_applied_objects(&applied_refs));
                     }
                 }
@@ -243,6 +321,39 @@ where
         &self,
         objects: &[RenderedObjectRef],
     ) -> Result<(), MaterializerError> {
+        if let Some(pvc) = objects
+            .iter()
+            .find(|object| object.kind == "PersistentVolumeClaim")
+        {
+            self.client
+                .verify_retained_bindings(objects)
+                .await
+                .map_err(|source| MaterializerError::Delete {
+                    object: Box::new(pvc.clone()),
+                    source,
+                })?;
+        }
+        for object in objects
+            .iter()
+            .filter(|object| object.kind == "PersistentVolume")
+        {
+            let inspection = self.client.inspect_object(object).await.map_err(|source| {
+                MaterializerError::Delete {
+                    object: Box::new(object.clone()),
+                    source,
+                }
+            })?;
+            if let ProjectionObjectInspection::Present(live) = inspection {
+                if live.persistent_volume_reclaim_policy.as_deref() != Some("Retain") {
+                    return Err(MaterializerError::Delete {
+                        object: Box::new(object.clone()),
+                        source: KubernetesClientError::new(
+                            "managed static PV requires Retain before any cleanup, including PVC deletion",
+                        ),
+                    });
+                }
+            }
+        }
         for object in delete_order(objects) {
             self.delete_rendered_object(object).await?;
         }
@@ -254,8 +365,28 @@ where
         &self,
         object: &RenderedObjectRef,
     ) -> Result<(), MaterializerError> {
+        let inspection = self.client.inspect_object(object).await.map_err(|source| {
+            MaterializerError::Delete {
+                object: Box::new(object.clone()),
+                source,
+            }
+        })?;
+        match inspection {
+            ProjectionObjectInspection::Missing => Ok(()),
+            ProjectionObjectInspection::Present(live) => {
+                self.delete_rendered_object_conditionally(object, &live.identity)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn delete_rendered_object_conditionally(
+        &self,
+        object: &RenderedObjectRef,
+        precondition: &crate::projection::LiveObjectIdentity,
+    ) -> Result<(), MaterializerError> {
         self.client
-            .delete_object(object)
+            .delete_object(object, precondition)
             .await
             .map_err(|source| MaterializerError::Delete {
                 object: Box::new(object.clone()),
@@ -263,19 +394,18 @@ where
             })
     }
 
-    async fn delete_rendered_objects_best_effort(&self, objects: &[RenderedObjectRef]) {
-        for object in delete_order(objects) {
-            let _ = self.client.delete_object(object).await;
-        }
-    }
-
     async fn apply_object(
         &self,
         object: &KubernetesObject,
+        observations: &[crate::projection::ProjectionObservation],
     ) -> Result<RenderedObjectRef, MaterializerError> {
         let object_ref = rendered_object_ref(object);
+        let precondition = observations
+            .iter()
+            .find(|observation| observation.object_ref == object_ref)
+            .and_then(|observation| observation.identity.as_ref());
         self.client
-            .apply_object(object)
+            .apply_object(object, precondition)
             .await
             .map_err(|source| MaterializerError::Apply {
                 object: Box::new(object_ref.clone()),
@@ -359,16 +489,25 @@ impl<C> KubernetesMaterializerClient for RetryingKubernetesMaterializerClient<C>
 where
     C: KubernetesMaterializerClient,
 {
+    fn verify_idle_member<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        identity: &'a IdleMemberIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        self.inner.verify_idle_member(objects, identity)
+    }
+
     fn apply_object<'a>(
         &'a self,
         object: &'a KubernetesObject,
+        precondition: Option<&'a crate::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         let inner = &self.inner;
         let policy = self.policy;
         Box::pin(async move {
             policy
                 .retry_if(
-                    || inner.apply_object(object),
+                    || inner.apply_object(object, precondition),
                     KubernetesClientError::is_retryable,
                 )
                 .await
@@ -378,13 +517,14 @@ where
     fn delete_object<'a>(
         &'a self,
         object: &'a RenderedObjectRef,
+        precondition: &'a crate::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         let inner = &self.inner;
         let policy = self.policy;
         Box::pin(async move {
             policy
                 .retry_if(
-                    || inner.delete_object(object),
+                    || inner.delete_object(object, precondition),
                     KubernetesClientError::is_retryable,
                 )
                 .await
@@ -438,6 +578,21 @@ where
                 )
                 .await
         })
+    }
+
+    fn verify_retained_bindings<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        self.inner.verify_retained_bindings(objects)
+    }
+
+    fn ensure_no_descendants<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        self.inner.ensure_no_descendants(objects, instance_id)
     }
 
     fn inspect_readiness<'a>(
@@ -589,6 +744,7 @@ impl KubernetesClientError {
         Self {
             message: message.into(),
             retryable: false,
+            outcome_uncertain: false,
         }
     }
 
@@ -596,11 +752,24 @@ impl KubernetesClientError {
         Self {
             message: message.into(),
             retryable: true,
+            outcome_uncertain: false,
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            outcome_uncertain: true,
+        }
+    }
+
+    pub fn outcome_uncertain(&self) -> bool {
+        self.outcome_uncertain
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -860,6 +1029,42 @@ mod tests {
         let error = KubernetesClientError::new("permanent");
 
         assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn applies_sidecar_token_secret_before_the_workload() {
+        let mut manifest = deployment_manifest();
+        let metadata = match &manifest
+            .objects
+            .iter()
+            .find(|rendered| matches!(rendered.object, KubernetesObject::Service(_)))
+            .unwrap()
+            .object
+        {
+            KubernetesObject::Service(service) => service.metadata.clone(),
+            _ => unreachable!(),
+        };
+        let mut metadata = metadata;
+        metadata.name = "sidecar-token".into();
+        manifest
+            .objects
+            .push(crate::manifest::RenderedManifestObject {
+                apply_order: crate::manifest::ApplyOrder::Secret,
+                object: KubernetesObject::Secret(crate::manifest::Secret {
+                    metadata,
+                    type_: "Opaque".into(),
+                    string_data: BTreeMap::from([("token".into(), "sidecar-test-token".into())]),
+                }),
+            });
+        let client = FakeKubernetesClient::default();
+        KubernetesMaterializer::new(client.clone())
+            .apply_manifest(&manifest)
+            .await
+            .unwrap();
+        let operations = client.operations();
+        let secret = operations.iter().position(|operation| matches!(operation, FakeOperation::Apply(object) if object.kind == "Secret")).unwrap();
+        let workload = operations.iter().position(|operation| matches!(operation, FakeOperation::Apply(object) if object.kind == "Deployment")).unwrap();
+        assert!(secret < workload);
     }
 
     #[tokio::test]
@@ -1241,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_failure_after_partial_stateful_apply_deletes_known_refs() {
+    async fn apply_failure_after_partial_stateful_apply_retains_inventory_for_guarded_cleanup() {
         let client = FakeKubernetesClient::default();
         let service_ref = object_ref("v1", "Service", "data", "db-acme-2e1ac556");
         let pvc_ref = object_ref("v1", "PersistentVolumeClaim", "data", "pvc-acme-2e1ac556");
@@ -1272,8 +1477,6 @@ mod tests {
                     name: "pvc-acme-2e1ac556".to_owned(),
                 },
                 FakeOperation::Apply(service_ref),
-                FakeOperation::Delete(pvc_ref),
-                FakeOperation::Delete(pv_ref),
             ]
         );
     }
@@ -1309,8 +1512,6 @@ mod tests {
                     namespace: "data".to_owned(),
                     name: "pvc-acme-2e1ac556".to_owned(),
                 },
-                FakeOperation::Delete(pvc_ref),
-                FakeOperation::Delete(pv_ref),
             ]
         );
     }
@@ -1346,8 +1547,6 @@ mod tests {
                     namespace: "data".to_owned(),
                     name: "pvc-acme-2e1ac556".to_owned(),
                 },
-                FakeOperation::Delete(pvc_ref),
-                FakeOperation::Delete(pv_ref),
             ]
         );
     }
@@ -1660,6 +1859,7 @@ mod tests {
         fn apply_object<'a>(
             &'a self,
             object: &'a KubernetesObject,
+            _precondition: Option<&'a crate::projection::LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             let object = object.clone();
             let client = self.clone();
@@ -1687,6 +1887,7 @@ mod tests {
         fn delete_object<'a>(
             &'a self,
             object: &'a RenderedObjectRef,
+            _precondition: &'a crate::projection::LiveObjectIdentity,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             let object = object.clone();
             let client = self.clone();
@@ -1778,6 +1979,48 @@ mod tests {
                     .clone()
                     .unwrap_or(ProjectionReadinessInspection::NotObserved))
             })
+        }
+
+        fn ensure_no_descendants<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+            _instance_id: &'a str,
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn inspect_object<'a>(
+            &'a self,
+            _object: &'a RenderedObjectRef,
+        ) -> KubernetesClientFuture<
+            'a,
+            KubernetesClientResult<crate::projection::ProjectionObjectInspection>,
+        > {
+            Box::pin(async {
+                Ok(crate::projection::ProjectionObjectInspection::Present(
+                    crate::projection::LiveObjectMetadata {
+                        persistent_volume_reclaim_policy: Some("Retain".into()),
+                        identity: crate::projection::LiveObjectIdentity {
+                            uid: "test-uid".into(),
+                            resource_version: "1".into(),
+                        },
+                        labels: Default::default(),
+                        annotations: Default::default(),
+                        deleting: false,
+                        finalizers: Vec::new(),
+                    },
+                ))
+            })
+        }
+
+        fn verify_retained_bindings<'a>(
+            &'a self,
+            _objects: &'a [RenderedObjectRef],
+        ) -> crate::materializer::KubernetesClientFuture<
+            'a,
+            crate::materializer::KubernetesClientResult<()>,
+        > {
+            Box::pin(async { Ok(()) })
         }
     }
 

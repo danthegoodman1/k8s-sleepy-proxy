@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,7 +29,6 @@ use crate::{
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     projection::{ProjectionObservation, ProjectionPlan, ProjectionReconciler},
-    reconciler::{MaterializationReconciler, MaterializationReconcilerConfig},
     route as domain_route,
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{ControlPlaneStore, StoreError},
@@ -182,6 +178,8 @@ where
         target,
         route_events,
     ))
+    .max_decoding_message_size(256 * 1024)
+    .max_encoding_message_size(1024 * 1024)
 }
 
 pub fn operator_grpc_server_builder() -> Server {
@@ -379,6 +377,8 @@ where
             .await
             .map_err(store_error_to_status)?;
 
+        self.route_events
+            .notify_routes_changed(&result.route_bindings);
         Ok(Response::new(instance_to_proto(result.instance)))
     }
 
@@ -403,29 +403,32 @@ where
         &self,
         request: Request<pb::DeleteInstanceRequest>,
     ) -> Result<Response<pb::DeleteInstanceResponse>, Status> {
-        let request = domain_instance::DeleteInstanceRequest::new(parse_instance_id(
-            request.into_inner().instance_id,
-        )?);
-        let route_bindings = self
+        let request = request.into_inner();
+        let expected_generation = request
+            .expected_generation
+            .ok_or_else(|| Status::invalid_argument("expected_generation is required"))?;
+        if expected_generation > i64::MAX as u64 {
+            return Err(Status::invalid_argument(
+                "expected_generation exceeds the supported revision range",
+            ));
+        }
+        let request = domain_instance::RequestInstanceDeletion {
+            instance_id: parse_instance_id(request.instance_id)?,
+            expected_generation: crate::ids::Generation::new(expected_generation),
+        };
+        let instance_id = request.instance_id.clone();
+        let deleted = self
             .store
-            .list_route_bindings_for_instance(
-                domain_route::ListRouteBindingsForInstanceRequest::new(request.instance_id.clone()),
-            )
+            .request_instance_deletion(request)
             .await
             .map_err(store_error_to_status)?;
-        let deleted = domain_instance::delete_instance(
-            self.store.as_ref(),
-            &self.materializer,
-            self.target.clone(),
-            request,
-        )
-        .await
-        .map_err(delete_instance_error_to_status)?;
         if deleted {
-            self.route_events.notify_routes_removed(&route_bindings);
+            self.route_events.notify_instance_changed(instance_id);
         }
 
-        Ok(Response::new(pb::DeleteInstanceResponse { deleted }))
+        Ok(Response::new(pb::DeleteInstanceResponse {
+            accepted: deleted,
+        }))
     }
 
     async fn create_route_binding(
@@ -556,8 +559,9 @@ where
         &self,
         request: Request<pb::ReconcileMaterializationRequest>,
     ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
-        let materialization_id = MaterializationId::new(request.into_inner().materialization_id)
-            .map_err(invalid_argument_status)?;
+        let request = request.into_inner();
+        let materialization_id =
+            MaterializationId::new(request.materialization_id).map_err(invalid_argument_status)?;
         let before = self
             .store
             .load_materialization(LoadMaterializationRequest::new(materialization_id.clone()))
@@ -575,27 +579,23 @@ where
                 lease_attempt: 0,
                 observed_refs: Vec::new(),
                 projection_observations: Vec::new(),
+                ..Default::default()
             }));
         };
 
-        let attempted = matches!(
-            before.state,
-            MaterializationState::Pending | MaterializationState::Deleting
-        );
-        if attempted {
-            let reconciler = MaterializationReconciler::new(
-                Arc::clone(&self.store),
-                self.materializer.clone(),
-                MaterializationReconcilerConfig {
-                    owner: operator_reconcile_owner(),
-                    ..MaterializationReconcilerConfig::default()
-                },
-                proxy_core::observability::recorder::ObservabilityRecorder::noop(),
-            )
-            .with_route_events(self.route_events.clone());
-            reconciler.reconcile_materialization(before.clone()).await;
-        }
-
+        let attempted = if request.status_only || before.target != self.target {
+            false
+        } else {
+            self.store
+                .enqueue_materialization(materialization_id.clone())
+                .await
+                .map_err(store_error_to_status)?
+        };
+        let status = self
+            .store
+            .load_materialization_work_status(materialization_id.clone())
+            .await
+            .map_err(store_error_to_status)?;
         let after = self
             .store
             .load_materialization(LoadMaterializationRequest::new(materialization_id))
@@ -604,11 +604,37 @@ where
             .unwrap_or(before);
         let projection_observations = self.projection_observations(&after).await;
 
-        Ok(Response::new(reconcile_materialization_response(
-            &after,
-            attempted,
-            projection_observations,
-        )))
+        let mut response =
+            reconcile_materialization_response(&after, attempted, projection_observations);
+        if let Some(status) = status {
+            response.next_attempt_at_unix_millis = status.next_attempt_at_unix_millis;
+            response.operation_deadline_unix_millis = status.operation_deadline_unix_millis;
+            response.failure_count = status.failure_count;
+            response.failure_kind = if status.uncertain_effect.is_some() {
+                "uncertain".into()
+            } else {
+                status.failure_kind.unwrap_or_default()
+            };
+            response.failure_message = status.failure_message;
+            response.wake_failure_message = status.wake_failure_message;
+            response.uncertain_effect =
+                status
+                    .uncertain_effect
+                    .map(|effect| pb::UncertainMaterializationEffect {
+                        instance_generation: effect.generation.get(),
+                        owner: effect.owner,
+                        lease_attempt: effect.attempt,
+                        effect_id: effect.effect_id,
+                        operation: effect.operation,
+                        object: Some(rendered_object_ref_to_proto(&effect.object)),
+                        expected_uid: effect.expected_uid.unwrap_or_default(),
+                        expected_resource_version: effect
+                            .expected_resource_version
+                            .unwrap_or_default(),
+                        started_at_unix_millis: effect.started_at_unix_millis,
+                    });
+        }
+        Ok(Response::new(response))
     }
 
     async fn force_delete_materialization(
@@ -936,14 +962,8 @@ fn reconcile_materialization_response(
             .map(rendered_object_ref_to_proto)
             .collect(),
         projection_observations,
+        ..Default::default()
     }
-}
-
-fn operator_reconcile_owner() -> String {
-    static OPERATOR_RECONCILE_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
-    let counter = OPERATOR_RECONCILE_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = unix_millis_from_system_time(SystemTime::now()).unwrap_or_default();
-    format!("operator-reconcile-{}-{now}-{counter}", std::process::id())
 }
 
 fn materialization_state_name(state: MaterializationState) -> &'static str {
@@ -1166,21 +1186,24 @@ fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
     Status::invalid_argument(error.to_string())
 }
 
-fn delete_instance_error_to_status(error: domain_instance::DeleteInstanceError) -> Status {
-    match error {
-        domain_instance::DeleteInstanceError::Projection {
-            instance_id,
-            source,
-        } => Status::unavailable(format!(
-            "delete cleanup failed for instance {}: {source}",
-            instance_id.as_str()
-        )),
-        domain_instance::DeleteInstanceError::Store(error) => store_error_to_status(error),
-    }
-}
-
 fn store_error_to_status(error: StoreError) -> Status {
     match error {
+        StoreError::SleepDeferred { retry_after } => {
+            let mut status = Status::failed_precondition(format!(
+                "automatic sleep deferred for {} ms after activation",
+                retry_after.as_millis()
+            ));
+            status.metadata_mut().insert(
+                sleepypods_api::IDLE_RETRY_AFTER_METADATA,
+                retry_after
+                    .as_millis()
+                    .min(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT.as_millis())
+                    .to_string()
+                    .parse()
+                    .expect("decimal metadata"),
+            );
+            status
+        }
         StoreError::InvalidArgument { message } => Status::invalid_argument(message),
         StoreError::NotFound { resource } => Status::not_found(format!("{resource} not found")),
         StoreError::AlreadyExists { resource } => {
@@ -1206,6 +1229,10 @@ fn store_error_to_status(error: StoreError) -> Status {
                 message.push_str(&format!(" generation {owner_generation}"));
             }
             Status::failed_precondition(message)
+        }
+        StoreError::LeaseConflict { message } => Status::aborted(message),
+        StoreError::IdempotencyResourceDeleted { resource } => {
+            Status::failed_precondition(format!("idempotent replay refers to a deleted {resource}"))
         }
         StoreError::IdempotencyConflict => {
             Status::already_exists("idempotency key was already used for a different request")

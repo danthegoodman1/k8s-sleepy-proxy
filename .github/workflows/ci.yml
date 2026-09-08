@@ -39,6 +39,17 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+      - name: Check production dependency boundaries
+        run: python3 scripts/test-dependency-boundaries.py
+
+      - name: Test fail-closed soak inventory
+        run: python3 scripts/test-full-wake-sleep-inventory.py
+
+      - name: Check load helpers with isolated package features
+        run: |
+          cargo check --locked -p frontline --example frontline_load_smoke
+          cargo check --locked -p sidecar --example sidecar_load_smoke
+
       - name: Test Postgres store
         env:
           SLEEPYPODS_POSTGRES_URL: postgres://sleepypods:sleepypods@localhost:5432/sleepypods

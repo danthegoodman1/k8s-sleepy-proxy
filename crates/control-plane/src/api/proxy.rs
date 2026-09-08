@@ -1,6 +1,6 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
 
-use proxy_core::observability::recorder::ObservabilityRecorder;
+use sleepypods_observability::recorder::ObservabilityRecorder;
 use tokio::sync::broadcast;
 use tonic::{
     codegen::tokio_stream::{self, wrappers::ReceiverStream},
@@ -10,21 +10,19 @@ use tonic::{
 use crate::{
     api::{
         pb::{self, proxy_control_plane_server::ProxyControlPlaneServer},
-        route_events::{RouteBindingChange, RouteBindingChangeReason, RouteSubscriptionBroker},
+        route_events::{RouteBindingChange, RouteSubscriptionBroker},
     },
     ids::{BackendGeneration, Generation, InstanceId},
     instance::{self as domain_instance, InstanceState},
-    materialization::{
-        LoadReadyMaterializationRequest, MaterializationRecord, MaterializationTarget,
-    },
+    materialization::{MaterializationRecord, MaterializationTarget},
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    route::{self as domain_route, ListRouteBindingsForInstanceRequest},
+    route::{self as domain_route},
     store::{ControlPlaneStore, StoreError},
     wake::{self, WakeInstanceError, WakeInstanceResult, WakeUnavailableReason},
 };
 
 pub const PROXY_SERVICE_NAME: &str = "sleepypods.controlplane.v1.ProxyControlPlane";
-const POSITIVE_ROUTE_CACHE_TTL: Duration = Duration::from_secs(300);
+const POSITIVE_ROUTE_CACHE_TTL: Duration = Duration::from_secs(10);
 const SUBSCRIBE_RESPONSE_BUFFER: usize = 16;
 
 type ProxySubscribeResponseStream = Pin<
@@ -38,6 +36,7 @@ type ProxySubscribeResponseStream = Pin<
 #[derive(Clone, Debug)]
 struct ActiveRouteSubscription {
     route_binding_id: crate::ids::RouteBindingId,
+    instance_id: InstanceId,
     request_identity: domain_route::RouteIdentity,
     matched_identity: domain_route::RouteIdentity,
     protocol: domain_route::ProtocolRoute,
@@ -147,6 +146,8 @@ where
         ObservabilityRecorder::global(),
         route_events,
     ))
+    .max_decoding_message_size(256 * 1024)
+    .max_encoding_message_size(1024 * 1024)
 }
 
 #[tonic::async_trait]
@@ -171,15 +172,6 @@ where
         )
         .await;
         let response = match result {
-            Ok(WakeInstanceResult::Completed { result }) => {
-                notify_instance_routes_changed(
-                    self.store.as_ref(),
-                    &self.route_events,
-                    result.instance.id.clone(),
-                )
-                .await?;
-                proxy_ready_response(&result.instance, &result.materialization)?
-            }
             Ok(WakeInstanceResult::AlreadyRunning {
                 instance,
                 materialization,
@@ -212,92 +204,92 @@ where
         &self,
         request: Request<tonic::Streaming<pb::ProxySubscribeRequest>>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let permit = self
+            .route_events
+            .streams
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("subscription stream capacity exhausted"))?;
+        let permit = Arc::new(permit);
         let mut requests = request.into_inner();
         let store = Arc::clone(&self.store);
         let target = self.target.clone();
+        // Register before resolving any snapshot, so a concurrent committed
+        // change remains queued until the corresponding dependency is installed.
         let mut route_events = self.route_events.subscribe();
+        let limits = self.route_events.limits.clone();
+        let cancellation = self.route_events.cancellation.clone();
         let (responses, response_stream) = tokio::sync::mpsc::channel(SUBSCRIBE_RESPONSE_BUFFER);
-
-        tokio::spawn(async move {
+        let producer_permit = permit.clone();
+        let producer_broker = self.route_events.clone();
+        let task = tokio::spawn(async move {
+            let _producer_permit = producer_permit;
+            // The tonic service value may be dropped once it returns response headers.
+            let _producer_broker = producer_broker;
             let mut subscriptions = HashMap::new();
             let mut next_subscription_number = 0_u64;
-
+            let expiry = tokio::time::sleep(limits.subscription_lifetime);
+            tokio::pin!(expiry);
             loop {
                 tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = responses.closed() => return,
+                    _ = &mut expiry => return,
                     request = requests.message() => {
-                        let Some(request) = (match request {
-                            Ok(request) => request,
-                            Err(status) => {
-                                let _ = responses.send(Err(status)).await;
-                                return;
-                            }
-                        }) else {
+                        let request = match request { Ok(Some(request)) => request, _ => return };
+                        let adding = matches!(request.input, Some(pb::proxy_subscribe_request::Input::SubscribeRoute(_)));
+                        if adding && subscriptions.len() >= limits.subscriptions_per_stream {
+                            let _ = responses.try_send(Err(Status::resource_exhausted("subscription entry capacity exhausted")));
                             return;
+                        }
+                        let response = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            _ = &mut expiry => return,
+                            result = tokio::time::timeout(limits.lookup_timeout, handle_subscribe_request(store.as_ref(), target.clone(), request, &mut subscriptions, &mut next_subscription_number)) => {
+                                match result { Ok(response) => response, Err(_) => Err(Status::deadline_exceeded("route lookup timed out")) }
+                            }
                         };
-
-                        let response = handle_subscribe_request(
-                            store.as_ref(),
-                            target.clone(),
-                            request,
-                            &mut subscriptions,
-                            &mut next_subscription_number,
-                        )
-                        .await;
-
                         match response {
-                            Ok(Some(response)) => {
-                                if responses.send(Ok(response)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(status) => {
-                                let _ = responses.send(Err(status)).await;
-                                return;
-                            }
+                            Ok(Some(response)) => if !send_subscription_response(&responses, Ok(response), &limits, &cancellation).await { return; },
+                            Ok(None) => {},
+                            Err(status) => { let _ = send_subscription_response(&responses, Err(status), &limits, &cancellation).await; return; }
                         }
                     }
                     event = route_events.recv() => {
-                        match event {
-                            Ok(event) => {
-                                for response in invalidations_for_route_event(
-                                    &mut subscriptions,
-                                    &event,
-                                ) {
-                                    if responses.send(Ok(response)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                let _ = responses
-                                    .send(Err(Status::unavailable("route update stream lagged")))
-                                    .await;
-                                return;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {}
+                        let event = match event {
+                            Ok(RouteBindingChange::Reset) | Err(broadcast::error::RecvError::Lagged(_)) => return,
+                            Ok(event) => event,
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        };
+                        for response in invalidations_for_route_event(&mut subscriptions, &event) {
+                            if !send_subscription_response(&responses, Ok(response), &limits, &cancellation).await { return; }
                         }
                     }
                 }
             }
         });
-
-        Ok(Response::new(Box::pin(ReceiverStream::new(
-            response_stream,
-        ))))
+        let mut response: Response<Self::SubscribeStream> =
+            Response::new(Box::pin(OwnedSubscriptionStream {
+                receiver: ReceiverStream::new(response_stream),
+                task,
+                _permit: permit.clone(),
+            }));
+        response
+            .extensions_mut()
+            .insert(super::admission::SubscriptionLease {
+                permit,
+                lifetime: self.route_events.limits.subscription_lifetime,
+            });
+        Ok(response)
     }
 }
 
 async fn notify_instance_routes_changed(
-    store: &dyn ControlPlaneStore,
+    _store: &dyn ControlPlaneStore,
     route_events: &RouteSubscriptionBroker,
     instance_id: InstanceId,
 ) -> Result<(), Status> {
-    let route_bindings = store
-        .list_route_bindings_for_instance(ListRouteBindingsForInstanceRequest::new(instance_id))
-        .await
-        .map_err(store_error_to_status)?;
-    route_events.notify_routes_changed(&route_bindings);
+    route_events.notify_instance_changed(instance_id);
     Ok(())
 }
 
@@ -306,8 +298,7 @@ fn failed_wake_instance(error: &WakeInstanceError) -> Option<&crate::instance::I
         WakeInstanceError::WorkloadClassNotFound { instance }
         | WakeInstanceError::Render { instance, .. }
         | WakeInstanceError::SleepPolicy { instance, .. }
-        | WakeInstanceError::Materializer { instance, .. }
-        | WakeInstanceError::Projection { instance, .. } => Some(instance),
+        | WakeInstanceError::Materializer { instance, .. } => Some(instance),
         WakeInstanceError::NotFound
         | WakeInstanceError::GenerationConflict { .. }
         | WakeInstanceError::Unavailable { .. }
@@ -336,7 +327,7 @@ fn invalidations_for_route_event(
             output: Some(pb::proxy_subscribe_response::Output::RouteInvalidated(
                 pb::ProxyRouteInvalidatedResponse {
                     subscription_id,
-                    reason: route_change_reason_to_proto(event.reason) as i32,
+                    reason: route_change_reason_to_proto(event) as i32,
                 },
             )),
         })
@@ -347,22 +338,27 @@ fn subscription_invalidated_by_event(
     subscription: &ActiveRouteSubscription,
     event: &RouteBindingChange,
 ) -> bool {
-    match event.reason {
-        RouteBindingChangeReason::Removed => {
-            subscription.route_binding_id == event.route_binding_id
-        }
-        RouteBindingChangeReason::Changed => {
-            if subscription.route_binding_id == event.route_binding_id {
+    match event {
+        RouteBindingChange::Reset => true,
+        RouteBindingChange::Instance(id) => subscription.instance_id == *id,
+        RouteBindingChange::Route {
+            route_binding_id,
+            removed,
+            identity,
+            protocol,
+        } => {
+            if subscription.route_binding_id == *route_binding_id {
                 return true;
             }
-
-            let (Some(identity), Some(protocol)) = (&event.identity, event.protocol) else {
-                return false;
-            };
-            if subscription.protocol != protocol {
+            if *removed {
                 return false;
             }
-
+            let (Some(identity), Some(protocol)) = (identity, protocol) else {
+                return false;
+            };
+            if subscription.protocol != *protocol {
+                return false;
+            }
             let Some(new_score) =
                 domain_route::route_match_score(identity, &subscription.request_identity)
             else {
@@ -374,18 +370,16 @@ fn subscription_invalidated_by_event(
             ) else {
                 return true;
             };
-
             new_score > cached_score
         }
     }
 }
-
-fn route_change_reason_to_proto(
-    reason: RouteBindingChangeReason,
-) -> pb::ProxyRouteInvalidationReason {
-    match reason {
-        RouteBindingChangeReason::Removed => pb::ProxyRouteInvalidationReason::RouteRemoved,
-        RouteBindingChangeReason::Changed => pb::ProxyRouteInvalidationReason::RouteChanged,
+fn route_change_reason_to_proto(event: &RouteBindingChange) -> pb::ProxyRouteInvalidationReason {
+    match event {
+        RouteBindingChange::Route { removed: true, .. } => {
+            pb::ProxyRouteInvalidationReason::RouteRemoved
+        }
+        _ => pb::ProxyRouteInvalidationReason::RouteChanged,
     }
 }
 
@@ -427,26 +421,34 @@ async fn subscribe_route(
     next_subscription_number: &mut u64,
 ) -> Result<pb::ProxySubscribeResponse, Status> {
     let request_id = non_empty_field(request.request_id, "request_id")?;
+    let identity = request
+        .identity
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("identity required"))?;
+    validate_identity_size(identity)?;
     let request_identity = request
         .identity
         .ok_or_else(|| Status::invalid_argument("identity is required"))
         .and_then(route_identity_from_proto)?;
 
     match store
-        .resolve_route(request_identity.clone())
+        .resolve_route(domain_route::ResolveRouteRequest::new(
+            request_identity.clone(),
+            target.clone(),
+        ))
         .await
         .map_err(store_error_to_status)?
     {
         domain_route::RouteResolution::Resolved {
             matched_identity,
-            mut entry,
+            entry,
         } => {
-            publish_ready_backend(store, &mut entry, target).await?;
             let subscription_id = next_subscription_id(next_subscription_number);
             subscriptions.insert(
                 subscription_id.clone(),
                 ActiveRouteSubscription {
                     route_binding_id: entry.route_binding_id.clone(),
+                    instance_id: entry.instance_id.clone(),
                     request_identity: request_identity.clone(),
                     matched_identity: matched_identity.clone(),
                     protocol: protocol_for_route_identity(&matched_identity),
@@ -488,39 +490,17 @@ fn protocol_for_route_identity(
     }
 }
 
-async fn publish_ready_backend(
-    store: &dyn ControlPlaneStore,
-    entry: &mut domain_route::RouteEntry,
-    target: MaterializationTarget,
-) -> Result<(), Status> {
-    entry.backend = None;
-    entry.backend_generation = None;
-
-    let materialization = store
-        .load_ready_materialization(LoadReadyMaterializationRequest::new(
-            entry.instance_id.clone(),
-            entry.instance_generation,
-            target,
-        ))
-        .await
-        .map_err(store_error_to_status)?;
-
-    if let Some(materialization) = materialization {
-        if let Some(backend) = materialization.backend {
-            entry.backend = Some(backend);
-            entry.backend_generation = Some(materialization.backend_generation);
-        }
-    }
-
-    Ok(())
-}
-
 fn next_subscription_id(next_subscription_number: &mut u64) -> String {
     *next_subscription_number += 1;
     format!("sub:{next_subscription_number}")
 }
 
 fn non_empty_field(value: String, field: &'static str) -> Result<String, Status> {
+    if value.len() > 4096 {
+        return Err(Status::invalid_argument(format!(
+            "{field} exceeds 4096 bytes"
+        )));
+    }
     if value.trim().is_empty() {
         return Err(Status::invalid_argument(format!(
             "{field} must not be empty"
@@ -619,10 +599,6 @@ fn proxy_wake_error_response(
         ))),
         WakeInstanceError::Materializer { instance, source } => Err(Status::unavailable(format!(
             "materialization failed for instance {}: {source}",
-            instance.id.as_str()
-        ))),
-        WakeInstanceError::Projection { instance, source } => Err(Status::unavailable(format!(
-            "projection failed for instance {}: {source}",
             instance.id.as_str()
         ))),
         WakeInstanceError::Store(error) => Err(store_error_to_status(error)),
@@ -750,6 +726,22 @@ fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
 
 fn store_error_to_status(error: StoreError) -> Status {
     match error {
+        StoreError::SleepDeferred { retry_after } => {
+            let mut status = Status::failed_precondition(format!(
+                "automatic sleep deferred for {} ms after activation",
+                retry_after.as_millis()
+            ));
+            status.metadata_mut().insert(
+                sleepypods_api::IDLE_RETRY_AFTER_METADATA,
+                retry_after
+                    .as_millis()
+                    .min(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT.as_millis())
+                    .to_string()
+                    .parse()
+                    .expect("decimal metadata"),
+            );
+            status
+        }
         StoreError::InvalidArgument { message } => Status::invalid_argument(message),
         StoreError::NotFound { resource } => Status::not_found(format!("{resource} not found")),
         StoreError::AlreadyExists { resource } => {
@@ -776,10 +768,58 @@ fn store_error_to_status(error: StoreError) -> Status {
             }
             Status::failed_precondition(message)
         }
+        StoreError::LeaseConflict { message } => Status::aborted(message),
+        StoreError::IdempotencyResourceDeleted { resource } => {
+            Status::failed_precondition(format!("idempotent replay refers to a deleted {resource}"))
+        }
         StoreError::IdempotencyConflict => {
             Status::already_exists("idempotency key was already used for a different request")
         }
         StoreError::Unavailable { message } => Status::unavailable(message),
         StoreError::Internal { message } => Status::internal(message),
     }
+}
+
+struct OwnedSubscriptionStream {
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    receiver: ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl tokio_stream::Stream for OwnedSubscriptionStream {
+    type Item = Result<pb::ProxySubscribeResponse, Status>;
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+impl Drop for OwnedSubscriptionStream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+async fn send_subscription_response(
+    responses: &tokio::sync::mpsc::Sender<Result<pb::ProxySubscribeResponse, Status>>,
+    response: Result<pb::ProxySubscribeResponse, Status>,
+    limits: &super::admission::ApiLimits,
+    cancellation: &crate::runtime_work::Cancellation,
+) -> bool {
+    tokio::select! { _ = cancellation.cancelled() => false, result = tokio::time::timeout(limits.response_timeout, responses.send(response)) => matches!(result, Ok(Ok(()))) }
+}
+fn validate_identity_size(identity: &pb::RouteIdentity) -> Result<(), Status> {
+    let (host, path) = match identity.kind.as_ref() {
+        Some(pb::route_identity::Kind::Http(http)) => {
+            (http.host.as_ref(), http.path_prefix.as_deref())
+        }
+        Some(pb::route_identity::Kind::Sni(sni)) => (sni.host.as_ref(), None),
+        None => return Err(Status::invalid_argument("route identity required")),
+    };
+    if host.is_some_and(|host| host.host.len() > 253) || path.is_some_and(|path| path.len() > 4096)
+    {
+        return Err(Status::invalid_argument(
+            "route identity exceeds supported length",
+        ));
+    }
+    Ok(())
 }

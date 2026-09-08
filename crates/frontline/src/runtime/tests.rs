@@ -11,11 +11,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use control_plane::{
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
-    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
-    RouteHost, RouteIdentity,
-};
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
@@ -26,6 +21,11 @@ use proxy_core::{
         recorder::{InMemoryObservability, ObservabilityEvent, EVENT_HTTP01},
     },
     DrainTracker,
+};
+use sleepypods_api::{
+    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
+    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
+    RouteHost, RouteIdentity,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -111,7 +111,7 @@ impl RouteSubscriptionClient for FakeRouteClient {
         &mut self,
         request_id: RouteRequestId,
         identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'_, SubscribeControlPlaneOutput, Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
         self.calls.push(RouteClientCall::Subscribe {
             request_id,
             identity,
@@ -126,7 +126,7 @@ impl RouteSubscriptionClient for FakeRouteClient {
     fn unsubscribe(
         &mut self,
         subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'_, (), Self::Error> {
+    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
         self.calls
             .push(RouteClientCall::Unsubscribe { subscription_id });
         Box::pin(async { Ok(()) })
@@ -181,7 +181,7 @@ impl WakeClient for FakeWakeClient {
     fn wake_instance(
         &mut self,
         request: WakeInstanceRequest,
-    ) -> WakeClientFuture<'_, WakeInstanceResponse, Self::Error> {
+    ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
         self.calls.push(request);
         let response = self.responses.pop_front().expect("queued wake response");
         Box::pin(async move { response })

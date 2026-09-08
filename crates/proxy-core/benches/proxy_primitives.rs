@@ -1,4 +1,4 @@
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
@@ -9,8 +9,8 @@ use proxy_core::{
         Operation, Outcome, Protocol, ProxyState, TlsClientHelloOutcome, TrafficDirection,
     },
     parse_tls_client_hello_sni, prepare_reverse_proxy_request, proxy_streams,
-    proxy_websocket_streams, strip_hop_by_hop_headers, ActiveConnectionCounter, AdmissionLimiter,
-    TlsClientHelloError,
+    proxy_streams_with_idle_timeout, proxy_websocket_streams, strip_hop_by_hop_headers,
+    ActiveConnectionCounter, AdmissionLimiter, TlsClientHelloError,
 };
 use tokio::{
     io::{duplex, AsyncReadExt, AsyncWriteExt},
@@ -25,43 +25,61 @@ fn tcp_forwarding(c: &mut Criterion) {
     let runtime = runtime();
     let payload = Bytes::from_static(&[7; 4096]);
 
-    c.bench_function("tcp/proxy_streams_duplex_4k_round_trip", |b| {
-        b.to_async(&runtime).iter(|| {
-            let payload = payload.clone();
+    for (name, idle_timeout) in [
+        ("tcp/proxy_streams_duplex_4k_round_trip", false),
+        (
+            "tcp/proxy_streams_with_idle_timeout_duplex_4k_round_trip",
+            true,
+        ),
+    ] {
+        c.bench_function(name, |b| {
+            b.to_async(&runtime).iter(|| {
+                let payload = payload.clone();
 
-            async move {
-                let (mut client, proxy_client) = duplex(16 * 1024);
-                let (proxy_upstream, mut upstream) = duplex(16 * 1024);
+                async move {
+                    let (mut client, proxy_client) = duplex(16 * 1024);
+                    let (proxy_upstream, mut upstream) = duplex(16 * 1024);
 
-                let proxy_task =
-                    tokio::spawn(async move { proxy_streams(proxy_client, proxy_upstream).await });
+                    let proxy_task = tokio::spawn(async move {
+                        if idle_timeout {
+                            proxy_streams_with_idle_timeout(
+                                proxy_client,
+                                proxy_upstream,
+                                Duration::from_secs(3600),
+                            )
+                            .await
+                        } else {
+                            proxy_streams(proxy_client, proxy_upstream).await
+                        }
+                    });
 
-                client.write_all(&payload).await.expect("client writes");
-                client.shutdown().await.expect("client closes writes");
+                    client.write_all(&payload).await.expect("client writes");
+                    client.shutdown().await.expect("client closes writes");
 
-                let mut received = vec![0; payload.len()];
-                upstream
-                    .read_exact(&mut received)
-                    .await
-                    .expect("upstream reads");
-                black_box(&received);
-
-                upstream.write_all(&payload).await.expect("upstream writes");
-                upstream.shutdown().await.expect("upstream closes writes");
-
-                let mut echoed = vec![0; payload.len()];
-                client.read_exact(&mut echoed).await.expect("client reads");
-                black_box(&echoed);
-
-                black_box(
-                    proxy_task
+                    let mut received = vec![0; payload.len()];
+                    upstream
+                        .read_exact(&mut received)
                         .await
-                        .expect("proxy task joins")
-                        .expect("proxy succeeds"),
-                );
-            }
-        })
-    });
+                        .expect("upstream reads");
+                    black_box(&received);
+
+                    upstream.write_all(&payload).await.expect("upstream writes");
+                    upstream.shutdown().await.expect("upstream closes writes");
+
+                    let mut echoed = vec![0; payload.len()];
+                    client.read_exact(&mut echoed).await.expect("client reads");
+                    black_box(&echoed);
+
+                    black_box(
+                        proxy_task
+                            .await
+                            .expect("proxy task joins")
+                            .expect("proxy succeeds"),
+                    );
+                }
+            })
+        });
+    }
 }
 
 fn http_helpers(c: &mut Criterion) {
@@ -200,7 +218,7 @@ fn admission_and_accounting(c: &mut Criterion) {
 }
 
 fn observability_helpers(c: &mut Criterion) {
-    let tls_error = Err(TlsClientHelloError::Malformed);
+    let tls_error: Result<proxy_core::TlsClientHelloSni, _> = Err(TlsClientHelloError::Malformed);
 
     c.bench_function("observability/label_as_str_and_outcome_mapping", |b| {
         b.iter(|| {

@@ -45,7 +45,7 @@ cleanup() {
   elif [[ "${keep_namespace}" != "1" ]]; then
     KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
     KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-      -l "sleepypods.io/workload-class-id in (failure-readiness,failure-unbound)" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      -l "sleepypods.io/workload-class-id in (failure-readiness,failure-unbound,failure-duplicate-volume)" --ignore-not-found --wait=true >/dev/null 2>&1 || true
     KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
       "sleepypods-control-plane-${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   fi
@@ -99,7 +99,7 @@ done
 echo "==> Recreating namespace ${namespace}"
 KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl delete persistentvolume \
-  -l "sleepypods.io/workload-class-id in (failure-readiness,failure-unbound)" --ignore-not-found --wait=true
+  -l "sleepypods.io/workload-class-id in (failure-readiness,failure-unbound,failure-duplicate-volume)" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl delete clusterrole,clusterrolebinding \
   "sleepypods-control-plane-${namespace}" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl create namespace "${namespace}"
@@ -191,11 +191,17 @@ metadata:
     sleepypods.io/kind-e2e: failures
 rules:
   - apiGroups: [""]
-    resources: ["services", "persistentvolumeclaims"]
+    resources: ["services", "persistentvolumeclaims", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -280,6 +286,9 @@ spec:
               value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
+            # Exercise the configured terminal deadline within this bounded failure gate.
+            - name: SLEEPYPODS_OPERATION_TIMEOUT_MS
+              value: "30000"
             - name: SLEEPYPODS_CLUSTER_ID
               value: kind-e2e-failures
             - name: SLEEPYPODS_NAMESPACE

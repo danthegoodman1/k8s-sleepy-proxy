@@ -1,12 +1,10 @@
-use std::{
-    error::Error,
-    fmt,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+pub use sleepypods_api::materialization::{
+    BackendEndpoint, InvalidMaterializationTarget, MaterializationTarget,
 };
 
-use crate::ids::{
-    BackendGeneration, EmptyStringError, Generation, InstanceId, MaterializationId, NonEmptyString,
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::ids::{BackendGeneration, Generation, InstanceId, MaterializationId};
 use crate::instance::InstanceRecord;
 use crate::workload::RenderedExclusivityKey;
 
@@ -15,6 +13,8 @@ pub struct MaterializationRecord {
     pub id: MaterializationId,
     pub instance_id: InstanceId,
     pub instance_generation: Generation,
+    /// Immutable ownership/sidecar incarnation; independent of the instance CAS revision.
+    pub projection_generation: Generation,
     pub target: MaterializationTarget,
     pub state: MaterializationState,
     pub backend: Option<BackendEndpoint>,
@@ -28,12 +28,22 @@ pub struct MaterializationRecord {
 pub struct RecordMaterializationRequest {
     pub instance_id: InstanceId,
     pub instance_generation: Generation,
+    /// Immutable ownership/sidecar incarnation; independent of the instance CAS revision.
+    pub projection_generation: Generation,
     pub target: MaterializationTarget,
     pub state: MaterializationState,
     pub backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
     pub exclusivity_keys: Vec<RenderedExclusivityKey>,
+}
+
+/// The immutable projection prepared before accepting a wake. The store commits
+/// both the state transition and discoverable work in one transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptWakeRequest {
+    pub expected_generation: Generation,
+    pub pending: RecordMaterializationRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +81,10 @@ pub struct BeginSleepRequest {
     pub expected_running_generation: Generation,
     pub target: MaterializationTarget,
     pub drain_grace_timeout: Duration,
+    /// Automatic idle sleep only: elapsed time since this generation became
+    /// Ready, checked under the same transaction as the Running transition.
+    /// Explicit operator sleep leaves this unset.
+    pub minimum_ready_age: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +103,7 @@ pub struct MaterializationReconciliationLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListMaterializationReconciliationCandidatesRequest {
+    pub target: Option<MaterializationTarget>,
     pub now: SystemTime,
     pub limit: usize,
 }
@@ -100,6 +115,8 @@ pub struct LoadMaterializationOperationalMetricsRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationOperationalMetrics {
+    pub uncertain_effects: u64,
+    pub blocked_failures: u64,
     pub backlog_states: Vec<MaterializationBacklogOperationalMetrics>,
     pub held_key_states: Vec<MaterializationHeldKeysOperationalMetrics>,
 }
@@ -127,15 +144,20 @@ pub struct ClaimMaterializationReconciliationRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenewMaterializationReconciliationLeaseRequest {
+    pub expected_state: MaterializationState,
+    pub instance_generation: Generation,
     pub materialization_id: MaterializationId,
     pub owner: String,
     pub lease_expires_at: SystemTime,
+    pub attempt: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseMaterializationReconciliationLeaseRequest {
+    pub instance_generation: Generation,
     pub materialization_id: MaterializationId,
     pub owner: String,
+    pub attempt: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +165,7 @@ pub struct CompleteWakeReconciliationRequest {
     pub materialization_id: MaterializationId,
     pub lease_owner: String,
     pub complete: CompleteWakeRequest,
+    pub attempt: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +173,7 @@ pub struct FinalizeSleepReconciliationRequest {
     pub materialization_id: MaterializationId,
     pub lease_owner: String,
     pub finalize: FinalizeSleepRequest,
+    pub attempt: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +184,7 @@ pub struct DeleteMaterializationReconciliationRequest {
     pub instance_id: InstanceId,
     pub instance_generation: Generation,
     pub target: MaterializationTarget,
+    pub attempt: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,12 +227,6 @@ pub struct FinalizeSleepResult {
     pub materialization: Option<MaterializationRecord>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterializationTarget {
-    cluster_id: String,
-    namespace: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MaterializationState {
     Pending,
@@ -218,21 +237,11 @@ pub enum MaterializationState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackendEndpoint {
-    uri: NonEmptyString,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedObjectRef {
     pub api_version: String,
     pub kind: String,
     pub namespace: String,
     pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidMaterializationTarget {
-    field: &'static str,
 }
 
 impl RecordMaterializationRequest {
@@ -246,6 +255,11 @@ impl RecordMaterializationRequest {
         Self {
             instance_id,
             instance_generation,
+            projection_generation: if state == MaterializationState::Pending {
+                instance_generation.next()
+            } else {
+                instance_generation
+            },
             target,
             state,
             backend: None,
@@ -316,11 +330,17 @@ impl BeginSleepRequest {
             expected_running_generation,
             target,
             drain_grace_timeout: Duration::ZERO,
+            minimum_ready_age: None,
         }
     }
 
     pub fn with_drain_grace_timeout(mut self, drain_grace_timeout: Duration) -> Self {
         self.drain_grace_timeout = drain_grace_timeout;
+        self
+    }
+
+    pub fn with_minimum_ready_age(mut self, minimum_ready_age: Duration) -> Self {
+        self.minimum_ready_age = Some(minimum_ready_age);
         self
     }
 }
@@ -340,8 +360,16 @@ impl FinalizeSleepRequest {
 }
 
 impl ListMaterializationReconciliationCandidatesRequest {
+    pub fn for_target(mut self, target: MaterializationTarget) -> Self {
+        self.target = Some(target);
+        self
+    }
     pub fn new(now: SystemTime, limit: usize) -> Self {
-        Self { now, limit }
+        Self {
+            target: None,
+            now,
+            limit,
+        }
     }
 }
 
@@ -359,6 +387,8 @@ impl MaterializationOperationalMetrics {
         Self {
             backlog_states,
             held_key_states,
+            uncertain_effects: 0,
+            blocked_failures: 0,
         }
     }
 }
@@ -406,9 +436,15 @@ impl RenewMaterializationReconciliationLeaseRequest {
     pub fn new(
         materialization_id: MaterializationId,
         owner: impl Into<String>,
+        attempt: u64,
+        instance_generation: Generation,
         lease_expires_at: SystemTime,
+        expected_state: MaterializationState,
     ) -> Self {
         Self {
+            expected_state,
+            instance_generation,
+            attempt,
             materialization_id,
             owner: owner.into(),
             lease_expires_at,
@@ -417,8 +453,15 @@ impl RenewMaterializationReconciliationLeaseRequest {
 }
 
 impl ReleaseMaterializationReconciliationLeaseRequest {
-    pub fn new(materialization_id: MaterializationId, owner: impl Into<String>) -> Self {
+    pub fn new(
+        materialization_id: MaterializationId,
+        owner: impl Into<String>,
+        attempt: u64,
+        instance_generation: Generation,
+    ) -> Self {
         Self {
+            instance_generation,
+            attempt,
             materialization_id,
             owner: owner.into(),
         }
@@ -429,9 +472,11 @@ impl CompleteWakeReconciliationRequest {
     pub fn new(
         materialization_id: MaterializationId,
         lease_owner: impl Into<String>,
+        attempt: u64,
         complete: CompleteWakeRequest,
     ) -> Self {
         Self {
+            attempt,
             materialization_id,
             lease_owner: lease_owner.into(),
             complete,
@@ -443,9 +488,11 @@ impl FinalizeSleepReconciliationRequest {
     pub fn new(
         materialization_id: MaterializationId,
         lease_owner: impl Into<String>,
+        attempt: u64,
         finalize: FinalizeSleepRequest,
     ) -> Self {
         Self {
+            attempt,
             materialization_id,
             lease_owner: lease_owner.into(),
             finalize,
@@ -457,12 +504,14 @@ impl DeleteMaterializationReconciliationRequest {
     pub fn new(
         materialization_id: MaterializationId,
         lease_owner: impl Into<String>,
+        attempt: u64,
         expected_state: MaterializationState,
         instance_id: InstanceId,
         instance_generation: Generation,
         target: MaterializationTarget,
     ) -> Self {
         Self {
+            attempt,
             materialization_id,
             lease_owner: lease_owner.into(),
             expected_state,
@@ -505,38 +554,6 @@ impl ForceReleaseExclusivityKeyRequest {
     }
 }
 
-impl MaterializationTarget {
-    pub fn new(
-        cluster_id: impl Into<String>,
-        namespace: impl Into<String>,
-    ) -> Result<Self, InvalidMaterializationTarget> {
-        let cluster_id = cluster_id.into();
-        if cluster_id.trim().is_empty() {
-            return Err(InvalidMaterializationTarget {
-                field: "cluster_id",
-            });
-        }
-
-        let namespace = namespace.into();
-        if namespace.trim().is_empty() {
-            return Err(InvalidMaterializationTarget { field: "namespace" });
-        }
-
-        Ok(Self {
-            cluster_id,
-            namespace,
-        })
-    }
-
-    pub fn cluster_id(&self) -> &str {
-        &self.cluster_id
-    }
-
-    pub fn namespace(&self) -> &str {
-        &self.namespace
-    }
-}
-
 impl MaterializationState {
     pub const BACKLOG_STATES: &'static [Self] = &[Self::Pending, Self::Deleting];
     pub const HELD_KEY_STATES: &'static [Self] =
@@ -552,36 +569,10 @@ impl MaterializationState {
         }
     }
 
-    pub const fn metric_label(self) -> proxy_core::observability::metrics::MetricLabel {
-        proxy_core::observability::metrics::MetricLabel::state(self.as_str())
+    pub const fn metric_label(self) -> sleepypods_observability::metrics::MetricLabel {
+        sleepypods_observability::metrics::MetricLabel::state(self.as_str())
     }
 }
-
-impl BackendEndpoint {
-    pub fn new(uri: impl Into<String>) -> Result<Self, EmptyStringError> {
-        Ok(Self {
-            uri: NonEmptyString::new("backend.uri", uri)?,
-        })
-    }
-
-    pub fn uri(&self) -> &str {
-        self.uri.as_str()
-    }
-}
-
-impl InvalidMaterializationTarget {
-    pub fn field(&self) -> &'static str {
-        self.field
-    }
-}
-
-impl fmt::Display for InvalidMaterializationTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "materialization target {} must not be empty", self.field)
-    }
-}
-
-impl Error for InvalidMaterializationTarget {}
 
 pub(crate) fn unix_millis_from_system_time(value: SystemTime) -> Result<i64, String> {
     match value.duration_since(UNIX_EPOCH) {
@@ -595,29 +586,25 @@ pub(crate) fn unix_millis_from_system_time(value: SystemTime) -> Result<i64, Str
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{BackendEndpoint, MaterializationTarget};
+/// One potentially dispatched mutation. This durable barrier survives lease expiry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationEffectRequest {
+    pub effect_id: u64,
+    pub materialization_id: MaterializationId,
+    pub owner: String,
+    pub attempt: u64,
+    pub instance_generation: Generation,
+    pub expected_state: MaterializationState,
+    pub operation: &'static str,
+    pub object: RenderedObjectRef,
+    pub precondition: Option<crate::projection::LiveObjectIdentity>,
+}
 
-    #[test]
-    fn target_requires_cluster_and_namespace() {
-        let error = MaterializationTarget::new("cluster-a", "").expect_err("namespace required");
-
-        assert_eq!(error.field(), "namespace");
-    }
-
-    #[test]
-    fn target_exposes_validated_fields_by_accessor() {
-        let target = MaterializationTarget::new("cluster-a", "default").expect("valid target");
-
-        assert_eq!(target.cluster_id(), "cluster-a");
-        assert_eq!(target.namespace(), "default");
-    }
-
-    #[test]
-    fn backend_endpoint_requires_uri() {
-        let error = BackendEndpoint::new(" ").expect_err("backend URI required");
-
-        assert_eq!(error.field(), "backend.uri");
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcknowledgeMaterializationEffectRequest {
+    pub instance_generation: Generation,
+    pub effect_id: u64,
+    pub materialization_id: MaterializationId,
+    pub owner: String,
+    pub attempt: u64,
 }

@@ -74,7 +74,7 @@ require_positive_integer SLEEPYPODS_SIDECAR_IMAGE_SIZE_BUDGET_BYTES "${sidecar_i
 expected_error() {
   case "$1" in
     control-plane) echo "failed to get Postgres connection" ;;
-    frontline) echo "transport error" ;;
+    frontline) echo "frontline control-plane startup exceeded 60 seconds" ;;
     sidecar) echo "transport error" ;;
     *) return 1 ;;
   esac
@@ -107,6 +107,7 @@ smoke_run() {
         --env SLEEPYPODS_APP_PORT=8080 \
         --env SLEEPYPODS_INSTANCE_ID=smoke-instance \
         --env SLEEPYPODS_INSTANCE_GENERATION=1 \
+        --env SLEEPYPODS_POD_UID=standalone-smoke \
         --env SLEEPYPODS_CONTROL_PLANE_ENDPOINT=http://127.0.0.1:9 \
         "${image}"
       ;;

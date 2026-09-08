@@ -56,6 +56,7 @@ fn deployment_to_value(object: &Deployment) -> Value {
         &object.metadata,
         json!({
             "replicas": object.spec.replicas,
+            "strategy": { "type": "Recreate" },
             "selector": label_selector_to_value(&object.spec.selector.match_labels),
             "template": pod_template_to_value(&object.spec.template),
         }),
@@ -244,13 +245,22 @@ fn pod_template_metadata_to_value(metadata: &PodTemplateMetadata) -> Value {
 }
 
 fn container_to_value(container: &Container) -> Value {
-    json!({
+    let mut value = json!({
         "name": container.name,
         "image": container.image,
         "ports": container.ports.iter().map(container_port_to_value).collect::<Vec<_>>(),
         "env": container.env.iter().map(env_var_to_value).collect::<Vec<_>>(),
         "volumeMounts": container.volume_mounts.iter().map(volume_mount_to_value).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(probe) = &container.readiness_probe {
+        value["readinessProbe"] = json!({
+            "httpGet": {"path": probe.path, "port": probe.port},
+            "periodSeconds": probe.period_seconds,
+            "timeoutSeconds": probe.timeout_seconds,
+            "failureThreshold": probe.failure_threshold,
+        });
+    }
+    value
 }
 
 fn container_port_to_value(port: &ContainerPort) -> Value {
@@ -266,12 +276,14 @@ fn env_var_to_value(env: &EnvVar) -> Value {
     if let Some(source) = &env.value_from {
         value.insert(
             "valueFrom".to_owned(),
-            json!({
-                "secretKeyRef": {
-                    "name": source.secret_key_ref.name,
-                    "key": source.secret_key_ref.key,
-                },
-            }),
+            match source {
+                super::EnvVarSource::SecretKeyRef(secret) => json!({
+                    "secretKeyRef": { "name": secret.name, "key": secret.key },
+                }),
+                super::EnvVarSource::FieldRef { field_path } => json!({
+                    "fieldRef": { "apiVersion": "v1", "fieldPath": field_path },
+                }),
+            },
         );
     } else {
         value.insert("value".to_owned(), json!(env.value));

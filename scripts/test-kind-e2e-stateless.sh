@@ -12,11 +12,14 @@ app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/stateless-app:${imag
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19051}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19080}"
+frontline_metrics_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_METRICS_PORT:-19090}"
 operator_token="${SLEEPYPODS_KIND_E2E_OPERATOR_TOKEN:-operator-token}"
 proxy_token="${SLEEPYPODS_KIND_E2E_PROXY_TOKEN:-proxy-token}"
 sidecar_token="${SLEEPYPODS_KIND_E2E_SIDECAR_TOKEN:-sidecar-token}"
 invalid_token="${SLEEPYPODS_KIND_E2E_INVALID_TOKEN:-invalid-token}"
 kubeconfig="$(mktemp)"
+control_plane_pf_log="$(mktemp)"
+frontline_pf_log="$(mktemp)"
 created_cluster=0
 control_plane_pf=""
 frontline_pf=""
@@ -33,6 +36,13 @@ require_command() {
 cleanup() {
   local status=$?
 
+  if [[ "${status}" != "0" ]]; then
+    echo "==> Stateless failure: control-plane port-forward diagnostics" >&2
+    cat "${control_plane_pf_log}" >&2 || true
+    echo "==> Stateless failure: frontline/metrics port-forward diagnostics" >&2
+    cat "${frontline_pf_log}" >&2 || true
+  fi
+
   if [[ -n "${control_plane_pf}" ]]; then
     kill "${control_plane_pf}" >/dev/null 2>&1 || true
     wait "${control_plane_pf}" 2>/dev/null || true
@@ -48,7 +58,7 @@ cleanup() {
     KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   fi
 
-  rm -f "${kubeconfig}"
+  rm -f "${kubeconfig}" "${control_plane_pf_log}" "${frontline_pf_log}"
   exit "${status}"
 }
 trap cleanup EXIT
@@ -185,11 +195,17 @@ metadata:
     sleepypods.io/kind-e2e: stateless
 rules:
   - apiGroups: [""]
-    resources: ["services"]
+    resources: ["services", "secrets"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
@@ -299,6 +315,8 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: metrics
+              containerPort: 19090
           readinessProbe:
             tcpSocket:
               port: http
@@ -307,6 +325,8 @@ spec:
           env:
             - name: SLEEPYPODS_FRONTLINE_LISTEN_ADDR
               value: 0.0.0.0:8080
+            - name: SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR
+              value: 0.0.0.0:19090
             - name: SLEEPYPODS_CONTROL_PLANE_ENDPOINT
               value: http://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
             - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
@@ -328,6 +348,9 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+    - name: metrics
+      port: 19090
+      targetPort: 19090
 YAML
 
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/sleepypods-control-plane --timeout=180s
@@ -335,10 +358,10 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 
 echo "==> Starting local port-forwards"
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
-  svc/sleepypods-control-plane "${operator_port}:50051" >/tmp/sleepypods-control-plane-port-forward.log 2>&1 &
+  svc/sleepypods-control-plane "${operator_port}:50051" >"${control_plane_pf_log}" 2>&1 &
 control_plane_pf=$!
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
-  svc/sleepypods-frontline "${frontline_port}:8080" >/tmp/sleepypods-frontline-port-forward.log 2>&1 &
+  svc/sleepypods-frontline "${frontline_port}:8080" "${frontline_metrics_port}:19090" >"${frontline_pf_log}" 2>&1 &
 frontline_pf=$!
 
 echo "==> Running stateless kind E2E driver"
@@ -347,6 +370,7 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
   SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
+  SLEEPYPODS_E2E_FRONTLINE_METRICS_ADDR="127.0.0.1:${frontline_metrics_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
   SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \

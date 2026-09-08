@@ -11,7 +11,6 @@ use crate::{
     ids::{Generation, InstanceId},
     materialization::MaterializationTarget,
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    route::ListRouteBindingsForInstanceRequest,
     store::{ControlPlaneStore, StoreError},
 };
 
@@ -77,6 +76,8 @@ where
         target,
         route_events,
     ))
+    .max_decoding_message_size(256 * 1024)
+    .max_encoding_message_size(1024 * 1024)
 }
 
 #[tonic::async_trait]
@@ -116,26 +117,24 @@ where
 }
 
 async fn notify_instance_routes_changed(
-    store: &dyn ControlPlaneStore,
+    _store: &dyn ControlPlaneStore,
     route_events: &RouteSubscriptionBroker,
     instance_id: InstanceId,
 ) -> Result<(), Status> {
-    let route_bindings = store
-        .list_route_bindings_for_instance(ListRouteBindingsForInstanceRequest::new(instance_id))
-        .await
-        .map_err(store_error_to_status)?;
-    route_events.notify_routes_changed(&route_bindings);
+    route_events.notify_instance_changed(instance_id);
     Ok(())
 }
 
 fn report_idle_request_from_proto(
     request: pb::SidecarReportIdleRequest,
 ) -> Result<idle::ReportIdleRequest, Status> {
-    Ok(idle::ReportIdleRequest::new(
+    let mut report = idle::ReportIdleRequest::new(
         InstanceId::new(request.instance_id).map_err(invalid_argument_status)?,
         Generation::new(request.expected_generation),
         request.active_count,
-    ))
+    );
+    report.pod_uid = request.pod_uid;
+    Ok(report)
 }
 
 fn report_idle_result_to_proto(result: ReportIdleResult) -> pb::SidecarReportIdleResponse {
@@ -184,6 +183,7 @@ fn report_idle_error_response(
         ReportIdleError::WorkloadClassNotFound => {
             Err(Status::not_found("workload class version not found"))
         }
+        ReportIdleError::UnsupportedSleep(error) => Err(Status::failed_precondition(error)),
         ReportIdleError::SleepPolicy(error) => Err(Status::failed_precondition(format!(
             "sleep policy invalid: {error}"
         ))),
@@ -223,6 +223,22 @@ fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
 
 fn store_error_to_status(error: StoreError) -> Status {
     match error {
+        StoreError::SleepDeferred { retry_after } => {
+            let mut status = Status::failed_precondition(format!(
+                "automatic sleep deferred for {} ms after activation",
+                retry_after.as_millis()
+            ));
+            status.metadata_mut().insert(
+                sleepypods_api::IDLE_RETRY_AFTER_METADATA,
+                retry_after
+                    .as_millis()
+                    .min(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT.as_millis())
+                    .to_string()
+                    .parse()
+                    .expect("decimal metadata"),
+            );
+            status
+        }
         StoreError::InvalidArgument { message } => Status::invalid_argument(message),
         StoreError::NotFound { resource } => Status::not_found(format!("{resource} not found")),
         StoreError::AlreadyExists { resource } => {
@@ -248,6 +264,10 @@ fn store_error_to_status(error: StoreError) -> Status {
                 message.push_str(&format!(" generation {owner_generation}"));
             }
             Status::failed_precondition(message)
+        }
+        StoreError::LeaseConflict { message } => Status::aborted(message),
+        StoreError::IdempotencyResourceDeleted { resource } => {
+            Status::failed_precondition(format!("idempotent replay refers to a deleted {resource}"))
         }
         StoreError::IdempotencyConflict => {
             Status::already_exists("idempotency key was already used for a different request")

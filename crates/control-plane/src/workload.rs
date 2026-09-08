@@ -67,6 +67,8 @@ pub enum ValueSchemaError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkloadClassValidationError {
     SleepPolicy(SleepPolicyError),
+    ReplicaContract(ManifestRenderError),
+    StorageContract(ManifestRenderError),
     ExclusivityKey(WorkloadExclusivityKeyError),
 }
 
@@ -99,6 +101,13 @@ impl LoadWorkloadClassVersionRequest {
 
 impl WorkloadClassVersion {
     pub fn validate(&self) -> Result<(), WorkloadClassValidationError> {
+        self.template
+            .workload
+            .validate_replicas()
+            .map_err(WorkloadClassValidationError::ReplicaContract)?;
+        self.template
+            .validate_storage_retention()
+            .map_err(WorkloadClassValidationError::StorageContract)?;
         self.sleep_policy
             .validate()
             .map_err(WorkloadClassValidationError::SleepPolicy)?;
@@ -311,6 +320,7 @@ impl fmt::Display for WorkloadClassValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SleepPolicy(error) => write!(f, "{error}"),
+            Self::ReplicaContract(error) | Self::StorageContract(error) => write!(f, "{error}"),
             Self::ExclusivityKey(error) => write!(f, "{error}"),
         }
     }
@@ -320,6 +330,7 @@ impl Error for WorkloadClassValidationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SleepPolicy(error) => Some(error),
+            Self::ReplicaContract(error) | Self::StorageContract(error) => Some(error),
             Self::ExclusivityKey(error) => Some(error),
         }
     }
