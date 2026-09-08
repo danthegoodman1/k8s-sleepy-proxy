@@ -201,3 +201,25 @@ resource/RSS and matched performance obligations.
 The independent reviewer approved whole-phase closure after verifying source and
 artifact hashes, raw counts, process peer evidence, both test-only corrections
 and the current contracts. Phase 4 is complete and ready for its stage commit.
+
+## Hosted follow-up
+
+[CI run 34288517173](https://github.com/danthegoodman1/sleepypods/actions/runs/34288517173)
+on commit `5a337f3078e4ae424eafb590c4eb1f9b8a705bb3` passed formatting, lint,
+workspace tests, dependency/inventory checks and isolated examples, but its
+actual PostgreSQL target failed: 23 passed, 1 failed, 0 ignored, in 72.51s.
+`postgres_sixteen_registered_watches_poll_with_two_connection_pool_and_ordinary_native_work`
+reported a closed watch stream. The full raw log is retained at
+`.generated/dynamic-certificates/phase4/hosted-ci-34288517173.log`.
+
+Controlled protocol-delay experiments establish fixed-phase starvation with both
+the raw store and production read-retry wrapper. The reviewed bounded FIFO
+correction also accounts for the overlap between a completed logical read's
+detached drain and its producer's next call. Same-relay red/green results,
+cancellation ownership and unchanged deadlines are recorded in the
+[Phase 5C correction evidence](../phase5/watch-admission.md). The original hosted
+run's exact network/scheduling delay remains unknown. The correction passes its
+exact-source broad gate; gate 4G remains reopened pending hosted validation.
+The local passing results above retain
+their exact scope; final integration and production-image confidence require the
+remaining gates.

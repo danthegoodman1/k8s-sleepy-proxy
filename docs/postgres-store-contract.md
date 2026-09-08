@@ -286,11 +286,22 @@ This bounds admitted local work and session reuse; remote statement termination
 still depends on PostgreSQL and its configured statement timeout.
 
 Snapshot and certificate-feed reads share an additional one-slot watch limit per
-store. The same ownership record carries it through connection checkout, queued
-SQL, protocol drain and discard. Thus a canceled watch read cannot release its
-slot while its SQL/session cleanup is still outstanding. Ordinary certificate
-operations retain the other default slots; the two-connection minimum still
-preserves one ordinary route/lifecycle connection.
+store. Admission allows at most 17 active or queued calls: 16 native producer
+calls plus one previous logical read whose detached protocol drain still owns
+the watch slot. A producer can queue its next poll before that drain finishes.
+The 17-call bound includes that overlap without admitting another concurrent
+watch SQL operation.
+
+Admitted calls wait in Tokio's FIFO semaphore under a three-second bound, then
+acquire ordinary certificate and database capacity. Queued calls own no ordinary
+operation permit or database connection; cancellation removes their queued
+ownership. The producer's fixed setup/query deadline still bounds the whole
+operation and is not renewed by admission or retries. The active call retains
+its admission, watch and operation permits together through connection checkout,
+SQL, protocol drain and discard. Canceling it cannot release capacity while
+SQL/session cleanup remains outstanding. Ordinary certificate operations retain
+the other default slots; the two-connection minimum still preserves one ordinary
+route/lifecycle connection.
 
 The [dynamic certificate plan](dynamic-certificates-plan.md) tracks
 the implementation and actual database validation evidence.

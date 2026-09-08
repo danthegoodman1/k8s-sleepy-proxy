@@ -20,8 +20,9 @@ exact canonical DNS hostnames; a supplied SAN/wildcard certificate is acceptable
 only when standards-based validation covers each explicitly bound hostname.
 
 Implementation is active on `dynamic-certificates`, starting from merged main
-`456d37e`. Phases 1–4 are complete; the first three are committed and pushed as `f138053`,
-`4688c23` and `9d0cfa9`. Phase 5 is next. Prior TLS and routing evidence is a
+`456d37e`. Phases 1–4 have reviewed stage commits `f138053`, `4688c23`, `9d0cfa9` and
+`5a337f3`. Phase 5 is active; hosted follow-up reopened 4G for the watch-admission
+correction tracked in 5C. Prior TLS and routing evidence is a
 baseline, not proof that dynamic delivery works. Execute phases in order, preserving a reviewable commit and
 independent review at each completed boundary.
 
@@ -282,7 +283,7 @@ Status ledger:
 | Complete | Work | 4C: Bounded interests, streams and independent progress | Reviewed decoded-memory reservations and three-fetch bound; SQL drain ownership and ordinary native API progress with 16 active watches on a two-connection pool pass. |
 | Complete | Work | 4D: Regression-gate test corrections | Actual PostgreSQL outbox read-retry red/green and controlled sidecar port-collision red/green; independent review approves both test-only fixes with original safety assertions intact. |
 | Complete | Test | 4T: Multi-replica convergence and adversarial ordering | Four actual PostgreSQL/native watch cases plus 13 two-control-plane/two-Frontline process cases pass; maximum observed post-commit convergence 0.476s, existing H2 survives rotation, pruned-history recovery preserves per-host authority. |
-| Complete | Gate | 4G: Reliable propagation with bounded stale service | Explicit whole-phase independent approval; final fmt/strict workspace Clippy, 864 local executions, actual PostgreSQL 24/0/0, dependency gates and process convergence pass at `49cf4e8a`. |
+| In Progress | Gate | 4G: Reliable propagation with bounded stale service | The reviewed local checkpoint `49cf4e8a` passes broad/process gates. A hosted watch-stream failure led to a controlled admission-starvation reproduction; the FIFO correction passes exact-source local gates, with hosted follow-up still required in 5C. |
 
 ## Phase 5: Deployed Certificate Lifecycle and Resource Proof
 
@@ -316,8 +317,9 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 5A: Dynamic-only deployed TLS fixtures | Missing: API-seeded final-image test driver with no Frontline cert mount. |
-| Incomplete | Work | 5B: Operational metrics and resource/load harness | Missing: bounded metrics, secret-safe diagnostics and repeatable workloads. |
+| In Progress | Work | 5A: Dynamic-only deployed TLS fixtures | Implementer converting three deployed/load fixtures to verified native API delivery; owned kind cluster is ready, final-source image execution pending. |
+| In Progress | Work | 5B: Operational metrics and resource/load harness | Bounded metrics and repeatable warm/miss/rotation/flood workloads assigned; source and observed resource evidence pending. |
+| In Progress | Work | 5C: Hosted watch-concurrency regression | Independent review approves bounded FIFO admission, cancellation/drain ownership and controlled drain-delay red/green under unchanged deadlines; [correction evidence](review-evidence/dynamic-certificates/phase5/watch-admission.md). Exact-source broad gates pass, including actual PostgreSQL 24/24 with no skips or ignores; hosted follow-up remains. |
 | Incomplete | Test | 5T: HA, lifecycle, protocol and outage matrix | Missing: actual kind executions with fingerprints and state assertions. |
 | Incomplete | Test | 5P: Matched performance and bounded resource results | Missing: three matched rounds, stable RSS/task/cache measurements and existing budget passes. |
 | Incomplete | Gate | 5G: Production-image behavioral and resource proof | Missing: independent review of deployed results and remaining limitations. |

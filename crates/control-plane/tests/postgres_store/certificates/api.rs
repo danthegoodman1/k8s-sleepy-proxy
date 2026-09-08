@@ -52,7 +52,7 @@ fn query(known: Option<u64>) -> pb::ResolveTlsCertificateRequest {
     }
 }
 async fn server(
-    store: PostgresStore,
+    store: impl ControlPlaneStore + 'static,
     auth: AuthConfig,
     tls: bool,
     tasks: &mut tokio::task::JoinSet<()>,

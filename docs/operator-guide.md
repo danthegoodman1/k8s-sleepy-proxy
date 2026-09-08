@@ -216,7 +216,10 @@ Each control plane admits at most 16 certificate streams. Interests are limited
 to 1,024 exact hosts per stream, messages to 512 KiB, and queued responses to two.
 Initial registration has a three-second setup bound. A registration or history
 poll runs at most once per 250 ms per stream; streams renew after at most 60
-seconds. These are local admission bounds, not a database throughput promise.
+seconds. Database watch reads wait in a bounded FIFO queue; a waiting read uses
+no ordinary database slot. One watch read or its protocol cleanup owns the watch
+database slot at a time. These are local admission bounds, not a database
+throughput promise.
 
 TLS 1.2 and 1.3 use full handshakes. Server session storage, session tickets and
 early data are disabled, so an attempted resumption cannot bypass current SNI

@@ -19,7 +19,7 @@ use tonic::{
     Request, Response, Status,
 };
 
-pub(crate) const WATCH_STREAMS: usize = 16;
+pub(crate) use crate::certificate::work::WATCH_STREAMS;
 const RESPONSE_QUEUE: usize = 2;
 const PAGE: u32 = 256;
 const POLL: Duration = Duration::from_millis(250);

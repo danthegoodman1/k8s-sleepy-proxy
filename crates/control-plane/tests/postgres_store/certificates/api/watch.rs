@@ -370,16 +370,24 @@ async fn postgres_sixteen_registered_watches_poll_with_two_connection_pool_and_o
             .with_certificate_sealer(ring("a", &[("a", 7)]));
         let mut tasks = tokio::task::JoinSet::new();
         let result = async {
-            let (url, ca) = server(limited, tokens(), true, &mut tasks).await?;
+            let (url, ca) = server(
+                RetryingControlPlaneStore::with_default_policy(Arc::new(limited)),
+                tokens(),
+                true,
+                &mut tasks,
+            )
+            .await?;
             let connection = channel(url, Some(&ca)).await?;
             let mut proxy = ProxyControlPlaneClient::new(connection.clone());
             let mut operator = OperatorControlPlaneClient::new(connection);
             let mut watches = Vec::new();
-            for _ in 0..16 {
+            for index in 0..16 {
                 let (send, mut events) =
                     watch(&mut proxy, Some(registration(1, &[("live.example", 0)]))).await?;
                 let pb::watch_tls_certificates_response::Value::Snapshot(snapshot) =
-                    next(&mut events).await?
+                    next(&mut events)
+                        .await
+                        .map_err(|error| format!("initial watch[{index}] snapshot: {error}"))?
                 else {
                     panic!("every admitted watch must complete a real SQL snapshot");
                 };
@@ -448,8 +456,10 @@ async fn postgres_sixteen_registered_watches_poll_with_two_connection_pool_and_o
                     Some(pb::proxy_subscribe_response::Output::RouteMiss(_))
                 ));
                 drop((route_send, route));
-                for (_, events) in &mut watches {
-                    let event = changes(events).await?;
+                for (index, (_, events)) in watches.iter_mut().enumerate() {
+                    let event = changes(events).await.map_err(|error| {
+                        format!("round[{round}] watch[{index}] changes: {error}")
+                    })?;
                     assert_eq!(event.events.len(), 1);
                     assert_eq!(event.events[0].view_revision, binding_revision.get());
                 }
@@ -483,9 +493,11 @@ async fn postgres_sixteen_registered_watches_poll_with_two_connection_pool_and_o
                 .await??;
                 recovered.push(pair);
             }
-            for (_, events) in &mut recovered {
+            for (index, (_, events)) in recovered.iter_mut().enumerate() {
                 assert!(matches!(
-                    next(events).await?,
+                    next(events)
+                        .await
+                        .map_err(|error| format!("recovered watch[{index}] snapshot: {error}"))?,
                     pb::watch_tls_certificates_response::Value::Snapshot(_)
                 ));
             }
@@ -534,22 +546,26 @@ async fn postgres_watch_read_slot_survives_cancelled_sql_without_starving_ordina
                         }).await??;
             reads.abort_all();
             while reads.join_next().await.is_some() {}
-            assert!(
-                matches!(
-                    store.load_tls_certificate_changes(rev(0), 1).await,
-                    Err(StoreError::Unavailable { .. })
+            let mut queued = store.load_tls_certificate_changes(rev(0), 1);
+            // Drive the actual outbox future while the cancelled bindings SQL
+            // remains blocked. Its initial Pending poll alone proves nothing.
+            let (waiting, ordinary) = tokio::join!(
+                tokio::time::timeout(Duration::from_millis(200), queued.as_mut()),
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    store.get_instance(GetInstanceRequest::new(InstanceId::new("ordinary")?)),
                 ),
-                "cancel must retain the watch slot through SQL drain"
             );
+            assert!(waiting.is_err(), "queued read must wait for the active SQL drain");
+            assert!(ordinary??.is_none(), "ordinary work progresses while the watch is queued");
+            assert_eq!(raw.query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock'",
+                &[&pid],
+            ).await?.get::<_,i64>(0), 1, "the original SQL is still blocked");
+            drop(queued); // Cancel the FIFO waiter independently of the active drain.
             assert!(tokio::time::timeout(
                 Duration::from_secs(1),
                 store.get_certificate_metadata(id("ordinary-certificate"))
-            )
-            .await??
-            .is_none());
-            assert!(tokio::time::timeout(
-                Duration::from_secs(1),
-                store.get_instance(GetInstanceRequest::new(InstanceId::new("ordinary")?))
             )
             .await??
             .is_none());

@@ -502,12 +502,12 @@ pub(super) async fn changes(
     cursor: CertificateRevision,
     limit: u32,
 ) -> StoreResult<DurableTlsCertificateChanges> {
-    let work = store.certificate_work.acquire_watch()?;
     if limit == 0 || limit > MAX_TLS_CHANGE_BATCH {
         return Err(StoreError::invalid_argument(
             "TLS change batch requires 1–1024 events",
         ));
     }
+    let work = store.certificate_work.acquire_watch().await?;
     let cursor_i64 = cursor.get() as i64;
     let row=work.client(store).await?.query_one("SELECT c.revision, (SELECT min(revision) FROM tls_certificate_outbox) AS first_revision, COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY revision) FROM (SELECT revision,hostname,certificate_id,certificate_version,kind FROM tls_certificate_outbox WHERE revision>$1 ORDER BY revision LIMIT $2) p),'[]'::jsonb) AS events FROM tls_certificate_revision c WHERE singleton", &[&cursor_i64,&(limit as i64)]).await.map_err(map_postgres_error)?;
     let current: i64 = row.get("revision");
@@ -573,7 +573,7 @@ pub(super) async fn snapshot(
         ));
     }
     let hosts: Vec<_> = hostnames.iter().map(|h| h.as_str()).collect();
-    let work = store.certificate_work.acquire_watch()?;
+    let work = store.certificate_work.acquire_watch().await?;
     let row = work.client(store).await?.query_one(
         "SELECT c.revision, COALESCE((SELECT jsonb_agg(jsonb_build_object('hostname', h.hostname, 'certificate_id', b.certificate_id, 'revision', COALESCE(b.revision,0)) ORDER BY h.ordinality) FROM unnest($1::text[]) WITH ORDINALITY h(hostname,ordinality) LEFT JOIN tls_hostname_bindings b ON b.hostname=h.hostname),'[]'::jsonb) AS bindings FROM tls_certificate_revision c WHERE singleton",
         &[&hosts],
