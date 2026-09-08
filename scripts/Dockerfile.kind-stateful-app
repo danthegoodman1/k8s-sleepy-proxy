@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.13-alpine
+
+RUN mkdir -p /app /data
+COPY scripts/kind-stateful-app.py /app/kind-stateful-app.py
+
+EXPOSE 8080
+CMD ["python", "/app/kind-stateful-app.py"]

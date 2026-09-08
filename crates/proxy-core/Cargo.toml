@@ -1,0 +1,33 @@
+[package]
+name = "proxy-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true, default-features = false }
+futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
+http = { workspace = true, default-features = false, features = ["std"] }
+http-body = { workspace = true, default-features = false }
+http-body-util = { workspace = true, default-features = false, features = ["full"] }
+hyper = { workspace = true, default-features = false, features = ["client", "http1", "http2", "server"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "tokio"], default-features = false }
+pin-project-lite = { version = "0.2.17", default-features = false }
+sleepypods-observability = { version = "0.1.0", path = "../sleepypods-observability" }
+socket2 = "0.6.4"
+tls-parser = { version = "0.12.2", default-features = false }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "time"], default-features = false }
+tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
+tower-service = "0.3.3"
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["async_tokio"], default-features = false }
+http-body-util = { workspace = true, default-features = false }
+hyper = { workspace = true, default-features = false, features = ["server"] }
+socket2 = "0.6.4"
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[[bench]]
+name = "proxy_primitives"
+harness = false

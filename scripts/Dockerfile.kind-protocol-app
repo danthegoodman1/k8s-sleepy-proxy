@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_IMAGE=rust:1-bookworm
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+
+FROM ${RUST_IMAGE} AS build
+WORKDIR /workspace
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/workspace/target \
+    cargo build --locked --release -p proxy-core --example kind_protocol_app && \
+    mkdir -p /out/usr/local/bin && \
+    cp target/release/examples/kind_protocol_app /out/usr/local/bin/kind-protocol-app
+
+FROM ${RUNTIME_IMAGE}
+
+COPY --from=build /out/ /
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/kind-protocol-app"]

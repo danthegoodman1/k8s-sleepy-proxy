@@ -1,6 +1,7 @@
 .git
 .generated
 .env.local
+target
 infra/terraform/.terraform
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.*

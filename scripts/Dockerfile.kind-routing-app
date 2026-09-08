@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.13-alpine
+
+RUN mkdir -p /app
+COPY scripts/kind-routing-app.py /app/kind-routing-app.py
+
+EXPOSE 8080
+CMD ["python", "/app/kind-routing-app.py"]

@@ -1,0 +1,26 @@
+[package]
+name = "sidecar"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true, default-features = false }
+http = { workspace = true, default-features = false, features = ["std"] }
+http-body = { workspace = true, default-features = false }
+http-body-util = { workspace = true, default-features = false, features = ["full"] }
+hyper = { workspace = true, default-features = false, features = ["http1", "http2", "server"] }
+hyper-util = { workspace = true, default-features = false, features = ["tokio", "http1", "http2"] }
+proxy-core = { workspace = true }
+sleepypods-api = { version = "0.1.0", path = "../sleepypods-api" }
+sleepypods-types = { workspace = true }
+tokio = { workspace = true, default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tonic = { workspace = true, features = ["channel", "codegen"] }
+
+[dev-dependencies]
+futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
+hyper = { workspace = true, default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "test-util"] }
+tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
+tonic = { workspace = true, features = ["server", "router"] }
