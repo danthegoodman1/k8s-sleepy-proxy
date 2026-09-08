@@ -37,3 +37,8 @@ locked dependencies under the same Rust 1.98.1 compiler.
 No deployed image, Kubernetes or performance run is relabeled by this repair.
 Those historical results retain the scopes in the original validation packet.
 Follow-up hosted status is reported on the pull request for its exact head.
+
+Both follow-up hosted Clippy gates passed. The push run then exposed a separate
+PostgreSQL observation failure while the PR run passed; the
+[supersession fixture correction](../ci-postgres-handoff/README.md) records that
+diagnosis, controlled regression and follow-up validation.

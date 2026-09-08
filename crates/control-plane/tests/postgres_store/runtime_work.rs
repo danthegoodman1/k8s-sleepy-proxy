@@ -200,6 +200,12 @@ struct SchedulerKubernetes {
     behavior: Arc<std::sync::Mutex<BTreeMap<String, &'static str>>>,
     waiting: Arc<std::sync::atomic::AtomicUsize>,
     operation_gate: Option<Arc<tokio::sync::Semaphore>>,
+    cleanup_gate: Option<Arc<SupersessionCleanupGate>>,
+}
+
+struct SupersessionCleanupGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
 }
 impl control_plane::KubernetesMaterializerClient for SchedulerKubernetes {
     fn apply_object<'a>(
@@ -303,7 +309,13 @@ impl control_plane::KubernetesMaterializerClient for SchedulerKubernetes {
         objects: &'a [RenderedObjectRef],
         id: &'a str,
     ) -> control_plane::KubernetesClientFuture<'a, control_plane::KubernetesClientResult<()>> {
-        self.inner.ensure_no_descendants(objects, id)
+        Box::pin(async move {
+            if let Some(gate) = &self.cleanup_gate {
+                gate.entered.notify_one();
+                gate.release.acquire().await.expect("cleanup gate").forget();
+            }
+            self.inner.ensure_no_descendants(objects, id).await
+        })
     }
     fn verify_retained_bindings<'a>(
         &'a self,
@@ -713,8 +725,16 @@ async fn delete_supersedes_pending_case(
         .await?
         .instance;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let definite_apply = matches!(behavior, "apply-permanent" | "apply-transient");
+    let cleanup_gate = definite_apply.then(|| {
+        Arc::new(SupersessionCleanupGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    });
     let client = SchedulerKubernetes {
         operation_gate: Some(gate.clone()),
+        cleanup_gate: cleanup_gate.clone(),
         ..Default::default()
     };
     client.behavior.lock().unwrap().insert(id.clone(), behavior);
@@ -755,6 +775,7 @@ async fn delete_supersedes_pending_case(
     );
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let mut jobs = tokio::task::JoinSet::new();
+    let driver_started = tokio::time::Instant::now();
     jobs.spawn(driver.run_until_shutdown(receiver));
     let result: TestResult = async {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -772,32 +793,110 @@ async fn delete_supersedes_pending_case(
         if waking.state != InstanceState::Waking {
             return Err(format!("expected Waking, got {waking:?}").into());
         }
-        let accepted = StoreBackedOperatorApi::new(store.clone(), materializer, target)
-            .delete_instance(tonic::Request::new(pb::DeleteInstanceRequest {
-                instance_id: id.clone(),
-                expected_generation: Some(waking.generation.get()),
-            }))
-            .await?
-            .into_inner();
-        if !accepted.accepted {
-            return Err("Delete was not accepted".into());
-        }
-        let after_accept = supersession_snapshot(raw, pending.id.as_str()).await?;
-        if behavior != "apply-hang" {
-            gate.add_permits(1);
-        }
-        let finished = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if store
-                    .get_instance(GetInstanceRequest::new(cold.id.clone()))
-                    .await?
-                    .is_none()
-                {
-                    return Ok::<_, control_plane::StoreError>(());
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // This is an observation budget, not a lifecycle policy. Definite errors
+        // must hand off before the first 10s heartbeat and the old 30s lease, but
+        // real database/cleanup I/O is not required to finish within one second.
+        let completion_budget = if definite_apply {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        let delete_started = tokio::time::Instant::now();
+        let completion_deadline = delete_started + completion_budget;
+        let accept = async {
+            let accepted = StoreBackedOperatorApi::new(store.clone(), materializer, target)
+                .delete_instance(tonic::Request::new(pb::DeleteInstanceRequest {
+                    instance_id: id.clone(),
+                    expected_generation: Some(waking.generation.get()),
+                }))
+                .await?
+                .into_inner();
+            if !accepted.accepted {
+                return Err("Delete was not accepted".into());
             }
-        })
+            supersession_snapshot(raw, pending.id.as_str()).await
+        };
+        let after_accept = if definite_apply {
+            tokio::time::timeout_at(completion_deadline, accept).await??
+        } else {
+            accept.await?
+        };
+        let finished = tokio::time::timeout_at(
+            if definite_apply {
+                completion_deadline
+            } else {
+                // Preserve the original short-read and uncertain-effect cases.
+                tokio::time::Instant::now() + completion_budget
+            },
+            async {
+                if behavior != "apply-hang" {
+                    gate.add_permits(1);
+                }
+                if let Some(cleanup_gate) = &cleanup_gate {
+                    cleanup_gate.entered.notified().await;
+                    let handoff = supersession_snapshot(raw, pending.id.as_str()).await?;
+                    let old: serde_json::Value = serde_json::from_str(&before)?;
+                    let accepted: serde_json::Value = serde_json::from_str(&after_accept)?;
+                    let current: serde_json::Value = serde_json::from_str(&handoff)?;
+                    // The real Deleting attempt is held before finalization, so
+                    // absence cannot erase a stale failure or lease handoff bug.
+                    if old["attempt"] != 1
+                        || current["attempt"] != 2
+                        || current["state"] != "deleting"
+                        || current["instance_state"] != "deleting"
+                        || current["instance_generation"] != 2
+                        || current["materialization_generation"] != 1
+                        || current["owner"] != old["owner"]
+                        || current["failure_count"] != 0
+                        || !current["failure_kind"].is_null()
+                        || current["failure_requires_cleanup"] != false
+                        || current["effect_count"] != 0
+                        || current["operation_deadline"] != accepted["operation_deadline"]
+                    {
+                        return Err(format!("invalid supersession handoff: {handoff}").into());
+                    }
+                    let old_lease_expiry = old["lease_expires"]
+                        .as_i64()
+                        .ok_or("old attempt has no lease expiry")?;
+                    let handoff_at = current["now"]
+                        .as_i64()
+                        .ok_or("handoff has no database timestamp")?;
+                    // A later lease snapshot may already reflect renewal. The
+                    // driver's start is a conservative lower bound for its first
+                    // heartbeat, independent of any intervening database delay.
+                    if tokio::time::Instant::now() >= driver_started + Duration::from_secs(10)
+                        || handoff_at >= old_lease_expiry - 20_000
+                    {
+                        return Err("definite error did not settle before its first heartbeat".into());
+                    }
+                    eprintln!("6L definite handoff {behavior}: old={before}; current={handoff}; elapsed={:?}", delete_started.elapsed());
+                    if behavior == "apply-transient" {
+                        // Controlled valid descendant-inspection latency proves
+                        // a one-second absence deadline conflates safe handoff
+                        // with I/O completion. This does not emulate WAL timing.
+                        tokio::time::sleep_until(delete_started + Duration::from_millis(1_100)).await;
+                        let held = store
+                            .get_instance(GetInstanceRequest::new(cold.id.clone()))
+                            .await?
+                            .ok_or("instance finalized while cleanup inspection was held")?;
+                        if held.state != InstanceState::Deleting || held.generation != Generation::new(2) {
+                            return Err("deletion identity changed while cleanup inspection was held".into());
+                        }
+                    }
+                    cleanup_gate.release.add_permits(1);
+                }
+                loop {
+                    if store
+                        .get_instance(GetInstanceRequest::new(cold.id.clone()))
+                        .await?
+                        .is_none()
+                    {
+                        return Ok::<_, Box<dyn Error + Send + Sync>>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            },
+        )
         .await;
         let after = supersession_snapshot(raw, pending.id.as_str()).await?;
         eprintln!(
@@ -873,7 +972,7 @@ async fn delete_supersedes_pending_case(
         match finished {
             Ok(result) => result?,
             Err(_) => {
-                return Err(format!("accepted Delete did not finish within 1s; {after}").into())
+                return Err(format!("accepted Delete did not finish within {completion_budget:?}; {after}").into())
             }
         }
         if !client.inner.objects.lock().unwrap().is_empty() {
@@ -916,7 +1015,7 @@ async fn delete_supersedes_pending_case(
 }
 
 async fn supersession_snapshot(raw: &tokio_postgres::Client, id: &str) -> TestResult<String> {
-    Ok(raw.query_opt("SELECT json_build_object('state', m.state, 'instance_state', i.state, 'instance_generation', i.generation, 'materialization_generation', m.instance_generation, 'owner', m.reconcile_owner, 'attempt', m.reconcile_attempt, 'lease_expires', m.reconcile_lease_expires_at_unix_millis, 'failure_kind', m.failure_kind, 'failure_count', m.failure_count, 'failure_requires_cleanup', m.failure_requires_cleanup, 'effect_count', (SELECT count(*) FROM materialization_effects e WHERE e.materialization_id=m.materialization_id))::text FROM materializations m JOIN instances i USING(instance_id) WHERE materialization_id=$1", &[&id]).await?.map(|row| row.get::<_, String>(0)).unwrap_or_else(|| "absent".into()))
+    Ok(raw.query_opt("SELECT json_build_object('state', m.state, 'instance_state', i.state, 'instance_generation', i.generation, 'materialization_generation', m.instance_generation, 'now', (extract(epoch from clock_timestamp()) * 1000)::bigint, 'operation_deadline', m.operation_deadline_unix_millis, 'owner', m.reconcile_owner, 'attempt', m.reconcile_attempt, 'lease_expires', m.reconcile_lease_expires_at_unix_millis, 'failure_kind', m.failure_kind, 'failure_count', m.failure_count, 'failure_requires_cleanup', m.failure_requires_cleanup, 'effect_count', (SELECT count(*) FROM materialization_effects e WHERE e.materialization_id=m.materialization_id))::text FROM materializations m JOIN instances i USING(instance_id) WHERE materialization_id=$1", &[&id]).await?.map(|row| row.get::<_, String>(0)).unwrap_or_else(|| "absent".into()))
 }
 
 async fn deletion_and_failure_use_one_lock_order(
