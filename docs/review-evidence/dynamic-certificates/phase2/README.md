@@ -105,3 +105,12 @@ denial, oversized input rejection, and decryption errors remaining errors.
 HTTP-01 evidence combines the actual proxy client, existing runtime interception
 tests with zero route/wake calls, and real PostgreSQL hit/expiry/error behavior.
 Recursive protobuf Debug tests cover enclosing publication and Found responses.
+
+## Hosted validation
+
+Commit `4688c231faa43d1547c4d7a7d0e27504a6948abe` passed
+[CI run 34276472052](https://github.com/danthegoodman1/sleepypods/actions/runs/34276472052),
+including formatting, strict Clippy, workspace tests, production dependency
+boundaries, inventory tests, isolated load-helper checks and actual PostgreSQL.
+The raw log is retained at
+`.generated/dynamic-certificates/phase2/hosted-ci-34276472052.log`.

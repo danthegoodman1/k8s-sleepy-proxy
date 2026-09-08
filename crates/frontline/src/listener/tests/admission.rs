@@ -64,9 +64,10 @@ async fn tls_and_sni_setup_share_global_admission_with_http_and_recover() {
     let sni_addr = sni.local_addr().unwrap();
     let cert = test_cert("app.example.com");
     let client_config = client_config_trusting(cert.cert.clone());
-    let store = TlsCertificateStore::new();
-    store
-        .upsert("app.example.com", vec![cert.cert], cert.key)
+    let fixture = crate::certificates::test_support::CertificateFixture::new();
+    let store = fixture.cache.clone();
+    fixture
+        .publish("app.example.com", vec![cert.cert], cert.key)
         .unwrap();
     let adapter = FrontlineTlsAdapter::new(store).with_resource_config(resources);
     let shutdown = Shutdown::new();
@@ -117,6 +118,7 @@ async fn tls_and_sni_setup_share_global_admission_with_http_and_recover() {
     assert_eq!(admission.connections.in_flight(), 0);
     assert_eq!(admission.requests.in_flight(), 0);
     assert_eq!(admission.handshakes.in_flight(), 0);
+    fixture.finish().await;
 }
 
 #[test]
@@ -202,7 +204,7 @@ async fn sni_write_override_bounds_only_pending_writes_and_preserves_quiet_sessi
     let runtime = tokio::spawn(serve_tls_passthrough_listener_with_shared(
         listener,
         shared,
-        FrontlineTlsAdapter::new(TlsCertificateStore::new()).with_resource_config(resources),
+        FrontlineTlsAdapter::new(TlsCertificateStore::disabled()).with_resource_config(resources),
         shutdown.clone(),
     ));
     let mut client = TcpStream::connect(addr).await.unwrap();

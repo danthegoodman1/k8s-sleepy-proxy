@@ -31,42 +31,14 @@ use crate::{
 const REQUEST_BODY: &[u8] = b"tls request body";
 const RESPONSE_BODY: &[u8] = b"tls response body";
 
-#[test]
-fn certificate_store_canonicalizes_selects_and_rotates_certificates() {
-    let store = TlsCertificateStore::new();
-    let first = test_cert("app.example.com");
-    store
-        .upsert(" App.Example.COM. ", vec![first.cert], first.key)
-        .expect("first cert inserts");
-
-    let first_config = store
-        .resolve("app.example.com")
-        .expect("lookup succeeds")
-        .expect("first cert exists");
-    assert!(store
-        .resolve("missing.example.com")
-        .expect("lookup succeeds")
-        .is_none());
-
-    let second = test_cert("app.example.com");
-    store
-        .upsert("app.example.com", vec![second.cert], second.key)
-        .expect("replacement cert inserts");
-    let second_config = store
-        .resolve("app.example.com")
-        .expect("lookup succeeds")
-        .expect("second cert exists");
-
-    assert!(!Arc::ptr_eq(&first_config, &second_config));
-}
-
 #[tokio::test]
 async fn unknown_sni_certificate_rejects_tls_handshake() {
-    let store = TlsCertificateStore::new();
+    let fixture = crate::certificates::test_support::CertificateFixture::new();
+    let store = fixture.cache.clone();
     let cert = test_cert("known.example.com");
     let client_config = client_config_trusting(cert.cert.clone());
-    store
-        .upsert("known.example.com", vec![cert.cert], cert.key)
+    fixture
+        .publish("known.example.com", vec![cert.cert], cert.key)
         .expect("cert inserts");
     let adapter = FrontlineTlsAdapter::new(store);
 
@@ -91,15 +63,17 @@ async fn unknown_sni_certificate_rejects_tls_handshake() {
         server.await.expect("server task completes"),
         TlsTerminationError::UnknownCertificate
     ));
+    fixture.finish().await;
 }
 
 #[tokio::test]
 async fn missing_sni_rejects_tls_handshake() {
-    let store = TlsCertificateStore::new();
+    let fixture = crate::certificates::test_support::CertificateFixture::new();
+    let store = fixture.cache.clone();
     let cert = test_cert("known.example.com");
     let client_config = client_config_trusting(cert.cert.clone());
-    store
-        .upsert("known.example.com", vec![cert.cert], cert.key)
+    fixture
+        .publish("known.example.com", vec![cert.cert], cert.key)
         .expect("cert inserts");
     let adapter = FrontlineTlsAdapter::new(store);
 
@@ -124,6 +98,7 @@ async fn missing_sni_rejects_tls_handshake() {
         server.await.expect("server task completes"),
         TlsTerminationError::MissingSni
     ));
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -167,9 +142,10 @@ async fn https_termination_composes_with_frontline_http_forwarding() {
 
     let cert = test_cert("app.example.com");
     let client_config = client_config_trusting(cert.cert.clone());
-    let store = TlsCertificateStore::new();
-    store
-        .upsert("app.example.com", vec![cert.cert], cert.key)
+    let fixture = crate::certificates::test_support::CertificateFixture::new();
+    let store = fixture.cache.clone();
+    fixture
+        .publish("app.example.com", vec![cert.cert], cert.key)
         .expect("cert inserts");
     let adapter = FrontlineTlsAdapter::new(store);
     let forwarder = FrontlineForwarder::new(DrainTracker::new(std::time::Duration::from_secs(5)));
@@ -211,6 +187,7 @@ async fn https_termination_composes_with_frontline_http_forwarding() {
 
     server.await.expect("server task completes");
     upstream_task.await.expect("upstream task completes");
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -244,7 +221,7 @@ async fn passthrough_extracts_sni_and_preserves_preread_prefix_and_tail() {
         }
     });
 
-    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::new());
+    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled());
     let (mut client, proxy_side) = io::duplex(4096);
     let proxy_task = tokio::spawn(async move { adapter.passthrough(&ready, proxy_side).await });
 
@@ -300,7 +277,7 @@ async fn passthrough_waits_for_late_listener_after_refusal_and_sends_prefix_once
     let mut expected = hello.clone();
     expected.extend_from_slice(tail);
     let expected_len = expected.len();
-    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::new()).with_resource_config(
+    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled()).with_resource_config(
         proxy_core::ProxyResourceConfig::default()
             .with_timeouts(
                 Duration::from_secs(1),
@@ -357,7 +334,7 @@ async fn passthrough_rejects_bad_inputs_before_connecting() {
         Err(TlsPassthroughBackendError::InvalidAuthority(_))
     ));
 
-    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::new());
+    let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled());
     let ready = ready_backend("tcp://127.0.0.1:1");
 
     let (mut client, proxy_side) = io::duplex(1024);
@@ -542,15 +519,16 @@ async fn passthrough_setup_timeout_and_cancellation_do_not_redial() {
         let address = reservation.local_addr().unwrap();
         drop(reservation);
         let ready = ready_backend(format!("tcp://{address}"));
-        let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::new()).with_resource_config(
-            proxy_core::ProxyResourceConfig::default()
-                .with_timeouts(
-                    Duration::from_millis(120),
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                )
-                .unwrap(),
-        );
+        let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled())
+            .with_resource_config(
+                proxy_core::ProxyResourceConfig::default()
+                    .with_timeouts(
+                        Duration::from_millis(120),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                    )
+                    .unwrap(),
+            );
         let (mut client, proxy_side) = io::duplex(4096);
         client
             .write_all(&client_hello(Some(sni_extension(b"late.example.com"))))
@@ -594,7 +572,7 @@ async fn passthrough_does_not_replay_after_clienthello_dispatch() {
     let (mut client, proxy_side) = io::duplex(4096);
     client.write_all(&hello).await.unwrap();
     let task = tokio::spawn(async move {
-        FrontlineTlsAdapter::new(TlsCertificateStore::new())
+        FrontlineTlsAdapter::new(TlsCertificateStore::disabled())
             .passthrough(&ready, proxy_side)
             .await
     });

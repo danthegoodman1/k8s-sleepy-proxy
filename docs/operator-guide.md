@@ -158,6 +158,45 @@ queued commit cannot still finish. Keep old read keys available through this
 settlement and retain keys required to restore older backups. Re-encryption
 preserves certificate versions and hostname views.
 
+## Frontline certificate cache
+
+Enable `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` and configure a verified
+HTTPS control-plane endpoint with the proxy bearer token. Frontline starts with
+an empty certificate cache. It fetches the exact SNI binding on the first TLS
+connection, validates the returned bundle, and keeps the result in memory.
+Warm handshakes perform no certificate RPC or certificate parsing. HTTP-01 works
+through the proxy API before publication and does not require an application
+certificate.
+
+Frontline loads no application certificates from files and writes no certificate
+cache to disk. Restarting loses the cache; a subsequent TLS connection needs a
+successful resolution. The existing bounded control-plane connection setup still
+applies at startup. An empty cache alone does not prevent listener readiness.
+
+The cache admits at most 1,024 hostname entries, including misses and pending
+lookups, with 64 MiB of accounted memory and at most 32 simultaneous fetches.
+Memory accounting includes fetch scratch space and configurations still retained
+by handshakes or other references after cache eviction. It is an admission budget, not a
+process RSS limit; connection buffers and the runtime have separate costs.
+Identical misses share one fetch. Lookup has a three-second deadline within the
+overall five-second TLS setup bound; capacity exhaustion fails the handshake.
+
+Positive views refresh after approximately 60 seconds with hostname jitter, or
+half the granted lease when that is sooner. The worker polls once per second;
+leases shorter than a poll or lookup cannot promise a completed refresh before
+expiry, and selection still fails closed at the original deadline.
+Each successful authoritative resolution grants at most five minutes of service,
+capped by the effective validity of the entire chain and measured conservatively
+from the start of the RPC. Failed refreshes never extend that deadline. An
+unchanged response can renew only the exact certificate view still held locally.
+Authoritative misses are cached for at most one second. During a control-plane
+outage, an existing valid view remains usable only until its original deadline.
+
+TLS 1.2 and 1.3 use full handshakes. Server session storage, session tickets and
+early data are disabled, so an attempted resumption cannot bypass current SNI
+authorization. Already established connections continue under their existing
+connection and drain policy.
+
 ## Control-plane transport and sealing configuration
 
 Provision the control plane's native TLS identity independently of application
@@ -654,7 +693,6 @@ Important environment variables:
 | frontline | `SLEEPYPODS_ROUTE_CACHE_CAPACITY` optional, default `1024` |
 | frontline | `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS` optional, default `30000` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
-| frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` as `sni|cert|key;...` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 | sidecar | rendered by the control plane: listen address, app port, instance ID, generation, downward-API `SLEEPYPODS_POD_UID`, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |

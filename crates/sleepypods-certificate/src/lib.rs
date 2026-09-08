@@ -1,7 +1,10 @@
-use super::{CertificateBundle, InvalidCertificateResource, TlsHostname, MAX_CERTIFICATE_SANS};
+//! Shared certificate validation; no persistence, sealing or application routing.
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
     sign::CertifiedKey,
+};
+use sleepypods_api::{
+    CertificateBundle, InvalidCertificateResource, TlsHostname, MAX_CERTIFICATE_SANS,
 };
 use std::time::Duration;
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, time::ASN1Time};

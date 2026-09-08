@@ -1,0 +1,12 @@
+[package]
+name = "sleepypods-certificate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sleepypods-api = { version = "0.1.0", path = "../sleepypods-api" }
+webpki = { version = "0.103", package = "rustls-webpki", features = ["ring"] }
+x509-parser = { version = "0.18", features = ["verify"] }

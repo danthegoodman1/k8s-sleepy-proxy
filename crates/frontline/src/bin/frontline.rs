@@ -53,13 +53,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let env = FrontlineEnvConfig::from_env()?;
     let prometheus = install_runtime_observability(env.metrics_listen_addr().is_some());
     let observability = ObservabilityRecorder::global();
-    let tls_certificates = env
-        .load_tls_certificate_store()?
-        .unwrap_or_else(TlsCertificateStore::new);
     let shutdown = Shutdown::new();
     let shutdown_task = spawn_shutdown_signal(shutdown.clone())?;
-    let result =
-        run_with_shutdown(env, prometheus, observability, tls_certificates, shutdown).await;
+    let result = run_with_shutdown(env, prometheus, observability, shutdown).await;
     shutdown_task.abort();
     let _ = shutdown_task.await;
     result
@@ -69,7 +65,6 @@ async fn run_with_shutdown(
     env: FrontlineEnvConfig,
     prometheus: Option<PrometheusMetricsSink>,
     observability: ObservabilityRecorder,
-    tls_certificates: TlsCertificateStore,
     shutdown: Shutdown,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let endpoint = sleepypods_api::transport::native_endpoint(
@@ -91,8 +86,11 @@ async fn run_with_shutdown(
         proxy_interceptor.clone(),
     ));
     let http01_resolver = GrpcProxyHttp01Resolver::new(ProxyControlPlaneClient::with_interceptor(
-        channel,
-        proxy_interceptor,
+        channel.clone(),
+        proxy_interceptor.clone(),
+    ));
+    let (tls_certificates, certificate_worker) = TlsCertificateStore::new(std::sync::Arc::new(
+        frontline::certificates::GrpcCertificateResolver::new(channel, proxy_interceptor),
     ));
     let resolver = FrontlineRouteResolver::with_observability(
         env.route_cache_capacity(),
@@ -116,46 +114,57 @@ async fn run_with_shutdown(
         drain,
         observability,
     );
-    if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr(), prometheus) {
-        let metrics_shutdown = shutdown.clone();
-        tokio::try_join!(
-            async {
+    let worker_shutdown = shutdown.clone();
+    let serve = async {
+        let result: Result<(), Box<dyn Error + Send + Sync>> = async {
+            if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr(), prometheus)
+            {
+                let metrics_shutdown = shutdown.clone();
+                tokio::try_join!(
+                    async {
+                        serve_frontline(
+                            env.listeners(),
+                            runtime,
+                            FrontlineTlsAdapter::new(tls_certificates),
+                            shutdown.clone(),
+                        )
+                        .await
+                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+                    },
+                    async {
+                        serve_prometheus_metrics_with_collector(
+                            metrics_addr,
+                            prometheus,
+                            metrics_shutdown.cancelled(),
+                            move |sink| {
+                                let active_streams = active_streams.clone();
+                                async move {
+                                    active_streams.collect(sink);
+                                }
+                            },
+                        )
+                        .await
+                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+                    },
+                )?;
+            } else {
                 serve_frontline(
                     env.listeners(),
                     runtime,
                     FrontlineTlsAdapter::new(tls_certificates),
-                    shutdown,
+                    shutdown.clone(),
                 )
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
-            },
-            async {
-                serve_prometheus_metrics_with_collector(
-                    metrics_addr,
-                    prometheus,
-                    metrics_shutdown.cancelled(),
-                    move |sink| {
-                        let active_streams = active_streams.clone();
-                        async move {
-                            active_streams.collect(sink);
-                        }
-                    },
-                )
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
-            },
-        )?;
-    } else {
-        serve_frontline(
-            env.listeners(),
-            runtime,
-            FrontlineTlsAdapter::new(tls_certificates),
-            shutdown,
-        )
-        .await?;
-    }
+                .await?;
+            }
 
-    Ok(())
+            Ok(())
+        }
+        .await;
+        shutdown.shutdown();
+        result
+    };
+    let (result, ()) = tokio::join!(serve, certificate_worker.run(worker_shutdown));
+    result
 }
 
 // The filtered stderr sink keeps lifecycle and error events visible while

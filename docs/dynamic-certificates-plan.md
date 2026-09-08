@@ -20,7 +20,8 @@ exact canonical DNS hostnames; a supplied SAN/wildcard certificate is acceptable
 only when standards-based validation covers each explicitly bound hostname.
 
 Implementation is active on `dynamic-certificates`, starting from merged main
-`456d37e`. Phase 1 is committed and pushed as `f138053`; Phase 2 is active. Prior TLS and routing evidence is a baseline, not proof that dynamic
+`456d37e`. Phases 1 and 2 are committed and pushed as `f138053` and `4688c23`;
+Phase 3 is active. Prior TLS and routing evidence is a baseline, not proof that dynamic
 delivery works. Execute phases in order, preserving a reviewable commit and
 independent review at each completed boundary.
 
@@ -206,8 +207,10 @@ renew a lease. Keep unrelated hostnames
 independent and give all background work owned cancellation/join behavior.
 
 Remove `FrontlineTlsCertificateConfig`, startup PEM loaders and
-`SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS`, along with production application
-certificate mounts/examples. TLS-listener enablement no longer requires any
+`SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` and current configuration examples.
+Phase 5 converts the deployed TLS/load/libpq fixtures to API seeding and removes
+their application-certificate mounts; those scripts are not valid dynamic-delivery
+gates until converted. TLS-listener enablement no longer requires any
 preloaded certificate; an empty cache alone does not fail process readiness.
 Delete the configuration surface without retaining a compatibility loader.
 Generated test material may seed API calls, but tests must not preload the
@@ -230,11 +233,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: Bounded cache, coalesced fetch and lease refresh | Missing: cache/resolver implementation and deadline/resource accounting tests. |
-| Incomplete | Work | 3B: Dynamic handshake and owned background tasks | Missing: adapter/runtime integration, cancellation and resumption tests. |
-| Incomplete | Work | 3C: Remove static application certificate loading | Missing: loader/config/mount removal and empty-cache process tests. |
-| Incomplete | Test | 3T: Real TLS, cache limits and failure behavior | Missing: peer-certificate assertions, zero-RPC warm proof and no-disk proof. |
-| Incomplete | Gate | 3G: Dynamic-only TLS operation | Missing: independent review and passing process/cache/handshake gates. |
+| Complete | Work | 3A: Bounded cache, coalesced fetch and lease refresh | Reviewed generation-fenced cache, bounded owned work/configuration accounting and fixed/short-lease refresh; [phase evidence](review-evidence/dynamic-certificates/phase3/README.md). |
+| Complete | Work | 3B: Dynamic handshake and owned background tasks | Real TLS 1.2/1.3 peer/ALPN and offered-session tests, causal five-second setup deadline, caller cancellation and blocking validation shutdown ownership pass. |
+| Complete | Work | 3C: Remove static application certificate loading | Production loader/config removed; rebuilt Frontline starts empty and resolves through native API. Deployed fixture conversion and mount removal remain tracked by 5A. |
+| Complete | Test | 3T: Real TLS, cache limits and failure behavior | 58 focused executions and final workspace/process tests; warm benchmark sanity asserts zero additional RPCs, with source/no-key-input and empty-directory observations. Final-image inspection remains 5A/5T. |
+| Complete | Gate | 3G: Dynamic-only TLS operation | Independent source/focused and final evidence approval; frozen fmt/Clippy, 852 local workspace executions, actual PostgreSQL 20-target gate, dependency checks and rebuilt process proof pass. |
 
 ## Phase 4: Rotation, Removal and Reconnect Convergence
 
@@ -281,8 +284,9 @@ Status ledger:
 Goal: verify the complete feature using production images and realistic concurrent
 traffic, including the conditions under which availability is intentionally lost.
 
-Scope: convert `scripts/test-kind-e2e-tls.sh` and its Rust driver to publish
-certificates through the API; remove Frontline's certificate Secret mounts.
+Scope: convert `scripts/test-kind-e2e-tls.sh`, `test-kind-e2e-libpq-sni.sh`,
+`smoke-frontline-load.sh` and their Rust drivers to supply certificates through
+the control-plane delivery API; remove Frontline's application-certificate mounts.
 Use ephemeral platform transport identity for the test control plane. Run two
 Frontlines and two control-plane replicas with explicit certificate fingerprints,
 resource ownership and fault barriers. Add bounded metrics for cache entries/

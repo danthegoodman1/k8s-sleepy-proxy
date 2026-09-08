@@ -17,7 +17,11 @@ status when a documented gap actually closes.
 - `crates/proxy-core`: shared proxy primitives, TLS ClientHello/SNI parsing,
   accounting, drain, shutdown, timeout, proxy-specific metrics adapters, and hot-path benches.
 - `crates/sleepypods-api`: generated protobuf clients/services, shared routing and
-  HTTP-01 contracts, state/backend/target values, and client bearer authentication.
+  HTTP-01/certificate contracts, state/backend/target values, and native transport
+  and client bearer authentication.
+- `crates/sleepypods-certificate`: maintained-library certificate/key/chain and
+  hostname validation shared by publication and Frontline installation, without
+  persistence or sealing dependencies.
 - `crates/sleepypods-observability`: metric and tracing vocabulary, the single
   process-wide recorder, sinks, and Prometheus exporter.
 - `crates/sleepypods-types`: shared ID/value types.
@@ -44,6 +48,10 @@ status when a documented gap actually closes.
 - Frontline route cache/resolver:
   `crates/frontline/src/cache.rs`, `matcher.rs`, `resolver.rs`, `route.rs`,
   `subscription.rs`
+- Certificate delivery: `crates/frontline/src/certificates/`; shared validation:
+  `crates/sleepypods-certificate/src/lib.rs`; encrypted persistence and native
+  management/resolution APIs: `crates/control-plane/src/certificate/`,
+  `postgres/certificate_ops.rs` and `api/certificates.rs`.
 - Sidecar idle: `crates/sidecar/src/idle.rs` and
   `crates/sidecar/src/idle/control_plane.rs`
 - Observability: `crates/sleepypods-observability/src/metrics.rs`,

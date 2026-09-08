@@ -336,14 +336,19 @@ TLS termination or SNI passthrough fails:
 
 1. Check `sleepypods_proxy_tls_client_hello_total` outcomes, especially
    `no_sni`, `invalid_hostname`, `not_tls`, or `malformed`.
-2. For termination, verify
-   `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` and
-   `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` entries use
-   `sni|certificate_path|private_key_path`.
+2. For termination, verify `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR`,
+   verified HTTPS control-plane connectivity and the proxy bearer token. Inspect
+   the exact hostname's `GetTlsBinding` and `GetCertificateMetadata`; the active
+   bundle must cover the hostname and its whole chain must still be valid.
+   Frontline starts with an empty in-memory cache and has no application
+   certificate files. Check cache capacity and lookup failures before restarting;
+   a restart requires a successful control-plane resolution.
 3. For passthrough, verify
    `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` and a TLS SNI route
    binding.
-4. Confirm client SNI matches an exact or wildcard route/certificate.
+4. Confirm client SNI has an exact TLS binding for termination. A wildcard SAN
+   can cover that explicit binding. Passthrough uses its exact or wildcard SNI
+   route independently of application certificate delivery.
 
 Postgres or database outage:
 

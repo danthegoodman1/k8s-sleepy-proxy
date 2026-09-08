@@ -420,9 +420,10 @@ async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
     let tls_addr = reserve_addr().await;
     let cert = test_cert("app.example.com");
     let client_config = client_config_trusting(cert.cert.clone());
-    let store = TlsCertificateStore::new();
-    store
-        .upsert("app.example.com", vec![cert.cert], cert.key)
+    let fixture = crate::certificates::test_support::CertificateFixture::new();
+    let store = fixture.cache.clone();
+    fixture
+        .publish("app.example.com", vec![cert.cert], cert.key)
         .expect("cert inserts");
     let shutdown = Shutdown::new();
     let runtime = runtime_with_state(
@@ -461,6 +462,7 @@ async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
         .expect("frontline task joins")
         .expect("frontline exits");
     upstream_task.await.expect("upstream task joins");
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -486,9 +488,10 @@ async fn tls_termination_applies_forwarded_header_trust_policy_to_http_upstream(
     let tls_addr = reserve_addr().await;
     let cert = test_cert("app.example.com");
     let client_config = client_config_trusting(cert.cert.clone());
-    let store = TlsCertificateStore::new();
-    store
-        .upsert("app.example.com", vec![cert.cert], cert.key)
+    let fixture = crate::certificates::test_support::CertificateFixture::new();
+    let store = fixture.cache.clone();
+    fixture
+        .publish("app.example.com", vec![cert.cert], cert.key)
         .expect("cert inserts");
     let shutdown = Shutdown::new();
     let runtime = runtime_with_state(
@@ -530,6 +533,7 @@ async fn tls_termination_applies_forwarded_header_trust_policy_to_http_upstream(
         .expect("frontline task joins")
         .expect("frontline exits");
     upstream_task.await.expect("upstream task joins");
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -588,7 +592,7 @@ async fn frontline_runtime_wires_tls_passthrough_listener_to_sni_route_and_prese
     let task = tokio::spawn(serve_frontline(
         config,
         runtime,
-        FrontlineTlsAdapter::new(TlsCertificateStore::new()),
+        FrontlineTlsAdapter::new(TlsCertificateStore::disabled()),
         shutdown.clone(),
     ));
 
@@ -639,7 +643,7 @@ async fn tls_passthrough_listener_rejects_malformed_or_missing_sni_without_route
     let task = tokio::spawn(serve_frontline(
         config,
         runtime,
-        FrontlineTlsAdapter::new(TlsCertificateStore::new()),
+        FrontlineTlsAdapter::new(TlsCertificateStore::disabled()),
         shutdown.clone(),
     ));
 
