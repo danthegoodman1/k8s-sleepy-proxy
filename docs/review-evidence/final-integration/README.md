@@ -109,7 +109,9 @@ An unresolved sent Kubernetes effect can deliberately retain ownership
 indefinitely until explicit settlement under the [projection recovery contract](../../projection-safety.md).
 A bounded process exit does not imply cancellation of a blocking DNS worker.
 
-No commit, push or production deployment was requested or performed. The
-[remediation plan](../../review-remediation-plan.md) remains the canonical status
+This implementation-validation checkpoint preceded PR publication. Subsequent
+commits, branch integration and hosted checks are recorded in
+[PR preparation](../pr-preparation/README.md). No production deployment was
+performed. The [remediation plan](../../review-remediation-plan.md) remains the canonical status
 ledger. The reviewed [reversible test-node teardown](test-node-teardown/README.md) and
 retained diagnostics are recorded separately from system correctness gates.

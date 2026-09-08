@@ -127,8 +127,9 @@ release load smokes, clippy and benchmarks were not rerun for this docs review.
 Implementation is authorized for every required outstanding item below. The
 coordinator uses separate implementer and skeptical reviewer agents. Work is
 complete only after explicit review approval and the relevant integration gates;
-an implementer's passing tests alone do not close a phase. No commits or pushes
-have been requested.
+an implementer's passing tests alone do not close a phase. The implementation
+review preceded publication; later commit and PR preparation are recorded
+[separately](review-evidence/pr-preparation/README.md).
 
 | Phase | Final execution status | Evidence |
 | --- | --- | --- |
@@ -148,7 +149,7 @@ source. Required deployed lifecycle, restart, protocol, ownership, routing,
 exclusivity and four-cycle soak gates pass; the corrected fail-closed inventory
 also passes. Repeated performance gates pass with documented warnings and
 capacity limits. Independent [final whole-system review](review-evidence/final-integration/final-review.md)
-approves closure with no unresolved required findings. No production deployment, commit or push is
+approves closure with no unresolved required findings. These validation records precede PR publication; no production deployment is
 claimed.
 
 
@@ -179,7 +180,7 @@ Status ledger:
 | Complete | Work | 1C: Required CI gates | `.github/workflows/ci.yml` runs fmt, clippy with denied warnings, workspace tests and Postgres with skip/nonzero guards. |
 | Complete | Work | 1D: Fail-closed soak discovery | The four inventory reads preserve failures and distinguish verified absence from unavailable discovery. Six mocked regression tests pass locally and independently and are wired into CI; Bash/YAML/source-scope checks pass. [Reviewed packet](review-evidence/soak-inventory-fail-closed/README.md). |
 | Complete | Test | Supplemental deployed inventory | The corrected read-only inventory passes all four original selector queries with zero objects after the four-cycle soak. [Log and scope](review-evidence/final-integration/final-soak-inventory.json) distinguish this point-in-time evidence from the original reader and retained diagnostic namespaces. |
-| Complete | Gate | Existing default-branch CI baseline | Prior evidence retained: CI run `28637514645` at `3fd1997` passed. Final implementation is checked with the local CI-equivalent commands; no new hosted CI run is claimed because no commit or push was requested. |
+| Complete | Gate | Existing default-branch CI baseline | Prior evidence retained: CI run `28637514645` at `3fd1997` passed. The implementation-review checkpoint passed local CI-equivalent commands before publication. Subsequent commit, PR and hosted-check preparation are tracked in review-evidence/pr-preparation/. |
 | Complete | Test | Local workspace and real-store baseline | 2026-09-04: `cargo test --workspace` exited 0; `./scripts/test-postgres-store.sh` exited 0, two tests passed including real conformance. |
 
 ## Phase 2: Data-Plane Quick Wins

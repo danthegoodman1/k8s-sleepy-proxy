@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${repo_root}/scripts/lib/kind-image.sh"
 cluster_name="${SLEEPYPODS_KIND_CLUSTER:-sleepypods-e2e-protocols-test}"
 namespace="${SLEEPYPODS_KIND_E2E_NAMESPACE:-sleepypods-e2e-protocols}"
 keep_cluster="${SLEEPYPODS_KIND_KEEP_CLUSTER:-0}"
@@ -156,7 +157,7 @@ for image in \
   "${app_image}" \
   "${postgres_image}"; do
   echo "==> Loading ${image} into kind/${cluster_name}"
-  kind load docker-image "${image}" --name "${cluster_name}"
+  kind_load_image "${cluster_name}" "${image}"
 done
 
 echo "==> Recreating namespace ${namespace}"

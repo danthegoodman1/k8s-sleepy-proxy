@@ -33,5 +33,7 @@ The reviewer independently verified:
 Approval establishes completion within the documented operating contract and
 measured workloads. It does not establish unlimited capacity or identify the
 exact causes of historical failures whose transient state was not captured.
-No hosted CI run, commit, push or production deployment is claimed. The
-[git-state record](final-git-state.json) preserves the uncommitted branch state.
+This review predates PR publication and does not claim a hosted CI run or
+production deployment. The [git-state record](final-git-state.json) preserves the
+then-uncommitted branch state; later publication is recorded in
+[PR preparation](../pr-preparation/README.md).

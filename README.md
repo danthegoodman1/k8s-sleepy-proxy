@@ -1,8 +1,15 @@
 # SleepyPods
 
 SleepyPods is a Rust control plane and proxy system that materializes Kubernetes
-workloads on demand. The review and remediation plan tracks current implementation
-evidence and remaining production gates.
+workloads on demand. Frontline routes incoming traffic and wakes cold workloads;
+a workload-local sidecar proxies application traffic and reports idleness.
+Postgres stores durable lifecycle intent so accepted work survives client loss
+and controller restart.
+
+The required implementation and production validation gates are complete within
+the documented operating contract. See the
+[validation and independent review](docs/review-evidence/final-integration/README.md)
+for measured workloads, recovery guarantees and remaining capacity limits.
 
 Start here:
 
@@ -14,6 +21,6 @@ Start here:
 - [Contributor and agent guide](docs/contributor-guide.md)
 - [Proxy hot-path budgets](docs/proxy-hot-path-budgets.md)
 
-The old Go, DigitalOcean, Terraform, and demo-script implementation has been
-removed from the `north-star` branch so SleepyPods can start from a clean
-Rust/local development baseline.
+This workspace replaces the Go, DigitalOcean, Terraform and demo-script proof of
+concept. Use the operator guide for the Rust deployment and coordinated API/state
+upgrade requirements.

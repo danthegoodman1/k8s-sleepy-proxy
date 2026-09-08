@@ -19,7 +19,7 @@ use control_plane::{
         TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
         WorkloadTemplate, WorkloadValueSchema,
     },
-    BearerToken, OptionalBearerTokenInterceptor,
+    render_instance_scoped_name, BearerToken, InstanceId, OptionalBearerTokenInterceptor,
 };
 use k8s_openapi::{
     api::{
@@ -50,6 +50,21 @@ const SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd";
 const APP_RESPONSE: &str = "sleepypods-stateless-app";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
+
+#[test]
+fn rendered_name_constants_match_instance_scoped_naming() {
+    let instance_id = InstanceId::new(INSTANCE_ID).unwrap();
+    for (constant, base) in [
+        (RENDERED_WORKLOAD_NAME, WORKLOAD_NAME),
+        (SIDECAR_TOKEN_SECRET_NAME, "sleepypods-sidecar-token"),
+    ] {
+        assert_eq!(
+            constant,
+            render_instance_scoped_name(base, &instance_id),
+            "rendered name constant no longer matches the control plane's instance-scoped naming"
+        );
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires scripts/test-kind-e2e-stateless.sh or an equivalent kind deployment"]

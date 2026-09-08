@@ -24,6 +24,7 @@ use control_plane::api::pb::{
     WorkloadValueSchema,
 };
 use control_plane::projection::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
+use control_plane::{render_instance_scoped_name, InstanceId};
 use k8s_openapi::{
     api::{
         apps::v1::StatefulSet,
@@ -79,6 +80,22 @@ const EXCLUSIVE_BLOCKED_TENANT: &str = "m12-blocked";
 const EXCLUSIVE_OTHER_TENANT: &str = "m12-other";
 const EXCLUSIVE_SHARED_HANDLE: &str = "opaque-shared-handle";
 const EXCLUSIVE_OTHER_HANDLE: &str = "opaque-other-handle";
+
+#[test]
+fn rendered_name_constants_match_instance_scoped_naming() {
+    let instance_id = InstanceId::new(INSTANCE_ID).unwrap();
+    for (constant, base) in [
+        (RENDERED_WORKLOAD_NAME, WORKLOAD_NAME),
+        (RENDERED_PVC_NAME, "e2e-stateful-pvc"),
+        (RENDERED_PV_NAME, "e2e-stateful-pv"),
+    ] {
+        assert_eq!(
+            constant,
+            render_instance_scoped_name(base, &instance_id),
+            "rendered name constant no longer matches the control plane's instance-scoped naming"
+        );
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires scripts/test-kind-e2e-stateful.sh or an equivalent kind deployment"]
