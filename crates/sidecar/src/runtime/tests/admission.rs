@@ -430,9 +430,7 @@ async fn http2_advertises_transport_stream_bound_before_any_application_request(
     let mut settings = vec![0; len];
     stream.read_exact(&mut settings).await.unwrap();
     assert!(
-        settings
-            .chunks_exact(6)
-            .any(|setting| setting == [0, 3, 0, 0, 0, 1]),
+        settings.as_chunks::<6>().0.contains(&[0, 3, 0, 0, 0, 1]),
         "missing max concurrent streams=1: {settings:?}"
     );
     assert_eq!(fixture.admission.requests.in_flight(), 0);

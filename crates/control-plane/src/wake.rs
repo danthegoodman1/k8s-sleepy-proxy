@@ -59,27 +59,27 @@ pub enum WakeInstanceError {
         actual: Generation,
     },
     Unavailable {
-        instance: InstanceRecord,
+        instance: Box<InstanceRecord>,
         reason: WakeUnavailableReason,
     },
     ReadyMaterializationNotFound {
-        instance: InstanceRecord,
+        instance: Box<InstanceRecord>,
         target: MaterializationTarget,
     },
     WorkloadClassNotFound {
-        instance: InstanceRecord,
+        instance: Box<InstanceRecord>,
     },
     Store(StoreError),
     Render {
-        instance: InstanceRecord,
+        instance: Box<InstanceRecord>,
         source: ManifestRenderError,
     },
     SleepPolicy {
-        instance: InstanceRecord,
+        instance: Box<InstanceRecord>,
         source: SleepPolicyError,
     },
     Materializer {
-        instance: InstanceRecord,
+        instance: Box<InstanceRecord>,
         source: MaterializerError,
     },
 }
@@ -137,7 +137,7 @@ where
                 .await
                 .map_err(map_store_error)?
                 .ok_or_else(|| WakeInstanceError::ReadyMaterializationNotFound {
-                    instance: instance.clone(),
+                    instance: Box::new(instance.clone()),
                     target: request.target,
                 })?;
             return Ok(WakeInstanceResult::AlreadyRunning {
@@ -169,7 +169,10 @@ where
             } else {
                 WakeUnavailableReason::Deleted
             };
-            return Err(WakeInstanceError::Unavailable { instance, reason });
+            return Err(WakeInstanceError::Unavailable {
+                instance: Box::new(instance),
+                reason,
+            });
         }
         InstanceState::Cold | InstanceState::Failed | InstanceState::Draining => {}
     }
@@ -180,7 +183,7 @@ where
         .await
         .map_err(map_store_error)?
         .ok_or_else(|| WakeInstanceError::WorkloadClassNotFound {
-            instance: instance.clone(),
+            instance: Box::new(instance.clone()),
         })?;
     class
         .validate()
@@ -189,7 +192,7 @@ where
         .sleep_policy
         .resolve(&instance.values)
         .map_err(|source| WakeInstanceError::SleepPolicy {
-            instance: instance.clone(),
+            instance: Box::new(instance.clone()),
             source,
         })?;
     let waking_generation = if instance.state == InstanceState::Draining {
@@ -215,19 +218,19 @@ where
         },
     )
     .map_err(|source| WakeInstanceError::Render {
-        instance: instance.clone(),
+        instance: Box::new(instance.clone()),
         source,
     })?;
     let refs = materializer
         .rendered_object_refs(&manifest)
         .map_err(|source| WakeInstanceError::Materializer {
-            instance: instance.clone(),
+            instance: Box::new(instance.clone()),
             source,
         })?;
     let keys = class
         .render_exclusivity_keys(&instance.values)
         .map_err(|source| WakeInstanceError::Render {
-            instance: instance.clone(),
+            instance: Box::new(instance.clone()),
             source,
         })?;
     let backend_generation = request

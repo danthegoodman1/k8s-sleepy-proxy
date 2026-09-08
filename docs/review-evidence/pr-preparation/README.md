@@ -47,3 +47,8 @@ exact revisions and limitations remain in the implementation validation packet.
 The remote-integration source has explicit independent approval, including the
 separate hot-path coverage described above. No required merge conflicts or local
 validation failures remain. Hosted CI status is reported by the PR on GitHub.
+
+The initial hosted runs exposed two additional Clippy lints under Rust 1.98.1;
+the local integration checks above used Rust 1.97.0. The subsequent
+[CI repair and matching-compiler validation](../ci-rust-1.98/README.md) records
+the narrow correction separately from this historical integration checkpoint.
