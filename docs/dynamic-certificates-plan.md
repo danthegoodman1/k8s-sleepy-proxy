@@ -20,7 +20,7 @@ exact canonical DNS hostnames; a supplied SAN/wildcard certificate is acceptable
 only when standards-based validation covers each explicitly bound hostname.
 
 Implementation is active on `dynamic-certificates`, starting from merged main
-`456d37e`. Prior TLS and routing evidence is a baseline, not proof that dynamic
+`456d37e`. Phase 1 is committed and pushed as `f138053`; Phase 2 is active. Prior TLS and routing evidence is a baseline, not proof that dynamic
 delivery works. Execute phases in order, preserving a reviewable commit and
 independent review at each completed boundary.
 
@@ -186,11 +186,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: Operator management and proxy resolution APIs | Missing: mappings, metadata-only responses and atomic read results. |
-| Incomplete | Work | 2B: Encrypted authenticated delivery with bounded transport | Missing: native TLS integration, bootstrap configuration and negative tests. |
-| Incomplete | Work | 2C: Proxy HTTP-01 resolution; remove Frontline operator access | Missing: protocol/client/config removal and interception regression tests. |
-| Incomplete | Test | 2T: Real transport, authorization and disclosure checks | Missing: passing role/TLS/limit/error/secret-marker tests. |
-| Incomplete | Gate | 2G: Safe runtime API boundary | Missing: independent review and end-to-end publish/resolve evidence. |
+| Complete | Work | 2A: Operator management and proxy resolution APIs | Reviewed native-only certificate CRUD/reencryption, mandatory CAS and coherent Found/Unchanged/Missing; [phase evidence](review-evidence/dynamic-certificates/phase2/README.md). |
+| Complete | Work | 2B: Encrypted authenticated delivery with bounded transport | Real TLS/role/body/withheld-delivery tests; dedicated RPC/crypto/database admission and cancellation-safe session drain; external platform identity and sealing-key configuration. |
+| Complete | Work | 2C: Proxy HTTP-01 resolution; remove Frontline operator access | Protocol/client/config and deployed fixture credential removed; proxy mapping and zero-route/zero-wake interception regression tests pass. |
+| Complete | Test | 2T: Real transport, authorization and disclosure checks | Three actual PostgreSQL/TLS cases plus real same-peer TLS/H2, recursive Debug markers and rebuilt process startup/role/trust/key-file tests pass. |
+| Complete | Gate | 2G: Safe runtime API boundary | Independent source/focused approval; frozen fmt, strict workspace Clippy, 843 local workspace executions, actual PostgreSQL 20-target gate, dependency checks and real process proof all pass. |
 
 ## Phase 3: Dynamic Frontline Cache and Handshakes
 

@@ -7,6 +7,13 @@ package sleepypods.controlplane.v1;
 // The proxy cache-miss Subscribe stream is a separate native-gRPC-only protocol
 // and is not part of this browser-facing service.
 service OperatorControlPlane {
+  // Certificate methods require authenticated native TLS, never gRPC-Web.
+  rpc PublishCertificate(PublishCertificateRequest) returns (CertificateMetadata);
+  rpc GetCertificateMetadata(GetCertificateMetadataRequest) returns (CertificateMetadata);
+  rpc SetTlsBinding(SetTlsBindingRequest) returns (TlsBinding);
+  rpc GetTlsBinding(GetTlsBindingRequest) returns (TlsBinding);
+  rpc RemoveCertificate(RemoveCertificateRequest) returns (CertificateMetadata);
+  rpc ReencryptCertificate(ReencryptCertificateRequest) returns (CertificateMetadata);
   rpc CreateWorkloadClassVersion(CreateWorkloadClassVersionRequest) returns (WorkloadClassVersion);
   rpc GetWorkloadClassVersion(GetWorkloadClassVersionRequest) returns (WorkloadClassVersion);
   rpc CreateInstance(CreateInstanceRequest) returns (Instance);
@@ -16,7 +23,6 @@ service OperatorControlPlane {
   rpc GetRouteBinding(GetRouteBindingRequest) returns (RouteBinding);
   rpc DeleteRouteBinding(DeleteRouteBindingRequest) returns (DeleteRouteBindingResponse);
   rpc PutHttp01Challenge(PutHttp01ChallengeRequest) returns (Http01Challenge);
-  rpc ResolveHttp01Challenge(ResolveHttp01ChallengeRequest) returns (ResolveHttp01ChallengeResponse);
   rpc DeleteHttp01Challenge(DeleteHttp01ChallengeRequest) returns (DeleteHttp01ChallengeResponse);
   rpc ExpireHttp01Challenges(ExpireHttp01ChallengesRequest) returns (ExpireHttp01ChallengesResponse);
   rpc ReconcileMaterialization(ReconcileMaterializationRequest) returns (ReconcileMaterializationResponse);
@@ -28,6 +34,8 @@ service OperatorControlPlane {
 // intentionally separate from OperatorControlPlane so proxy wake and subscribe
 // traffic does not expand the operator/gRPC-Web API.
 service ProxyControlPlane {
+  rpc ResolveHttp01Challenge(ResolveHttp01ChallengeRequest) returns (ResolveHttp01ChallengeResponse);
+  rpc ResolveTlsCertificate(ResolveTlsCertificateRequest) returns (ResolveTlsCertificateResponse);
   rpc WakeInstance(ProxyWakeInstanceRequest) returns (ProxyWakeInstanceResponse);
   rpc Subscribe(stream ProxySubscribeRequest) returns (stream ProxySubscribeResponse);
 }
@@ -616,3 +624,69 @@ message ForceReleaseExclusivityKeyResponse {
   uint64 updated_materializations = 1;
   repeated ProjectionObservation projection_observations = 2;
 }
+
+// Leaf-first DER chain, unencrypted PKCS#8 DER key; 128 KiB combined/16 entries.
+// Only Publish and Found carry this payload. Never log these messages.
+message CertificateBundle {
+  repeated bytes chain_der = 1;
+  bytes private_key_pkcs8_der = 2;
+}
+message CertificateMetadata {
+  string certificate_id = 1;
+  uint64 version = 2;
+  bool deleted = 3;
+  int64 not_before_unix_millis = 4;
+  int64 not_after_unix_millis = 5;
+  repeated string dns_names = 6;
+  bytes leaf_sha256 = 7;
+  optional string sealing_key_id = 8;
+  uint64 sealing_revision = 9;
+}
+message PublishCertificateRequest {
+  string certificate_id = 1;
+  optional uint64 expected_version = 2;
+  CertificateBundle bundle = 3;
+}
+message GetCertificateMetadataRequest { string certificate_id = 1; }
+message SetTlsBindingRequest {
+  string hostname = 1;
+  optional uint64 expected_revision = 2;
+  optional string certificate_id = 3;
+}
+message GetTlsBindingRequest { string hostname = 1; }
+message TlsBinding {
+  string hostname = 1;
+  optional string certificate_id = 2;
+  uint64 revision = 3;
+}
+message RemoveCertificateRequest {
+  string certificate_id = 1;
+  optional uint64 expected_version = 2;
+}
+message ReencryptCertificateRequest {
+  string certificate_id = 1;
+  optional uint64 expected_version = 2;
+  optional uint64 expected_sealing_revision = 3;
+}
+message ResolveTlsCertificateRequest {
+  string server_name = 1;
+  optional uint64 known_view_revision = 2;
+}
+message ResolveTlsCertificateResponse {
+  string server_name = 1;
+  uint64 view_revision = 2;
+  int64 observed_at_unix_millis = 3;
+  // Start this maximum authorization lifetime at the client's monotonic RPC
+  // START, never receipt. Also enforce the validated chain's usable interval.
+  uint64 authorization_ttl_millis = 4;
+  oneof value {
+    FoundTlsCertificate found = 5;
+    CertificateMetadata unchanged = 6;
+    MissingTlsCertificate missing = 7;
+  }
+}
+message FoundTlsCertificate {
+  CertificateMetadata metadata = 1;
+  CertificateBundle bundle = 2;
+}
+message MissingTlsCertificate {}

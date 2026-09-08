@@ -256,6 +256,9 @@ sealing revision, preserving the logical certificate and hostname view. Old
 sealing keys remain read-capable while every control-plane writer is rolled to
 the new active key ID. Only then re-encrypt/check live records; an old-configured
 writer could otherwise publish new material under the old key after that check.
+Settle in-flight or ambiguous database writes from old-key writers before the
+final check and key retirement; a disconnected caller or stopped transport alone
+does not rule out a queued commit completing later.
 Keep each old key available for as long as required live records or retained
 backups need it. The store's row CAS does not coordinate deployment keyring
 configuration. An unavailable key or failed authentication is an error, never
@@ -264,5 +267,15 @@ an authoritative certificate miss.
 Certificate writes are one-shot through the retry wrapper. Callers inspect
 metadata after an uncertain outcome before choosing a new conditional write.
 Certificate metadata, bindings, resolution and durable feed reads retain bounded
-read retries. The [dynamic certificate plan](dynamic-certificates-plan.md) tracks
+read retries. Certificate operations have their own local admission limit of
+`min(4, pool_capacity - 1)` and two blocking-crypto slots, preserving an ordinary
+pool slot. Sealing-enabled runtime configuration requires at least two pool
+connections. Cancellation retains the operation permit during blocking work and
+while a checked-out session drains sent SQL and queued rollback. The drain has a
+five-second local timeout; only a successful protocol round trip returns the
+session to the pool. Failure, timeout or task cancellation discards its transport.
+This bounds admitted local work and session reuse; remote statement termination
+still depends on PostgreSQL and its configured statement timeout.
+
+The [dynamic certificate plan](dynamic-certificates-plan.md) tracks
 the implementation and actual database validation evidence.

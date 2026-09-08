@@ -2,8 +2,8 @@ use std::{error::Error, process, time::Duration};
 
 use frontline::{
     serve_frontline, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
-    FrontlineRouteResolver, FrontlineTlsAdapter, GrpcOperatorHttp01Resolver,
-    GrpcProxyControlPlaneClient, TlsCertificateStore, WakeTracker,
+    FrontlineRouteResolver, FrontlineTlsAdapter, GrpcProxyControlPlaneClient,
+    GrpcProxyHttp01Resolver, TlsCertificateStore, WakeTracker,
 };
 use proxy_core::{
     observability::{
@@ -18,11 +18,7 @@ use proxy_core::{
     DrainTracker, Shutdown,
 };
 use sleepypods_api::{
-    pb::{
-        operator_control_plane_client::OperatorControlPlaneClient,
-        proxy_control_plane_client::ProxyControlPlaneClient,
-    },
-    OptionalBearerTokenInterceptor,
+    pb::proxy_control_plane_client::ProxyControlPlaneClient, OptionalBearerTokenInterceptor,
 };
 use tokio::time::{sleep, Instant};
 use tonic::transport::Endpoint;
@@ -76,26 +72,28 @@ async fn run_with_shutdown(
     tls_certificates: TlsCertificateStore,
     shutdown: Shutdown,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let endpoint = Endpoint::from_shared(env.control_plane_endpoint().to_owned())?;
+    let endpoint = sleepypods_api::transport::native_endpoint(
+        env.control_plane_endpoint().to_owned(),
+        env.control_plane_ca_pem(),
+    )?;
     let Some(channel) =
         connect_control_plane(endpoint, env.control_plane_endpoint(), &shutdown).await?
     else {
         return Ok(());
     };
     let proxy_interceptor = OptionalBearerTokenInterceptor::new(env.control_plane_proxy_token())?;
-    let operator_interceptor =
-        OptionalBearerTokenInterceptor::new(env.control_plane_operator_token())?;
     let route_client = GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::with_interceptor(
         channel.clone(),
         proxy_interceptor.clone(),
     ));
     let wake_client = GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::with_interceptor(
         channel.clone(),
+        proxy_interceptor.clone(),
+    ));
+    let http01_resolver = GrpcProxyHttp01Resolver::new(ProxyControlPlaneClient::with_interceptor(
+        channel,
         proxy_interceptor,
     ));
-    let http01_resolver = GrpcOperatorHttp01Resolver::new(
-        OperatorControlPlaneClient::with_interceptor(channel, operator_interceptor),
-    );
     let resolver = FrontlineRouteResolver::with_observability(
         env.route_cache_capacity(),
         route_client,

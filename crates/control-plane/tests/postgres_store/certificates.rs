@@ -904,3 +904,6 @@ async fn postgres_certificate_committed_response_loss_is_not_replayed() -> TestR
     })
     .await
 }
+
+#[path = "certificates/api.rs"]
+mod api;

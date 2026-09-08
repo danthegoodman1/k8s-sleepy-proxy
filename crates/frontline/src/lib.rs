@@ -34,8 +34,8 @@ pub use control_plane::{
     proxy_wake_response_from_proto, wake_instance_request_to_proto, ProxyProtocolAdapterError,
 };
 pub use control_plane_transport::{
-    GrpcOperatorHttp01Resolver, GrpcOperatorHttp01ResolverError, GrpcProxyControlPlaneClient,
-    GrpcProxyControlPlaneError,
+    GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError, GrpcProxyHttp01Resolver,
+    GrpcProxyHttp01ResolverError,
 };
 pub use forward::{
     http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardContext,

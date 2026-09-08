@@ -25,7 +25,7 @@ use crate::{
     api::RouteSubscriptionBroker,
     ids::InstanceId,
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
-    manifest::{render_manifests_with_options, RenderManifestOptions, RenderManifestRequest},
+    manifest::{render_manifests_with_options, RenderManifestRequest},
     materialization::{
         BackendEndpoint, ClaimMaterializationReconciliationRequest,
         CompleteWakeReconciliationRequest, CompleteWakeRequest,
@@ -738,9 +738,7 @@ where
                 namespace: materialization.target.namespace(),
                 template_generation: Some(workload_class.template_generation),
             },
-            RenderManifestOptions {
-                sidecar_control_plane_token: self.materializer.sidecar_control_plane_token(),
-            },
+            self.materializer.render_options(),
         )
         .map_err(|error| MaterializationReconcileError::Render(error.to_string()))
     }

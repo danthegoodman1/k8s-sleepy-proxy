@@ -13,6 +13,7 @@ pub mod http01;
 pub mod instance;
 pub mod materialization;
 pub mod route;
+pub mod transport;
 pub mod ids {
     pub use sleepypods_types::*;
 }
@@ -26,3 +27,48 @@ pub use instance::InstanceState;
 pub use materialization::{BackendEndpoint, MaterializationTarget};
 pub use route::*;
 pub use sleepypods_types::*;
+
+impl std::fmt::Debug for pb::CertificateBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertificateBundle")
+            .field("chain_entries", &self.chain_der.len())
+            .field("private_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod certificate_wire_debug_tests {
+    use super::pb;
+
+    #[test]
+    fn enclosing_publication_and_found_debug_redact_private_key_bytes() {
+        let marker = b"PRIVATE-PROTOBUF-DEBUG-MARKER";
+        let bundle = pb::CertificateBundle {
+            chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: marker.to_vec(),
+        };
+        let publication = pb::PublishCertificateRequest {
+            certificate_id: "debug-test".into(),
+            expected_version: Some(0),
+            bundle: Some(bundle.clone()),
+        };
+        let resolution = pb::ResolveTlsCertificateResponse {
+            server_name: "app.example".into(),
+            view_revision: 2,
+            value: Some(pb::resolve_tls_certificate_response::Value::Found(
+                pb::FoundTlsCertificate {
+                    metadata: None,
+                    bundle: Some(bundle),
+                },
+            )),
+            ..Default::default()
+        };
+        let byte_debug = format!("{:?}", marker.as_slice());
+        for debug in [format!("{publication:?}"), format!("{resolution:?}")] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains(std::str::from_utf8(marker).unwrap()));
+            assert!(!debug.contains(&byte_debug));
+        }
+    }
+}

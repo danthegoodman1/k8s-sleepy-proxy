@@ -826,6 +826,19 @@ impl FakeProxyControlPlane {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for FakeProxyControlPlane {
+    async fn resolve_http01_challenge(
+        &self,
+        _: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        panic!("unexpected HTTP01")
+    }
+    async fn resolve_tls_certificate(
+        &self,
+        _: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        panic!("unexpected certificate")
+    }
+
     type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
 
     async fn wake_instance(
@@ -895,6 +908,19 @@ impl GeneratedGrpcBackend {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for GeneratedGrpcBackend {
+    async fn resolve_http01_challenge(
+        &self,
+        _: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        panic!("unexpected HTTP01")
+    }
+    async fn resolve_tls_certificate(
+        &self,
+        _: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        panic!("unexpected certificate")
+    }
+
     type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
 
     async fn wake_instance(

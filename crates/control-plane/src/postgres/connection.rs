@@ -13,6 +13,7 @@ use super::migrations;
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
     pub(crate) pool: Pool,
+    pub(crate) certificate_work: crate::certificate::work::CertificateWorkLimits,
     pub(crate) certificate_sealer: Option<std::sync::Arc<crate::certificate::CertificateSealer>>,
     pub(crate) idempotency_retention_millis: Option<i64>,
 }
@@ -50,6 +51,9 @@ impl PostgresStore {
             })?;
         let store = Self {
             pool,
+            certificate_work: crate::certificate::work::CertificateWorkLimits::new(
+                config.max_connections,
+            ),
             certificate_sealer: None,
             idempotency_retention_millis: retention,
         };

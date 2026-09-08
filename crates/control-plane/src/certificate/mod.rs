@@ -9,3 +9,5 @@ pub use validate::{validate_certificate, validate_hostname, ValidatedCertificate
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod work;

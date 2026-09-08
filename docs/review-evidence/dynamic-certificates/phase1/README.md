@@ -28,6 +28,14 @@ task-owned PostgreSQL 17 container `a6c50eed5695`, not an in-memory substitute.
 The dependency lockfile adds edges to already locked packages; no package version
 or checksum changed. Tokio's `test-util` is enabled only for control-plane tests.
 
+The committed stage `f138053292c8c844f4d369a5d0fd2b64f539d3bc` also passed
+[hosted CI run 34271552704](https://github.com/danthegoodman1/sleepypods/actions/runs/34271552704)
+on 2026-09-08. That run includes workspace checks, real PostgreSQL, dependency
+boundaries, the soak-inventory regression and both isolated load-helper builds.
+Its log is retained locally as `phase1/hosted-ci-34271552704.log` under the same
+ignored artifact root. It is evidence for this storage stage, not later API or
+proxy code.
+
 ## Resource and transaction coverage
 
 The implementation and independent review cover exact canonical DNS bindings,

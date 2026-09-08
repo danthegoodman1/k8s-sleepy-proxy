@@ -29,7 +29,6 @@ const ROUTE_TIMEOUT_MS: &str = "SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS";
 const FRONTLINE_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_LISTEN_ADDR";
 const CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
 const CONTROL_PLANE_PROXY_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
-const CONTROL_PLANE_OPERATOR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN";
 const ROUTE_CACHE_CAPACITY: &str = "SLEEPYPODS_ROUTE_CACHE_CAPACITY";
 const DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const WAKE_INSTANCE_TIMEOUT_MS: &str = "SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS";
@@ -44,7 +43,7 @@ pub struct FrontlineEnvConfig {
     tls_certificates: Vec<FrontlineTlsCertificateConfig>,
     control_plane_endpoint: String,
     control_plane_proxy_token: Option<BearerToken>,
-    control_plane_operator_token: Option<BearerToken>,
+    control_plane_ca_pem: Option<String>,
     route_cache_capacity: usize,
     drain_grace_timeout: Duration,
     wake_instance_timeout: Duration,
@@ -148,8 +147,9 @@ impl FrontlineEnvConfig {
         })?;
         let control_plane_endpoint = required(&vars, CONTROL_PLANE_ENDPOINT)?;
         let control_plane_proxy_token = optional_bearer_token(&vars, CONTROL_PLANE_PROXY_TOKEN)?;
-        let control_plane_operator_token =
-            optional_bearer_token(&vars, CONTROL_PLANE_OPERATOR_TOKEN)?;
+        let control_plane_ca_pem = vars
+            .get(sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV)
+            .cloned();
         let route_cache_capacity =
             optional_usize(&vars, ROUTE_CACHE_CAPACITY, DEFAULT_ROUTE_CACHE_CAPACITY)?;
         let drain_grace_timeout = optional_duration_ms(
@@ -190,7 +190,7 @@ impl FrontlineEnvConfig {
             tls_certificates,
             control_plane_endpoint,
             control_plane_proxy_token,
-            control_plane_operator_token,
+            control_plane_ca_pem,
             route_cache_capacity,
             drain_grace_timeout,
             wake_instance_timeout,
@@ -251,8 +251,8 @@ impl FrontlineEnvConfig {
         self.control_plane_proxy_token.as_ref()
     }
 
-    pub fn control_plane_operator_token(&self) -> Option<&BearerToken> {
-        self.control_plane_operator_token.as_ref()
+    pub fn control_plane_ca_pem(&self) -> Option<&str> {
+        self.control_plane_ca_pem.as_deref()
     }
 
     pub fn route_cache_capacity(&self) -> usize {
@@ -655,7 +655,7 @@ mod tests {
         );
         assert_eq!(config.control_plane_endpoint(), "http://127.0.0.1:50051");
         assert!(config.control_plane_proxy_token().is_none());
-        assert!(config.control_plane_operator_token().is_none());
+        assert!(config.control_plane_ca_pem().is_none());
         assert_eq!(config.route_cache_capacity(), DEFAULT_ROUTE_CACHE_CAPACITY);
         assert_eq!(
             config.drain_grace_timeout(),
@@ -681,7 +681,6 @@ mod tests {
             (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
             (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
             (CONTROL_PLANE_PROXY_TOKEN, "proxy-secret"),
-            (CONTROL_PLANE_OPERATOR_TOKEN, "operator-secret"),
             (ROUTE_CACHE_CAPACITY, "17"),
             (DRAIN_GRACE_TIMEOUT_MS, "250"),
             (WAKE_INSTANCE_TIMEOUT_MS, "750"),
@@ -698,16 +697,6 @@ mod tests {
                 .to_str()
                 .expect("ascii"),
             "Bearer proxy-secret"
-        );
-        assert_eq!(
-            config
-                .control_plane_operator_token()
-                .expect("operator token")
-                .authorization_header_value()
-                .expect("header value")
-                .to_str()
-                .expect("ascii"),
-            "Bearer operator-secret"
         );
         assert_eq!(config.route_cache_capacity(), 17);
         assert_eq!(config.drain_grace_timeout(), Duration::from_millis(250));

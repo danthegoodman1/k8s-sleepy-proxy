@@ -2,6 +2,7 @@
 #[path = "support/unexpected_store.rs"]
 mod unexpected_store;
 mod support;
+use control_plane::api::pb::proxy_control_plane_server::ProxyControlPlane;
 use support::TestStore as FakeInstanceStore;
 
 use std::{
@@ -61,6 +62,16 @@ fn store_operator_api(
     store: Arc<dyn ControlPlaneStore>,
 ) -> StoreBackedOperatorApi<FakeKubernetesClient> {
     StoreBackedOperatorApi::new(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        target(),
+    )
+}
+
+fn store_proxy_api(
+    store: Arc<dyn ControlPlaneStore>,
+) -> control_plane::api::StoreBackedProxyApi<FakeKubernetesClient> {
+    control_plane::api::StoreBackedProxyApi::new(
         store,
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         target(),
@@ -132,7 +143,7 @@ async fn manual_http01_expiry_is_deterministic_after_background_collection() {
         // Both are valid manual results depending on the background sweep.
         assert_eq!(natural.expired, if background_collected { 0 } else { 1 });
         for token in ["manual", "sentinel"] {
-            let record = service
+            let record = store_proxy_api(store.clone())
                 .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
                     key: Some(key(token)),
                 }))
@@ -157,7 +168,7 @@ async fn manual_http01_expiry_is_deterministic_after_background_collection() {
             1
         );
         for (token, expected) in [("manual", None), ("sentinel", Some("sentinel"))] {
-            let record = service
+            let record = store_proxy_api(store.clone())
                 .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
                     key: Some(key(token)),
                 }))
@@ -189,7 +200,7 @@ async fn manual_http01_expiry_is_deterministic_after_background_collection() {
                 .into_inner()
                 .deleted
         );
-        assert!(service
+        assert!(store_proxy_api(store.clone())
             .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
                 key: Some(key("sentinel"))
             }))
@@ -1408,7 +1419,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         "acme.example.com"
     );
 
-    let resolved = service
+    let resolved = store_proxy_api(store.clone())
         .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
             key: Some(challenge_key.clone()),
         }))
@@ -2297,7 +2308,7 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
         "acme.example.com"
     );
 
-    let resolved: ResolveHttp01ChallengeResponse = grpc_web_store_unary(
+    let resolved: ResolveHttp01ChallengeResponse = grpc_proxy_store_unary(
         Arc::clone(&store),
         "ResolveHttp01Challenge",
         ResolveHttp01ChallengeRequest {
@@ -2467,7 +2478,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
         "native-acme.example.com"
     );
 
-    let resolved: ResolveHttp01ChallengeResponse = grpc_store_unary(
+    let resolved: ResolveHttp01ChallengeResponse = grpc_proxy_store_unary(
         Arc::clone(&store),
         "ResolveHttp01Challenge",
         ResolveHttp01ChallengeRequest {
@@ -2787,7 +2798,7 @@ async fn native_grpc_and_grpc_web_requests_dispatch_to_same_placeholder_method()
 
 #[test]
 fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
-    assert_eq!(OPERATOR_UNARY_METHODS.len(), 15);
+    assert_eq!(OPERATOR_UNARY_METHODS.len(), 20);
     assert!(OPERATOR_UNARY_METHODS.contains(&"CreateWorkloadClassVersion"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"GetWorkloadClassVersion"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"CreateInstance"));
@@ -2796,7 +2807,7 @@ fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
     assert!(OPERATOR_UNARY_METHODS.contains(&"CreateRouteBinding"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"GetRouteBinding"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteRouteBinding"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
+    assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"ReconcileMaterialization"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"ForceDeleteMaterialization"));
     assert!(OPERATOR_UNARY_METHODS.contains(&"ForceReleaseExclusivityKey"));
@@ -2860,6 +2871,42 @@ where
         ))
         .await
         .expect("native gRPC request should route through store-backed service");
+    let headers = response.headers().clone();
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .expect("native gRPC response body should collect");
+    let trailers = collected.trailers().cloned();
+    let body = collected.to_bytes();
+
+    assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
+
+    decode_grpc_message(body.as_ref())
+}
+
+async fn grpc_proxy_store_unary<M, R>(
+    store: Arc<dyn ControlPlaneStore>,
+    method: &'static str,
+    request: R,
+) -> M
+where
+    M: Message + Default,
+    R: Message,
+{
+    let mut request =
+        grpc_operator_unary_request(request, method, "application/grpc", Version::HTTP_2);
+    *request.uri_mut() = format!("/sleepypods.controlplane.v1.ProxyControlPlane/{method}")
+        .parse()
+        .unwrap();
+    let response = control_plane::api::proxy_grpc_service_with_store(
+        store,
+        KubernetesMaterializer::new(FakeKubernetesClient::default()),
+        target(),
+    )
+    .oneshot(request)
+    .await
+    .expect("native gRPC request should route through store-backed service");
     let headers = response.headers().clone();
     let collected = response
         .into_body()
@@ -3241,6 +3288,48 @@ impl MetadataCapturingOperatorApi {
 
 #[tonic::async_trait]
 impl OperatorControlPlane for MetadataCapturingOperatorApi {
+    async fn publish_certificate(
+        &self,
+        _: tonic::Request<control_plane::api::pb::PublishCertificateRequest>,
+    ) -> Result<Response<control_plane::api::pb::CertificateMetadata>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
+    async fn get_certificate_metadata(
+        &self,
+        _: tonic::Request<control_plane::api::pb::GetCertificateMetadataRequest>,
+    ) -> Result<Response<control_plane::api::pb::CertificateMetadata>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
+    async fn set_tls_binding(
+        &self,
+        _: tonic::Request<control_plane::api::pb::SetTlsBindingRequest>,
+    ) -> Result<Response<control_plane::api::pb::TlsBinding>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
+    async fn get_tls_binding(
+        &self,
+        _: tonic::Request<control_plane::api::pb::GetTlsBindingRequest>,
+    ) -> Result<Response<control_plane::api::pb::TlsBinding>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
+    async fn remove_certificate(
+        &self,
+        _: tonic::Request<control_plane::api::pb::RemoveCertificateRequest>,
+    ) -> Result<Response<control_plane::api::pb::CertificateMetadata>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
+    async fn reencrypt_certificate(
+        &self,
+        _: tonic::Request<control_plane::api::pb::ReencryptCertificateRequest>,
+    ) -> Result<Response<control_plane::api::pb::CertificateMetadata>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
     async fn create_workload_class_version(
         &self,
         _request: tonic::Request<CreateWorkloadClassVersionRequest>,
@@ -3317,15 +3406,6 @@ impl OperatorControlPlane for MetadataCapturingOperatorApi {
         &self,
         _request: tonic::Request<PutHttp01ChallengeRequest>,
     ) -> Result<Response<Http01Challenge>, Status> {
-        Err(Status::unimplemented(
-            "metadata test only implements CreateInstance",
-        ))
-    }
-
-    async fn resolve_http01_challenge(
-        &self,
-        _request: tonic::Request<ResolveHttp01ChallengeRequest>,
-    ) -> Result<Response<ResolveHttp01ChallengeResponse>, Status> {
         Err(Status::unimplemented(
             "metadata test only implements CreateInstance",
         ))

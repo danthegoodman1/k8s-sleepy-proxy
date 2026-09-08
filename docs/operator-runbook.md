@@ -20,6 +20,28 @@ It is disabled unless an explicit listen address is configured:
 Bind metrics listeners on an internal address or behind your normal scrape
 auth/network policy. Do not expose them on the public proxy listener.
 
+## Certificate API diagnosis
+
+Use authenticated native TLS for certificate operations. Transport trust is
+provisioned independently of application certificates; publishing an application
+certificate cannot repair the control plane's own TLS identity or caller trust.
+
+| Failure | Check |
+| --- | --- |
+| Native TLS setup fails | Confirm the endpoint hostname is covered by the platform server certificate and that the caller trusts its CA. Check certificate validity and the configured public CA PEM. |
+| `Unauthenticated` or `PermissionDenied` | Confirm the correct role token and native TLS transport. Operators manage certificates; proxies resolve certificates and HTTP-01; sidecars cannot read certificate material. Certificate RPCs reject no-auth, plaintext and gRPC-Web. |
+| Publication returns `InvalidArgument` | Check leaf-first DER chain, matching PKCS#8 DER key, effective chain validity, server-auth use, all existing bound hostnames and bundle limits. A failed rotation leaves the active version intact. |
+| Resolution returns `InvalidArgument` | Check the hostname and the stored chain's validity. An expired or otherwise invalid active bundle is a validation error, not an authoritative miss. |
+| Mutation returns `FailedPrecondition` | Read current metadata or binding revision and reconcile the desired change. Expected versions/revisions are required; a stale value cannot overwrite a newer view. |
+| Resolution returns `Missing` | Inspect the exact hostname binding, including whether its certificate was removed. Binding and certificate resources are independent of the application's route. |
+| `Unavailable` or deadline errors | Check PostgreSQL health and certificate work saturation. A timeout may follow a committed mutation; inspect current state before another conditional write. |
+| Resolution returns `Internal` | Check that each replica has the required sealing read key and consistent key material. Investigate damaged stored material without dumping private keys into diagnostics. Storage/decryption errors are not authoritative misses. |
+
+Follow the [operator guide](operator-guide.md#control-plane-transport-and-sealing-configuration)
+for bootstrap configuration and coordinated endpoint/CA changes. Keep old sealing
+keys until old-writer database work is settled, live rows are verified under the
+new key, and retained backups no longer require them.
+
 ## Metric Names
 
 Low-cardinality label keys are `protocol`, `direction`, `operation`,

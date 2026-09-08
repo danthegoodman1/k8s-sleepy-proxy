@@ -12,6 +12,7 @@ use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
     task::JoinSet,
 };
+use tonic::transport::Endpoint;
 
 // Own an exclusive endpoint without publishing a listener. These guards stay
 // alive until a never-publish test has checked its exact startup outcome.
@@ -56,6 +57,7 @@ fn config(proxy: SocketAddr, app: SocketAddr, ready: SocketAddr) -> EnvConfig {
         .unwrap(),
         runtime_mode: SidecarRuntimeMode::Http,
         pod_uid: "fixture-pod".into(),
+        control_plane_ca_pem: None,
         control_plane_endpoint: "http://127.0.0.1:1".into(),
         control_plane_sidecar_token: None,
         metrics_listen_addr: None,

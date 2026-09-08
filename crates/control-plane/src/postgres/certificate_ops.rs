@@ -65,14 +65,8 @@ fn chain_digest(chain: &[Vec<u8>]) -> Vec<u8> {
     }
     digest.finish().as_ref().to_vec()
 }
-fn sealer(store: &PostgresStore) -> StoreResult<&CertificateSealer> {
-    store
-        .certificate_sealer
-        .as_deref()
-        .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))
-}
 fn bundle(
-    store: &PostgresStore,
+    sealer: &CertificateSealer,
     row: &Row,
     meta: &CertificateMetadata,
 ) -> StoreResult<CertificateBundle> {
@@ -96,7 +90,7 @@ fn bundle(
             .get::<_, Option<Vec<u8>>>("sealed_private_key")
             .ok_or_else(|| StoreError::internal("sealed certificate key is missing"))?,
     };
-    let key = sealer(store)?
+    let key = sealer
         .open(&meta.id, meta.version, &chain_digest(&chain), &envelope)
         .map_err(|e| StoreError::internal(e.0))?;
     CertificateBundle::new(chain, key.to_vec()).map_err(invalid)
@@ -188,7 +182,8 @@ pub(super) async fn publish(
     store: &PostgresStore,
     request: PublishCertificateRequest,
 ) -> StoreResult<CertificateMetadata> {
-    let mut client = store.client().await?;
+    let work = store.certificate_work.acquire()?;
+    let mut client = work.client(store).await?;
     let tx = client.transaction().await.map_err(map_postgres_error)?;
     lock(&tx).await?;
     let old = certificate(&tx, &request.id).await?;
@@ -207,7 +202,7 @@ pub(super) async fn publish(
             resource: "retired certificate ID",
         });
     }
-    let validated = validate_certificate(&request.bundle, now(&tx).await?).map_err(invalid)?;
+    let observed_at = now(&tx).await?;
     let hosts = tx
         .query(
             "SELECT hostname FROM tls_hostname_bindings WHERE certificate_id=$1 LIMIT 1025",
@@ -220,27 +215,37 @@ pub(super) async fn publish(
             "certificate binding inventory exceeds its bound",
         ));
     }
-    for row in hosts {
-        validate_hostname(
-            request.bundle.chain_der(),
-            &TlsHostname::new(row.get::<_, String>(0)).map_err(invalid)?,
-        )
-        .map_err(invalid)?;
-    }
     let version = next(request.expected_version)?;
     let sealing_revision = next(
         old_meta
             .as_ref()
             .map_or(CertificateRevision::ZERO, |m| m.sealing_revision),
     )?;
-    let sealed = sealer(store)?
-        .seal(
-            &request.id,
-            version,
-            &chain_digest(request.bundle.chain_der()),
-            request.bundle.private_key_pkcs8_der(),
-        )
-        .map_err(|e| StoreError::internal(e.0))?;
+    let keyring = store
+        .certificate_sealer
+        .clone()
+        .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))?;
+    let (request, validated, sealed) = work
+        .blocking(move || {
+            let validated = validate_certificate(&request.bundle, observed_at).map_err(invalid)?;
+            for row in hosts {
+                validate_hostname(
+                    request.bundle.chain_der(),
+                    &TlsHostname::new(row.get::<_, String>(0)).map_err(invalid)?,
+                )
+                .map_err(invalid)?;
+            }
+            let sealed = keyring
+                .seal(
+                    &request.id,
+                    version,
+                    &chain_digest(request.bundle.chain_der()),
+                    request.bundle.private_key_pkcs8_der(),
+                )
+                .map_err(|e| StoreError::internal(e.0))?;
+            Ok((request, validated, sealed))
+        })
+        .await?;
     tx.execute("INSERT INTO certificates(certificate_id,version,state,not_before_unix_millis,not_after_unix_millis,dns_names,leaf_sha256,chain_der,seal_format,seal_key_id,seal_nonce,sealed_private_key,sealing_revision) VALUES($1,$2,'active',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(certificate_id) DO UPDATE SET version=excluded.version,state=excluded.state,not_before_unix_millis=excluded.not_before_unix_millis,not_after_unix_millis=excluded.not_after_unix_millis,dns_names=excluded.dns_names,leaf_sha256=excluded.leaf_sha256,chain_der=excluded.chain_der,seal_format=excluded.seal_format,seal_key_id=excluded.seal_key_id,seal_nonce=excluded.seal_nonce,sealed_private_key=excluded.sealed_private_key,sealing_revision=excluded.sealing_revision", &[&request.id.as_str(),&(version.get() as i64),&validated.not_before_unix_millis,&validated.not_after_unix_millis,&validated.dns_names,&validated.leaf_sha256,&request.bundle.chain_der(),&(sealed.format_version as i16),&sealed.key_id,&&sealed.nonce[..],&sealed.ciphertext,&(sealing_revision.get() as i64)]).await.map_err(map_postgres_error)?;
     invalidate_hosts(&tx, &request.id, version, false).await?;
     let result = metadata(&certificate(&tx, &request.id).await?.unwrap())?;
@@ -252,14 +257,16 @@ pub(super) async fn get_metadata(
     store: &PostgresStore,
     id: CertificateId,
 ) -> StoreResult<Option<CertificateMetadata>> {
-    store.client().await?.query_opt("SELECT certificate_id,version,state,not_before_unix_millis,not_after_unix_millis,dns_names,leaf_sha256,seal_key_id,sealing_revision FROM certificates WHERE certificate_id=$1", &[&id.as_str()]).await.map_err(map_postgres_error)?.as_ref().map(metadata).transpose()
+    let work = store.certificate_work.acquire()?;
+    work.client(store).await?.query_opt("SELECT certificate_id,version,state,not_before_unix_millis,not_after_unix_millis,dns_names,leaf_sha256,seal_key_id,sealing_revision FROM certificates WHERE certificate_id=$1", &[&id.as_str()]).await.map_err(map_postgres_error)?.as_ref().map(metadata).transpose()
 }
 pub(super) async fn get_binding(
     store: &PostgresStore,
     hostname: TlsHostname,
 ) -> StoreResult<TlsBinding> {
-    let row = store
-        .client()
+    let work = store.certificate_work.acquire()?;
+    let row = work
+        .client(store)
         .await?
         .query_opt(
             "SELECT certificate_id, revision FROM tls_hostname_bindings WHERE hostname=$1",
@@ -286,7 +293,8 @@ pub(super) async fn set_binding(
     store: &PostgresStore,
     request: SetTlsBindingRequest,
 ) -> StoreResult<TlsBinding> {
-    let mut client = store.client().await?;
+    let work = store.certificate_work.acquire()?;
+    let mut client = work.client(store).await?;
     let tx = client.transaction().await.map_err(map_postgres_error)?;
     lock(&tx).await?;
     let old = tx
@@ -313,9 +321,20 @@ pub(super) async fn set_binding(
                 resource: "active certificate",
             });
         }
-        let material = bundle(store, &row, &meta)?;
-        validate_certificate(&material, now(&tx).await?).map_err(invalid)?;
-        validate_hostname(material.chain_der(), &request.hostname).map_err(invalid)?;
+        let keyring = store
+            .certificate_sealer
+            .clone()
+            .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))?;
+        let observed_at = now(&tx).await?;
+        let hostname = request.hostname.clone();
+        let checked_meta = meta.clone();
+        work.blocking(move || {
+            let material = bundle(&keyring, &row, &checked_meta)?;
+            validate_certificate(&material, observed_at).map_err(invalid)?;
+            validate_hostname(material.chain_der(), &hostname).map_err(invalid)?;
+            Ok(())
+        })
+        .await?;
         let count:i64 = tx.query_one("SELECT count(*) FROM tls_hostname_bindings WHERE certificate_id=$1 AND hostname<>$2", &[&id.as_str(),&request.hostname.as_str()]).await.map_err(map_postgres_error)?.get(0);
         if count >= MAX_CERTIFICATE_BINDINGS as i64 {
             return Err(StoreError::invalid_argument(
@@ -348,7 +367,8 @@ pub(super) async fn remove(
     store: &PostgresStore,
     request: RemoveCertificateRequest,
 ) -> StoreResult<CertificateMetadata> {
-    let mut client = store.client().await?;
+    let work = store.certificate_work.acquire()?;
+    let mut client = work.client(store).await?;
     let tx = client.transaction().await.map_err(map_postgres_error)?;
     lock(&tx).await?;
     let row = certificate(&tx, &request.id)
@@ -376,8 +396,9 @@ pub(super) async fn resolve(
     store: &PostgresStore,
     request: ResolveTlsCertificateRequest,
 ) -> StoreResult<TlsCertificateResolution> {
+    let work = store.certificate_work.acquire()?;
     // One statement gives a coherent binding + certificate + observed-time view.
-    let row=store.client().await?.query_one("SELECT b.revision AS view_revision,c.*,(extract(epoch from clock_timestamp())*1000)::bigint AS observed_at FROM (SELECT 1) anchor LEFT JOIN tls_hostname_bindings b ON b.hostname=$1 LEFT JOIN certificates c ON c.certificate_id=b.certificate_id", &[&request.hostname.as_str()]).await.map_err(map_postgres_error)?;
+    let row=work.client(store).await?.query_one("SELECT b.revision AS view_revision,c.*,(extract(epoch from clock_timestamp())*1000)::bigint AS observed_at FROM (SELECT 1) anchor LEFT JOIN tls_hostname_bindings b ON b.hostname=$1 LEFT JOIN certificates c ON c.certificate_id=b.certificate_id", &[&request.hostname.as_str()]).await.map_err(map_postgres_error)?;
     let view_revision = rev(row.get::<_, Option<i64>>("view_revision").unwrap_or(0))?;
     let observed_at_unix_millis = row.get("observed_at");
     let value = if row.get::<_, Option<String>>("certificate_id").is_none() {
@@ -389,9 +410,20 @@ pub(super) async fn resolve(
                 "TLS binding references a removed certificate",
             ));
         }
-        let bundle = bundle(store, &row, &metadata)?;
-        validate_certificate(&bundle, observed_at_unix_millis).map_err(invalid)?;
-        validate_hostname(bundle.chain_der(), &request.hostname).map_err(invalid)?;
+        let keyring = store
+            .certificate_sealer
+            .clone()
+            .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))?;
+        let checked_meta = metadata.clone();
+        let hostname = request.hostname.clone();
+        let bundle = work
+            .blocking(move || {
+                let bundle = bundle(&keyring, &row, &checked_meta)?;
+                validate_certificate(&bundle, observed_at_unix_millis).map_err(invalid)?;
+                validate_hostname(bundle.chain_der(), &hostname).map_err(invalid)?;
+                Ok(bundle)
+            })
+            .await?;
         if request.known_view_revision == Some(view_revision) {
             TlsCertificateValue::Unchanged { metadata }
         } else {
@@ -410,7 +442,8 @@ pub(super) async fn reencrypt(
     store: &PostgresStore,
     request: ReencryptCertificateRequest,
 ) -> StoreResult<CertificateMetadata> {
-    let mut client = store.client().await?;
+    let work = store.certificate_work.acquire()?;
+    let mut client = work.client(store).await?;
     let tx = client.transaction().await.map_err(map_postgres_error)?;
     lock(&tx).await?;
     let row = certificate(&tx, &request.id)
@@ -426,15 +459,24 @@ pub(super) async fn reencrypt(
             resource: "active certificate",
         });
     }
-    let material = bundle(store, &row, &meta)?;
-    let sealed = sealer(store)?
-        .seal(
-            &request.id,
-            meta.version,
-            &chain_digest(material.chain_der()),
-            material.private_key_pkcs8_der(),
-        )
-        .map_err(|e| StoreError::internal(e.0))?;
+    let keyring = store
+        .certificate_sealer
+        .clone()
+        .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))?;
+    let checked_meta = meta.clone();
+    let sealed = work
+        .blocking(move || {
+            let material = bundle(&keyring, &row, &checked_meta)?;
+            keyring
+                .seal(
+                    &checked_meta.id,
+                    checked_meta.version,
+                    &chain_digest(material.chain_der()),
+                    material.private_key_pkcs8_der(),
+                )
+                .map_err(|e| StoreError::internal(e.0))
+        })
+        .await?;
     let sealing_revision = next(meta.sealing_revision)?;
     tx.execute("UPDATE certificates SET seal_format=$2,seal_key_id=$3,seal_nonce=$4,sealed_private_key=$5,sealing_revision=$6 WHERE certificate_id=$1", &[&request.id.as_str(),&(sealed.format_version as i16),&sealed.key_id,&&sealed.nonce[..],&sealed.ciphertext,&(sealing_revision.get() as i64)]).await.map_err(map_postgres_error)?;
     let result = metadata(&certificate(&tx, &request.id).await?.unwrap())?;
@@ -443,8 +485,9 @@ pub(super) async fn reencrypt(
 }
 
 pub(super) async fn revision(store: &PostgresStore) -> StoreResult<CertificateRevision> {
-    rev(store
-        .client()
+    let work = store.certificate_work.acquire()?;
+    rev(work
+        .client(store)
         .await?
         .query_one(
             "SELECT revision FROM tls_certificate_revision WHERE singleton",
@@ -459,13 +502,14 @@ pub(super) async fn changes(
     cursor: CertificateRevision,
     limit: u32,
 ) -> StoreResult<DurableTlsCertificateChanges> {
+    let work = store.certificate_work.acquire()?;
     if limit == 0 || limit > MAX_TLS_CHANGE_BATCH {
         return Err(StoreError::invalid_argument(
             "TLS change batch requires 1–1024 events",
         ));
     }
     let cursor_i64 = cursor.get() as i64;
-    let row=store.client().await?.query_one("SELECT c.revision, (SELECT min(revision) FROM tls_certificate_outbox) AS first_revision, COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY revision) FROM (SELECT revision,hostname,certificate_id,certificate_version,kind FROM tls_certificate_outbox WHERE revision>$1 ORDER BY revision LIMIT $2) p),'[]'::jsonb) AS events FROM tls_certificate_revision c WHERE singleton", &[&cursor_i64,&(limit as i64)]).await.map_err(map_postgres_error)?;
+    let row=work.client(store).await?.query_one("SELECT c.revision, (SELECT min(revision) FROM tls_certificate_outbox) AS first_revision, COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY revision) FROM (SELECT revision,hostname,certificate_id,certificate_version,kind FROM tls_certificate_outbox WHERE revision>$1 ORDER BY revision LIMIT $2) p),'[]'::jsonb) AS events FROM tls_certificate_revision c WHERE singleton", &[&cursor_i64,&(limit as i64)]).await.map_err(map_postgres_error)?;
     let current: i64 = row.get("revision");
     let first: Option<i64> = row.get("first_revision");
     let reset = cursor_i64 > current || cursor_i64 < first.map_or(current, |n| n - 1);

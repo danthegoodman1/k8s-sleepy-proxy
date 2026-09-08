@@ -157,6 +157,35 @@ where
 {
     type SubscribeStream = ProxySubscribeResponseStream;
 
+    async fn resolve_http01_challenge(
+        &self,
+        request: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("key is required"))
+            .and_then(super::server::http01_key_from_proto)?;
+        let challenge = self
+            .store
+            .resolve_http01_challenge(key)
+            .await
+            .map_err(super::server::store_error_to_status)?
+            .map(super::server::http01_to_proto)
+            .transpose()?;
+
+        Ok(Response::new(pb::ResolveHttp01ChallengeResponse {
+            challenge,
+        }))
+    }
+
+    async fn resolve_tls_certificate(
+        &self,
+        request: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        super::certificates::resolve(self.store.as_ref(), request).await
+    }
+
     async fn wake_instance(
         &self,
         request: Request<pb::ProxyWakeInstanceRequest>,

@@ -459,6 +459,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_tls_progress_survives_setup_and_cancels_withheld_delivery() {
+        use http_body_util::BodyExt;
+        for subscription in [false, true] {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.der().clone()).unwrap();
+            let mut tls_client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            tls_client.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_client));
+            let mut server_jobs = tokio::task::JoinSet::new();
+            let mut peer_jobs = tokio::task::JoinSet::new();
+            let sockets = Arc::new(Semaphore::new(2));
+            let incoming = BoundedIncoming::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                sockets,
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+            let address = incoming.local_addr().unwrap();
+            let (shutdown, receiver) = tokio::sync::oneshot::channel();
+            server_jobs.spawn(
+                tonic::transport::Server::builder()
+                    .tls_config(tonic::transport::ServerTlsConfig::new().identity(
+                        tonic::transport::Identity::from_pem(
+                            cert.pem(),
+                            signing_key.serialize_pem(),
+                        ),
+                    ))
+                    .unwrap()
+                    .http2_keepalive_interval(Some(Duration::from_millis(20)))
+                    .http2_keepalive_timeout(Some(Duration::from_millis(20)))
+                    .layer(
+                        crate::api::admission::RpcAdmissionLayer::with_delivery_timeout(
+                            1,
+                            Duration::from_millis(300),
+                        ),
+                    )
+                    .add_service(FlowControlledService {
+                        subscriptions: Arc::new(Semaphore::new(1)),
+                        lifetime: Duration::from_millis(300),
+                    })
+                    .serve_with_incoming_shutdown(incoming, async {
+                        let _ = receiver.await;
+                    }),
+            );
+            let path = if subscription {
+                "Subscribe"
+            } else {
+                "WakeInstance"
+            };
+            let request = || {
+                tonic::codegen::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "http://{address}/sleepypods.controlplane.v1.ProxyControlPlane/{path}"
+                    ))
+                    .header("content-type", "application/grpc")
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap()
+            };
+            let socket = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .initial_stream_window_size(1)
+                    .handshake(hyper_util::rt::TokioIo::new(socket))
+                    .await
+                    .unwrap();
+            let peer = peer_jobs.spawn(connection); // Hyper answers PING while withholding stream credit.
+            let first = sender.send_request(request()).await.unwrap();
+            let rejected = sender.send_request(request()).await.unwrap();
+            assert_eq!(
+                rejected.headers()["grpc-status"],
+                "8",
+                "the final queued DATA still owns capacity"
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                !peer.is_finished(),
+                "the same verified TLS/H2 connection survives its 100ms setup deadline before delivery expiry"
+            );
+            tokio::time::timeout(Duration::from_secs(2), peer_jobs.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap_or_default();
+            drop(first);
+            drop(sender);
+            let socket = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .handshake(hyper_util::rt::TokioIo::new(socket))
+                    .await
+                    .unwrap();
+            let recovered_peer = peer_jobs.spawn(connection);
+            let recovered = sender.send_request(request()).await.unwrap();
+            assert!(!recovered.headers().contains_key("grpc-status"));
+            assert_eq!(
+                recovered
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .len(),
+                4096
+            );
+            drop(sender);
+            recovered_peer.abort();
+            while peer_jobs.join_next().await.is_some() {}
+            shutdown.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), server_jobs.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn grpc_web_text_encoded_final_data_retains_rpc_admission_then_recovers() {
         use http_body_util::BodyExt;
         {

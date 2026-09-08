@@ -22,12 +22,12 @@ sleepypods-observability = { version = "0.1.0", path = "../sleepypods-observabil
 sleepypods-types = { workspace = true }
 tokio = { workspace = true, default-features = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
-tonic = { workspace = true, default-features = true, features = ["transport"] }
+tonic = { workspace = true, features = ["tls-ring", "transport"], default-features = true }
 tonic-web = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors"] }
 x509-parser = { version = "0.18", features = ["verify"] }
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 bytes = { workspace = true, default-features = true }
@@ -39,4 +39,5 @@ hyper-util = { workspace = true, default-features = false, features = ["tokio"] 
 prost = "0.14.4"
 rcgen = "0.14"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util", "time"], default-features = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }

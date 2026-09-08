@@ -1,3 +1,4 @@
+use control_plane::api::pb::proxy_control_plane_client::ProxyControlPlaneClient;
 use std::{
     collections::HashMap,
     env,
@@ -415,6 +416,7 @@ async fn assert_http01_flow(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
+    let mut proxy = ProxyControlPlaneClient::connect(config.operator_endpoint.clone()).await?;
     wait_for_instance_response(
         config,
         "normal route before HTTP-01 challenge",
@@ -433,14 +435,14 @@ async fn assert_http01_flow(
         SystemTime::now() + Duration::from_secs(60),
     )
     .await?;
-    let resolved = operator
+    let resolved = proxy
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(EXACT_HOST, HTTP01_TOKEN)),
         })
         .await?
         .into_inner()
         .challenge
-        .ok_or("inserted HTTP-01 challenge did not resolve through operator API")?;
+        .ok_or("inserted HTTP-01 challenge did not resolve through proxy API")?;
     if resolved.key_authorization != HTTP01_KEY_AUTHORIZATION {
         return Err(format!(
             "operator resolved key authorization {:?}, expected {:?}",
@@ -536,7 +538,7 @@ async fn assert_http01_flow(
         .await?;
     tokio::time::timeout(
         Duration::from_secs(30),
-        assert_manual_http01_expiry(operator),
+        assert_manual_http01_expiry(operator, &mut proxy),
     )
     .await??;
 
@@ -555,6 +557,7 @@ async fn assert_http01_flow(
 
 async fn assert_manual_http01_expiry(
     operator: &mut OperatorControlPlaneClient<Channel>,
+    proxy: &mut ProxyControlPlaneClient<Channel>,
 ) -> TestResult<()> {
     let target = "routing-manual-expiry-token";
     let sentinel = "routing-later-expiry-token";
@@ -567,7 +570,7 @@ async fn assert_manual_http01_expiry(
         (sentinel, now + Duration::from_secs(7_200)),
     ] {
         put_http01_challenge(operator, EXACT_HOST, token, token, expiry).await?;
-        assert_operator_http01_value(operator, token, Some(token)).await?;
+        assert_proxy_http01_value(proxy, token, Some(token)).await?;
     }
     let request = ExpireHttp01ChallengesRequest {
         now_unix_millis: unix_millis(target_expiry)?,
@@ -584,8 +587,8 @@ async fn assert_manual_http01_expiry(
         )
         .into());
     }
-    assert_operator_http01_value(operator, target, None).await?;
-    assert_operator_http01_value(operator, sentinel, Some(sentinel)).await?;
+    assert_proxy_http01_value(proxy, target, None).await?;
+    assert_proxy_http01_value(proxy, sentinel, Some(sentinel)).await?;
     let repeated = operator
         .expire_http01_challenges(request)
         .await?
@@ -602,15 +605,15 @@ async fn assert_manual_http01_expiry(
     if !deleted.deleted {
         return Err("later sentinel must survive manual expiry until explicit cleanup".into());
     }
-    assert_operator_http01_value(operator, sentinel, None).await
+    assert_proxy_http01_value(proxy, sentinel, None).await
 }
 
-async fn assert_operator_http01_value(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+async fn assert_proxy_http01_value(
+    proxy: &mut ProxyControlPlaneClient<Channel>,
     token: &str,
     expected: Option<&str>,
 ) -> TestResult<()> {
-    let challenge = operator
+    let challenge = proxy
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(EXACT_HOST, token)),
         })

@@ -9,8 +9,6 @@ use std::{
 use sleepypods_api::{
     pb::{
         self,
-        operator_control_plane_client::OperatorControlPlaneClient,
-        operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
         proxy_control_plane_client::ProxyControlPlaneClient,
         proxy_control_plane_server::{ProxyControlPlane, ProxyControlPlaneServer},
     },
@@ -25,8 +23,8 @@ use tonic::{
 };
 
 use super::{
-    GrpcOperatorHttp01Resolver, GrpcOperatorHttp01ResolverError, GrpcProxyControlPlaneClient,
-    GrpcProxyControlPlaneError,
+    GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError, GrpcProxyHttp01Resolver,
+    GrpcProxyHttp01ResolverError,
 };
 use crate::{
     Http01ChallengeResolver, InvalidationReason, RouteRequestId, RouteSubscriptionClient,
@@ -526,7 +524,7 @@ async fn closed_subscribe_request_stream_is_surfaced() {
 
 #[tokio::test]
 async fn http01_resolve_hit_sends_key_and_maps_challenge_record() {
-    let service = FakeOperatorControlPlane::default();
+    let service = FakeHttp01Proxy::default();
     service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse {
         challenge: Some(http01_challenge(
             "app.example.com",
@@ -559,8 +557,8 @@ async fn http01_resolve_hit_sends_key_and_maps_challenge_record() {
 }
 
 #[tokio::test]
-async fn http01_resolve_with_operator_token_sends_authorization_metadata() {
-    let service = FakeOperatorControlPlane::default();
+async fn http01_resolve_with_proxy_token_sends_authorization_metadata() {
+    let service = FakeHttp01Proxy::default();
     service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse {
         challenge: Some(http01_challenge(
             "app.example.com",
@@ -568,12 +566,13 @@ async fn http01_resolve_with_operator_token_sends_authorization_metadata() {
             "token-a.key",
         )),
     }));
-    let token = BearerToken::new("operator_token", "operator-secret").expect("valid token");
+    let token = BearerToken::new("proxy_token", "proxy-secret").expect("valid token");
     let interceptor = OptionalBearerTokenInterceptor::new(Some(&token)).expect("valid interceptor");
-    let server = OperatorControlPlaneServer::new(service.clone());
-    let mut resolver = GrpcOperatorHttp01Resolver::new(
-        OperatorControlPlaneClient::with_interceptor(InProcessService::new(server), interceptor),
-    );
+    let server = ProxyControlPlaneServer::new(service.clone());
+    let mut resolver = GrpcProxyHttp01Resolver::new(ProxyControlPlaneClient::with_interceptor(
+        InProcessService::new(server),
+        interceptor,
+    ));
 
     let response = resolver
         .resolve_http01_challenge(
@@ -586,13 +585,13 @@ async fn http01_resolve_with_operator_token_sends_authorization_metadata() {
     assert_eq!(response.key_authorization(), "token-a.key");
     assert_eq!(
         service.resolve_http01_authorizations(),
-        vec![Some("Bearer operator-secret".to_owned())]
+        vec![Some("Bearer proxy-secret".to_owned())]
     );
 }
 
 #[tokio::test]
 async fn http01_resolve_miss_maps_to_none() {
-    let service = FakeOperatorControlPlane::default();
+    let service = FakeHttp01Proxy::default();
     service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse { challenge: None }));
     let mut resolver = test_http01_resolver(service);
 
@@ -608,7 +607,7 @@ async fn http01_resolve_miss_maps_to_none() {
 
 #[tokio::test]
 async fn http01_resolve_status_error_is_surfaced() {
-    let service = FakeOperatorControlPlane::default();
+    let service = FakeHttp01Proxy::default();
     service.set_resolve_http01_response(Err(Status::unavailable("store unavailable")));
     let mut resolver = test_http01_resolver(service);
 
@@ -621,14 +620,14 @@ async fn http01_resolve_status_error_is_surfaced() {
 
     assert!(matches!(
         error,
-        GrpcOperatorHttp01ResolverError::Status(status)
+        GrpcProxyHttp01ResolverError::Status(status)
             if status.code() == tonic::Code::Unavailable
     ));
 }
 
 #[tokio::test]
 async fn http01_resolve_malformed_challenge_is_protocol_error() {
-    let service = FakeOperatorControlPlane::default();
+    let service = FakeHttp01Proxy::default();
     service.set_resolve_http01_response(Ok(pb::ResolveHttp01ChallengeResponse {
         challenge: Some(pb::Http01Challenge {
             key: None,
@@ -645,10 +644,7 @@ async fn http01_resolve_malformed_challenge_is_protocol_error() {
         .await
         .expect_err("malformed challenge should surface");
 
-    assert!(matches!(
-        error,
-        GrpcOperatorHttp01ResolverError::Protocol(_)
-    ));
+    assert!(matches!(error, GrpcProxyHttp01ResolverError::Protocol(_)));
 }
 
 #[derive(Clone)]
@@ -693,8 +689,8 @@ struct FakeProxyControlPlane {
 }
 
 #[derive(Clone, Default)]
-struct FakeOperatorControlPlane {
-    state: Arc<Mutex<FakeOperatorControlPlaneState>>,
+struct FakeHttp01Proxy {
+    state: Arc<Mutex<FakeHttp01ProxyState>>,
 }
 
 #[derive(Default)]
@@ -706,7 +702,7 @@ struct FakeProxyControlPlaneState {
 }
 
 #[derive(Default)]
-struct FakeOperatorControlPlaneState {
+struct FakeHttp01ProxyState {
     resolve_http01_response: Option<Result<pb::ResolveHttp01ChallengeResponse, Status>>,
     resolve_http01_requests: Vec<pb::ResolveHttp01ChallengeRequest>,
     resolve_http01_authorizations: Vec<Option<String>>,
@@ -738,6 +734,19 @@ impl SubscribeAction {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for FakeProxyControlPlane {
+    async fn resolve_http01_challenge(
+        &self,
+        _: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        panic!("unexpected HTTP01")
+    }
+    async fn resolve_tls_certificate(
+        &self,
+        _: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        panic!("unexpected certificate")
+    }
+
     type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
 
     async fn wake_instance(
@@ -852,70 +861,26 @@ impl FakeProxyControlPlane {
 }
 
 #[tonic::async_trait]
-impl OperatorControlPlane for FakeOperatorControlPlane {
-    async fn create_workload_class_version(
+impl ProxyControlPlane for FakeHttp01Proxy {
+    type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
+    async fn wake_instance(
         &self,
-        _request: Request<pb::CreateWorkloadClassVersionRequest>,
-    ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
-        Err(Status::unimplemented("unused fake method"))
+        _: Request<pb::ProxyWakeInstanceRequest>,
+    ) -> Result<Response<pb::ProxyWakeInstanceResponse>, Status> {
+        panic!("HTTP01 must not wake")
     }
-
-    async fn get_workload_class_version(
+    async fn subscribe(
         &self,
-        _request: Request<pb::GetWorkloadClassVersionRequest>,
-    ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
-        Err(Status::unimplemented("unused fake method"))
+        _: Request<tonic::Streaming<pb::ProxySubscribeRequest>>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        panic!("HTTP01 must not resolve routes")
     }
-
-    async fn create_instance(
+    async fn resolve_tls_certificate(
         &self,
-        _request: Request<pb::CreateInstanceRequest>,
-    ) -> Result<Response<pb::Instance>, Status> {
-        Err(Status::unimplemented("unused fake method"))
+        _: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        panic!("HTTP01 must not resolve certificates")
     }
-
-    async fn get_instance(
-        &self,
-        _request: Request<pb::GetInstanceRequest>,
-    ) -> Result<Response<pb::Instance>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn delete_instance(
-        &self,
-        _request: Request<pb::DeleteInstanceRequest>,
-    ) -> Result<Response<pb::DeleteInstanceResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn create_route_binding(
-        &self,
-        _request: Request<pb::CreateRouteBindingRequest>,
-    ) -> Result<Response<pb::RouteBinding>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn get_route_binding(
-        &self,
-        _request: Request<pb::GetRouteBindingRequest>,
-    ) -> Result<Response<pb::RouteBinding>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn delete_route_binding(
-        &self,
-        _request: Request<pb::DeleteRouteBindingRequest>,
-    ) -> Result<Response<pb::DeleteRouteBindingResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn put_http01_challenge(
-        &self,
-        _request: Request<pb::PutHttp01ChallengeRequest>,
-    ) -> Result<Response<pb::Http01Challenge>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
     async fn resolve_http01_challenge(
         &self,
         request: Request<pb::ResolveHttp01ChallengeRequest>,
@@ -939,44 +904,9 @@ impl OperatorControlPlane for FakeOperatorControlPlane {
 
         response.map(Response::new)
     }
-
-    async fn delete_http01_challenge(
-        &self,
-        _request: Request<pb::DeleteHttp01ChallengeRequest>,
-    ) -> Result<Response<pb::DeleteHttp01ChallengeResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn expire_http01_challenges(
-        &self,
-        _request: Request<pb::ExpireHttp01ChallengesRequest>,
-    ) -> Result<Response<pb::ExpireHttp01ChallengesResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn reconcile_materialization(
-        &self,
-        _request: Request<pb::ReconcileMaterializationRequest>,
-    ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn force_delete_materialization(
-        &self,
-        _request: Request<pb::ForceDeleteMaterializationRequest>,
-    ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
-
-    async fn force_release_exclusivity_key(
-        &self,
-        _request: Request<pb::ForceReleaseExclusivityKeyRequest>,
-    ) -> Result<Response<pb::ForceReleaseExclusivityKeyResponse>, Status> {
-        Err(Status::unimplemented("unused fake method"))
-    }
 }
 
-impl FakeOperatorControlPlane {
+impl FakeHttp01Proxy {
     fn set_resolve_http01_response(
         &self,
         response: Result<pb::ResolveHttp01ChallengeResponse, Status>,
@@ -1023,14 +953,10 @@ fn test_client_with_subscribe_reconnect_backoff(
 }
 
 fn test_http01_resolver(
-    service: FakeOperatorControlPlane,
-) -> GrpcOperatorHttp01Resolver<
-    InProcessService<OperatorControlPlaneServer<FakeOperatorControlPlane>>,
-> {
-    let server = OperatorControlPlaneServer::new(service);
-    GrpcOperatorHttp01Resolver::new(OperatorControlPlaneClient::new(InProcessService::new(
-        server,
-    )))
+    service: FakeHttp01Proxy,
+) -> GrpcProxyHttp01Resolver<InProcessService<ProxyControlPlaneServer<FakeHttp01Proxy>>> {
+    let server = ProxyControlPlaneServer::new(service);
+    GrpcProxyHttp01Resolver::new(ProxyControlPlaneClient::new(InProcessService::new(server)))
 }
 
 fn route_resolved_response(request_id: &str, subscription_id: &str) -> pb::ProxySubscribeResponse {
