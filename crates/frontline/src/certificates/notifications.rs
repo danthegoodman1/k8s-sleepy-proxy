@@ -107,7 +107,7 @@ async fn session(
     let mut stream = tokio::time::timeout_at(acknowledgement, watcher.watch(receiver))
         .await
         .map_err(|_| CertificateLookupError::Deadline)??;
-    let mut registered = HashMap::new();
+    let mut registered: Option<Registration> = None;
     let mut next_registration = Instant::now() + REGISTRATION_INTERVAL;
     loop {
         tokio::select! {
@@ -128,77 +128,33 @@ async fn session(
             }
             message = stream.next() => {
                 let message = message.ok_or(CertificateLookupError::Unavailable)??;
-                match message.value.ok_or(CertificateLookupError::Invalid)? {
-                    pb::watch_tls_certificates_response::Value::Snapshot(snapshot) => {
-                        let sent = pending.take().ok_or(CertificateLookupError::Invalid)?;
-                        if snapshot.registration != sent.id
-                            || snapshot.bindings.len() != sent.incarnations.len()
-                            || CertificateRevision::new(snapshot.cursor).is_err()
-                        {
-                            return Err(CertificateLookupError::Invalid);
-                        }
-                        let mut seen = std::collections::HashSet::new();
-                        for b in &snapshot.bindings {
-                            if !sent.incarnations.contains_key(&b.hostname)
-                                || !seen.insert(&b.hostname)
-                                || CertificateRevision::new(b.revision).is_err()
-                                || b.revision > snapshot.cursor
-                                || b.certificate_id
-                                    .as_ref()
-                                    .is_some_and(|id| CertificateId::new(id.clone()).is_err())
-                            {
-                                return Err(CertificateLookupError::Invalid);
-                            }
-                        }
-                        // Validate the entire bounded message before applying it.
-                        for binding in snapshot.bindings {
-                            apply(
-                                cache,
-                                &binding.hostname,
-                                sent.incarnations[&binding.hostname],
-                                binding.revision,
-                                binding.certificate_id.as_deref(),
-                                true,
-                            )?;
-                        }
-                        registered = sent.incarnations;
-                        cache.event(Operation::CertificateWatch, Outcome::Updated);
-                    }
-                    pb::watch_tls_certificates_response::Value::Changes(changes) => {
-                        if CertificateRevision::new(changes.cursor).is_err() || changes.events.len() > 256 {
-                            return Err(CertificateLookupError::Invalid);
-                        }
-                        for e in &changes.events {
-                            if CertificateRevision::new(e.view_revision).is_err()
-                                || e.view_revision > changes.cursor
-                                || !registered.contains_key(&e.hostname)
-                                || e.certificate_id
-                                    .as_ref()
-                                    .is_some_and(|id| CertificateId::new(id.clone()).is_err())
-                            {
-                                return Err(CertificateLookupError::Invalid);
-                            }
-                        }
-                        for event in changes.events {
-                            apply(
-                                cache,
-                                &event.hostname,
-                                registered[&event.hostname],
-                                event.view_revision,
-                                event.certificate_id.as_deref(),
-                                event.invalidate,
-                            )?;
-                        }
-                    }
-                    pb::watch_tls_certificates_response::Value::Reset(reset) => {
-                        if CertificateRevision::new(reset.cursor).is_err() {
-                            return Err(CertificateLookupError::Invalid);
-                        }
-                        reset_views(cache)?;
-                        cache.event(Operation::CertificateReset, Outcome::Success);
-                        return Ok(());
+                let acknowledges = pending.as_ref().is_some_and(|r| r.id == message.registration);
+                let sent = if acknowledges { pending.as_ref() } else { registered.as_ref() }
+                    .filter(|r| r.id == message.registration)
+                    .ok_or(CertificateLookupError::Invalid)?;
+                if message.bindings.len() != sent.incarnations.len() {
+                    return Err(CertificateLookupError::Invalid);
+                }
+                let mut seen = std::collections::HashSet::new();
+                for b in &message.bindings {
+                    if !sent.incarnations.contains_key(&b.hostname)
+                        || !seen.insert(&b.hostname)
+                        || CertificateRevision::new(b.revision).is_err()
+                        || b.last_invalidating_revision > b.revision
+                        || (b.revision == 0 && b.certificate_id.is_some())
+                        || (b.revision > 0 && b.last_invalidating_revision == 0)
+                        || b.certificate_id.as_ref().is_some_and(|id| CertificateId::new(id.clone()).is_err())
+                    {
+                        return Err(CertificateLookupError::Invalid);
                     }
                 }
+                // Validate the complete snapshot before touching any cache entry.
+                for binding in message.bindings {
+                    apply(cache, &binding.hostname, sent.incarnations[&binding.hostname],
+                        binding.revision, binding.certificate_id.as_deref(), binding.last_invalidating_revision)?;
+                }
+                if acknowledges { registered = pending.take(); }
+                cache.event(Operation::CertificateWatch, Outcome::Updated);
             }
         }
     }
@@ -209,7 +165,7 @@ fn apply(
     incarnation: u64,
     revision: u64,
     id: Option<&str>,
-    invalidate: bool,
+    last_invalidating_revision: u64,
 ) -> Result<(), CertificateLookupError> {
     let mut state = cache.shared.state.lock().unwrap();
     let Some(entry) = state
@@ -222,11 +178,11 @@ fn apply(
     if revision <= entry.floor {
         return Ok(());
     }
-    let retain = !invalidate
-        && id.is_some()
+    let retain = id.is_some()
         && entry
             .value
             .as_ref()
+            .filter(|v| v.revision >= last_invalidating_revision)
             .and_then(|v| v.metadata.as_ref())
             .is_some_and(|m| Some(m.certificate_id.as_str()) == id);
     state.serial = state
@@ -247,26 +203,5 @@ fn apply(
     let _ = cache.queue_locked(&mut state, hostname);
     Ok(())
 }
-fn reset_views(cache: &TlsCertificateStore) -> Result<(), CertificateLookupError> {
-    let mut state = cache.shared.state.lock().unwrap();
-    let hosts: Vec<_> = state.entries.keys().cloned().collect();
-    for hostname in hosts {
-        state.serial = state
-            .serial
-            .checked_add(1)
-            .ok_or(CertificateLookupError::Capacity)?;
-        let serial = state.serial;
-        let entry = state.entries.get_mut(&hostname).unwrap();
-        entry.generation = serial;
-        entry.pending = false;
-        entry.value = None;
-        entry.refresh_requested = true;
-        entry.changed.send_modify(|v| *v = v.wrapping_add(1));
-        // Keep only the per-host floor already observed. The reset's global
-        // history cursor must never fence an unchanged low-revision hostname.
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;

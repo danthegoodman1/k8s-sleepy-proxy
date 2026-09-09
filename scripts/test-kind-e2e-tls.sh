@@ -49,6 +49,43 @@ stop_port_forwards() {
   fi
 }
 
+capture_failure_details() {
+  # Only this fixture's public status and bounded logs; never Pod specs/env.
+  python3 - "${kubeconfig}" "${namespace}" "${artifact_dir}" <<'PY'
+import json, pathlib, subprocess, sys
+kubeconfig, namespace, directory = sys.argv[1:]
+directory = pathlib.Path(directory)
+pods = json.loads((directory / "pod-identities.json").read_text())
+if len(pods) > 8:
+    raise SystemExit("unexpected fixture pod inventory; skipping diagnostic collection")
+for pod in pods:
+    name = pod["name"]
+    commands = [
+        ("status", ["get", "pod", name, "-o=jsonpath={.metadata.uid}{'\\n'}{.status}{'\\n'}"]),
+        ("current", ["logs", name, "--all-containers=true", "--timestamps", "--tail=80", "--limit-bytes=16384"]),
+        ("previous", ["logs", name, "--all-containers=true", "--previous", "--timestamps", "--tail=80", "--limit-bytes=16384"]),
+        ("events", ["get", "events", "--field-selector", f"involvedObject.name={name}", "-o=custom-columns=TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message", "--no-headers"]),
+    ]
+    for label, arguments in commands:
+        path = directory / f"pod-{name}-{label}.log"
+        with path.open("w+b") as output:
+            try:
+                result = subprocess.run(
+                    ["kubectl", "--kubeconfig", kubeconfig, "--request-timeout=3s", "-n", namespace, *arguments],
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=4,
+                )
+                output.write(f"\ncollector_exit={result.returncode}\n".encode())
+            except subprocess.TimeoutExpired:
+                output.write(b"\ncollector_timeout=4s\n")
+            length = output.tell()
+            output.seek(max(0, length - 65536))
+            tail = output.read(65536)
+            output.seek(0)
+            output.write(tail)
+            output.truncate()
+PY
+}
+
 cleanup() {
   local status=$?
 
@@ -60,6 +97,9 @@ cleanup() {
     fi
   fi
   if [[ "${status}" != "0" ]]; then
+    if [[ "${namespace_created}" == "1" ]]; then
+      capture_failure_details || echo "failed to retain bounded fixture failure details" >&2
+    fi
     if [[ -s "${control_plane_pf_log}" ]]; then
       echo "==> Last control-plane port-forward log lines (${control_plane_pf_log})" >&2
       tail -n 80 "${control_plane_pf_log}" >&2 || true

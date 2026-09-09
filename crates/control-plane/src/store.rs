@@ -73,16 +73,12 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         request: ReencryptCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>>;
-    fn load_tls_certificate_changes(
-        &self,
-        cursor: CertificateRevision,
-        limit: u32,
-    ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>>;
-    fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>>;
+
     fn snapshot_tls_bindings(
         &self,
         hostnames: Vec<TlsHostname>,
-    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>>;
+        known_revision: Option<CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>>;
 
     fn load_route_changes(
         &self,
@@ -443,27 +439,14 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         self.inner.reencrypt_certificate(request)
     }
-    fn load_tls_certificate_changes(
-        &self,
-        cursor: CertificateRevision,
-        limit: u32,
-    ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.load_tls_certificate_changes(cursor, limit)
-        })
-    }
-    fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.load_tls_certificate_revision()
-        })
-    }
 
     fn snapshot_tls_bindings(
         &self,
         hostnames: Vec<TlsHostname>,
-    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>> {
+        known_revision: Option<CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
-            store.snapshot_tls_bindings(hostnames.clone())
+            store.snapshot_tls_bindings(hostnames.clone(), known_revision)
         })
     }
 
@@ -1038,8 +1021,6 @@ mod tests {
             remove_certificate,
             resolve_tls_certificate,
             reencrypt_certificate,
-            load_tls_certificate_changes,
-            load_tls_certificate_revision,
             snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,

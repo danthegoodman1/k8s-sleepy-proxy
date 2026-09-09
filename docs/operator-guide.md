@@ -215,28 +215,30 @@ Authoritative misses are cached for at most one second. During a control-plane
 outage, an existing valid view remains usable only until its original deadline.
 
 Frontline opens one native certificate watch when its cache first has interests.
-The watch carries hostname revisions and metadata only. Initial registration and
-reconnect synchronize current bindings atomically before following durable
-changes, including changes made through another control-plane replica. Eviction
-releases the hostname's interest; input updates coalesce into a bounded complete
-replacement set.
+The watch pushes complete binding snapshots containing metadata only. Each
+registration supplies an ID and exact hostname list; the server acknowledges it
+with an atomic current snapshot. Eviction releases the hostname's interest;
+updates coalesce into a bounded complete replacement set. Reconnects synchronize
+all current interests through either control-plane replica.
 
-A registration supplies its ID and exact hostname list. The server always
-acknowledges it with the complete current snapshot; registration has no client
-revision or resume cursor. Conditional revisions belong to certificate fetches,
-and the proxy retains per-host floors locally to reject stale responses.
+The server checks a private global revision and reads the requested bindings only
+when it changes, or when a new registration requires a snapshot. There is no
+certificate event history or resume cursor. Each binding carries its view revision
+and last-invalidating revision. Binding changes and removal advance both;
+ordinary rotation advances only the view revision.
 
-A rotation prompts a refresh while an already valid view may remain usable within
-its existing lease. Received removal, unbind or rebind events invalidate the
-affected view before another handshake can select it. A history gap resets and
-resynchronizes the watched views. Per-host revisions and local generations fence
-late responses; a global history cursor never authorizes a hostname. Events,
+A rotation prompts a refresh while an already valid configuration may remain
+usable within its existing lease. If a snapshot's last-invalidating revision is
+newer than the retained configuration's actual view revision, that configuration
+is discarded before another handshake. This also covers unbind/rebind/rotation
+coalesced between polls. Per-host floors, local generations and cache incarnations
+fence stale responses; a global revision never authorizes a hostname. Snapshots,
 reconnects and failed lookups cannot extend a lease. During a partition, delivery
 can be delayed until the original lease expires.
 
 Each control plane admits at most 16 certificate streams. Interests are limited
 to 1,024 exact hosts per stream, messages to 512 KiB, and queued responses to two.
-Initial registration has a three-second setup bound. A registration or history
+Initial registration has a three-second setup bound. A registration or snapshot
 poll runs at most once per 250 ms per stream; streams renew after at most 60
 seconds. Database watch reads wait in a bounded FIFO queue; a waiting read uses
 no ordinary database slot. One watch read or its protocol cleanup owns the watch

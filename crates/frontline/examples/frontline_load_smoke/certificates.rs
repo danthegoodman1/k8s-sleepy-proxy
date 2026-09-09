@@ -96,24 +96,20 @@ impl Delivery {
                     ))
                 } else {
                     Ok(pb::WatchTlsCertificatesResponse {
-                        value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
-                            pb::TlsCertificateSnapshot {
-                                registration: request.registration,
-                                cursor: 1,
-                                bindings: request
-                                    .hostnames
-                                    .into_iter()
-                                    .map(|interest| {
-                                        let found = interest == host;
-                                        pb::TlsBinding {
-                                            hostname: interest,
-                                            revision: u64::from(found),
-                                            certificate_id: found.then(|| "load-fixture".into()),
-                                        }
-                                    })
-                                    .collect(),
-                            },
-                        )),
+                        registration: request.registration,
+                        bindings: request
+                            .hostnames
+                            .into_iter()
+                            .map(|hostname| {
+                                let found = hostname == host;
+                                pb::TlsBinding {
+                                    hostname,
+                                    revision: u64::from(found),
+                                    last_invalidating_revision: u64::from(found),
+                                    certificate_id: found.then(|| "load-fixture".into()),
+                                }
+                            })
+                            .collect(),
                     })
                 };
                 Some((response, (requests, host)))
@@ -272,15 +268,7 @@ mod tests {
                 .metadata_mut()
                 .insert("authorization", "Bearer proxy-only".parse()?);
             let mut stream = client.watch_tls_certificates(request).await?.into_inner();
-            let value = stream
-                .message()
-                .await?
-                .ok_or("fixture watch closed")?
-                .value
-                .unwrap();
-            let pb::watch_tls_certificates_response::Value::Snapshot(snapshot) = value else {
-                panic!("expected synchronized snapshot")
-            };
+            let snapshot = stream.message().await?.ok_or("fixture watch closed")?;
             assert_eq!(snapshot.bindings[0].revision, 1);
             assert_eq!(stats.resolve_certificate_calls.load(Ordering::Relaxed), 3);
             assert_eq!(stats.snapshot().subscribe_route_calls, 0);

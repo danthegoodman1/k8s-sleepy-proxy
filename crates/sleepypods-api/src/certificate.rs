@@ -7,7 +7,6 @@ pub const MAX_CERTIFICATE_BUNDLE_BYTES: usize = 128 * 1024;
 pub const MAX_CERTIFICATE_CHAIN_ENTRIES: usize = 16;
 pub const MAX_CERTIFICATE_SANS: usize = 100;
 pub const MAX_CERTIFICATE_BINDINGS: usize = 1024;
-pub const MAX_TLS_CHANGE_BATCH: u32 = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidCertificateResource(pub &'static str);
@@ -100,7 +99,7 @@ impl CertificateRevision {
 }
 
 /// Secret-bearing payload. Debug never prints material; owned key bytes are
-/// zeroized on drop. Metadata, bindings and change records never contain this type.
+/// zeroized on drop. Metadata, bindings and snapshots never contain this type.
 #[derive(Clone)]
 pub struct CertificateBundle {
     chain_der: Vec<Vec<u8>>,
@@ -173,6 +172,7 @@ pub struct TlsBinding {
     /// View/CAS revision also changes when the referenced certificate changes.
     /// The row and revision survive unbinding; never-bound names use zero.
     pub revision: CertificateRevision,
+    pub last_invalidating_revision: CertificateRevision,
 }
 
 #[derive(Clone, Debug)]
@@ -224,32 +224,10 @@ pub struct TlsCertificateResolution {
     pub value: TlsCertificateValue,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TlsCertificateChangeKind {
-    Published,
-    Bound,
-    Unbound,
-    Removed,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TlsCertificateChange {
-    pub revision: CertificateRevision,
-    pub hostname: Option<TlsHostname>,
-    pub certificate_id: Option<CertificateId>,
-    pub certificate_version: Option<CertificateRevision>,
-    pub kind: TlsCertificateChangeKind,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DurableTlsCertificateChanges {
-    pub cursor: CertificateRevision,
-    pub reset: bool,
-    pub events: Vec<TlsCertificateChange>,
-}
-
-/// One metadata-only MVCC snapshot; cursor is global, binding revisions are per host.
+/// One metadata-only MVCC snapshot. The global revision only gates repeated reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsBindingSnapshot {
-    pub cursor: CertificateRevision,
+    pub revision: CertificateRevision,
     pub bindings: Vec<TlsBinding>,
 }
 
@@ -313,24 +291,18 @@ mod watch_decode_tests {
     fn bounded_wire_can_expand_repeated_elements_and_valid_full_interests_fit() {
         let n = (512 * 1024 - 16) / 2;
         let wire = pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Changes(
-                pb::TlsCertificateChanges {
-                    cursor: 0,
-                    events: vec![pb::TlsCertificateEvent::default(); n],
-                },
-            )),
+            registration: 1,
+            bindings: vec![pb::TlsBinding::default(); n],
         }
         .encode_to_vec();
         assert!(wire.len() <= 512 * 1024);
         let decoded = pb::WatchTlsCertificatesResponse::decode(wire.as_slice()).unwrap();
-        let Some(pb::watch_tls_certificates_response::Value::Changes(decoded)) = decoded.value
-        else {
-            panic!()
-        };
-        let event_bytes =
-            decoded.events.capacity() * std::mem::size_of::<pb::TlsCertificateEvent>();
-        assert!(event_bytes > 4 * 1024 * 1024);
-        assert!(event_bytes + 2 * 512 * 1024 < 24 * 1024 * 1024);
+        let binding_bytes = decoded.bindings.capacity() * std::mem::size_of::<pb::TlsBinding>();
+        // A moving realloc retains the previous half-capacity vector. Include
+        // two wire buffers, a full wire-sized payload and 3MiB retained state.
+        let watch_envelope = binding_bytes + binding_bytes / 2 + 3 * 512 * 1024 + 3 * 1024 * 1024;
+        assert!(binding_bytes > 4 * 1024 * 1024);
+        assert!(watch_envelope < 36 * 1024 * 1024);
         let input = pb::WatchTlsCertificatesRequest {
             registration: 1,
             hostnames: vec![String::new(); n],
@@ -394,64 +366,21 @@ mod watch_decode_tests {
             + decoded_unary.bundle.unwrap().chain_der.capacity() * std::mem::size_of::<Vec<u8>>();
         assert!(unary_bytes > 4 * 1024 * 1024);
         assert!(unary_bytes + 2 * 256 * 1024 + 1024 * 1024 < 8 * 1024 * 1024);
-        // Prost retains the previous oneof variant while decoding a different
-        // replacement. Both threshold-rounded vectors coexist at this point.
-        let mut old_bindings = vec![pb::TlsBinding::default(); 65_537];
-        old_bindings[0].hostname = "x".repeat(127 * 1024);
-        let old_wire = pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
-                pb::TlsCertificateSnapshot {
-                    registration: 0,
-                    cursor: 0,
-                    bindings: old_bindings,
-                },
-            )),
-        }
-        .encode_to_vec();
-        let new_wire = pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Changes(
-                pb::TlsCertificateChanges {
-                    cursor: 0,
-                    events: vec![pb::TlsCertificateEvent::default(); 131_073],
-                },
-            )),
-        }
-        .encode_to_vec();
-        let mut replacement = old_wire.clone();
-        replacement.extend_from_slice(&new_wire);
-        assert!(replacement.len() <= 512 * 1024);
-        let old_decoded = pb::WatchTlsCertificatesResponse::decode(old_wire.as_slice()).unwrap();
-        let Some(pb::watch_tls_certificates_response::Value::Snapshot(old_decoded)) =
-            old_decoded.value
-        else {
-            panic!()
-        };
-        let new_decoded = pb::WatchTlsCertificatesResponse::decode(replacement.as_slice()).unwrap();
-        let Some(pb::watch_tls_certificates_response::Value::Changes(new_decoded)) =
-            new_decoded.value
-        else {
-            panic!()
-        };
-        let replacement_peak = old_decoded.bindings.capacity()
-            * std::mem::size_of::<pb::TlsBinding>()
-            + old_decoded
-                .bindings
+        let valid_response = pb::WatchTlsCertificatesResponse {
+            registration: u64::MAX,
+            bindings: valid
+                .hostnames
                 .iter()
-                .map(|b| {
-                    b.hostname.capacity() + b.certificate_id.as_ref().map_or(0, String::capacity)
+                .map(|hostname| pb::TlsBinding {
+                    hostname: hostname.clone(),
+                    certificate_id: Some("c".repeat(128)),
+                    revision: i64::MAX as u64,
+                    last_invalidating_revision: i64::MAX as u64,
                 })
-                .sum::<usize>()
-            + new_decoded.events.capacity() * std::mem::size_of::<pb::TlsCertificateEvent>();
-        // A moving realloc can retain the old half-capacity Changes vector
-        // while allocating its doubled replacement, with Snapshot still alive.
-        let growth_overlap =
-            new_decoded.events.capacity() / 2 * std::mem::size_of::<pb::TlsCertificateEvent>();
-        let watch_peak = replacement_peak + growth_overlap;
-        // The 32MiB watch +4MiB shared structure charge covers that peak, two
-        // maximum wire buffers, and up to3MiB registration/queue/task state.
-        // Per-entry/config charges are separate.
-        assert!(watch_peak + 2 * 512 * 1024 + 3 * 1024 * 1024 < 36 * 1024 * 1024);
-        println!("watch_oneof_replacement wire_bytes={} coexisting_capacity_bytes={} growth_overlap_bytes={} envelope_with_wire_and_state={}",replacement.len(),replacement_peak,growth_overlap,watch_peak+2*512*1024+3*1024*1024);
+                .collect(),
+        };
+        assert!(valid_response.encoded_len() <= 512 * 1024);
+        println!("watch_snapshot wire_bytes={} binding_capacity_bytes={} envelope_bytes={} valid_snapshot_bytes={}", wire.len(), binding_bytes, watch_envelope, valid_response.encoded_len());
         // Exercise the corresponding unary Found -> Unchanged replacement.
         // Its two threshold-rounded DNS vectors and the growing vector's old
         // allocation must also fit the distinct 8MiB fetch charge.
@@ -509,6 +438,6 @@ mod watch_decode_tests {
             4 * super::MAX_CERTIFICATE_BUNDLE_BYTES + 2 * 256 * 1024 + 1024 * 1024;
         assert!(decode_envelope.max(validation_envelope) < 8 * 1024 * 1024);
         println!("unary_oneof_replacement wire_bytes={} moving_growth_peak_bytes={} decode_envelope={} valid_domain_validation_envelope={}",combined.len(),unary_peak,decode_envelope,validation_envelope);
-        println!("bounded_decode event_struct={} event_capacity_bytes={event_bytes} request_struct={} request_capacity_bytes={request_bytes} request_envelope_bytes={request_envelope} unary_capacity_bytes={unary_bytes} valid_interests_wire_bytes={}",std::mem::size_of::<pb::TlsCertificateEvent>(),std::mem::size_of::<String>(),valid.encoded_len());
+        println!("bounded_decode binding_struct={} binding_capacity_bytes={binding_bytes} request_struct={} request_capacity_bytes={request_bytes} request_envelope_bytes={request_envelope} unary_capacity_bytes={unary_bytes} valid_interests_wire_bytes={}",std::mem::size_of::<pb::TlsBinding>(),std::mem::size_of::<String>(),valid.encoded_len());
     }
 }

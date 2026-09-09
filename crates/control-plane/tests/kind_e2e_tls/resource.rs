@@ -52,14 +52,21 @@ enum Outcome {
     Rejected,
     Timeout,
 }
-async fn metrics(peer: &Peer) -> TestResult<HashMap<String, f64>> {
-    let response = http_once::get_once(
-        peer.addr(9090),
-        "localhost",
-        "/metrics",
-        Duration::from_secs(3),
+async fn metrics(peer: &Peer, phase: &str) -> TestResult<HashMap<String, f64>> {
+    let response =
+        http_once::get_once(
+            peer.addr(9090),
+            "localhost",
+            "/metrics",
+            Duration::from_secs(3),
+        )
+        .await
+        .map_err(|error| {
+            format!(
+        "resource phase={phase} operation=metrics pod={} uid={} local={} remote=9090: {error}",
+        peer.name(), peer.uid(), peer.addr(9090)
     )
-    .await?;
+        })?;
     assert_eq!(response.status(), http::StatusCode::OK);
     let mut result: HashMap<String, f64> = HashMap::new();
     for line in response
@@ -104,11 +111,11 @@ fn cold_fetches(values: &HashMap<String, f64>) -> f64 {
         .map(|(_, value)| value)
         .sum()
 }
-async fn zero_work(peer: &Peer) -> TestResult<HashMap<String, f64>> {
+async fn zero_work(peer: &Peer, phase: &str) -> TestResult<HashMap<String, f64>> {
     timeout(Duration::from_secs(10), async {
         let mut previous = false;
         loop {
-            let values = metrics(peer).await?;
+            let values = metrics(peer, phase).await?;
             let quiet = ["fetches", "queue", "tasks"]
                 .iter()
                 .all(|key| values[&format!("sleepypods_runtime_certificate_{key}")] == 0.0);
@@ -137,7 +144,7 @@ impl Wave<'_> {
         start: Option<oneshot::Sender<Instant>>,
         samples: &mut Vec<serde_json::Value>,
     ) -> TestResult<()> {
-        let before = metrics(self.peer).await?;
+        let before = metrics(self.peer, "before").await?;
         samples.push(serde_json::json!({"phase":"before","cycle":self.cycle,"pod":self.peer.name(),"uid":self.peer.uid(),"unix_millis":now(),"gauges":before}));
         let mut all_roots = self.roots.to_vec();
         all_roots.extend([self.previous_rotation.clone(), self.next_rotation.clone()]);
@@ -145,6 +152,13 @@ impl Wave<'_> {
         let refusal_config = sessions::refusal_config(&all_roots)?;
         let started = Instant::now();
         let deadline = started + Duration::from_secs(10);
+        let peer_context = Arc::new(format!(
+            "resource phase=flood cycle={} pod={} uid={} local={} remote=8443",
+            self.cycle,
+            self.peer.name(),
+            self.peer.uid(),
+            self.peer.addr(8443)
+        ));
         let mut jobs = JoinSet::new();
         let mut miss_live = 0;
         let mut warm_live = false;
@@ -182,6 +196,7 @@ impl Wave<'_> {
                 let expected = self.current.clone();
                 let previous_rotation = self.previous_rotation.clone();
                 let next_rotation = self.next_rotation.clone();
+                let context = peer_context.clone();
                 jobs.spawn(async move {
                     let at = Instant::now();
                     let mut installed_new = false;
@@ -196,7 +211,9 @@ impl Wave<'_> {
                             {
                                 Outcome::Timeout
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                return Err(format!("{context} lane=miss: {error}").into())
+                            }
                         }
                     } else {
                         match handshake(addr, &name, config).await {
@@ -236,7 +253,9 @@ impl Wave<'_> {
                             {
                                 Outcome::Rejected
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                return Err(format!("{context} lane=warm: {error}").into())
+                            }
                         }
                     };
                     Ok::<_, Box<dyn Error + Send + Sync>>((
@@ -271,7 +290,7 @@ impl Wave<'_> {
             }
             if Instant::now() >= next_sample {
                 next_sample = Instant::now() + Duration::from_millis(250);
-                samples.push(serde_json::json!({"phase":"flood","cycle":self.cycle,"pod":self.peer.name(),"uid":self.peer.uid(),"unix_millis":now(),"gauges":metrics(self.peer).await?}));
+                samples.push(serde_json::json!({"phase":"flood","cycle":self.cycle,"pod":self.peer.name(),"uid":self.peer.uid(),"unix_millis":now(),"gauges":metrics(self.peer, "flood").await?}));
                 fs::write(self.path, serde_json::to_vec_pretty(samples)?)?;
             }
         }
@@ -287,11 +306,11 @@ impl Wave<'_> {
             installed_new_at.is_some(),
             "rotated fingerprint was not installed and used during sustained miss pressure"
         );
-        zero_work(self.peer).await?;
+        zero_work(self.peer, "post-wave-quiet").await?;
         let prepared = handshake(self.peer.addr(8443), self.host, warm_config.clone()).await?;
         assert_peer(&prepared, self.current, &rustls::version::TLS13, b"h2")?;
         drop(prepared);
-        let before_warm = metrics(self.peer).await?;
+        let before_warm = metrics(self.peer, "before-warm-recovery").await?;
         let mut recovery = Counts::default();
         for _ in 0..32 {
             let at = Instant::now();
@@ -299,7 +318,7 @@ impl Wave<'_> {
             assert_peer(&stream, self.current, &rustls::version::TLS13, b"h2")?;
             recovery.observe(Outcome::Success, at.elapsed().as_micros());
         }
-        let after_warm = metrics(self.peer).await?;
+        let after_warm = metrics(self.peer, "after-warm-recovery").await?;
         assert_eq!(
             cold_fetches(&before_warm),
             cold_fetches(&after_warm),
@@ -365,7 +384,14 @@ pub(super) async fn run(
                     path: &path,
                 }
                 .run(start.take(), &mut samples)
-                .await?;
+                .await
+                .map_err(|error| {
+                    format!(
+                        "resource cycle={cycle} pod={} uid={}: {error}",
+                        peer.name(),
+                        peer.uid()
+                    )
+                })?;
             }
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
@@ -391,13 +417,17 @@ pub(super) async fn run(
         .await?;
         samples.push(serde_json::json!({"phase":"rotation","cycle":cycle,"started_unix_millis":rotation.0,"completed_unix_millis":rotation.1,"version":rotation.2,"fingerprint":fingerprint(rotating.cert.der())}));
         for peer in fronts {
-            let gauges = zero_work(peer).await?;
+            let gauges = zero_work(peer, "cycle-tail-start")
+                .await
+                .map_err(|error| format!("resource cycle={cycle}: {error}"))?;
             samples.push(serde_json::json!({"phase":"cycle-tail-start","cycle":cycle,"pod":peer.name(),"uid":peer.uid(),"unix_millis":now(),"gauges":gauges}));
         }
         fs::write(&path, serde_json::to_vec_pretty(&samples)?)?;
         sleep(Duration::from_secs(7)).await;
         for peer in fronts {
-            let gauges = zero_work(peer).await?;
+            let gauges = zero_work(peer, "cycle-tail-end")
+                .await
+                .map_err(|error| format!("resource cycle={cycle}: {error}"))?;
             samples.push(serde_json::json!({"phase":"cycle-tail-end","cycle":cycle,"pod":peer.name(),"uid":peer.uid(),"unix_millis":now(),"gauges":gauges}));
         }
         fs::write(&path, serde_json::to_vec_pretty(&samples)?)?;

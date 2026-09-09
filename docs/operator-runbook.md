@@ -68,7 +68,7 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_certificate_task_high_water` | gauge | none | Maximum retained supervisor task records since startup. |
 | `sleepypods_runtime_certificate_watches` | gauge | none | Watch sessions in setup, streaming or teardown. |
 | `sleepypods_runtime_certificate_expiry_risk` | gauge | none | Retained positive views whose lease or chain expires within 60 seconds, including already expired views. |
-| `sleepypods_runtime_certificate_events_total` | counter | `operation`, `outcome` | Fixed certificate fetch, refresh, watch, reset and install outcomes. |
+| `sleepypods_runtime_certificate_events_total` | counter | `operation`, `outcome` | Fixed certificate fetch, refresh, watch and install outcomes. |
 | `sleepypods_runtime_materialization_failures_total` | counter | `operation`, `outcome` | Kubernetes/materialization failure path. |
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline route-cache hit/miss results. |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream close/update/invalidation events. |
@@ -95,7 +95,7 @@ Known bounded label values:
   `unsubscribe`, `subscribe_stream`, `wake_instance`, `materialize`,
   `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`,
   `certificate_fetch`, `certificate_refresh`, `certificate_watch`,
-  `certificate_install`, `certificate_reset`
+  `certificate_install`
 - `outcome`: `success`, `error`, `timeout`, `rejected`, `canceled`, `hit`,
   `miss`, `started`, `closed`, `updated`, `invalidated`, `already_running`,
   `already_waking`, `already_draining`
@@ -378,11 +378,11 @@ TLS termination or SNI passthrough fails:
    can cover that explicit binding. Passthrough uses its exact or wildcard SNI
    route independently of application certificate delivery.
 5. If an update has not appeared, inspect native watch connectivity and stream
-   capacity on both the serving proxy and its control plane. Reconnects and
-   history gaps synchronize current bindings. Neither notifications nor failed
+   capacity on both the serving proxy and its control plane. Registrations and
+   reconnects synchronize complete current bindings. Neither notifications nor failed
    refreshes renew permission to serve: an old valid view lasts only until its
    original lease/chain validity deadline, at most five minutes from resolution.
-   Received removal/unbind/rebind events invalidate new-handshake selection;
+   Snapshots carrying removal/unbind/rebind invalidations prevent stale selection;
    already established connections follow the normal connection/drain policy.
 
 Postgres or database outage:

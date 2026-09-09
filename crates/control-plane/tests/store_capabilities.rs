@@ -67,24 +67,13 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         self.fail("reencrypt_certificate", format!("{request:?}"))
     }
-    fn load_tls_certificate_changes(
-        &self,
-        cursor: CertificateRevision,
-        limit: u32,
-    ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>> {
-        self.fail(
-            "load_tls_certificate_changes",
-            format!("{cursor:?}, {limit:?}"),
-        )
-    }
+
     fn snapshot_tls_bindings(
         &self,
         hosts: Vec<TlsHostname>,
-    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>> {
-        self.fail("snapshot_tls_bindings", format!("{hosts:?}"))
-    }
-    fn load_tls_certificate_revision(&self) -> StoreFuture<'_, StoreResult<CertificateRevision>> {
-        self.fail("load_tls_certificate_revision", "()".to_owned())
+        known: Option<CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>> {
+        self.fail("snapshot_tls_bindings", format!("{hosts:?}, {known:?}"))
     }
 
     fn load_route_changes(
@@ -464,20 +453,14 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             expected_sealing_revision: CertificateRevision::new(31).unwrap()
         }
     );
-    assert!(store
-        .load_tls_certificate_changes(cert_rev, 19)
-        .await
-        .is_err());
-    probe.check(
-        "load_tls_certificate_changes",
-        format!("{cert_rev:?}, 19"),
-        2,
-    );
     let hosts = vec![TlsHostname::new("snapshot.example").unwrap()];
-    assert!(store.snapshot_tls_bindings(hosts.clone()).await.is_err());
-    probe.check("snapshot_tls_bindings", format!("{hosts:?}"), 2);
-    assert!(store.load_tls_certificate_revision().await.is_err());
-    probe.check("load_tls_certificate_revision", "()".into(), 2);
+    for known in [None, Some(cert_rev)] {
+        assert!(store
+            .snapshot_tls_bindings(hosts.clone(), known)
+            .await
+            .is_err());
+        probe.check("snapshot_tls_bindings", format!("{hosts:?}, {known:?}"), 2);
+    }
     assert!(store.load_route_changes(73, 19).await.is_err());
     probe.check("load_route_changes", "73, 19".into(), 2);
     assert!(store.load_route_change_revision().await.is_err());

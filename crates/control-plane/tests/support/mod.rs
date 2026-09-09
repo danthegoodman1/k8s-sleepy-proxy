@@ -268,8 +268,6 @@ impl ControlPlaneStore for TestStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
-        load_tls_certificate_changes,
-        load_tls_certificate_revision,
         snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,

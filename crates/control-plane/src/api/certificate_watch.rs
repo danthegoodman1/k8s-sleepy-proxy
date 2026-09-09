@@ -1,5 +1,5 @@
-//! Metadata-only native watches over the durable outbox. Each stream owns its
-//! cursor; replica switching needs no local broker or historical task registry.
+//! Metadata-only current-state push. The private global revision skips stable
+//! SQL reads; hostname revisions and invalidation watermarks carry authority.
 use super::{
     admission::SubscriptionLease, certificates, pb, route_events::RouteSubscriptionBroker,
 };
@@ -21,7 +21,6 @@ use tonic::{
 
 pub(crate) use crate::certificate::work::WATCH_STREAMS;
 const RESPONSE_QUEUE: usize = 2;
-const PAGE: u32 = 256;
 const POLL: Duration = Duration::from_millis(250);
 const LIFETIME: Duration = Duration::from_secs(60);
 const LOOKUP: Duration = Duration::from_secs(3);
@@ -87,7 +86,7 @@ async fn produce<S>(
                 tokio::select! {
                     _ = cancellation.cancelled() => return,
                     _ = responses.closed() => return,
-                    _ = &mut setup, if state.cursor.is_none() => return,
+                    _ = &mut setup, if state.revision.is_none() => return,
                     next = tokio_stream::StreamExt::next(&mut requests), if state.pending.is_none() => {
                         let next = match next {
                             Some(Ok(next)) => next,
@@ -101,21 +100,18 @@ async fn produce<S>(
                             }
                         }
                     }
-                    _ = tokio::time::sleep_until(next_poll), if state.pending.is_some() || state.cursor.is_some() => {
+                    _ = tokio::time::sleep_until(next_poll), if state.pending.is_some() || state.revision.is_some() => {
                         next_poll = tokio::time::Instant::now() + POLL;
                         let result = tokio::select! {
                             _ = cancellation.cancelled() => return,
-                            _ = &mut setup, if state.cursor.is_none() => return,
+                            _ = &mut setup, if state.revision.is_none() => return,
                             result = tokio::time::timeout(LOOKUP, state.poll(store.as_ref())) => result,
                         };
                         let response = match result {
                             Ok(response) => response,
                             Err(_) => Err(Status::deadline_exceeded("certificate watch query deadline elapsed")),
                         };
-                        let terminal = response.is_err()
-                            || response.as_ref().ok().and_then(|r| r.as_ref()).is_some_and(|r| {
-                                matches!(r.value, Some(pb::watch_tls_certificates_response::Value::Reset(_)))
-                            });
+                        let terminal = response.is_err();
                         let response = match response {
                             Ok(Some(v)) => Ok(v),
                             Ok(None) => continue,
@@ -134,8 +130,8 @@ async fn produce<S>(
 }
 #[derive(Default)]
 struct WatchState {
-    hosts: HashSet<TlsHostname>,
-    cursor: Option<CertificateRevision>,
+    hosts: Vec<TlsHostname>,
+    revision: Option<CertificateRevision>,
     registration: u64,
     pending: Option<Vec<TlsHostname>>,
 }
@@ -157,80 +153,41 @@ impl WatchState {
         &mut self,
         store: &dyn ControlPlaneStore,
     ) -> Result<Option<pb::WatchTlsCertificatesResponse>, Status> {
-        use pb::watch_tls_certificates_response::Value;
-        if let Some(names) = self.pending.as_ref() {
-            let snapshot = match store.snapshot_tls_bindings(names.clone()).await {
-                Ok(snapshot) => snapshot,
-                Err(crate::store::StoreError::Unavailable { .. }) => return Ok(None),
-                Err(_) => {
-                    return Err(Status::unavailable(
-                        "certificate synchronization unavailable",
-                    ))
-                }
-            };
-            let names = self.pending.take().unwrap();
-            self.hosts = names.into_iter().collect();
-            self.cursor = Some(snapshot.cursor);
-            return Ok(Some(pb::WatchTlsCertificatesResponse {
-                value: Some(Value::Snapshot(pb::TlsCertificateSnapshot {
-                    registration: self.registration,
-                    cursor: snapshot.cursor.get(),
-                    bindings: snapshot
-                        .bindings
-                        .into_iter()
-                        .map(|b| pb::TlsBinding {
-                            hostname: b.hostname.to_string(),
-                            certificate_id: b.certificate_id.map(|id| id.to_string()),
-                            revision: b.revision.get(),
-                        })
-                        .collect(),
-                })),
-            }));
-        }
-        if self.hosts.is_empty() {
+        if self.pending.is_none() && self.hosts.is_empty() {
             return Ok(None);
         }
-        let page = match store
-            .load_tls_certificate_changes(self.cursor.unwrap(), PAGE)
-            .await
-        {
-            Ok(page) => page,
-            // Certificate admission pressure is transient. Retain the exact
-            // cursor and try a later tick rather than amplify it by reconnecting.
-            Err(crate::store::StoreError::Unavailable { .. }) => return Ok(None),
-            Err(_) => return Err(Status::unavailable("certificate history unavailable")),
+        let names = self.pending.as_ref().unwrap_or(&self.hosts);
+        let known = if self.pending.is_some() {
+            None
+        } else {
+            self.revision
         };
-        self.cursor = Some(page.cursor);
-        if page.reset {
-            return Ok(Some(pb::WatchTlsCertificatesResponse {
-                value: Some(Value::Reset(pb::TlsCertificateReset {
-                    cursor: page.cursor.get(),
-                })),
-            }));
+        let snapshot = match store.snapshot_tls_bindings(names.clone(), known).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) | Err(crate::store::StoreError::Unavailable { .. }) => return Ok(None),
+            Err(_) => {
+                return Err(Status::unavailable(
+                    "certificate synchronization unavailable",
+                ))
+            }
+        };
+        if let Some(names) = self.pending.take() {
+            self.hosts = names;
         }
-        let events: Vec<_> = page
-            .events
-            .into_iter()
-            .filter_map(|event| {
-                let hostname = event.hostname?;
-                self.hosts
-                    .contains(&hostname)
-                    .then(|| pb::TlsCertificateEvent {
-                        hostname: hostname.to_string(),
-                        view_revision: event.revision.get(),
-                        certificate_id: event.certificate_id.map(|id| id.to_string()),
-                        invalidate: event.kind != TlsCertificateChangeKind::Published,
-                    })
-            })
-            .collect();
-        Ok(
-            (!events.is_empty()).then(|| pb::WatchTlsCertificatesResponse {
-                value: Some(Value::Changes(pb::TlsCertificateChanges {
-                    cursor: page.cursor.get(),
-                    events,
-                })),
-            }),
-        )
+        self.revision = Some(snapshot.revision);
+        Ok(Some(pb::WatchTlsCertificatesResponse {
+            registration: self.registration,
+            bindings: snapshot
+                .bindings
+                .into_iter()
+                .map(|b| pb::TlsBinding {
+                    hostname: b.hostname.to_string(),
+                    certificate_id: b.certificate_id.map(|id| id.to_string()),
+                    revision: b.revision.get(),
+                    last_invalidating_revision: b.last_invalidating_revision.get(),
+                })
+                .collect(),
+        }))
     }
 }
 fn interests(values: Vec<String>) -> Result<Vec<TlsHostname>, Status> {

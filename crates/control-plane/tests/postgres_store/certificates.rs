@@ -65,6 +65,22 @@ async fn resolve(store: &PostgresStore, name: &str) -> StoreResult<TlsCertificat
         .await
 }
 
+async fn snapshot(
+    store: &PostgresStore,
+    hosts: Vec<TlsHostname>,
+    known: Option<CertificateRevision>,
+) -> StoreResult<Option<TlsBindingSnapshot>> {
+    RetryingControlPlaneStore::with_default_policy(Arc::new(store.clone()))
+        .snapshot_tls_bindings(hosts, known)
+        .await
+}
+async fn global_revision(store: &PostgresStore) -> StoreResult<CertificateRevision> {
+    Ok(snapshot(store, Vec::new(), None)
+        .await?
+        .expect("forced empty snapshot")
+        .revision)
+}
+
 async fn database_test<F, Fut>(test: F) -> TestResult
 where
     F: FnOnce(PostgresStore, Arc<Client>, PostgresStoreConfig) -> Fut + Send + 'static,
@@ -171,7 +187,7 @@ async fn postgres_certificate_cas_rotation_tombstones_and_sealing() -> TestResul
             unchanged.value,
             TlsCertificateValue::Unchanged { .. }
         ));
-        let before = store.load_tls_certificate_revision().await?;
+        let before = global_revision(&store).await?;
         assert!(
             store
                 .publish_certificate(publish("a", 1, &["a.example.test"]))
@@ -194,9 +210,9 @@ async fn postgres_certificate_cas_rotation_tombstones_and_sealing() -> TestResul
             .await
             .is_err());
         assert_eq!(
-            store.load_tls_certificate_revision().await?,
+            global_revision(&store).await?,
             before,
-            "validation failure rolls back authority/event revision"
+            "validation failure preserves authority revision"
         );
         assert_eq!(
             store.get_certificate_metadata(id("a")).await?,
@@ -208,7 +224,10 @@ async fn postgres_certificate_cas_rotation_tombstones_and_sealing() -> TestResul
         assert_eq!(second.version, rev(2));
         let a2 = store.get_tls_binding(host("a.example.test")).await?;
         let b2 = store.get_tls_binding(host("b.example.test")).await?;
-        assert!(a2.revision > a.revision && b2.revision > b.revision && a2.revision != b2.revision);
+        assert!(a2.revision > a.revision && b2.revision > b.revision);
+        assert_eq!(a2.revision, b2.revision);
+        assert_eq!(a2.last_invalidating_revision, a.last_invalidating_revision);
+        assert_eq!(b2.last_invalidating_revision, b.last_invalidating_revision);
         assert!(store
             .set_tls_binding(bind("a.example.test", a.revision, None))
             .await
@@ -274,7 +293,7 @@ async fn postgres_certificate_cas_rotation_tombstones_and_sealing() -> TestResul
         let rotated = store
             .clone()
             .with_certificate_sealer(ring("b", &[("a", 7), ("b", 8)]));
-        let authority_before = store.load_tls_certificate_revision().await?;
+        let authority_before = global_revision(&store).await?;
         let reencrypted = rotated
             .reencrypt_certificate(ReencryptCertificateRequest {
                 id: id("a"),
@@ -286,7 +305,7 @@ async fn postgres_certificate_cas_rotation_tombstones_and_sealing() -> TestResul
         assert_eq!(reencrypted.sealing_key_id.as_deref(), Some("b"));
         assert!(reencrypted.sealing_revision > second.sealing_revision);
         assert_eq!(
-            store.load_tls_certificate_revision().await?,
+            global_revision(&store).await?,
             authority_before,
             "storage-key rotation does not change authority"
         );
@@ -522,15 +541,15 @@ async fn postgres_certificate_rotation_binding_races_and_atomic_views() -> TestR
         store
             .publish_certificate(publish("bulk", 0, &["*.bulk.example.test"]))
             .await?;
-        raw.batch_execute("BEGIN; UPDATE tls_certificate_revision SET revision=revision+1024 WHERE singleton; INSERT INTO tls_hostname_bindings(hostname,certificate_id,revision) SELECT 'h'||n||'.bulk.example.test','bulk',revision-1024+n FROM tls_certificate_revision CROSS JOIN generate_series(1,1024) n WHERE singleton; COMMIT").await?;
-        let before_limit = store.load_tls_certificate_revision().await?;
+        raw.batch_execute("BEGIN; UPDATE tls_certificate_revision SET revision=revision+1 WHERE singleton; INSERT INTO tls_hostname_bindings(hostname,certificate_id,revision,last_invalidating_revision) SELECT 'h'||n||'.bulk.example.test','bulk',revision,revision FROM tls_certificate_revision CROSS JOIN generate_series(1,1024) n WHERE singleton; COMMIT").await?;
+        let before_limit = global_revision(&store).await?;
         assert!(matches!(
             store
                 .set_tls_binding(bind("extra.bulk.example.test", rev(0), Some("bulk")))
                 .await,
             Err(StoreError::InvalidArgument { .. })
         ));
-        assert_eq!(store.load_tls_certificate_revision().await?, before_limit);
+        assert_eq!(global_revision(&store).await?, before_limit);
         assert_eq!(
             store
                 .get_tls_binding(host("extra.bulk.example.test"))
@@ -541,20 +560,10 @@ async fn postgres_certificate_rotation_binding_races_and_atomic_views() -> TestR
         store
             .publish_certificate(publish("bulk", 1, &["*.bulk.example.test"]))
             .await?;
-        let full = store
-            .load_tls_certificate_changes(before_limit, 1024)
-            .await?;
-        assert!(!full.reset);
-        assert_eq!(full.events.len(), 1024);
-        assert_eq!(full.cursor.get(), before_limit.get() + 1024);
-        assert_eq!(
-            full.events
-                .iter()
-                .map(|e| e.revision)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            1024
-        );
+        let full = snapshot(&store, (1..=1024).map(|n| host(&format!("h{n}.bulk.example.test"))).collect(), None).await?.unwrap();
+        assert_eq!(full.bindings.len(), 1024);
+        assert_eq!(full.revision.get(), before_limit.get() + 1);
+        assert!(full.bindings.iter().all(|b| b.revision == full.revision && b.last_invalidating_revision == before_limit));
 
         Ok(())
     }).await
@@ -565,141 +574,8 @@ fn ring_digest(bytes: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-#[tokio::test]
-async fn postgres_certificate_outbox_commit_order_rollback_and_retention() -> TestResult {
-    database_test(|store, raw, config| async move {
-        // A successful read may still own its asynchronous protocol drain.
-        // Page observations use the declared bounded read-only retry capability;
-        // mutations below remain direct, one-shot calls.
-        let reads = RetryingControlPlaneStore::with_default_policy(Arc::new(store.clone()));
-        store
-            .publish_certificate(publish("events", 0, &["a.example.test", "b.example.test"]))
-            .await?;
-        let a = store
-            .set_tls_binding(bind("a.example.test", rev(0), Some("events")))
-            .await?;
-        store
-            .set_tls_binding(bind("b.example.test", rev(0), Some("events")))
-            .await?;
-        let start = store.load_tls_certificate_revision().await?;
-        store
-            .publish_certificate(publish("events", 1, &["a.example.test", "b.example.test"]))
-            .await?;
-        let page1 = reads.load_tls_certificate_changes(start, 1).await?;
-        let page2 = reads.load_tls_certificate_changes(page1.cursor, 1).await?;
-        assert!(!page1.reset && !page2.reset);
-        assert_eq!(page1.events.len(), 1);
-        assert_eq!(page2.events.len(), 1);
-        assert!(page2.cursor > page1.cursor);
-        assert_eq!(page1.events[0].hostname, Some(host("a.example.test")));
-        assert_eq!(page2.events[0].hostname, Some(host("b.example.test")));
-        assert!(page1
-            .events
-            .iter()
-            .chain(&page2.events)
-            .all(|e| e.certificate_version == Some(rev(2))));
-        // A real transaction holds the authority row, advances it, and appends
-        // an event before rollback. Other writers cannot bypass its commit order.
-        let (mut blocker, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
-        let mut connections = tokio::task::JoinSet::new();
-        connections.spawn(connection);
-        let blocker_pid: i32 = blocker
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await?
-            .get(0);
-        let tx = blocker.transaction().await?;
-        tx.query_one(
-            "SELECT revision FROM tls_certificate_revision WHERE singleton FOR UPDATE",
-            &[],
-        )
-        .await?;
-        let before = store.load_tls_certificate_revision().await?;
-        tx.execute(
-            "UPDATE tls_certificate_revision SET revision=revision+1 WHERE singleton",
-            &[],
-        )
-        .await?;
-        tx.execute("INSERT INTO tls_certificate_outbox(revision,kind) SELECT revision,'published' FROM tls_certificate_revision WHERE singleton",&[]).await?;
-        assert_eq!(
-            store.load_tls_certificate_revision().await?,
-            before,
-            "uncommitted revision must not be observed"
-        );
-        let next = store.get_tls_binding(host("a.example.test")).await?;
-        let writer = store.clone();
-        let mut mutations = tokio::task::JoinSet::new();
-        mutations.spawn(async move {
-            writer
-                .set_tls_binding(bind("a.example.test", next.revision, None))
-                .await
-        });
-        // Observe the actual lock waiter rather than using a sleep to infer order.
-        tokio::time::timeout(Duration::from_secs(3),async {
-                loop {let waiting:i64=raw.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%tls_certificate_revision%' AND $1=ANY(pg_blocking_pids(pid))",&[&blocker_pid]).await.unwrap().get(0);if waiting>0 {break;}tokio::task::yield_now().await;}
-            }).await?;
-        assert!(mutations.try_join_next().is_none());
-        tx.rollback().await?;
-        let unbound = tokio::time::timeout(Duration::from_secs(3), mutations.join_next())
-            .await?
-            .expect("one mutation")??;
-        assert_eq!(
-            unbound.revision.get(),
-            before.get() + 1,
-            "rolled-back revisions leave no hole or phantom event"
-        );
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-        let event = reads.load_tls_certificate_changes(before, 10).await?;
-        assert_eq!(event.events.len(), 1);
-        assert_eq!(event.events[0].kind, TlsCertificateChangeKind::Unbound);
-        assert!(store
-            .set_tls_binding(bind("a.example.test", a.revision, Some("events")))
-            .await
-            .is_err());
-        // Direct bounded fixture inventory exercises hard-cap pruning without
-        // 100k expensive certificate parses; the next real mutation performs GC.
-        raw.batch_execute("INSERT INTO tls_certificate_outbox(revision,kind) SELECT revision+n,'published' FROM tls_certificate_revision CROSS JOIN generate_series(1,100003) n WHERE singleton; UPDATE tls_certificate_revision SET revision=revision+100003 WHERE singleton").await?;
-        let current = store.get_tls_binding(host("b.example.test")).await?;
-        store
-            .set_tls_binding(bind("b.example.test", current.revision, None))
-            .await?;
-        assert_eq!(
-            raw.query_one("SELECT count(*) FROM tls_certificate_outbox", &[])
-                .await?
-                .get::<_, i64>(0),
-            100000
-        );
-        let reset = reads.load_tls_certificate_changes(rev(0), 10).await?;
-        assert!(reset.reset && reset.events.is_empty());
-        assert_eq!(reset.cursor, store.load_tls_certificate_revision().await?);
-        assert!(
-            reads
-                .load_tls_certificate_changes(rev(i64::MAX as u64), 10)
-                .await?
-                .reset
-        );
-        for limit in [0, 1025] {
-            assert!(matches!(
-                reads.load_tls_certificate_changes(rev(0), limit).await,
-                Err(StoreError::InvalidArgument { .. })
-            ));
-        }
-        // Time retention removes at most the requested contiguous prefix.
-        raw.execute("UPDATE tls_certificate_outbox SET created_at_unix_millis=0 WHERE revision IN (SELECT revision FROM tls_certificate_outbox ORDER BY revision LIMIT 3)",&[]).await?;
-        let old_count: i64 = raw
-            .query_one("SELECT count(*) FROM tls_certificate_outbox", &[])
-            .await?
-            .get(0);
-        assert_eq!(store.maintain_runtime_records(2).await?, 2);
-        assert_eq!(
-            raw.query_one("SELECT count(*) FROM tls_certificate_outbox", &[])
-                .await?
-                .get::<_, i64>(0),
-            old_count - 2
-        );
-        Ok(())
-    }).await
-}
+#[path = "certificates/snapshot.rs"]
+mod snapshot;
 
 /// Injects a lost response only after the real database commit; no fake state.
 struct LostCertificateResponse {
@@ -711,8 +587,6 @@ impl ControlPlaneStore for LostCertificateResponse {
         get_certificate_metadata,
         get_tls_binding,
         resolve_tls_certificate,
-        load_tls_certificate_changes,
-        load_tls_certificate_revision,
         snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,

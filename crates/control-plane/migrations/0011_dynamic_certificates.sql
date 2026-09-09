@@ -40,14 +40,7 @@ CREATE TABLE certificates (
 CREATE TABLE tls_hostname_bindings (
     hostname text PRIMARY KEY,
     certificate_id text REFERENCES certificates(certificate_id),
-    revision bigint NOT NULL CHECK (revision > 0)
+    revision bigint NOT NULL CHECK (revision > 0),
+    last_invalidating_revision bigint NOT NULL CHECK (last_invalidating_revision > 0 AND last_invalidating_revision <= revision)
 );
 CREATE INDEX tls_hostname_bindings_certificate ON tls_hostname_bindings(certificate_id) WHERE certificate_id IS NOT NULL;
-CREATE TABLE tls_certificate_outbox (
-    revision bigint PRIMARY KEY CHECK (revision > 0),
-    hostname text,
-    certificate_id text,
-    certificate_version bigint,
-    kind text NOT NULL CHECK (kind IN ('published', 'bound', 'unbound', 'removed')),
-    created_at_unix_millis bigint NOT NULL DEFAULT (extract(epoch from clock_timestamp()) * 1000)::bigint
-);

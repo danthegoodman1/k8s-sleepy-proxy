@@ -15,7 +15,6 @@ impl ControlPlaneStore for TestStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
-        load_tls_certificate_revision,
         load_route_changes,
         load_route_change_revision,
         load_materialization_work_status,
@@ -64,12 +63,13 @@ impl ControlPlaneStore for TestStore {
     fn snapshot_tls_bindings(
         &self,
         hosts: Vec<TlsHostname>,
-    ) -> StoreFuture<'_, StoreResult<TlsBindingSnapshot>> {
+        known: Option<CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>> {
         Box::pin(async move {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((hosts[0].to_string(), tokio::time::Instant::now()));
+            self.calls.lock().unwrap().push((
+                hosts.first().map_or_else(String::new, ToString::to_string),
+                tokio::time::Instant::now(),
+            ));
             if self
                 .failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -79,30 +79,21 @@ impl ControlPlaneStore for TestStore {
                     "controlled watch admission pressure",
                 ));
             }
-            Ok(TlsBindingSnapshot {
-                cursor: CertificateRevision::ZERO,
+            if known == Some(CertificateRevision::ZERO) {
+                return Ok(None);
+            }
+            Ok(Some(TlsBindingSnapshot {
+                revision: CertificateRevision::ZERO,
                 bindings: hosts
                     .into_iter()
                     .map(|hostname| TlsBinding {
                         hostname,
                         revision: CertificateRevision::ZERO,
+                        last_invalidating_revision: CertificateRevision::ZERO,
                         certificate_id: None,
                     })
                     .collect(),
-            })
-        })
-    }
-    fn load_tls_certificate_changes(
-        &self,
-        cursor: CertificateRevision,
-        _limit: u32,
-    ) -> StoreFuture<'_, StoreResult<DurableTlsCertificateChanges>> {
-        Box::pin(async move {
-            Ok(DurableTlsCertificateChanges {
-                cursor,
-                reset: false,
-                events: Vec::new(),
-            })
+            }))
         })
     }
 }
@@ -267,10 +258,8 @@ async fn transient_registration_pressure_retains_one_request_until_its_fixed_set
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        response.value,
-        Some(pb::watch_tls_certificates_response::Value::Snapshot(_))
-    ));
+    assert_eq!(response.registration, 1);
+    assert_eq!(response.bindings[0].hostname, "retry.example");
     assert_eq!(
         store.calls.lock().unwrap().len(),
         3,
@@ -282,4 +271,29 @@ async fn transient_registration_pressure_retains_one_request_until_its_fixed_set
         broker.certificate_streams.available_permits(),
         WATCH_STREAMS
     );
+}
+
+#[tokio::test]
+async fn empty_registration_acks_once_and_has_no_idle_database_polls() {
+    let store = TestStore::default();
+    let mut state = WatchState::default();
+    state
+        .register(pb::WatchTlsCertificatesRequest {
+            registration: 1,
+            hostnames: Vec::new(),
+        })
+        .unwrap();
+    let first = state.poll(&store).await.unwrap().unwrap();
+    assert_eq!(first.registration, 1);
+    assert!(first.bindings.is_empty());
+    for _ in 0..4 {
+        assert!(state.poll(&store).await.unwrap().is_none());
+    }
+    assert_eq!(store.calls.lock().unwrap().len(), 1);
+    state.register(input(2, "added.example")).unwrap();
+    assert_eq!(
+        state.poll(&store).await.unwrap().unwrap().bindings[0].hostname,
+        "added.example"
+    );
+    assert_eq!(store.calls.lock().unwrap().len(), 2);
 }

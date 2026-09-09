@@ -108,8 +108,7 @@ mod tests {
                 "certificate_fetch",
                 "certificate_refresh",
                 "certificate_watch",
-                "certificate_install",
-                "certificate_reset"
+                "certificate_install"
             ]
         );
         assert_eq!(

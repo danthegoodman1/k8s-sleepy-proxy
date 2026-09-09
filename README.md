@@ -11,7 +11,7 @@ records measured lifecycle/proxy workloads, recovery guarantees and capacity lim
 [Dynamic certificate delivery](docs/dynamic-certificates-plan.md) uses encrypted
 Postgres storage, bounded in-memory proxy caches and change notifications for
 rotation and removal. Frontline loads application certificates only from the
-control plane. The [certificate validation results](docs/review-evidence/dynamic-certificates/phase6/README.md)
+control plane. The [certificate validation results](docs/review-evidence/dynamic-certificates/phase7/README.md)
 record the deployed behavior, outage limits and measured resource/performance scope.
 
 Start here:

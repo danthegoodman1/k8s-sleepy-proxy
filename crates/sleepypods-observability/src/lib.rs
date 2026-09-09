@@ -52,7 +52,6 @@ pub enum Operation {
     CertificateRefresh,
     CertificateWatch,
     CertificateInstall,
-    CertificateReset,
 }
 
 /// Generic low-cardinality operation outcomes.
@@ -145,7 +144,6 @@ impl Operation {
         Self::CertificateRefresh,
         Self::CertificateWatch,
         Self::CertificateInstall,
-        Self::CertificateReset,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -172,7 +170,6 @@ impl Operation {
             Self::CertificateRefresh => "certificate_refresh",
             Self::CertificateWatch => "certificate_watch",
             Self::CertificateInstall => "certificate_install",
-            Self::CertificateReset => "certificate_reset",
         }
     }
 }

@@ -82,6 +82,7 @@ fn binding(b: TlsBinding) -> pb::TlsBinding {
         hostname: b.hostname.as_str().to_owned(),
         certificate_id: b.certificate_id.map(|id| id.as_str().to_owned()),
         revision: b.revision.get(),
+        last_invalidating_revision: b.last_invalidating_revision.get(),
     }
 }
 pub(crate) async fn publish(

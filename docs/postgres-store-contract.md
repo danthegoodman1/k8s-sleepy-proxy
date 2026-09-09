@@ -239,21 +239,23 @@ unbinding. Rotation, removal and rebinding advance affected hostname revisions,
 so a lower certificate version on a different resource cannot be mistaken for an
 older view. Rotation validates every current binding before changing anything.
 At most 1,024 hostnames may reference one certificate, bounding validation and
-event fanout. A failed mutation cannot publish a committed event.
+binding updates. A failed mutation rolls back its revision changes too.
 
-Each durable TLS event has its own revision, including events in a fanout batch;
-pagination cannot skip remaining hosts in the same transaction. The feed uses
-the route outbox's bounded prefix-retention and reset pattern, with a separate
-100,000-event hard cap and at most 1,024 events per read. Events and operator
-metadata contain no private key material.
+Each binding also retains a `last_invalidating_revision`. Binding mutations
+(including same-ID binding) and removal advance it atomically with the view
+revision; ordinary publication/rotation preserves it. It records the most recent
+destructive transition even when several mutations occur between watch polls.
+A proxy compares it against its retained configuration's actual view revision,
+not its possibly newer notification floor.
 
-`snapshot_tls_bindings` reads up to 1,024 requested current bindings and the
-global outbox cursor in one SQL snapshot, without loading or decrypting bundles.
-A native certificate watch starts from this coherent snapshot and polls durable
-changes after its cursor. A retention gap requires reset and resynchronization.
-The cursor advances over unrelated events too; only each hostname's own revision
-can fence that hostname. The client applies received events independently of
-other hostnames' delivery order.
+`snapshot_tls_bindings` reads up to 1,024 requested bindings and a private global
+revision in one SQL snapshot, without loading or decrypting bundles. The optional
+known global revision skips the scoped hostname query only on equality; a forced
+registration always returns a complete snapshot. Native watches periodically
+perform this conditional read and push changed snapshots. The global revision
+stays on the server as a read optimization; per-host revisions alone fence views.
+There is no certificate event outbox, history retention, pagination or reset path.
+Snapshots and operator metadata contain no private key material.
 
 Private keys use a versioned AES-256-GCM envelope. Associated data includes the
 certificate ID/version, sealing key ID and a digest of the complete chain.
@@ -274,7 +276,7 @@ an authoritative certificate miss.
 
 Certificate writes are one-shot through the retry wrapper. Callers inspect
 metadata after an uncertain outcome before choosing a new conditional write.
-Certificate metadata, bindings, resolution and durable feed reads retain bounded
+Certificate metadata, bindings, resolution and snapshot reads retain bounded
 read retries. Certificate operations have their own local admission limit of
 `min(4, pool_capacity - 1)` and two blocking-crypto slots, preserving an ordinary
 pool slot. Sealing-enabled runtime configuration requires at least two pool
@@ -285,7 +287,7 @@ session to the pool. Failure, timeout or task cancellation discards its transpor
 This bounds admitted local work and session reuse; remote statement termination
 still depends on PostgreSQL and its configured statement timeout.
 
-Snapshot and certificate-feed reads share an additional one-slot watch limit per
+Certificate snapshot reads have an additional one-slot watch limit per
 store. Admission allows at most 17 active or queued calls: 16 native producer
 calls plus one previous logical read whose detached protocol drain still owns
 the watch slot. A producer can queue its next poll before that drain finishes.

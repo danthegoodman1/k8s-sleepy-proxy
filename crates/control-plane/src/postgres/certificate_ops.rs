@@ -8,7 +8,6 @@ use deadpool_postgres::{GenericClient, Transaction};
 use tokio_postgres::Row;
 
 const CERT_COLUMNS: &str = "certificate_id, version, state, not_before_unix_millis, not_after_unix_millis, dns_names, leaf_sha256, chain_der, seal_format, seal_key_id, seal_nonce, sealed_private_key, sealing_revision";
-const MAX_OUTBOX: i64 = 100_000;
 
 fn invalid(error: InvalidCertificateResource) -> StoreError {
     StoreError::invalid_argument(error.0)
@@ -123,57 +122,21 @@ async fn certificate(client: &impl GenericClient, id: &CertificateId) -> StoreRe
         .await
         .map_err(map_postgres_error)
 }
-async fn reserve(tx: &Transaction<'_>, count: usize) -> StoreResult<i64> {
-    let count = i64::try_from(count)
-        .map_err(|_| StoreError::internal("certificate revision reservation overflow"))?;
-    // Writes already hold the counter lock. Overflow aborts the entire mutation.
-    Ok(tx.query_one("UPDATE tls_certificate_revision SET revision=revision+$1 WHERE singleton RETURNING revision-$1+1", &[&count]).await.map_err(map_postgres_error)?.get(0))
+async fn advance_revision(tx: &Transaction<'_>) -> StoreResult<i64> {
+    // The mutation holds the singleton lock. Overflow aborts the transaction.
+    Ok(tx.query_one("UPDATE tls_certificate_revision SET revision=revision+1 WHERE singleton RETURNING revision", &[]).await.map_err(map_postgres_error)?.get(0))
 }
-async fn event(
-    tx: &Transaction<'_>,
-    revision: i64,
-    host: Option<&str>,
-    id: Option<&str>,
-    version: Option<i64>,
-    kind: &str,
-) -> StoreResult<()> {
-    tx.execute("INSERT INTO tls_certificate_outbox(revision,hostname,certificate_id,certificate_version,kind) VALUES($1,$2,$3,$4,$5)", &[&revision,&host,&id,&version,&kind]).await.map_err(map_postgres_error)?;
-    Ok(())
-}
-async fn finish(tx: Transaction<'_>) -> StoreResult<()> {
-    // Remove only a contiguous prefix. Hard cap also bounds forgotten readers.
-    tx.execute("DELETE FROM tls_certificate_outbox WHERE revision <= (SELECT revision-$1 FROM tls_certificate_revision WHERE singleton)", &[&MAX_OUTBOX]).await.map_err(map_postgres_error)?;
-    tx.commit().await.map_err(map_postgres_error)
-}
-async fn invalidate_hosts(
+async fn update_bound_views(
     tx: &Transaction<'_>,
     id: &CertificateId,
-    version: CertificateRevision,
     remove: bool,
 ) -> StoreResult<()> {
-    let rows = tx
-        .query(
-            "SELECT hostname FROM tls_hostname_bindings WHERE certificate_id=$1 ORDER BY hostname",
-            &[&id.as_str()],
-        )
-        .await
-        .map_err(map_postgres_error)?;
-    if rows.len() > MAX_CERTIFICATE_BINDINGS {
+    let revision = advance_revision(tx).await?;
+    let changed = tx.execute("UPDATE tls_hostname_bindings SET revision=$2, last_invalidating_revision=CASE WHEN $3 THEN $2 ELSE last_invalidating_revision END, certificate_id=CASE WHEN $3 THEN NULL ELSE certificate_id END WHERE certificate_id=$1", &[&id.as_str(), &revision, &remove]).await.map_err(map_postgres_error)?;
+    if changed > MAX_CERTIFICATE_BINDINGS as u64 {
         return Err(StoreError::internal(
             "certificate binding inventory exceeds its bound",
         ));
-    }
-    let start = reserve(tx, rows.len().max(1)).await?;
-    let version = version.get() as i64;
-    let kind = if remove { "removed" } else { "published" };
-    if rows.is_empty() {
-        event(tx, start, None, Some(id.as_str()), Some(version), kind).await?;
-    } else {
-        // A single batch keeps the maximum 1024-host fanout bounded in database
-        // round trips. Each event has its own cursor revision, never a shared ID.
-        let hosts: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-        tx.execute("UPDATE tls_hostname_bindings b SET revision=$2+u.ordinality-1, certificate_id=CASE WHEN $3 THEN NULL ELSE b.certificate_id END FROM unnest($1::text[]) WITH ORDINALITY u(hostname,ordinality) WHERE b.hostname=u.hostname", &[&hosts,&start,&remove]).await.map_err(map_postgres_error)?;
-        tx.execute("INSERT INTO tls_certificate_outbox(revision,hostname,certificate_id,certificate_version,kind) SELECT $2+u.ordinality-1,u.hostname,$3,$4,$5 FROM unnest($1::text[]) WITH ORDINALITY u(hostname,ordinality)", &[&hosts,&start,&id.as_str(),&version,&kind]).await.map_err(map_postgres_error)?;
     }
     Ok(())
 }
@@ -247,9 +210,9 @@ pub(super) async fn publish(
         })
         .await?;
     tx.execute("INSERT INTO certificates(certificate_id,version,state,not_before_unix_millis,not_after_unix_millis,dns_names,leaf_sha256,chain_der,seal_format,seal_key_id,seal_nonce,sealed_private_key,sealing_revision) VALUES($1,$2,'active',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(certificate_id) DO UPDATE SET version=excluded.version,state=excluded.state,not_before_unix_millis=excluded.not_before_unix_millis,not_after_unix_millis=excluded.not_after_unix_millis,dns_names=excluded.dns_names,leaf_sha256=excluded.leaf_sha256,chain_der=excluded.chain_der,seal_format=excluded.seal_format,seal_key_id=excluded.seal_key_id,seal_nonce=excluded.seal_nonce,sealed_private_key=excluded.sealed_private_key,sealing_revision=excluded.sealing_revision", &[&request.id.as_str(),&(version.get() as i64),&validated.not_before_unix_millis,&validated.not_after_unix_millis,&validated.dns_names,&validated.leaf_sha256,&request.bundle.chain_der(),&(sealed.format_version as i16),&sealed.key_id,&&sealed.nonce[..],&sealed.ciphertext,&(sealing_revision.get() as i64)]).await.map_err(map_postgres_error)?;
-    invalidate_hosts(&tx, &request.id, version, false).await?;
+    update_bound_views(&tx, &request.id, false).await?;
     let result = metadata(&certificate(&tx, &request.id).await?.unwrap())?;
-    finish(tx).await?;
+    tx.commit().await.map_err(map_postgres_error)?;
     Ok(result)
 }
 
@@ -269,7 +232,7 @@ pub(super) async fn get_binding(
         .client(store)
         .await?
         .query_opt(
-            "SELECT certificate_id, revision FROM tls_hostname_bindings WHERE hostname=$1",
+            "SELECT certificate_id, revision, last_invalidating_revision FROM tls_hostname_bindings WHERE hostname=$1",
             &[&hostname.as_str()],
         )
         .await
@@ -285,6 +248,11 @@ pub(super) async fn get_binding(
         revision: row
             .as_ref()
             .map(|r| rev(r.get(1)))
+            .transpose()?
+            .unwrap_or(CertificateRevision::ZERO),
+        last_invalidating_revision: row
+            .as_ref()
+            .map(|r| rev(r.get(2)))
             .transpose()?
             .unwrap_or(CertificateRevision::ZERO),
     })
@@ -310,7 +278,6 @@ pub(super) async fn set_binding(
             .transpose()?
             .unwrap_or(CertificateRevision::ZERO),
     )?;
-    let mut version = None;
     if let Some(id) = &request.certificate_id {
         let row = certificate(&tx, id).await?.ok_or(StoreError::NotFound {
             resource: "certificate",
@@ -341,25 +308,16 @@ pub(super) async fn set_binding(
                 "certificate exceeds its 1024 binding bound",
             ));
         }
-        version = Some(meta.version.get() as i64);
     }
-    let revision = reserve(&tx, 1).await?;
+    let revision = advance_revision(&tx).await?;
     let id = request.certificate_id.as_ref().map(CertificateId::as_str);
-    tx.execute("INSERT INTO tls_hostname_bindings(hostname,certificate_id,revision) VALUES($1,$2,$3) ON CONFLICT(hostname) DO UPDATE SET certificate_id=excluded.certificate_id, revision=excluded.revision", &[&request.hostname.as_str(),&id,&revision]).await.map_err(map_postgres_error)?;
-    event(
-        &tx,
-        revision,
-        Some(request.hostname.as_str()),
-        id,
-        version,
-        if id.is_some() { "bound" } else { "unbound" },
-    )
-    .await?;
-    finish(tx).await?;
+    tx.execute("INSERT INTO tls_hostname_bindings(hostname,certificate_id,revision,last_invalidating_revision) VALUES($1,$2,$3,$3) ON CONFLICT(hostname) DO UPDATE SET certificate_id=excluded.certificate_id, revision=excluded.revision,last_invalidating_revision=excluded.last_invalidating_revision", &[&request.hostname.as_str(),&id,&revision]).await.map_err(map_postgres_error)?;
+    tx.commit().await.map_err(map_postgres_error)?;
     Ok(TlsBinding {
         hostname: request.hostname,
         certificate_id: request.certificate_id,
         revision: rev(revision)?,
+        last_invalidating_revision: rev(revision)?,
     })
 }
 
@@ -386,9 +344,9 @@ pub(super) async fn remove(
     let version = next(meta.version)?;
     let sealing_revision = next(meta.sealing_revision)?;
     tx.execute("UPDATE certificates SET version=$2,state='deleted',not_before_unix_millis=0,not_after_unix_millis=0,dns_names='{}',leaf_sha256=NULL,chain_der=NULL,seal_format=NULL,seal_key_id=NULL,seal_nonce=NULL,sealed_private_key=NULL,sealing_revision=$3 WHERE certificate_id=$1", &[&request.id.as_str(),&(version.get() as i64),&(sealing_revision.get() as i64)]).await.map_err(map_postgres_error)?;
-    invalidate_hosts(&tx, &request.id, version, true).await?;
+    update_bound_views(&tx, &request.id, true).await?;
     let result = metadata(&certificate(&tx, &request.id).await?.unwrap())?;
-    finish(tx).await?;
+    tx.commit().await.map_err(map_postgres_error)?;
     Ok(result)
 }
 
@@ -484,101 +442,32 @@ pub(super) async fn reencrypt(
     Ok(result)
 }
 
-pub(super) async fn revision(store: &PostgresStore) -> StoreResult<CertificateRevision> {
-    let work = store.certificate_work.acquire()?;
-    rev(work
-        .client(store)
-        .await?
-        .query_one(
-            "SELECT revision FROM tls_certificate_revision WHERE singleton",
-            &[],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .get(0))
-}
-pub(super) async fn changes(
-    store: &PostgresStore,
-    cursor: CertificateRevision,
-    limit: u32,
-) -> StoreResult<DurableTlsCertificateChanges> {
-    if limit == 0 || limit > MAX_TLS_CHANGE_BATCH {
-        return Err(StoreError::invalid_argument(
-            "TLS change batch requires 1–1024 events",
-        ));
-    }
-    let work = store.certificate_work.acquire_watch().await?;
-    let cursor_i64 = cursor.get() as i64;
-    let row=work.client(store).await?.query_one("SELECT c.revision, (SELECT min(revision) FROM tls_certificate_outbox) AS first_revision, COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY revision) FROM (SELECT revision,hostname,certificate_id,certificate_version,kind FROM tls_certificate_outbox WHERE revision>$1 ORDER BY revision LIMIT $2) p),'[]'::jsonb) AS events FROM tls_certificate_revision c WHERE singleton", &[&cursor_i64,&(limit as i64)]).await.map_err(map_postgres_error)?;
-    let current: i64 = row.get("revision");
-    let first: Option<i64> = row.get("first_revision");
-    let reset = cursor_i64 > current || cursor_i64 < first.map_or(current, |n| n - 1);
-    let mut events = Vec::new();
-    if !reset {
-        let values: serde_json::Value = row.get("events");
-        for value in values
-            .as_array()
-            .ok_or_else(|| StoreError::internal("invalid TLS outbox page"))?
-        {
-            let get = |key: &str| {
-                value[key]
-                    .as_str()
-                    .ok_or_else(|| StoreError::internal("invalid TLS outbox event"))
-            };
-            events.push(TlsCertificateChange {
-                revision: rev(value["revision"]
-                    .as_i64()
-                    .ok_or_else(|| StoreError::internal("invalid TLS outbox revision"))?)?,
-                hostname: value["hostname"]
-                    .as_str()
-                    .map(TlsHostname::new)
-                    .transpose()
-                    .map_err(invalid)?,
-                certificate_id: value["certificate_id"]
-                    .as_str()
-                    .map(CertificateId::new)
-                    .transpose()
-                    .map_err(invalid)?,
-                certificate_version: value["certificate_version"].as_i64().map(rev).transpose()?,
-                kind: match get("kind")? {
-                    "published" => TlsCertificateChangeKind::Published,
-                    "bound" => TlsCertificateChangeKind::Bound,
-                    "unbound" => TlsCertificateChangeKind::Unbound,
-                    "removed" => TlsCertificateChangeKind::Removed,
-                    _ => return Err(StoreError::internal("invalid TLS outbox kind")),
-                },
-            });
-        }
-    }
-    Ok(DurableTlsCertificateChanges {
-        cursor: if reset {
-            rev(current)?
-        } else {
-            events.last().map_or(cursor, |e| e.revision)
-        },
-        reset,
-        events,
-    })
-}
+// A single MVCC statement gates the scoped join on the private global revision.
+// Stable polls do not evaluate the hostname subquery or load any certificate data.
+const SNAPSHOT_SQL: &str = "SELECT c.revision, CASE WHEN $2::bigint IS DISTINCT FROM c.revision THEN COALESCE((SELECT jsonb_agg(jsonb_build_object('hostname', h.hostname, 'certificate_id', b.certificate_id, 'revision', COALESCE(b.revision,0), 'last_invalidating_revision', COALESCE(b.last_invalidating_revision,0)) ORDER BY h.ordinality) FROM unnest($1::text[]) WITH ORDINALITY h(hostname,ordinality) LEFT JOIN tls_hostname_bindings b ON b.hostname=h.hostname),'[]'::jsonb) END AS bindings FROM tls_certificate_revision c WHERE singleton";
 
-// One statement observes both the commit-ordered global cursor and each host's
-// own current view. No chain, sealed key, decryption, or sealer is involved.
 pub(super) async fn snapshot(
     store: &PostgresStore,
     hostnames: Vec<TlsHostname>,
-) -> StoreResult<TlsBindingSnapshot> {
+    known_revision: Option<CertificateRevision>,
+) -> StoreResult<Option<TlsBindingSnapshot>> {
     if hostnames.len() > MAX_CERTIFICATE_BINDINGS {
         return Err(StoreError::invalid_argument(
             "TLS interests exceed 1024 hosts",
         ));
     }
     let hosts: Vec<_> = hostnames.iter().map(|h| h.as_str()).collect();
+    let known = known_revision.map(|r| r.get() as i64);
     let work = store.certificate_work.acquire_watch().await?;
-    let row = work.client(store).await?.query_one(
-        "SELECT c.revision, COALESCE((SELECT jsonb_agg(jsonb_build_object('hostname', h.hostname, 'certificate_id', b.certificate_id, 'revision', COALESCE(b.revision,0)) ORDER BY h.ordinality) FROM unnest($1::text[]) WITH ORDINALITY h(hostname,ordinality) LEFT JOIN tls_hostname_bindings b ON b.hostname=h.hostname),'[]'::jsonb) AS bindings FROM tls_certificate_revision c WHERE singleton",
-        &[&hosts],
-    ).await.map_err(map_postgres_error)?;
-    let values: serde_json::Value = row.get("bindings");
+    let row = work
+        .client(store)
+        .await?
+        .query_one(SNAPSHOT_SQL, &[&hosts, &known])
+        .await
+        .map_err(map_postgres_error)?;
+    let Some(values) = row.get::<_, Option<serde_json::Value>>("bindings") else {
+        return Ok(None);
+    };
     let mut bindings = Vec::with_capacity(hosts.len());
     for v in values
         .as_array()
@@ -599,10 +488,13 @@ pub(super) async fn snapshot(
             revision: rev(v["revision"]
                 .as_i64()
                 .ok_or_else(|| StoreError::internal("invalid TLS snapshot revision"))?)?,
+            last_invalidating_revision: rev(v["last_invalidating_revision"]
+                .as_i64()
+                .ok_or_else(|| StoreError::internal("invalid TLS invalidating revision"))?)?,
         });
     }
-    Ok(TlsBindingSnapshot {
-        cursor: rev(row.get("revision"))?,
+    Ok(Some(TlsBindingSnapshot {
+        revision: rev(row.get("revision"))?,
         bindings,
-    })
+    }))
 }

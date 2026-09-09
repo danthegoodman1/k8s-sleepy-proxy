@@ -5,6 +5,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -15,13 +16,49 @@ static FORWARD_ID: AtomicUsize = AtomicUsize::new(0);
 pub(super) struct Peer {
     child: Child,
     log: std::path::PathBuf,
+    diagnostic: Option<std::path::PathBuf>,
     pub pod: Pod,
     ports: HashMap<u16, SocketAddr>,
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        let observed_at = now();
+        // Observe before our cleanup sends a signal: a killed child is not
+        // evidence that the forward had already failed during the workload.
+        let observed = match self.child.try_wait() {
+            Ok(Some(status)) => {
+                serde_json::json!({"state":"exited","status":status.to_string(),"code":status.code()})
+            }
+            Ok(None) => serde_json::json!({"state":"running"}),
+            Err(error) => serde_json::json!({"state":"unknown","error":error.to_string()}),
+        };
+        let child_pid = self.child.id();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(path) = &self.diagnostic {
+            let retained = (|| -> TestResult<()> {
+                let mut file = fs::File::open(&self.log)?;
+                let length = file.metadata()?.len();
+                let offset = length.saturating_sub(64 * 1024);
+                file.seek(SeekFrom::Start(offset))?;
+                let mut tail = Vec::new();
+                file.take(64 * 1024).read_to_end(&mut tail)?;
+                let record = serde_json::json!({
+                    "pod":self.name(),"uid":self.uid(),"child_pid":child_pid,
+                    "observed_unix_millis":observed_at,"observed_before_cleanup":observed,"ports":self.ports,
+                    "log_total_bytes":length,"log_tail_offset":offset,
+                    "log_tail":String::from_utf8_lossy(&tail),
+                });
+                fs::write(path, serde_json::to_vec_pretty(&record)?)?;
+                Ok(())
+            })();
+            if let Err(error) = retained {
+                eprintln!(
+                    "failed to retain exact Pod forward diagnostic for {}: {error}",
+                    self.name()
+                );
+            }
+        }
         let _ = fs::remove_file(&self.log);
     }
 }
@@ -37,11 +74,18 @@ impl Peer {
     }
     pub async fn start(namespace: &str, pod: Pod, ports: &[u16]) -> TestResult<Self> {
         let name = pod.metadata.name.as_deref().ok_or("Pod name missing")?;
+        let forward_id = FORWARD_ID.fetch_add(1, Ordering::Relaxed);
         let log = std::env::temp_dir().join(format!(
             "sleepypods-tls-pf-{}-{}",
             std::process::id(),
-            FORWARD_ID.fetch_add(1, Ordering::Relaxed)
+            forward_id
         ));
+        let diagnostic = std::env::var_os("SLEEPYPODS_E2E_ARTIFACT_DIR").map(|directory| {
+            std::path::PathBuf::from(directory).join(format!(
+                "pod-forward-{name}-{}-{forward_id}.json",
+                std::process::id()
+            ))
+        });
         let output = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -66,6 +110,7 @@ impl Peer {
         let mut peer = Self {
             child,
             log,
+            diagnostic,
             pod,
             ports: HashMap::new(),
         };
@@ -388,6 +433,56 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn forward_diagnostic_preserves_pre_cleanup_status_and_bounded_tail() -> TestResult<()> {
+        for exited in [true, false] {
+            let number = FORWARD_ID.fetch_add(1, Ordering::Relaxed);
+            let stem = format!("sleepypods-forward-proof-{}-{number}", std::process::id());
+            let log = std::env::temp_dir().join(&stem);
+            let diagnostic = log.with_extension("json");
+            let mut bytes = vec![b'x'; 128 * 1024];
+            bytes.extend_from_slice(b"final-forward-diagnostic");
+            fs::write(&log, &bytes)?;
+            let mut child = if exited {
+                Command::new("sh").args(["-c", "exit 17"]).spawn()?
+            } else {
+                Command::new("sleep").arg("30").spawn()?
+            };
+            if exited {
+                assert_eq!(child.wait()?.code(), Some(17));
+            }
+            let peer = Peer {
+                child,
+                log: log.clone(),
+                diagnostic: Some(diagnostic.clone()),
+                pod: serde_json::from_value(
+                    serde_json::json!({"metadata":{"name":"exact-peer","uid":"exact-uid"}}),
+                )?,
+                ports: HashMap::from([(8443, "127.0.0.1:23456".parse()?)]),
+            };
+            drop(peer);
+            let record: serde_json::Value = serde_json::from_slice(&fs::read(&diagnostic)?)?;
+            fs::remove_file(diagnostic)?;
+            assert!(!log.exists());
+            assert_eq!(record["pod"], "exact-peer");
+            assert_eq!(record["uid"], "exact-uid");
+            assert_eq!(record["ports"]["8443"], "127.0.0.1:23456");
+            assert_eq!(record["log_total_bytes"], bytes.len());
+            assert_eq!(record["log_tail"].as_str().unwrap().len(), 64 * 1024);
+            assert!(record["log_tail"]
+                .as_str()
+                .unwrap()
+                .ends_with("final-forward-diagnostic"));
+            if exited {
+                assert_eq!(record["observed_before_cleanup"]["state"], "exited");
+                assert_eq!(record["observed_before_cleanup"]["code"], 17);
+            } else {
+                assert_eq!(record["observed_before_cleanup"]["state"], "running");
+            }
+        }
+        Ok(())
+    }
 
     async fn fixture() -> TestResult<(
         tokio::net::TcpListener,

@@ -32,6 +32,8 @@ impl CertificateResolver for Resolver {
 struct Opened {
     requests: mpsc::Receiver<pb::WatchTlsCertificatesRequest>,
     events: mpsc::Sender<Result<pb::WatchTlsCertificatesResponse, CertificateLookupError>>,
+    registration: u64,
+    bindings: std::collections::BTreeMap<String, pb::TlsBinding>,
 }
 struct Watch(mpsc::Sender<Opened>);
 impl CertificateWatcher for Watch {
@@ -43,7 +45,12 @@ impl CertificateWatcher for Watch {
         Box::pin(async move {
             let (events, receiver) = mpsc::channel(2);
             opened
-                .send(Opened { requests, events })
+                .send(Opened {
+                    requests,
+                    events,
+                    registration: 0,
+                    bindings: Default::default(),
+                })
                 .await
                 .map_err(|_| CertificateLookupError::Unavailable)?;
             Ok(
@@ -175,56 +182,46 @@ fn revision(rig: &Rig, host: &str) -> Option<u64> {
         .and_then(|e| e.value.as_ref())
         .map(|v| v.revision)
 }
-async fn sync(open: &mut Opened, cursor: u64, bindings: Vec<(&str, u64, Option<&str>)>) {
+async fn sync(open: &mut Opened, bindings: Vec<(&str, u64, Option<&str>)>) {
     let request = tokio::time::timeout(Duration::from_secs(2), open.requests.recv())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(request.hostnames.len(), bindings.len());
+    open.registration = request.registration;
+    open.bindings = bindings
+        .into_iter()
+        .map(|(host, revision, id)| {
+            (
+                host.into(),
+                pb::TlsBinding {
+                    hostname: host.into(),
+                    revision,
+                    certificate_id: id.map(str::to_owned),
+                    last_invalidating_revision: revision,
+                },
+            )
+        })
+        .collect();
+    send_snapshot(open).await;
+}
+async fn send_snapshot(open: &Opened) {
     open.events
         .send(Ok(pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
-                pb::TlsCertificateSnapshot {
-                    registration: request.registration,
-                    cursor,
-                    bindings: bindings
-                        .into_iter()
-                        .map(|(host, revision, id)| pb::TlsBinding {
-                            hostname: host.into(),
-                            revision,
-                            certificate_id: id.map(str::to_owned),
-                        })
-                        .collect(),
-                },
-            )),
+            registration: open.registration,
+            bindings: open.bindings.values().cloned().collect(),
         }))
         .await
         .unwrap();
 }
-async fn event(
-    open: &Opened,
-    cursor: u64,
-    host: &str,
-    revision: u64,
-    id: Option<&str>,
-    invalidate: bool,
-) {
-    open.events
-        .send(Ok(pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Changes(
-                pb::TlsCertificateChanges {
-                    cursor,
-                    events: vec![pb::TlsCertificateEvent {
-                        hostname: host.into(),
-                        view_revision: revision,
-                        certificate_id: id.map(str::to_owned),
-                        invalidate,
-                    }],
-                },
-            )),
-        }))
-        .await
-        .unwrap();
+async fn push(open: &mut Opened, host: &str, revision: u64, id: Option<&str>, invalidate: bool) {
+    let binding = open.bindings.get_mut(host).unwrap();
+    binding.revision = revision;
+    binding.certificate_id = id.map(str::to_owned);
+    if invalidate {
+        binding.last_invalidating_revision = revision;
+    }
+    send_snapshot(open).await;
 }
 async fn peer(cache: &TlsCertificateStore, host: &str, cert: &CertificateDer<'static>) {
     let mut roots = rustls::RootCertStore::empty();
@@ -261,7 +258,7 @@ async fn cached_miss_then_registration_snapshot_closes_publish_race_with_real_pe
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
     let mut watch = rig.open().await;
     let cert = rig.publish("app.example", 2, "A", 1);
-    sync(&mut watch, 2, vec![("app.example", 2, Some("A"))]).await;
+    sync(&mut watch, vec![("app.example", 2, Some("A"))]).await;
     until(|| revision(&rig, "app.example") == Some(2)).await;
     peer(&rig.cache, "app.example", &cert).await;
     assert_eq!(rig.api.api.requests.lock().unwrap().len(), 2);
@@ -273,7 +270,7 @@ async fn rotation_fences_held_unchanged_and_preserves_only_original_view_until_r
     let old = rig.publish("app.example", 1, "A", 1);
     rig.cache.resolve("app.example").await.unwrap();
     let mut watch = rig.open().await;
-    sync(&mut watch, 1, vec![("app.example", 1, Some("A"))]).await;
+    sync(&mut watch, vec![("app.example", 1, Some("A"))]).await;
     let release = rig.hold();
     {
         let mut state = rig.cache.shared.state.lock().unwrap();
@@ -288,7 +285,7 @@ async fn rotation_fences_held_unchanged_and_preserves_only_original_view_until_r
         .expires;
     let new = rig.publish("app.example", 2, "A", 2);
     let replacement = rig.hold();
-    event(&watch, 2, "app.example", 2, Some("A"), false).await;
+    push(&mut watch, "app.example", 2, Some("A"), false).await;
     until(|| rig.api.api.requests.lock().unwrap().len() == 3).await;
     assert_eq!(
         rig.cache.shared.state.lock().unwrap().entries["app.example"].floor,
@@ -339,10 +336,10 @@ async fn received_removal_fences_late_found_and_rebind_accepts_lower_certificate
     let mut watch = rig.open().await;
     // Initial snapshot still observes A; its authoritative fetch supersedes the
     // original cold fetch without letting that held response restore removal.
-    sync(&mut watch, 9, vec![("app.example", 9, Some("A"))]).await;
+    sync(&mut watch, vec![("app.example", 9, Some("A"))]).await;
     until(|| revision(&rig, "app.example") == Some(9)).await;
     rig.missing("app.example", 10);
-    event(&watch, 10, "app.example", 10, None, true).await;
+    push(&mut watch, "app.example", 10, None, true).await;
     until(|| revision(&rig, "app.example") == Some(10)).await;
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
     release.send(()).unwrap();
@@ -350,32 +347,31 @@ async fn received_removal_fences_late_found_and_rebind_accepts_lower_certificate
     while callers.join_next().await.is_some() {}
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
     let cert = rig.publish("app.example", 11, "B", 1);
-    event(&watch, 11, "app.example", 11, Some("B"), true).await;
+    push(&mut watch, "app.example", 11, Some("B"), true).await;
     until(|| revision(&rig, "app.example") == Some(11)).await;
     peer(&rig.cache, "app.example", &cert).await;
     rig.finish().await;
 }
 #[tokio::test]
-async fn reordered_global_pages_apply_each_host_floor_and_duplicates_never_renew() {
+async fn independent_host_revisions_and_duplicate_snapshots_never_renew() {
     let mut rig = Rig::new();
     rig.publish("a.example", 1, "A", 1);
     rig.cache.resolve("a.example").await.unwrap();
     let mut watch = rig.open().await;
     // First registration precedes the second interest; acknowledge each exact set.
-    sync(&mut watch, 1, vec![("a.example", 1, Some("A"))]).await;
+    sync(&mut watch, vec![("a.example", 1, Some("A"))]).await;
     rig.publish("b.example", 2, "B", 1);
     rig.cache.resolve("b.example").await.unwrap();
     sync(
         &mut watch,
-        2,
         vec![("a.example", 1, Some("A")), ("b.example", 2, Some("B"))],
     )
     .await;
     rig.publish("b.example", 4, "B", 2);
-    event(&watch, 4, "b.example", 4, Some("B"), false).await;
+    push(&mut watch, "b.example", 4, Some("B"), false).await;
     until(|| revision(&rig, "b.example") == Some(4)).await;
     rig.missing("a.example", 3);
-    event(&watch, 3, "a.example", 3, None, true).await;
+    push(&mut watch, "a.example", 3, None, true).await;
     until(|| revision(&rig, "a.example") == Some(3)).await;
     assert!(rig.cache.resolve("a.example").await.unwrap().is_none());
     let expiry = rig.cache.shared.state.lock().unwrap().entries["b.example"]
@@ -383,11 +379,11 @@ async fn reordered_global_pages_apply_each_host_floor_and_duplicates_never_renew
         .as_ref()
         .unwrap()
         .expires;
-    event(&watch, 4, "b.example", 4, None, true).await;
+    send_snapshot(&watch).await;
     // The next distinct host event is a causal receive-order barrier; sending
     // a snapshot alone would not prove the duplicate had been processed.
     rig.missing("a.example", 5);
-    event(&watch, 5, "a.example", 5, None, true).await;
+    push(&mut watch, "a.example", 5, None, true).await;
     until(|| revision(&rig, "a.example") == Some(5)).await;
     assert_eq!(
         rig.cache.shared.state.lock().unwrap().entries["b.example"]
@@ -400,35 +396,38 @@ async fn reordered_global_pages_apply_each_host_floor_and_duplicates_never_renew
     rig.finish().await;
 }
 #[tokio::test]
-async fn retention_reset_resync_does_not_promote_global_cursor_to_old_host_floor() {
+async fn reconnect_snapshot_preserves_low_host_revision_and_original_lease() {
     let mut rig = Rig::new();
     let cert = rig.publish("app.example", 2, "A", 1);
     rig.cache.resolve("app.example").await.unwrap();
+    let original = rig.cache.shared.state.lock().unwrap().entries["app.example"]
+        .value
+        .as_ref()
+        .unwrap()
+        .expires;
     let mut watch = rig.open().await;
-    sync(&mut watch, 100_000, vec![("app.example", 2, Some("A"))]).await;
-    let release = rig.hold();
-    watch
-        .events
-        .send(Ok(pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Reset(
-                pb::TlsCertificateReset { cursor: 200_000 },
-            )),
-        }))
-        .await
-        .unwrap();
-    until(|| revision(&rig, "app.example").is_none()).await;
-    assert!(rig
-        .metrics
-        .render()
-        .contains("{operation=\"certificate_reset\",outcome=\"success\"} 1"));
+    sync(&mut watch, vec![("app.example", 2, Some("A"))]).await;
+    drop(watch);
+    let mut next = rig.open().await;
+    sync(&mut next, vec![("app.example", 2, Some("A"))]).await;
+    until(|| {
+        rig.metrics
+            .render()
+            .contains("{operation=\"certificate_watch\",outcome=\"updated\"} 2")
+    })
+    .await;
     assert_eq!(
         rig.cache.shared.state.lock().unwrap().entries["app.example"].floor,
         2
     );
-    let mut next = rig.open().await;
-    sync(&mut next, 200_000, vec![("app.example", 2, Some("A"))]).await;
-    drop(release);
-    until(|| revision(&rig, "app.example") == Some(2)).await;
+    assert_eq!(
+        rig.cache.shared.state.lock().unwrap().entries["app.example"]
+            .value
+            .as_ref()
+            .unwrap()
+            .expires,
+        original
+    );
     peer(&rig.cache, "app.example", &cert).await;
     rig.finish().await;
 }
@@ -445,17 +444,13 @@ async fn eviction_incarnation_fences_old_snapshot_and_releases_interest_stream()
     let incarnation = rig.cache.shared.state.lock().unwrap().entries["app.example"].incarnation;
     open.events
         .send(Ok(pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
-                pb::TlsCertificateSnapshot {
-                    registration: old_request.registration,
-                    cursor: 2,
-                    bindings: vec![pb::TlsBinding {
-                        hostname: "app.example".into(),
-                        revision: 2,
-                        certificate_id: Some("A".into()),
-                    }],
-                },
-            )),
+            registration: old_request.registration,
+            bindings: vec![pb::TlsBinding {
+                hostname: "app.example".into(),
+                revision: 2,
+                certificate_id: Some("A".into()),
+                last_invalidating_revision: 1,
+            }],
         }))
         .await
         .unwrap();
@@ -473,17 +468,13 @@ async fn eviction_incarnation_fences_old_snapshot_and_releases_interest_stream()
     let new = rig.publish("app.example", 2, "A", 2);
     open.events
         .send(Ok(pb::WatchTlsCertificatesResponse {
-            value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
-                pb::TlsCertificateSnapshot {
-                    registration: next.registration,
-                    cursor: 2,
-                    bindings: vec![pb::TlsBinding {
-                        hostname: "app.example".into(),
-                        revision: 2,
-                        certificate_id: Some("A".into()),
-                    }],
-                },
-            )),
+            registration: next.registration,
+            bindings: vec![pb::TlsBinding {
+                hostname: "app.example".into(),
+                revision: 2,
+                certificate_id: Some("A".into()),
+                last_invalidating_revision: 1,
+            }],
         }))
         .await
         .unwrap();
@@ -496,7 +487,7 @@ async fn eviction_incarnation_fences_old_snapshot_and_releases_interest_stream()
         let host = format!("cycle{cycle}.example");
         assert!(rig.cache.resolve(&host).await.unwrap().is_none());
         open = rig.open().await;
-        sync(&mut open, 0, vec![(&host, 0, None)]).await;
+        sync(&mut open, vec![(&host, 0, None)]).await;
         assert_eq!(rig.cache.usage().entries, 1);
         assert!(rig.cache.usage().accounted_bytes < CERTIFICATE_CACHE_BYTES);
     }
@@ -518,7 +509,7 @@ async fn invalid_replacement_and_watch_outage_cannot_extend_original_hard_lease(
         .authorization_ttl_millis = 10_000;
     rig.cache.resolve("app.example").await.unwrap();
     let mut open = rig.open().await;
-    sync(&mut open, 1, vec![("app.example", 1, Some("A"))]).await;
+    sync(&mut open, vec![("app.example", 1, Some("A"))]).await;
     let original = rig.cache.shared.state.lock().unwrap().entries["app.example"]
         .value
         .as_ref()
@@ -537,7 +528,7 @@ async fn invalid_replacement_and_watch_outage_cannot_extend_original_hard_lease(
     {
         found.bundle.as_mut().unwrap().private_key_pkcs8_der = b"invalid-key-marker".to_vec();
     }
-    event(&open, 2, "app.example", 2, Some("A"), false).await;
+    push(&mut open, "app.example", 2, Some("A"), false).await;
     until(|| {
         rig.cache.shared.state.lock().unwrap().entries["app.example"]
             .last_error
@@ -593,4 +584,129 @@ async fn watch_decode_reserve_and_three_fetch_owners_survive_until_joined_shutdo
     assert!(open.events.is_closed());
     assert_eq!(cache.usage().accounted_bytes, STRUCTURE_BYTES);
     assert!(releases.into_iter().all(|r| r.send(()).is_err()));
+}
+
+#[tokio::test]
+async fn coalesced_destructive_watermark_invalidates_retained_view_and_both_late_responses() {
+    let mut rig = Rig::new();
+    rig.publish("app.example", 1, "A", 1);
+    rig.cache.resolve("app.example").await.unwrap();
+    let mut open = rig.open().await;
+    sync(&mut open, vec![("app.example", 1, Some("A"))]).await;
+    let unchanged = rig.hold();
+    {
+        let mut state = rig.cache.shared.state.lock().unwrap();
+        rig.cache.queue_locked(&mut state, "app.example").unwrap();
+    }
+    until(|| rig.api.api.requests.lock().unwrap().len() == 2).await;
+    rig.publish("app.example", 4, "A", 2);
+    let stale_found = rig.hold();
+    push(&mut open, "app.example", 4, Some("A"), false).await;
+    until(|| rig.api.api.requests.lock().unwrap().len() == 3).await;
+    assert_eq!(
+        rig.cache.shared.state.lock().unwrap().entries["app.example"].floor,
+        4
+    );
+    assert_eq!(revision(&rig, "app.example"), Some(1));
+    // A -> unbind -> A -> rotate coalesces to the same certificate ID, with
+    // invalidation5 distinct from latest view7 and retained material view1.
+    let new = rig.publish("app.example", 7, "A", 3);
+    let current = rig.hold();
+    let binding = open.bindings.get_mut("app.example").unwrap();
+    binding.revision = 7;
+    binding.last_invalidating_revision = 5;
+    send_snapshot(&open).await;
+    until(|| rig.api.api.requests.lock().unwrap().len() == 4).await;
+    assert_eq!(
+        rig.cache.shared.state.lock().unwrap().entries["app.example"].floor,
+        7
+    );
+    assert_eq!(revision(&rig, "app.example"), None);
+    unchanged.send(()).unwrap();
+    stale_found.send(()).unwrap();
+    until(|| rig.cache.usage().fetches == 1).await;
+    assert_eq!(revision(&rig, "app.example"), None);
+    current.send(()).unwrap();
+    until(|| revision(&rig, "app.example") == Some(7)).await;
+    peer(&rig.cache, "app.example", &new).await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn malformed_snapshot_is_rejected_before_any_host_mutation() {
+    let mut rig = Rig::new();
+    rig.publish("a.example", 1, "A", 1);
+    rig.cache.resolve("a.example").await.unwrap();
+    let mut open = rig.open().await;
+    sync(&mut open, vec![("a.example", 1, Some("A"))]).await;
+    rig.publish("b.example", 2, "B", 1);
+    rig.cache.resolve("b.example").await.unwrap();
+    sync(
+        &mut open,
+        vec![("a.example", 1, Some("A")), ("b.example", 2, Some("B"))],
+    )
+    .await;
+    until(|| {
+        rig.metrics
+            .render()
+            .contains("{operation=\"certificate_watch\",outcome=\"updated\"} 2")
+    })
+    .await;
+    let original = rig.cache.shared.state.lock().unwrap().entries["a.example"]
+        .value
+        .as_ref()
+        .unwrap()
+        .expires;
+    let generation = rig.cache.shared.state.lock().unwrap().entries["a.example"].generation;
+    open.bindings.get_mut("a.example").unwrap().revision = 3;
+    open.bindings
+        .get_mut("b.example")
+        .unwrap()
+        .last_invalidating_revision = 4;
+    send_snapshot(&open).await;
+    until(|| open.events.is_closed()).await;
+    assert_eq!(
+        rig.cache.shared.state.lock().unwrap().entries["a.example"].generation,
+        generation
+    );
+    assert_eq!(
+        rig.cache.shared.state.lock().unwrap().entries["a.example"]
+            .value
+            .as_ref()
+            .unwrap()
+            .expires,
+        original
+    );
+    assert_eq!(revision(&rig, "a.example"), Some(1));
+    assert_eq!(rig.api.api.requests.lock().unwrap().len(), 2);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn acknowledged_registration_keeps_receiving_while_pending_ack_deadline_stays_fixed() {
+    let mut rig = Rig::new();
+    rig.publish("a.example", 1, "A", 1);
+    rig.cache.resolve("a.example").await.unwrap();
+    let mut open = rig.open().await;
+    sync(&mut open, vec![("a.example", 1, Some("A"))]).await;
+    rig.publish("b.example", 2, "B", 1);
+    rig.cache.resolve("b.example").await.unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(2), open.requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.registration, 2);
+    assert_eq!(pending.hostnames.len(), 2);
+    tokio::time::pause();
+    for revision in [3, 4] {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        push(&mut open, "a.example", revision, Some("A"), false).await;
+        until(|| rig.cache.shared.state.lock().unwrap().entries["a.example"].floor == revision)
+            .await;
+        assert!(!open.events.is_closed());
+    }
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    until(|| open.events.is_closed()).await;
+    assert_eq!(revision(&rig, "a.example"), Some(1));
+    rig.finish().await;
 }

@@ -43,8 +43,8 @@ const STRUCTURE_BYTES: usize = 4 * 1024 * 1024;
 // Includes bounded wire response, validation scratch, DER/key copies and the
 // replacement config. On installation this is reduced to the retained charge.
 const FETCH_BYTES: usize = 8 * 1024 * 1024;
-// Malformed bounded Prost messages may temporarily retain both oneof variants
-// plus old/new allocations during vector growth; this charge includes that peak.
+// Malformed bounded Prost snapshots can retain old/new vector allocations
+// during growth; retain the conservative existing notification envelope.
 const WATCH_BYTES: usize = 32 * 1024 * 1024;
 const CONFIG_OVERHEAD: usize = 128 * 1024;
 
