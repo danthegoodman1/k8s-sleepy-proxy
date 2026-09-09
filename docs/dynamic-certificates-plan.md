@@ -19,13 +19,14 @@ and a new tenant authorization system are outside this plan. V1 TLS bindings use
 exact canonical DNS hostnames; a supplied SAN/wildcard certificate is acceptable
 only when standards-based validation covers each explicitly bound hostname.
 
-Implementation is active on `dynamic-certificates`, starting from merged main
+Implementation is complete on `dynamic-certificates`, starting from merged main
 `456d37e`. Phases 1–4 have reviewed stage commits `f138053`, `4688c23`, `9d0cfa9` and
 `5a337f3`. Phase 5 has independent source, deployed and performance approval;
 watch-admission correction `004505f` also passes hosted CI, closing 4G through 5C.
 Phase 5 is complete at `e1db93d`, with successful hosted CI. Phase 6 resolves all
-three findings from the fresh whole-feature review; final release and hosted
-validation are being closed. Prior evidence retains its recorded source and
+three findings from the fresh whole-feature review. Final implementation
+`15a308e` passes local, deployed, performance and hosted validation. Both the
+normal reviewer and the fresh whole-feature reviewer approve completion. Prior evidence retains its recorded source and
 workload scope. Each completed phase has a reviewable commit and independent
 review.
 
@@ -370,8 +371,8 @@ Status ledger:
 | Complete | Doc | 6A: Current operator/security/failure contract | Independent audit approves the guide, runbook, store contract, configuration and first-deployment sequence; 41 local links resolve. Runtime/final evidence closure remains 6T/6G. |
 | Complete | Work | 6B: Required CI and release gate wiring | Independently approved shared actual-PostgreSQL checker: nine checker/composition tests, two protocol example tests and all 24 target cases pass without skips, ignores or filters. Checkpoint `0e77279` passes hosted CI 34305141692; final implementation CI remains 6T. |
 | Complete | Work | 6C: Final skeptical review and simplification pass | Fresh full-feature reviewer approves all three corrections: total native TLS setup deadline, removal of unused local cursor, and hostname-only watch registration. Identical paired TLS regression proves old failure/new success; 37 focused tests and strict affected checks pass. Final integration evidence remains 6T/6G. |
-| In Progress | Test | 6T: Final workspace, store, images and hosted checks | All twelve local checks pass at frozen 274-file source with independent verification. Final production images, packaging, deployed lifecycle/RSS and strict comparative load pass. Routing, protocols, restart, libpq and matched TLS timing also pass; final hosted CI remains. |
-| Incomplete | Gate | 6G: Implementation complete | Missing: independent final review, all prior gates and a clean final diff. |
+| Complete | Test | 6T: Final workspace, store, images and hosted checks | All twelve local checks, final images/packaging, deployed lifecycle/RSS/routing/protocol/restart/libpq and original performance budgets pass with independent evidence review. Final implementation `15a308e` passes hosted CI 34308484699, including all 24 actual PostgreSQL target cases. See [final evidence](review-evidence/dynamic-certificates/phase6/README.md). |
+| Complete | Gate | 6G: Implementation complete | Both independent reviewers approve the full implementation, all three simplifications/corrections, final local/deployed/performance/hosted evidence and current documentation. Owned fixtures are cleaned up. The closure commit changes documentation only; [final evidence](review-evidence/dynamic-certificates/phase6/README.md) records tested source, image IDs, counts and measurement limits. |
 
 ## Starting Points
 

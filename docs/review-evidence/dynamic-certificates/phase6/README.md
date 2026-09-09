@@ -1,8 +1,8 @@
 # Final dynamic certificate integration
 
 Phase 6 starts at `e1db93d3ce75ecabcef3483131a52ae00112428a`. Final integration
-and the fresh independent whole-feature review have passed their local and
-release gates; final hosted CI and fixture cleanup remain. The
+and the fresh independent whole-feature review have passed their local, release
+and hosted gates. The
 [Phase 5 results](../phase5/README.md) establish the deployed certificate lifecycle
 and measured workload limits for their recorded source and image identities.
 Any subsequent runtime correction must identify and rerun its affected gates.
@@ -14,8 +14,8 @@ Any subsequent runtime correction must identify and rerun its affected gates.
 | Fresh skeptical review | Entire feature from merged `456d37e`; all three findings resolved with paired TLS regression and 37 focused passing tests | Source and focused evidence approved |
 | Final local checks | Formatting, strict all-target Clippy, workspace, actual PostgreSQL, dependency/inventory/checker gates and protocol example tests | All twelve pass; independently verified |
 | Final release checks | Production images, dynamic TLS lifecycle, routing, protocols, libpq and restart; exact running image identities and applicable performance gates | All pass; independently approved |
-| Hosted checks | Successful required CI on the final implementation commit | Pending |
-| Completion | Approved final evidence and docs, reviewable commits, clean branch and cleanup of owned fixtures | Pending |
+| Hosted checks | Successful required CI on the final implementation commit | `15a308e` passes hosted CI 34308484699 |
+| Completion | Approved final evidence and docs, reviewable commits, clean branch and cleanup of owned fixtures | Independent full-feature closure approval; owned fixtures removed; documentation-only closure commit |
 
 The final review keeps correctness fences that prevent stale certificate
 installation, ambiguous database writes or premature capacity release. It
@@ -219,5 +219,24 @@ final deployed gates. Source hashes remain unchanged.
 The normal reviewer and the fresh skeptical reviewer independently approve the
 completed source, local, image, certificate lifecycle/RSS, performance, routing,
 protocol, restart, libpq and current-documentation evidence for commit. No
-actionable finding remains. Hosted CI, owned fixture cleanup and the final clean
-branch still require closure.
+actionable finding remains. Hosted CI is successful. Both reviewers approve Phase 6 and implementation
+closure, including the current documentation and owned fixture cleanup.
+
+Final implementation commit `15a308ea880d8130ac94912952e71a557bcdd482` contains the
+reviewed corrections and the same source tested above. The owned fixture cleanup
+completes at 2026-09-09 03:48:18 UTC: the recorded kind node and PostgreSQL
+container are removed after identity/ownership checks. All three unrelated local
+containers retain their IDs and prior running/stopped states. The cleanup record
+is `phase6/final-cleanup.json`; retained public evidence and the original TLS
+baseline remain available.
+
+The final implementation passes
+[hosted CI 34308484699](https://github.com/danthegoodman1/sleepypods/actions/runs/34308484699)
+on exact commit `15a308ea880d8130ac94912952e71a557bcdd482`. Formatting, strict
+all-target lint, the workspace, dependency/inventory checks, all nine PostgreSQL
+checker regressions, both protocol example tests and isolated load-helper builds
+pass. The real PostgreSQL target executes all 24 cases in 72.61 seconds, with
+zero failures, skips, ignores or filters and explicit complete-inventory
+acceptance. Raw metadata/logs and the extracted PostgreSQL log/check result are
+retained as `phase6/hosted-ci-34308484699*`. The final documentation closure does
+not change the source or images used by any gate above.
