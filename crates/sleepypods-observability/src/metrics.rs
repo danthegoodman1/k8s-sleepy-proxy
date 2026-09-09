@@ -293,6 +293,70 @@ pub const MATERIALIZATION_FAILURES_BLOCKED: MetricDescriptor = MetricDescriptor:
     &[],
 );
 
+pub const RUNTIME_CERTIFICATE_ENTRIES: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_entries",
+    MetricKind::Gauge,
+    Some("entries"),
+    "Certificate cache entries, including positive, missing and pending interests.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_ACCOUNTED_BYTES: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_accounted_bytes",
+    MetricKind::Gauge,
+    Some("bytes"),
+    "Certificate cache accounted ownership bytes; not process RSS.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_FETCHES: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_fetches",
+    MetricKind::Gauge,
+    Some("operations"),
+    "Certificate fetch permits held by queued, running or validating work.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_QUEUE: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_queue",
+    MetricKind::Gauge,
+    Some("operations"),
+    "Queued certificate fetch messages owned by the supervisor channel.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_TASKS: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_tasks",
+    MetricKind::Gauge,
+    Some("tasks"),
+    "Certificate supervisor JoinSet records, including completed unreaped tasks.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_TASK_HIGH_WATER: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_task_high_water",
+    MetricKind::Gauge,
+    Some("tasks"),
+    "Maximum retained certificate supervisor JoinSet records since startup.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_WATCHES: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_watches",
+    MetricKind::Gauge,
+    Some("streams"),
+    "Certificate watch sessions in setup, streaming or teardown.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_EXPIRY_RISK: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_expiry_risk",
+    MetricKind::Gauge,
+    Some("entries"),
+    "Retained certificate views whose authorization lease or chain expires within sixty seconds.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_EVENTS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_events_total",
+    MetricKind::Counter,
+    Some("events"),
+    "Certificate fetch, refresh, watch, reset and install outcomes without identity labels.",
+    OPERATION_OUTCOME_LABELS,
+);
+
 pub const ALL_METRICS: &[MetricDescriptor] = &[
     PROXY_ACTIVE_STREAMS,
     PROXY_ADMISSION_DECISIONS_TOTAL,
@@ -321,6 +385,15 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     KUBERNETES_OPERATION_DURATION_SECONDS,
     MATERIALIZATION_EFFECTS_UNCERTAIN,
     MATERIALIZATION_FAILURES_BLOCKED,
+    RUNTIME_CERTIFICATE_ENTRIES,
+    RUNTIME_CERTIFICATE_ACCOUNTED_BYTES,
+    RUNTIME_CERTIFICATE_FETCHES,
+    RUNTIME_CERTIFICATE_QUEUE,
+    RUNTIME_CERTIFICATE_TASKS,
+    RUNTIME_CERTIFICATE_TASK_HIGH_WATER,
+    RUNTIME_CERTIFICATE_WATCHES,
+    RUNTIME_CERTIFICATE_EXPIRY_RISK,
+    RUNTIME_CERTIFICATE_EVENTS_TOTAL,
 ];
 
 impl LabelKey {
@@ -618,6 +691,60 @@ mod tests {
                 MetricKind::Gauge,
                 Some("materializations"),
                 &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_entries",
+                MetricKind::Gauge,
+                Some("entries"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_accounted_bytes",
+                MetricKind::Gauge,
+                Some("bytes"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_fetches",
+                MetricKind::Gauge,
+                Some("operations"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_queue",
+                MetricKind::Gauge,
+                Some("operations"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_tasks",
+                MetricKind::Gauge,
+                Some("tasks"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_task_high_water",
+                MetricKind::Gauge,
+                Some("tasks"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_watches",
+                MetricKind::Gauge,
+                Some("streams"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_expiry_risk",
+                MetricKind::Gauge,
+                Some("entries"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_events_total",
+                MetricKind::Counter,
+                Some("events"),
+                &[LabelKey::Operation, LabelKey::Outcome],
             ),
         ];
 

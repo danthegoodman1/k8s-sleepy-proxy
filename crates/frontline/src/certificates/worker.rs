@@ -71,7 +71,7 @@ impl TlsCertificateWorker {
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => { self.cache.tasks(tasks.len()); },
                 Some(fetch) = self.receiver.recv(), if tasks.len() < CERTIFICATE_FETCHES => {
                     let cache = self.cache.clone();
                     let resolver = self.resolver.clone();
@@ -79,10 +79,7 @@ impl TlsCertificateWorker {
                     tasks.spawn(async move {
                         fetch_one(cache, resolver, fetch, shutdown).await;
                     });
-                    #[cfg(test)]
-                    self.cache.shared.task_high_water.fetch_max(
-                        tasks.len(), std::sync::atomic::Ordering::SeqCst,
-                    );
+                    self.cache.tasks(tasks.len());
                 },
                 _ = ticker.tick() => {
                     let mut state = self.cache.shared.state.lock().unwrap();
@@ -100,12 +97,15 @@ impl TlsCertificateWorker {
         self.cache.stop();
         self.receiver.close();
         while self.receiver.try_recv().is_ok() {}
-        while tasks.join_next().await.is_some() {}
+        while tasks.join_next().await.is_some() {
+            self.cache.tasks(tasks.len());
+        }
     }
 }
 impl Drop for TlsCertificateWorker {
     fn drop(&mut self) {
         self.cache.stop();
+        self.cache.tasks(0);
     }
 }
 
@@ -118,6 +118,12 @@ async fn fetch_one(
     let started = Instant::now();
     let wall = (cache.shared.wall)();
     let deadline = started + CERTIFICATE_LOOKUP_TIMEOUT;
+    let operation = if fetch.prior.is_some() {
+        Operation::CertificateRefresh
+    } else {
+        Operation::CertificateFetch
+    };
+    cache.event(operation, Outcome::Started);
     let request = pb::ResolveTlsCertificateRequest {
         server_name: fetch.hostname.clone(),
         known_view_revision: fetch.prior.as_ref().map(|v| v.revision),
@@ -128,6 +134,17 @@ async fn fetch_one(
     };
     let hostname = fetch.hostname.clone();
     let generation = fetch.generation;
+    cache.event(
+        operation,
+        match &response {
+            Ok(response) => match response.value {
+                Some(pb::resolve_tls_certificate_response::Value::Missing(_)) => Outcome::Miss,
+                Some(pb::resolve_tls_certificate_response::Value::Unchanged(_)) => Outcome::Hit,
+                _ => Outcome::Success,
+            },
+            Err(error) => metrics::outcome(*error),
+        },
+    );
     // The worker task awaits this handle even after deadline/shutdown. Its
     // memory and fetch slot move into the closure and cannot be prematurely
     // released by an abandoned handshake or aborted outer async future.
@@ -154,6 +171,8 @@ async fn fetch_one(
         .get_mut(&hostname)
         .filter(|e| e.generation == generation)
     else {
+        drop(state);
+        cache.event(Operation::CertificateInstall, Outcome::Canceled);
         return;
     };
     entry.pending = false;
@@ -176,6 +195,9 @@ async fn fetch_one(
         }
     }
     entry.changed.send_modify(|v| *v = v.wrapping_add(1));
+    let outcome = entry.last_error.map_or(Outcome::Success, metrics::outcome);
+    drop(state);
+    cache.event(Operation::CertificateInstall, outcome);
 }
 
 // The resolver and its permit are retained by ServerConfig, including any old

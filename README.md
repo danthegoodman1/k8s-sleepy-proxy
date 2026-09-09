@@ -6,10 +6,11 @@ a workload-local sidecar proxies application traffic and reports idleness.
 Postgres stores durable lifecycle intent so accepted work survives client loss
 and controller restart.
 
-The required implementation and production validation gates are complete within
-the documented operating contract. See the
-[validation and independent review](docs/review-evidence/final-integration/README.md)
-for measured workloads, recovery guarantees and remaining capacity limits.
+The [original validation and independent review](docs/review-evidence/final-integration/README.md)
+records measured lifecycle/proxy workloads, recovery guarantees and capacity limits.
+[Dynamic certificate delivery](docs/dynamic-certificates-plan.md) is being added
+with separate deployment, outage, resource and final review gates; the historical
+results do not establish those new guarantees.
 
 Start here:
 

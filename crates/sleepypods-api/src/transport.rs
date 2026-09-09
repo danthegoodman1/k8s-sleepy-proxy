@@ -1,6 +1,13 @@
 //! Independently provisioned native control-plane transport. Tenant certificate
 //! resolution never supplies this trust configuration.
+use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+// Bound each background reconnect stage even when the requesting RPC is
+// canceled. Tonic keeps its connecting future in the shared Channel; an RPC
+// deadline alone does not cancel that attempt. These are per-stage bounds,
+// independent of callers' overall request and startup budgets.
+const CONNECT_STAGE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const CONTROL_PLANE_TLS_CA_PEM_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM";
 pub const MAX_CONTROL_PLANE_CA_BYTES: usize = 64 * 1024;
 
@@ -10,10 +17,12 @@ pub fn native_endpoint(
     uri: String,
     ca_pem: Option<&str>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint = Endpoint::from_shared(uri)?;
+    let endpoint = Endpoint::from_shared(uri)?.connect_timeout(CONNECT_STAGE_TIMEOUT);
     match endpoint.uri().scheme_str() {
         Some("https") => {
-            let mut tls = ClientTlsConfig::new().with_webpki_roots();
+            let mut tls = ClientTlsConfig::new()
+                .with_webpki_roots()
+                .timeout(CONNECT_STAGE_TIMEOUT);
             if let Some(pem) = ca_pem {
                 if pem.is_empty() || pem.len() > MAX_CONTROL_PLANE_CA_BYTES {
                     return Err("invalid control-plane CA size".into());

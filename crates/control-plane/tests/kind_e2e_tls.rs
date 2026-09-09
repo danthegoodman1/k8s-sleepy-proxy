@@ -1,3 +1,8 @@
+#[path = "kind_e2e_tls/dynamic.rs"]
+mod dynamic;
+#[path = "support/native_operator.rs"]
+mod native_operator;
+use native_operator::{connect as connect_operator, Operator};
 use std::{
     collections::HashMap,
     env,
@@ -9,13 +14,13 @@ use std::{
 };
 
 use control_plane::api::pb::{
-    operator_control_plane_client::OperatorControlPlaneClient, route_identity, template_text_part,
-    ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
-    CreateWorkloadClassVersionRequest, EnvVarTemplate, GetInstanceRequest, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, RouteHost,
-    RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    SniRouteIdentity, TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
+    CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
+    EnvVarTemplate, GetInstanceRequest, HttpRouteIdentity, Instance,
+    InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity,
+    TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use k8s_openapi::{
     api::{
@@ -30,7 +35,6 @@ use rustls::{
     ClientConfig, ClientConnection, RootCertStore, StreamOwned,
 };
 use tokio::time::{sleep, Instant};
-use tonic::transport::{Channel, Endpoint};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -74,9 +78,40 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
     )
     .await?;
 
+    // The application key exists only in this operator client and encrypted CP
+    // storage. No Frontline startup file or preload can authorize this host.
+    let app = rcgen::generate_simple_self_signed(vec![TERMINATION_HOST.into()])?;
+    let published = operator
+        .publish_certificate(control_plane::api::pb::PublishCertificateRequest {
+            certificate_id: "kind-termination".into(),
+            expected_version: Some(0),
+            bundle: Some(control_plane::api::pb::CertificateBundle {
+                chain_der: vec![app.cert.der().to_vec()],
+                private_key_pkcs8_der: app.signing_key.serialize_der(),
+            }),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(published.version, 1);
+    operator
+        .set_tls_binding(control_plane::api::pb::SetTlsBindingRequest {
+            hostname: TERMINATION_HOST.into(),
+            expected_revision: Some(0),
+            certificate_id: Some("kind-termination".into()),
+        })
+        .await?;
+    wait_for_instance_state(
+        &mut operator,
+        TERMINATION_INSTANCE_ID,
+        PbInstanceState::Cold,
+        Duration::from_secs(1),
+    )
+    .await?;
+
     let response = cold_tls_response(
         config.tls_termination_addr,
         TlsResponseExpectation {
+            certificate: Some(app.cert.der().clone()),
             context: "TLS termination",
             sni: TERMINATION_HOST,
             host: TERMINATION_HOST,
@@ -128,6 +163,7 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
     let exact = cold_tls_response(
         config.tls_passthrough_addr,
         TlsResponseExpectation {
+            certificate: None,
             context: "exact SNI passthrough",
             sni: EXACT_SNI_HOST,
             host: EXACT_SNI_HOST,
@@ -142,6 +178,7 @@ async fn sni_passthrough_through_deployed_platform() -> TestResult<()> {
     let wildcard = cold_tls_response(
         config.tls_passthrough_addr,
         TlsResponseExpectation {
+            certificate: None,
             context: "wildcard SNI passthrough",
             sni: WILDCARD_SNI_CHILD_HOST,
             host: WILDCARD_SNI_CHILD_HOST,
@@ -222,7 +259,7 @@ impl E2eConfig {
             namespace: env::var("SLEEPYPODS_E2E_NAMESPACE")
                 .unwrap_or_else(|_| "sleepypods-e2e-tls".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:19351".to_owned()),
+                .unwrap_or_else(|_| "https://127.0.0.1:19351".to_owned()),
             tls_termination_addr: env::var("SLEEPYPODS_E2E_TLS_TERMINATION_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19443".to_owned())
                 .parse()?,
@@ -256,27 +293,8 @@ fn passthrough_specs() -> [PassthroughSpec; 2] {
     ]
 }
 
-async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClient<Channel>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let channel = Endpoint::from_shared(endpoint.to_owned())?
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(10))
-            .connect()
-            .await;
-        match channel {
-            Ok(channel) => return Ok(OperatorControlPlaneClient::new(channel)),
-            Err(error) if Instant::now() < deadline => {
-                eprintln!("waiting for operator gRPC endpoint {endpoint}: {error}");
-                sleep(Duration::from_secs(1)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
 async fn create_tls_termination_resources(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut Operator,
     config: &E2eConfig,
 ) -> TestResult<()> {
     create_workload_class(operator, config, TERMINATION_CLASS_ID, "http", None).await?;
@@ -310,7 +328,7 @@ async fn create_tls_termination_resources(
 }
 
 async fn create_sni_passthrough_resources(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut Operator,
     config: &E2eConfig,
 ) -> TestResult<()> {
     create_workload_class(operator, config, PASSTHROUGH_CLASS_ID, "tls", Some("tcp")).await?;
@@ -343,7 +361,7 @@ async fn create_sni_passthrough_resources(
 }
 
 async fn create_workload_class(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut Operator,
     config: &E2eConfig,
     class_id: &str,
     app_mode: &str,
@@ -380,7 +398,7 @@ async fn create_workload_class(
 }
 
 async fn wait_for_instance_state(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut Operator,
     instance_id: &str,
     expected: PbInstanceState,
     timeout: Duration,
@@ -411,6 +429,7 @@ async fn wait_for_instance_state(
 }
 
 struct TlsResponseExpectation<'a> {
+    certificate: Option<CertificateDer<'static>>,
     context: &'a str,
     sni: &'a str,
     host: &'a str,
@@ -434,6 +453,7 @@ async fn cold_tls_response(
             expectation.host,
             expectation.path,
             budget,
+            expectation.certificate,
         ),
     )
     .await
@@ -451,7 +471,7 @@ async fn assert_tls_route_miss(
 ) -> TestResult<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        match tls_get(addr, sni, host, "/miss", Duration::from_secs(15)).await {
+        match tls_get(addr, sni, host, "/miss", Duration::from_secs(15), None).await {
             Ok(response) => {
                 return Err(format!(
                     "{context} unexpectedly completed TLS/HTTP for SNI {sni}: HTTP {} {:?}",
@@ -489,13 +509,16 @@ async fn tls_get(
     host: &str,
     path: &str,
     io_timeout: Duration,
+    certificate: Option<CertificateDer<'static>>,
 ) -> TestResult<HttpResponse> {
     let sni = sni.to_owned();
     let host = host.to_owned();
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || tls_get_blocking(addr, &sni, &host, &path, io_timeout))
-        .await
-        .map_err(|error| format!("TLS request task failed: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        tls_get_blocking(addr, &sni, &host, &path, io_timeout, certificate)
+    })
+    .await
+    .map_err(|error| format!("TLS request task failed: {error}"))?
 }
 
 fn tls_get_blocking(
@@ -504,13 +527,20 @@ fn tls_get_blocking(
     host: &str,
     path: &str,
     timeout: Duration,
+    certificate: Option<CertificateDer<'static>>,
 ) -> TestResult<HttpResponse> {
     let started = Instant::now();
     let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from_pem_slice(TEST_CERT_PEM)?)?;
-    let config = ClientConfig::builder()
+    let dynamic = certificate.is_some();
+    let certificate = match certificate {
+        Some(cert) => cert,
+        None => CertificateDer::from_pem_slice(TEST_CERT_PEM)?.into_owned(),
+    };
+    roots.add(certificate.clone())?;
+    let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let server_name = ServerName::try_from(sni.to_owned())?;
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|error| format!("TLS TCP connect to {addr} for SNI {sni} failed: {error:?}"))?;
@@ -547,6 +577,24 @@ fn tls_get_blocking(
             ).into());
         }
     }
+    let peer = &stream
+        .conn
+        .peer_certificates()
+        .ok_or("TLS peer certificate absent")?[0];
+    assert_eq!(peer, &certificate, "exact verified application peer");
+    if dynamic {
+        assert_eq!(stream.conn.alpn_protocol(), Some(&b"http/1.1"[..]));
+    }
+    use sha2::{Digest, Sha256};
+    let fingerprint: String = Sha256::digest(peer.as_ref())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    eprintln!(
+        "TLS_PEER sni={sni} fingerprint={fingerprint} protocol={:?} alpn={:?}",
+        stream.conn.protocol_version(),
+        stream.conn.alpn_protocol()
+    );
     let raw = String::from_utf8_lossy(&bytes);
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
     let status = head
@@ -657,10 +705,11 @@ async fn assert_materialized_deployment_and_service(
         sidecar,
         "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
         &format!(
-            "http://sleepypods-control-plane.{}.svc.cluster.local:50051",
+            "https://sleepypods-control-plane.{}.svc.cluster.local:50051",
             config.namespace
         ),
     )?;
+    assert_ca_env(sidecar, &env::var("SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM")?)?;
     let service = services.get(&workload_name).await?;
     let backend_scheme = service
         .metadata
@@ -830,4 +879,58 @@ fn target_text(prefix: &str, suffix: &str) -> TemplateText {
             },
         ],
     }
+}
+
+// Shell command substitution removes final newlines; Kubernetes env-from-Secret
+// preserves them. Compare the complete public certificate identities, preserving
+// every unrelated rendered environment assertion exactly.
+fn assert_ca_env(container: &Container, expected: &str) -> TestResult<()> {
+    let actual = container
+        .env
+        .as_ref()
+        .and_then(|vars| {
+            vars.iter()
+                .find(|var| var.name == "SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM")
+        })
+        .and_then(|var| var.value.as_deref())
+        .ok_or("missing sidecar platform CA")?;
+    let decode = |pem: &str| -> TestResult<Vec<CertificateDer<'static>>> {
+        let certificates =
+            CertificateDer::pem_slice_iter(pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+        if certificates.is_empty() {
+            return Err("platform CA contains no certificate".into());
+        }
+        Ok(certificates)
+    };
+    if decode(actual)? != decode(expected)? {
+        return Err(
+            "rendered sidecar platform trust differs from expected certificate identity".into(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rendered_platform_trust_compares_certificate_identity_without_shell_newline_artifacts() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let make = |value: String| Container {
+        name: "sidecar".into(),
+        env: Some(vec![k8s_openapi::api::core::v1::EnvVar {
+            name: "SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM".into(),
+            value: Some(value),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let pem = cert.cert.pem();
+    let container = make(pem.clone());
+    assert!(assert_ca_env(&container, pem.trim_end_matches('\n')).is_ok());
+    assert!(assert_ca_env(&container, &other.cert.pem()).is_err());
+    assert!(assert_ca_env(&make(String::new()), "").is_err());
+    assert!(assert_ca_env(
+        &make("-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n".into()),
+        &pem
+    )
+    .is_err());
 }

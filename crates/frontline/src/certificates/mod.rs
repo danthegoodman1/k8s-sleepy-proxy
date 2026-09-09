@@ -1,6 +1,7 @@
 //! Demand-loaded application certificates. The worker owns all asynchronous
 //! work; the handle only accesses bounded memory and queues bounded fetches.
 mod client;
+mod metrics;
 mod notifications;
 mod worker;
 pub use client::GrpcCertificateResolver;
@@ -12,6 +13,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
+use proxy_core::observability::{recorder::ObservabilityRecorder, Operation, Outcome};
 use sleepypods_api::{pb, TlsHostname};
 use std::{
     collections::HashMap,
@@ -97,8 +99,10 @@ struct Shared {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
-    #[cfg(test)]
     task_high_water: std::sync::atomic::AtomicUsize,
+    retained_tasks: std::sync::atomic::AtomicUsize,
+    watches: std::sync::atomic::AtomicUsize,
+    observability: ObservabilityRecorder,
     wall: Arc<dyn Fn() -> i64 + Send + Sync>,
     state: Mutex<State>,
     bytes: Arc<Semaphore>,
@@ -147,11 +151,25 @@ pub struct CertificateCacheUsage {
 
 impl TlsCertificateStore {
     pub fn new(resolver: Arc<dyn CertificateResolver>) -> (Self, TlsCertificateWorker) {
-        Self::with_clock(resolver, Arc::new(wall_now))
+        Self::with_observability(resolver, ObservabilityRecorder::default())
     }
+    pub fn with_observability(
+        resolver: Arc<dyn CertificateResolver>,
+        observability: ObservabilityRecorder,
+    ) -> (Self, TlsCertificateWorker) {
+        Self::with_clock_and_observability(resolver, Arc::new(wall_now), observability)
+    }
+    #[cfg(test)]
     fn with_clock(
         resolver: Arc<dyn CertificateResolver>,
         wall: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> (Self, TlsCertificateWorker) {
+        Self::with_clock_and_observability(resolver, wall, ObservabilityRecorder::default())
+    }
+    fn with_clock_and_observability(
+        resolver: Arc<dyn CertificateResolver>,
+        wall: Arc<dyn Fn() -> i64 + Send + Sync>,
+        observability: ObservabilityRecorder,
     ) -> (Self, TlsCertificateWorker) {
         let bytes = Arc::new(Semaphore::new(CERTIFICATE_CACHE_BYTES));
         let structures = bytes
@@ -162,8 +180,10 @@ impl TlsCertificateStore {
             _structures: structures,
             #[cfg(test)]
             validation_gate: Mutex::new(None),
-            #[cfg(test)]
             task_high_water: std::sync::atomic::AtomicUsize::new(0),
+            retained_tasks: std::sync::atomic::AtomicUsize::new(0),
+            watches: std::sync::atomic::AtomicUsize::new(0),
+            observability,
             wall,
             state: Mutex::new(State {
                 interests_changed: watch::channel(()).0,

@@ -21,9 +21,10 @@ only when standards-based validation covers each explicitly bound hostname.
 
 Implementation is active on `dynamic-certificates`, starting from merged main
 `456d37e`. Phases 1–4 have reviewed stage commits `f138053`, `4688c23`, `9d0cfa9` and
-`5a337f3`. Phase 5 is active; hosted follow-up reopened 4G for the watch-admission
-correction tracked in 5C. Prior TLS and routing evidence is a
-baseline, not proof that dynamic delivery works. Execute phases in order, preserving a reviewable commit and
+`5a337f3`. Phase 5 has independent source, deployed and performance approval;
+watch-admission correction `004505f` also passes hosted CI, closing 4G through 5C.
+Phase 6 integration and the fresh whole-feature review are active. Prior TLS and
+routing evidence retains its original scope. Execute phases in order, preserving a reviewable commit and
 independent review at each completed boundary.
 
 ## Implementation Principles
@@ -283,7 +284,7 @@ Status ledger:
 | Complete | Work | 4C: Bounded interests, streams and independent progress | Reviewed decoded-memory reservations and three-fetch bound; SQL drain ownership and ordinary native API progress with 16 active watches on a two-connection pool pass. |
 | Complete | Work | 4D: Regression-gate test corrections | Actual PostgreSQL outbox read-retry red/green and controlled sidecar port-collision red/green; independent review approves both test-only fixes with original safety assertions intact. |
 | Complete | Test | 4T: Multi-replica convergence and adversarial ordering | Four actual PostgreSQL/native watch cases plus 13 two-control-plane/two-Frontline process cases pass; maximum observed post-commit convergence 0.476s, existing H2 survives rotation, pruned-history recovery preserves per-host authority. |
-| In Progress | Gate | 4G: Reliable propagation with bounded stale service | The reviewed local checkpoint `49cf4e8a` passes broad/process gates. A hosted watch-stream failure led to a controlled admission-starvation reproduction; the FIFO correction passes exact-source local gates, with hosted follow-up still required in 5C. |
+| Complete | Gate | 4G: Reliable propagation with bounded stale service | Historical broad/process proof plus reviewed FIFO correction `004505f`, exact-source local gates and hosted CI 34292414386 pass; actual PostgreSQL 24/24 without skips or ignores closes the reopened watch regression in 5C. |
 
 ## Phase 5: Deployed Certificate Lifecycle and Resource Proof
 
@@ -317,12 +318,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| In Progress | Work | 5A: Dynamic-only deployed TLS fixtures | Implementer converting three deployed/load fixtures to verified native API delivery; owned kind cluster is ready, final-source image execution pending. |
-| In Progress | Work | 5B: Operational metrics and resource/load harness | Bounded metrics and repeatable warm/miss/rotation/flood workloads assigned; source and observed resource evidence pending. |
-| In Progress | Work | 5C: Hosted watch-concurrency regression | Independent review approves bounded FIFO admission, cancellation/drain ownership and controlled drain-delay red/green under unchanged deadlines; [correction evidence](review-evidence/dynamic-certificates/phase5/watch-admission.md). Exact-source broad gates pass, including actual PostgreSQL 24/24 with no skips or ignores; hosted follow-up remains. |
-| Incomplete | Test | 5T: HA, lifecycle, protocol and outage matrix | Missing: actual kind executions with fingerprints and state assertions. |
-| Incomplete | Test | 5P: Matched performance and bounded resource results | Missing: three matched rounds, stable RSS/task/cache measurements and existing budget passes. |
-| Incomplete | Gate | 5G: Production-image behavioral and resource proof | Missing: independent review of deployed results and remaining limitations. |
+| Complete | Work | 5A: Dynamic-only deployed TLS fixtures | Reviewed native bootstrap and simplified protocol fixture; rebuilt production-image TLS termination/SNI passthrough, complete expanded lifecycle and strict load gates pass. Independent evidence review approves the final results. |
+| Complete | Work | 5B: Operational metrics and resource/load harness | Independently reviewed bounded metrics pass 45 local tests; all three warm/miss/rotation cycles pass structural and predeclared sampled RSS limits. Independent evidence review approves the final results. |
+| Complete | Work | 5C: Hosted watch-concurrency regression | Independently reviewed bounded FIFO admission and cancellation/drain ownership; controlled red/green under unchanged deadlines; [correction evidence](review-evidence/dynamic-certificates/phase5/watch-admission.md). Commit `004505f` passes exact-source local and hosted CI 34292414386, each with actual PostgreSQL 24/24 and no skips or ignores. |
+| Complete | Work | 5D: Bound native reconnect attempts | Independently approved two-second TCP and TLS stage bounds; exact strengthened same-channel regression fails old source and passes the fix. Full production checkpoint plus test-only focused checks pass. Rebuilt-image recovery remains in 5T under the original ten-second gate. |
+| Complete | Test | 5T: HA, lifecycle, protocol and outage matrix | Expanded v3 passes all three actual deployed tests, including both-replica restoration within 2.072s, real sleep/re-wake, default-lease outage, cold startup refusal and recovery. Independent evidence review approves the final results. |
+| Complete | Test | 5P: Matched performance and bounded resource results | Current strict load and matched TLS gates pass (median 220.161 µs versus baseline 243.454 µs, -9.568%). Sampled RSS peaks 18.875/19.875 MiB with passing tail growth and structural limits. Warm flood counts include 42 refusals in 5,418 attempts; all 192 post-flood handshakes pass. Independent review approves this bounded progress/recovery scope. |
+| Complete | Gate | 5G: Production-image behavioral and resource proof | Independent source, deployed, sampled RSS and matched-performance approval; [phase evidence](review-evidence/dynamic-certificates/phase5/README.md) records exact inputs, current image IDs and warm-refusal limits. Final integration and hosted checks remain Phase 6. |
 
 ## Phase 6: CI, Operator Contract and Final Integration
 

@@ -110,7 +110,11 @@ Targeted gates live in `scripts/`:
   continuity.
 - `test-kind-e2e-routing.sh`: exact/wildcard HTTP route and HTTP-01 behavior.
 - `test-kind-e2e-protocols.sh`: HTTP/2, h2c gRPC-shaped, and WebSockets.
-- `test-kind-e2e-tls.sh`: TLS termination and SNI passthrough.
+- `test-kind-e2e-tls.sh`: native certificate publication, TLS termination and SNI
+  passthrough, plus exact-replica certificate rotation/removal, live protocols,
+  lifecycle, outage and restart checks. This explicit release gate includes real
+  sleep-floor and five-minute lease waits. Local ignored tests are not deployed
+  execution evidence.
 - `test-kind-e2e-grpc-web.sh`: deployed browser-shaped gRPC-Web operator path.
 - `test-kind-e2e-libpq-sni.sh`: real PostgreSQL/libpq 17 direct SNI
   passthrough.
@@ -123,8 +127,9 @@ Targeted gates live in `scripts/`:
 ## Invariants
 
 - The control-plane API is the only public write path for workload classes,
-  instances, routes, HTTP-01 tokens, lifecycle state, and materialization
-  intent. Do not introduce a direct user-facing Kubernetes manifest workflow.
+  instances, routes, certificates, TLS hostname bindings, HTTP-01 tokens,
+  lifecycle state, and materialization intent. Do not introduce a direct
+  user-facing Kubernetes manifest workflow.
 - The database is the source of truth. Proxies, sidecars, and users do not write
   it directly.
 - Keep provider-specific semantics behind traits such as `ControlPlaneStore`

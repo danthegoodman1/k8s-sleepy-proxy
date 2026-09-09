@@ -247,14 +247,17 @@ direct-backend baseline and the same production frontline image. The h2c phase
 also fails if measured hot-cache requests make additional `SubscribeRoute`
 calls.
 
-The script then generates a temporary self-signed certificate for the route
-host, mounts it into the production frontline container, enables the production
-TLS-termination listener, and warms/measures the same gRPC-shaped request over
+The script generates a temporary self-signed certificate for the route host and
+serves it from the helper's authenticated native TLS certificate API. Frontline
+receives only its proxy credential and the public platform CA, resolves the
+application certificate into memory, and warms/measures the same request over
 negotiated HTTP/2-over-TLS. Each load worker completes its TCP, TLS, and
 HTTP/2 setup before the timed window starts and multiplexes measured requests
 over that single negotiated channel. The client trusts only the generated
 certificate and fails unless TLS ALPN negotiates `h2`, so this phase cannot
-silently fall back to h2c. Its same-run direct baseline is the helper's direct
+silently fall back to h2c. This uses the production proxy delivery path with a
+fixture resolver; it does not exercise production certificate publication or
+encrypted database storage. Its same-run direct baseline is the helper's direct
 h2c backend path, so the frontend ratio and p99 gates intentionally include
 TLS termination and proxy overhead rather than comparing against a separate
 direct TLS backend.

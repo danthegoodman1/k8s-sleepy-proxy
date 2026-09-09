@@ -104,7 +104,12 @@ mod tests {
                 "report_idle",
                 "apply",
                 "delete",
-                "readiness"
+                "readiness",
+                "certificate_fetch",
+                "certificate_refresh",
+                "certificate_watch",
+                "certificate_install",
+                "certificate_reset"
             ]
         );
         assert_eq!(

@@ -93,7 +93,7 @@ async fn run_with_shutdown(
         frontline::certificates::GrpcCertificateResolver::new(channel, proxy_interceptor),
     );
     let (tls_certificates, certificate_worker) =
-        TlsCertificateStore::new(certificate_client.clone());
+        TlsCertificateStore::with_observability(certificate_client.clone(), observability.clone());
     let certificate_worker = certificate_worker.with_watch(certificate_client)?;
     let resolver = FrontlineRouteResolver::with_observability(
         env.route_cache_capacity(),
@@ -118,6 +118,7 @@ async fn run_with_shutdown(
         observability,
     );
     let worker_shutdown = shutdown.clone();
+    let certificate_metrics = tls_certificates.clone();
     let serve = async {
         let result: Result<(), Box<dyn Error + Send + Sync>> = async {
             if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr(), prometheus)
@@ -141,8 +142,10 @@ async fn run_with_shutdown(
                             metrics_shutdown.cancelled(),
                             move |sink| {
                                 let active_streams = active_streams.clone();
+                                let certificate_metrics = certificate_metrics.clone();
                                 async move {
-                                    active_streams.collect(sink);
+                                    active_streams.collect(sink.clone());
+                                    certificate_metrics.collect_metrics(&sink);
                                 }
                             },
                         )

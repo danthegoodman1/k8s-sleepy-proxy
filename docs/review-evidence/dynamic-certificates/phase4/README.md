@@ -218,8 +218,10 @@ correction also accounts for the overlap between a completed logical read's
 detached drain and its producer's next call. Same-relay red/green results,
 cancellation ownership and unchanged deadlines are recorded in the
 [Phase 5C correction evidence](../phase5/watch-admission.md). The original hosted
-run's exact network/scheduling delay remains unknown. The correction passes its
-exact-source broad gate; gate 4G remains reopened pending hosted validation.
-The local passing results above retain
+run's exact network/scheduling delay remains unknown. Correction commit `004505f`
+passes exact-source broad gates and
+[hosted CI 34292414386](https://github.com/danthegoodman1/sleepypods/actions/runs/34292414386),
+including actual PostgreSQL 24/24 with no skips or ignores. Gate 4G is closed
+again. The local passing results above retain
 their exact scope; final integration and production-image confidence require the
 remaining gates.

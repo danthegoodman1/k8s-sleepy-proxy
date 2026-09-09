@@ -98,5 +98,10 @@ those 23 database cases plus the invalid-URL test. Workspace ignores remain
 explicit deployed/subprocess gates and are not counted as this checkpoint's
 proof. Compiler: local Rust 1.98.1; PostgreSQL: the task-owned 17-alpine container.
 
-Hosted follow-up remains required after pushing this checkpoint. Unfinished
-metrics and deployment fixtures are outside this commit and validation scope.
+Commit `004505f70a7d6e68df5823265222ab45465d05fa` passes
+[hosted CI 34292414386](https://github.com/danthegoodman1/sleepypods/actions/runs/34292414386).
+All required steps pass, including actual PostgreSQL 24 passed, 0 failed,
+0 ignored, no self-skips, in 73.22s. Hosted status and raw logs are retained as
+`hosted-ci-34292414386.json` and `.log` in the correction's generated directory.
+This closes 5C and the reopened 4G. Unfinished metrics and deployment fixtures
+remain outside this commit and validation scope.

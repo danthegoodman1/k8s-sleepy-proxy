@@ -244,6 +244,13 @@ and certificate chain against public roots. For a private platform CA, configure
 The CA setting is rejected with a plaintext endpoint. Application TLS bindings
 never provide this bootstrap identity or trust.
 
+Frontline gives each native TCP connection attempt and platform TLS handshake
+a two-second timeout, including background reconnects on its shared channel.
+These stage deadlines are separate from overall RPC and startup deadlines.
+Sidecars use their configured TCP setup timeout and the same two-second TLS
+handshake timeout. Canceling an async caller does not stop an operating-system
+DNS lookup already running on a blocking worker.
+
 Configure platform TLS before creating workloads. Sidecars receive their endpoint
 and public CA when the control plane materializes them; existing Pods do not
 reload those values. A later endpoint or embedded-CA change requires a coordinated

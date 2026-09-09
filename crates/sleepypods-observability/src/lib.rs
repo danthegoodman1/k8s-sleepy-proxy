@@ -48,6 +48,11 @@ pub enum Operation {
     Apply,
     Delete,
     Readiness,
+    CertificateFetch,
+    CertificateRefresh,
+    CertificateWatch,
+    CertificateInstall,
+    CertificateReset,
 }
 
 /// Generic low-cardinality operation outcomes.
@@ -136,6 +141,11 @@ impl Operation {
         Self::Apply,
         Self::Delete,
         Self::Readiness,
+        Self::CertificateFetch,
+        Self::CertificateRefresh,
+        Self::CertificateWatch,
+        Self::CertificateInstall,
+        Self::CertificateReset,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -158,6 +168,11 @@ impl Operation {
             Self::Apply => "apply",
             Self::Delete => "delete",
             Self::Readiness => "readiness",
+            Self::CertificateFetch => "certificate_fetch",
+            Self::CertificateRefresh => "certificate_refresh",
+            Self::CertificateWatch => "certificate_watch",
+            Self::CertificateInstall => "certificate_install",
+            Self::CertificateReset => "certificate_reset",
         }
     }
 }

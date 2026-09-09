@@ -76,9 +76,17 @@ pub(super) async fn run(
         }
         // No spawned task or historical stream survives a session. The outer
         // fixed bound includes setup, registrations and a silent broken peer.
-        tokio::select! {
-            _ = shutdown.cancelled() => return,
-            _ = tokio::time::timeout(SESSION_LIMIT, session(&cache, watcher.as_ref(), &mut changed)) => {},
+        {
+            let _watch = metrics::WatchObservation::new(cache.clone());
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                result = tokio::time::timeout(SESSION_LIMIT, session(&cache, watcher.as_ref(), &mut changed)) => result,
+            };
+            match result {
+                Ok(Err(error)) => cache.event(Operation::CertificateWatch, metrics::outcome(error)),
+                Err(_) => cache.event(Operation::CertificateWatch, Outcome::Timeout),
+                Ok(Ok(())) => {}
+            }
         }
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -163,6 +171,7 @@ async fn session(
                         }
                         registered = sent.incarnations;
                         cursor = snapshot.cursor;
+                        cache.event(Operation::CertificateWatch, Outcome::Updated);
                     }
                     pb::watch_tls_certificates_response::Value::Changes(changes) => {
                         if CertificateRevision::new(changes.cursor).is_err() || changes.events.len() > 256 {
@@ -196,6 +205,7 @@ async fn session(
                             return Err(CertificateLookupError::Invalid);
                         }
                         reset_views(cache)?;
+                        cache.event(Operation::CertificateReset, Outcome::Success);
                         return Ok(());
                     }
                 }

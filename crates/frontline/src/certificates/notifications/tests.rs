@@ -60,11 +60,16 @@ struct Rig {
     opened: mpsc::Receiver<Opened>,
     shutdown: Shutdown,
     tasks: JoinSet<()>,
+    metrics: proxy_core::observability::prometheus::PrometheusMetricsSink,
 }
 impl Rig {
     fn new() -> Self {
         let api = Arc::new(Resolver::default());
-        let (cache, worker) = TlsCertificateStore::new(api.clone());
+        let metrics = proxy_core::observability::prometheus::PrometheusMetricsSink::new();
+        let (cache, worker) = TlsCertificateStore::with_observability(
+            api.clone(),
+            ObservabilityRecorder::new(Arc::new(metrics.clone())),
+        );
         let (watch, opened) = mpsc::channel(2);
         let shutdown = Shutdown::new();
         let mut tasks = JoinSet::new();
@@ -80,6 +85,7 @@ impl Rig {
             opened,
             shutdown,
             tasks,
+            metrics,
         }
     }
     fn publish(
@@ -316,6 +322,9 @@ async fn rotation_fences_held_unchanged_and_preserves_only_original_view_until_r
         expiry
     );
     peer(&rig.cache, "app.example", &new).await;
+    let counters = rig.metrics.render();
+    assert!(counters.contains("{operation=\"certificate_refresh\",outcome=\"hit\"} 1"));
+    assert!(counters.contains("{operation=\"certificate_install\",outcome=\"canceled\"} 1"));
     rig.finish().await;
 }
 #[tokio::test]
@@ -408,6 +417,10 @@ async fn retention_reset_resync_does_not_promote_global_cursor_to_old_host_floor
         .await
         .unwrap();
     until(|| revision(&rig, "app.example").is_none()).await;
+    assert!(rig
+        .metrics
+        .render()
+        .contains("{operation=\"certificate_reset\",outcome=\"success\"} 1"));
     assert_eq!(
         rig.cache.shared.state.lock().unwrap().entries["app.example"].floor,
         2

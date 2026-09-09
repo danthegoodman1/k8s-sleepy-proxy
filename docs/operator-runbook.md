@@ -60,6 +60,15 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
+| `sleepypods_runtime_certificate_entries` | gauge | none | Cached positive, missing and pending hostname entries. |
+| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Owned cache reservations and retained configurations; separate from process RSS. |
+| `sleepypods_runtime_certificate_fetches` | gauge | none | Fetch permits held by queued, running, validating or completed work awaiting release. |
+| `sleepypods_runtime_certificate_queue` | gauge | none | Work waiting in the bounded certificate fetch channel. |
+| `sleepypods_runtime_certificate_tasks` | gauge | none | Supervisor task records, including completed tasks not yet reaped. |
+| `sleepypods_runtime_certificate_task_high_water` | gauge | none | Maximum retained supervisor task records since startup. |
+| `sleepypods_runtime_certificate_watches` | gauge | none | Watch sessions in setup, streaming or teardown. |
+| `sleepypods_runtime_certificate_expiry_risk` | gauge | none | Retained positive views whose lease or chain expires within 60 seconds, including already expired views. |
+| `sleepypods_runtime_certificate_events_total` | counter | `operation`, `outcome` | Fixed certificate fetch, refresh, watch, reset and install outcomes. |
 | `sleepypods_runtime_materialization_failures_total` | counter | `operation`, `outcome` | Kubernetes/materialization failure path. |
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline route-cache hit/miss results. |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream close/update/invalidation events. |
@@ -84,7 +93,9 @@ Known bounded label values:
 - `operation`: `accept`, `admit`, `connect`, `forward`, `rewrite_request`,
   `drain`, `tls_client_hello`, `route_cache_lookup`, `subscribe_route`,
   `unsubscribe`, `subscribe_stream`, `wake_instance`, `materialize`,
-  `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`
+  `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`,
+  `certificate_fetch`, `certificate_refresh`, `certificate_watch`,
+  `certificate_install`, `certificate_reset`
 - `outcome`: `success`, `error`, `timeout`, `rejected`, `canceled`, `hit`,
   `miss`, `started`, `closed`, `updated`, `invalidated`, `already_running`,
   `already_waking`, `already_draining`
@@ -93,6 +104,14 @@ Known bounded label values:
 - TLS ClientHello outcomes use the `outcome` label with `sni`, `no_sni`,
   `incomplete`, `not_tls`, `unsupported_version`, `not_client_hello`,
   `record_too_large`, `malformed`, or `invalid_hostname`.
+
+Certificate gauges are sampled from cache and worker ownership; separate gauges
+may observe slightly different instants during concurrent work. Check each
+against its own bound rather than treating a scrape as an atomic transaction.
+A successful fetch outcome records receipt of a response; installation has its
+own outcome and may still reject invalid or superseded material. Expiry risk
+counts host views, so several bindings for one certificate contribute separately.
+No certificate metric labels contain hostnames, certificate IDs or error text.
 
 ## Structured Events
 
@@ -183,6 +202,15 @@ Build dashboards from the exact names above:
   `sleepypods_proxy_active_streams`.
 - TLS/SNI:
   `sleepypods_proxy_tls_client_hello_total` and TLS listener errors.
+- Certificate delivery: inspect `sleepypods_runtime_certificate_events_total`
+  by operation and outcome. Sustained refresh errors/timeouts together with
+  increasing `sleepypods_runtime_certificate_expiry_risk` indicate approaching
+  handshake failures. Installation errors require investigation even when fetch
+  receipt succeeded. Compare cache and work gauges to their configured bounds
+  and observe process RSS separately. Watch streams normally reconnect at their
+  60-second lifetime; a close event alone is not an outage. Sustained absence of
+  a watch while the cache has entries calls for checking connectivity and
+  control-plane admission.
 - Load-budget gates: show the latest results from
   `docs/proxy-hot-path-budgets.md` scripts, especially p99 added latency,
   request-rate/throughput ratios, hot-cache zero-control-plane-call assertions,
@@ -395,8 +423,9 @@ Image or container startup failures:
 
 1. Run `./scripts/smoke-images.sh` for production image startup, non-root,
    runtime-file, CA, and image-size checks.
-2. Inspect pod events for image pull, missing env, missing certificate files,
-   or service-account permission errors.
+2. Inspect pod events for image pull, missing environment settings or
+   service-account permission errors. On the control plane, also check the
+   independently provisioned platform TLS and sealing-key files.
 3. For sidecars, verify rendered env includes app port, instance ID/generation,
    control-plane endpoint, idle policy, runtime-injected
    `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled, and
