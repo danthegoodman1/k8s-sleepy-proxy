@@ -88,6 +88,7 @@ or cross-component contracts move.
 | Proxy-core primitives | `cargo test -p proxy-core` and, for hot paths, `cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Frontline route/cache/listener | `cargo test -p frontline`; route lookup changes also run `cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Control-plane API/store/lifecycle | `cargo test -p control-plane`; Postgres-backed store work also run `./scripts/test-postgres-store.sh` |
+| PostgreSQL execution gate | `python3 scripts/test-postgres-execution.py`; CI and `test-postgres-store.sh` use the same complete-target skip/count checker |
 | Sidecar runtime/idle | `cargo test -p sidecar` |
 | API/observability crate boundaries | `./scripts/test-dependency-boundaries.py`, `cargo test -p sleepypods-api -p sleepypods-observability -p proxy-core -p frontline -p sidecar` |
 | Production images | `./scripts/smoke-images.sh` |
@@ -95,11 +96,18 @@ or cross-component contracts move.
 | Benchmark regression review | `./scripts/check-criterion-regressions.py` after collecting local Criterion baselines |
 | Kubernetes materializer | `./scripts/test-kind-materializer.sh` |
 | Full platform behavior | the targeted `./scripts/test-kind-e2e-*.sh` gate |
+| Protocol fixture | `cargo test --locked -p proxy-core --example kind_protocol_app` executes direct HTTP/2, two-proxy-hop and WebSocket fixture regressions |
 | Soak inventory reader/polling | `python3 scripts/test-full-wake-sleep-inventory.py` (mocked Kubernetes; no cluster) |
 | Repeated wake/sleep leaks | `./scripts/soak-kind-full-wake-sleep.sh` or `./scripts/soak-kind-materializer.sh` |
 
 No cargo tests are required for docs-only changes unless the docs edit also
 changes code.
+
+An ordinary workspace run may self-skip optional database wrappers when no
+PostgreSQL URL is set. It is not actual store conformance. The separate database
+gate requires a complete unfiltered `postgres_store` target, including certificate
+store, native API and watch tests, and rejects skips, ignored cases and incomplete
+output. Its checker supplements Cargo's exit status; callers must preserve both.
 
 ## kind And Smoke Scripts
 
