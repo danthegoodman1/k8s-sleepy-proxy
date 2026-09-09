@@ -20,6 +20,28 @@ It is disabled unless an explicit listen address is configured:
 Bind metrics listeners on an internal address or behind your normal scrape
 auth/network policy. Do not expose them on the public proxy listener.
 
+## Certificate API diagnosis
+
+Use authenticated native TLS for certificate operations. Transport trust is
+provisioned independently of application certificates; publishing an application
+certificate cannot repair the control plane's own TLS identity or caller trust.
+
+| Failure | Check |
+| --- | --- |
+| Native TLS setup fails | Confirm the endpoint hostname is covered by the platform server certificate and that the caller trusts its CA. Check certificate validity and the configured public CA PEM. |
+| `Unauthenticated` or `PermissionDenied` | Confirm the correct role token and native TLS transport. Operators manage certificates; proxies resolve certificates and HTTP-01; sidecars cannot read certificate material. Certificate RPCs reject no-auth, plaintext and gRPC-Web. |
+| Publication returns `InvalidArgument` | Check leaf-first DER chain, matching PKCS#8 DER key, effective chain validity, server-auth use, all existing bound hostnames and bundle limits. A failed rotation leaves the active version intact. |
+| Resolution returns `InvalidArgument` | Check the hostname and the stored chain's validity. An expired or otherwise invalid active bundle is a validation error, not an authoritative miss. |
+| Mutation returns `FailedPrecondition` | Read current metadata or binding revision and reconcile the desired change. Expected versions/revisions are required; a stale value cannot overwrite a newer view. |
+| Resolution returns `Missing` | Inspect the exact hostname binding, including whether its certificate was removed. Binding and certificate resources are independent of the application's route. |
+| `Unavailable` or deadline errors | Check PostgreSQL health and certificate work saturation. A timeout may follow a committed mutation; inspect current state before another conditional write. |
+| Resolution returns `Internal` | Check that each replica has the required sealing read key and consistent key material. Investigate damaged stored material without dumping private keys into diagnostics. Storage/decryption errors are not authoritative misses. |
+
+Follow the [operator guide](operator-guide.md#control-plane-transport-and-sealing-configuration)
+for bootstrap configuration and coordinated endpoint/CA changes. Keep old sealing
+keys until old-writer database work is settled, live rows are verified under the
+new key, and retained backups no longer require them.
+
 ## Metric Names
 
 Low-cardinality label keys are `protocol`, `direction`, `operation`,
@@ -38,6 +60,15 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
+| `sleepypods_runtime_certificate_entries` | gauge | none | Cached positive, missing and pending hostname entries. |
+| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Owned cache reservations and retained configurations; separate from process RSS. |
+| `sleepypods_runtime_certificate_fetches` | gauge | none | Fetch permits held by queued, running, validating or completed work awaiting release. |
+| `sleepypods_runtime_certificate_queue` | gauge | none | Work waiting in the bounded certificate fetch channel. |
+| `sleepypods_runtime_certificate_tasks` | gauge | none | Supervisor task records, including completed tasks not yet reaped. |
+| `sleepypods_runtime_certificate_task_high_water` | gauge | none | Maximum retained supervisor task records since startup. |
+| `sleepypods_runtime_certificate_watches` | gauge | none | Watch sessions in setup, streaming or teardown. |
+| `sleepypods_runtime_certificate_expiry_risk` | gauge | none | Retained positive views whose lease or chain expires within 60 seconds, including already expired views. |
+| `sleepypods_runtime_certificate_events_total` | counter | `operation`, `outcome` | Fixed certificate fetch, refresh, watch and install outcomes. |
 | `sleepypods_runtime_materialization_failures_total` | counter | `operation`, `outcome` | Kubernetes/materialization failure path. |
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline route-cache hit/miss results. |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream close/update/invalidation events. |
@@ -62,7 +93,9 @@ Known bounded label values:
 - `operation`: `accept`, `admit`, `connect`, `forward`, `rewrite_request`,
   `drain`, `tls_client_hello`, `route_cache_lookup`, `subscribe_route`,
   `unsubscribe`, `subscribe_stream`, `wake_instance`, `materialize`,
-  `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`
+  `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`,
+  `certificate_fetch`, `certificate_refresh`, `certificate_watch`,
+  `certificate_install`
 - `outcome`: `success`, `error`, `timeout`, `rejected`, `canceled`, `hit`,
   `miss`, `started`, `closed`, `updated`, `invalidated`, `already_running`,
   `already_waking`, `already_draining`
@@ -71,6 +104,14 @@ Known bounded label values:
 - TLS ClientHello outcomes use the `outcome` label with `sni`, `no_sni`,
   `incomplete`, `not_tls`, `unsupported_version`, `not_client_hello`,
   `record_too_large`, `malformed`, or `invalid_hostname`.
+
+Certificate gauges are sampled from cache and worker ownership; separate gauges
+may observe slightly different instants during concurrent work. Check each
+against its own bound rather than treating a scrape as an atomic transaction.
+A successful fetch outcome records receipt of a response; installation has its
+own outcome and may still reject invalid or superseded material. Expiry risk
+counts host views, so several bindings for one certificate contribute separately.
+No certificate metric labels contain hostnames, certificate IDs or error text.
 
 ## Structured Events
 
@@ -161,6 +202,15 @@ Build dashboards from the exact names above:
   `sleepypods_proxy_active_streams`.
 - TLS/SNI:
   `sleepypods_proxy_tls_client_hello_total` and TLS listener errors.
+- Certificate delivery: inspect `sleepypods_runtime_certificate_events_total`
+  by operation and outcome. Sustained refresh errors/timeouts together with
+  increasing `sleepypods_runtime_certificate_expiry_risk` indicate approaching
+  handshake failures. Installation errors require investigation even when fetch
+  receipt succeeded. Compare cache and work gauges to their configured bounds
+  and observe process RSS separately. Watch streams normally reconnect at their
+  60-second lifetime; a close event alone is not an outage. Sustained absence of
+  a watch while the cache has entries calls for checking connectivity and
+  control-plane admission.
 - Load-budget gates: show the latest results from
   `docs/proxy-hot-path-budgets.md` scripts, especially p99 added latency,
   request-rate/throughput ratios, hot-cache zero-control-plane-call assertions,
@@ -314,14 +364,26 @@ TLS termination or SNI passthrough fails:
 
 1. Check `sleepypods_proxy_tls_client_hello_total` outcomes, especially
    `no_sni`, `invalid_hostname`, `not_tls`, or `malformed`.
-2. For termination, verify
-   `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` and
-   `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` entries use
-   `sni|certificate_path|private_key_path`.
+2. For termination, verify `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR`,
+   verified HTTPS control-plane connectivity and the proxy bearer token. Inspect
+   the exact hostname's `GetTlsBinding` and `GetCertificateMetadata`; the active
+   bundle must cover the hostname and its whole chain must still be valid.
+   Frontline starts with an empty in-memory cache and has no application
+   certificate files. Check cache capacity and lookup failures before restarting;
+   a restart requires a successful control-plane resolution.
 3. For passthrough, verify
    `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` and a TLS SNI route
    binding.
-4. Confirm client SNI matches an exact or wildcard route/certificate.
+4. Confirm client SNI has an exact TLS binding for termination. A wildcard SAN
+   can cover that explicit binding. Passthrough uses its exact or wildcard SNI
+   route independently of application certificate delivery.
+5. If an update has not appeared, inspect native watch connectivity and stream
+   capacity on both the serving proxy and its control plane. Registrations and
+   reconnects synchronize complete current bindings. Neither notifications nor failed
+   refreshes renew permission to serve: an old valid view lasts only until its
+   original lease/chain validity deadline, at most five minutes from resolution.
+   Snapshots carrying removal/unbind/rebind invalidations prevent stale selection;
+   already established connections follow the normal connection/drain policy.
 
 Postgres or database outage:
 
@@ -361,8 +423,9 @@ Image or container startup failures:
 
 1. Run `./scripts/smoke-images.sh` for production image startup, non-root,
    runtime-file, CA, and image-size checks.
-2. Inspect pod events for image pull, missing env, missing certificate files,
-   or service-account permission errors.
+2. Inspect pod events for image pull, missing environment settings or
+   service-account permission errors. On the control plane, also check the
+   independently provisioned platform TLS and sealing-key files.
 3. For sidecars, verify rendered env includes app port, instance ID/generation,
    control-plane endpoint, idle policy, runtime-injected
    `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled, and

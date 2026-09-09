@@ -43,6 +43,8 @@ impl Default for ApiLimits {
 #[derive(Clone, Debug)]
 pub struct RpcAdmissionLayer {
     semaphore: Arc<Semaphore>,
+    certificate_semaphore: Arc<Semaphore>,
+    certificate_watch_semaphore: Arc<Semaphore>,
     delivery_timeout: Duration,
 }
 impl RpcAdmissionLayer {
@@ -52,6 +54,10 @@ impl RpcAdmissionLayer {
     pub fn with_delivery_timeout(limit: usize, delivery_timeout: Duration) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(limit)),
+            certificate_semaphore: Arc::new(Semaphore::new(8)),
+            certificate_watch_semaphore: Arc::new(Semaphore::new(
+                super::certificate_watch::WATCH_STREAMS,
+            )),
             delivery_timeout,
         }
     }
@@ -60,6 +66,8 @@ impl RpcAdmissionLayer {
 pub struct RpcAdmissionService<S> {
     inner: S,
     semaphore: Arc<Semaphore>,
+    certificate_semaphore: Arc<Semaphore>,
+    certificate_watch_semaphore: Arc<Semaphore>,
     delivery_timeout: Duration,
 }
 impl<S> Layer<S> for RpcAdmissionLayer {
@@ -68,6 +76,8 @@ impl<S> Layer<S> for RpcAdmissionLayer {
         RpcAdmissionService {
             inner,
             semaphore: self.semaphore.clone(),
+            certificate_semaphore: self.certificate_semaphore.clone(),
+            certificate_watch_semaphore: self.certificate_watch_semaphore.clone(),
             delivery_timeout: self.delivery_timeout,
         }
     }
@@ -85,13 +95,34 @@ where
         self.inner.poll_ready(cx)
     }
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
-        if let Some(progress) = request
-            .extensions()
-            .get::<crate::runtime_io::ConnectionProgress>()
-        {
+        if let Some(progress) = connection_progress(request.extensions()) {
             progress.request_started();
         }
-        let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+        let certificate = certificate_method(request.uri().path());
+        if certificate
+            && request
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("application/grpc-web"))
+        {
+            return Box::pin(async {
+                Ok(
+                    Status::permission_denied("certificate operations require native TLS")
+                        .into_http(),
+                )
+            });
+        }
+        let certificate_watch = request.uri().path()
+            == "/sleepypods.controlplane.v1.ProxyControlPlane/WatchTlsCertificates";
+        let capacity = if certificate_watch {
+            &self.certificate_watch_semaphore
+        } else if certificate {
+            &self.certificate_semaphore
+        } else {
+            &self.semaphore
+        };
+        let Ok(permit) = capacity.clone().try_acquire_owned() else {
             let mut response =
                 Status::resource_exhausted("control-plane RPC capacity exhausted").into_http();
             if request
@@ -118,19 +149,29 @@ where
             }
             return Box::pin(async move { Ok(response) });
         };
-        let subscription = request
-            .uri()
-            .path()
-            .ends_with("/ProxyControlPlane/Subscribe")
+        let subscription = certificate_watch
+            || request
+                .uri()
+                .path()
+                .ends_with("/ProxyControlPlane/Subscribe")
             || request.uri().path() == "/sleepypods.controlplane.v1.ProxyControlPlane/Subscribe";
-        let connection = request
-            .extensions()
-            .get::<crate::runtime_io::ConnectionProgress>()
-            .cloned();
+        let connection = connection_progress(request.extensions()).cloned();
         let delivery_timeout = self.delivery_timeout;
         let future = self.inner.call(request);
         Box::pin(async move {
-            let mut response = future.await?;
+            let mut response = if certificate {
+                match tokio::time::timeout(Duration::from_secs(10), future).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Ok(
+                            Status::deadline_exceeded("certificate RPC deadline exceeded")
+                                .into_http(),
+                        )
+                    }
+                }
+            } else {
+                future.await?
+            };
             let (permit, delivery_timeout) = if subscription {
                 drop(permit);
                 let Some(lease) = response.extensions_mut().remove::<SubscriptionLease>() else {
@@ -277,4 +318,79 @@ impl http_body::Body for UnaryResponseBody {
 pub(crate) struct SubscriptionLease {
     pub permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     pub lifetime: Duration,
+}
+
+fn connection_progress(
+    extensions: &http::Extensions,
+) -> Option<&crate::runtime_io::ConnectionProgress> {
+    extensions.get::<crate::runtime_io::ConnectionProgress>().or_else(||
+        extensions.get::<tonic::transport::server::TlsConnectInfo<crate::runtime_io::ConnectionProgress>>()
+            .map(|info|info.get_ref()))
+}
+fn certificate_method(path: &str) -> bool {
+    matches!(
+        path,
+        "/sleepypods.controlplane.v1.OperatorControlPlane/PublishCertificate"
+            | "/sleepypods.controlplane.v1.OperatorControlPlane/GetCertificateMetadata"
+            | "/sleepypods.controlplane.v1.OperatorControlPlane/SetTlsBinding"
+            | "/sleepypods.controlplane.v1.OperatorControlPlane/GetTlsBinding"
+            | "/sleepypods.controlplane.v1.OperatorControlPlane/RemoveCertificate"
+            | "/sleepypods.controlplane.v1.OperatorControlPlane/ReencryptCertificate"
+            | "/sleepypods.controlplane.v1.ProxyControlPlane/ResolveTlsCertificate"
+            | "/sleepypods.controlplane.v1.ProxyControlPlane/WatchTlsCertificates"
+    )
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::*;
+    #[tokio::test]
+    async fn certificate_decode_flood_does_not_consume_ordinary_admission() {
+        let inner = tower::service_fn(|_: http::Request<Body>| async {
+            std::future::pending::<()>().await;
+            Ok::<_, std::convert::Infallible>(http::Response::new(Body::empty()))
+        });
+        let mut service = RpcAdmissionLayer::new(1).layer(inner);
+        let request = || {
+            http::Request::builder()
+                .uri("/sleepypods.controlplane.v1.ProxyControlPlane/ResolveTlsCertificate")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mut pending = Vec::new();
+        for _ in 0..8 {
+            pending.push(service.call(request()));
+        }
+        assert_eq!(service.certificate_semaphore.available_permits(), 0);
+        assert_eq!(
+            service.call(request()).await.unwrap().headers()["grpc-status"],
+            "8"
+        );
+        assert_eq!(service.semaphore.available_permits(), 1);
+        let ordinary = service.call(http::Request::new(Body::empty()));
+        assert_eq!(service.semaphore.available_permits(), 0);
+        drop(pending);
+        drop(ordinary);
+        assert_eq!(service.certificate_semaphore.available_permits(), 8);
+        assert_eq!(service.semaphore.available_permits(), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn slow_certificate_body_owns_one_slot_until_fixed_deadline() {
+        let inner = tower::service_fn(|_: http::Request<Body>| async {
+            std::future::pending::<()>().await;
+            Ok::<_, std::convert::Infallible>(http::Response::new(Body::empty()))
+        });
+        let mut service = RpcAdmissionLayer::new(1).layer(inner);
+        let response = service.call(
+            http::Request::builder()
+                .uri("/sleepypods.controlplane.v1.OperatorControlPlane/PublishCertificate")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        assert_eq!(service.certificate_semaphore.available_permits(), 7);
+        let started = tokio::time::Instant::now();
+        assert_eq!(response.await.unwrap().headers()["grpc-status"], "4");
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert_eq!(service.certificate_semaphore.available_permits(), 8);
+    }
 }

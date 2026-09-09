@@ -12,6 +12,7 @@ use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
     task::JoinSet,
 };
+use tonic::transport::Endpoint;
 
 // Own an exclusive endpoint without publishing a listener. These guards stay
 // alive until a never-publish test has checked its exact startup outcome.
@@ -56,6 +57,7 @@ fn config(proxy: SocketAddr, app: SocketAddr, ready: SocketAddr) -> EnvConfig {
         .unwrap(),
         runtime_mode: SidecarRuntimeMode::Http,
         pod_uid: "fixture-pod".into(),
+        control_plane_ca_pem: None,
         control_plane_endpoint: "http://127.0.0.1:1".into(),
         control_plane_sidecar_token: None,
         metrics_listen_addr: None,
@@ -221,20 +223,18 @@ async fn stalled_initial_cp_setup_expires_without_publishing_health() {
 #[tokio::test]
 async fn occupied_metrics_port_shuts_down_and_joins_both_listeners() {
     let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (proxy_guard, proxy) = reserved_addr();
     let (app_guard, app) = reserved_addr();
-    let (ready_guard, ready) = reserved_addr();
-    let mut env = config(proxy, app, ready);
+    // This test never dials proxy/readiness endpoints. Let the production
+    // binds atomically choose and own them, avoiding a release/rebind gap.
+    let ephemeral: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut env = config(ephemeral, app, ephemeral);
     env.metrics_listen_addr = Some(occupied.local_addr().unwrap());
     let shutdown = Shutdown::new();
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         run_with_connection(
             env,
-            async move {
-                drop((proxy_guard, ready_guard));
-                Ok(Endpoint::from_static("http://127.0.0.1:1").connect_lazy())
-            },
+            async move { Ok(Endpoint::from_static("http://127.0.0.1:1").connect_lazy()) },
             shutdown.clone(),
         ),
     )

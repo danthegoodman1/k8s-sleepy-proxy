@@ -4739,3 +4739,6 @@ mod activation_idle;
 
 #[path = "postgres_store/cleanup_boundary.rs"]
 mod cleanup_boundary;
+
+#[path = "postgres_store/certificates.rs"]
+mod certificates;

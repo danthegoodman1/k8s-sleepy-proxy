@@ -332,8 +332,6 @@ spec:
               value: http://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
             - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
               value: ${proxy_token}
-            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
-              value: ${operator_token}
 ---
 apiVersion: v1
 kind: Service

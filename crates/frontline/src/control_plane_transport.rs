@@ -10,10 +10,7 @@ use std::{
 };
 
 use sleepypods_api::{
-    pb::{
-        self, operator_control_plane_client::OperatorControlPlaneClient,
-        proxy_control_plane_client::ProxyControlPlaneClient,
-    },
+    pb::{self, proxy_control_plane_client::ProxyControlPlaneClient},
     Http01ChallengeKey, Http01ChallengeRecord, RouteIdentity,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -42,8 +39,8 @@ pub struct GrpcProxyControlPlaneClient<T> {
     events: Arc<SubscriptionEvents>,
 }
 #[derive(Debug)]
-pub struct GrpcOperatorHttp01Resolver<T> {
-    client: OperatorControlPlaneClient<T>,
+pub struct GrpcProxyHttp01Resolver<T> {
+    client: ProxyControlPlaneClient<T>,
 }
 #[derive(Debug)]
 struct SubscriptionTransport<T> {
@@ -123,7 +120,7 @@ pub enum GrpcProxyControlPlaneError {
 }
 
 #[derive(Clone, Debug)]
-pub enum GrpcOperatorHttp01ResolverError {
+pub enum GrpcProxyHttp01ResolverError {
     Status(tonic::Status),
     Protocol(ProxyProtocolAdapterError),
 }
@@ -190,20 +187,20 @@ impl<T> GrpcProxyControlPlaneClient<T> {
         }
     }
 }
-impl<T> GrpcOperatorHttp01Resolver<T> {
-    pub fn new(client: OperatorControlPlaneClient<T>) -> Self {
+impl<T> GrpcProxyHttp01Resolver<T> {
+    pub fn new(client: ProxyControlPlaneClient<T>) -> Self {
         Self { client }
     }
 
-    pub fn inner(&self) -> &OperatorControlPlaneClient<T> {
+    pub fn inner(&self) -> &ProxyControlPlaneClient<T> {
         &self.client
     }
 
-    pub fn inner_mut(&mut self) -> &mut OperatorControlPlaneClient<T> {
+    pub fn inner_mut(&mut self) -> &mut ProxyControlPlaneClient<T> {
         &mut self.client
     }
 
-    pub fn into_inner(self) -> OperatorControlPlaneClient<T> {
+    pub fn into_inner(self) -> ProxyControlPlaneClient<T> {
         self.client
     }
 }
@@ -268,7 +265,7 @@ where
         Ok(self.session.as_mut().expect("initialized subscription"))
     }
 }
-impl<T> GrpcOperatorHttp01Resolver<T>
+impl<T> GrpcProxyHttp01Resolver<T>
 where
     T: tonic::client::GrpcService<tonic::body::Body>,
     T::Error: Into<tonic::codegen::StdError>,
@@ -278,21 +275,21 @@ where
     async fn resolve_http01_challenge_via_transport(
         &mut self,
         key: Http01ChallengeKey,
-    ) -> Result<Option<Http01ChallengeRecord>, GrpcOperatorHttp01ResolverError> {
+    ) -> Result<Option<Http01ChallengeRecord>, GrpcProxyHttp01ResolverError> {
         let response = self
             .client
             .resolve_http01_challenge(pb::ResolveHttp01ChallengeRequest {
                 key: Some(http01_challenge_key_to_proto(key)),
             })
             .await
-            .map_err(GrpcOperatorHttp01ResolverError::Status)?
+            .map_err(GrpcProxyHttp01ResolverError::Status)?
             .into_inner();
 
         response
             .challenge
             .map(http01_challenge_record_from_proto)
             .transpose()
-            .map_err(GrpcOperatorHttp01ResolverError::Protocol)
+            .map_err(GrpcProxyHttp01ResolverError::Protocol)
     }
 }
 
@@ -476,7 +473,7 @@ where
         })
     }
 }
-impl<T> Http01ChallengeResolver for GrpcOperatorHttp01Resolver<T>
+impl<T> Http01ChallengeResolver for GrpcProxyHttp01Resolver<T>
 where
     T: tonic::client::GrpcService<tonic::body::Body> + Send,
     T::Error: Into<tonic::codegen::StdError>,
@@ -484,7 +481,7 @@ where
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
-    type Error = GrpcOperatorHttp01ResolverError;
+    type Error = GrpcProxyHttp01ResolverError;
 
     fn resolve_http01_challenge(
         &mut self,
@@ -526,16 +523,16 @@ impl Error for GrpcProxyControlPlaneError {
     }
 }
 
-impl fmt::Display for GrpcOperatorHttp01ResolverError {
+impl fmt::Display for GrpcProxyHttp01ResolverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Status(status) => write!(f, "operator HTTP-01 gRPC status: {status}"),
+            Self::Status(status) => write!(f, "proxy HTTP-01 gRPC status: {status}"),
             Self::Protocol(error) => write!(f, "operator HTTP-01 protocol error: {error}"),
         }
     }
 }
 
-impl Error for GrpcOperatorHttp01ResolverError {
+impl Error for GrpcProxyHttp01ResolverError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Status(status) => Some(status),

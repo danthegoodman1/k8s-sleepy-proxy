@@ -348,21 +348,26 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "prost",
+ "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
  "sleepypods-api",
+ "sleepypods-certificate",
  "sleepypods-observability",
  "sleepypods-types",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tonic",
  "tonic-web",
  "tower",
  "tower-http 0.7.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -716,6 +721,7 @@ dependencies = [
  "rustls-pemfile",
  "sidecar",
  "sleepypods-api",
+ "sleepypods-certificate",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -2390,6 +2396,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
+]
+
+[[package]]
+name = "sleepypods-certificate"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "rustls",
+ "rustls-webpki",
+ "sleepypods-api",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2734,11 +2752,13 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3094,6 +3114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "whoami"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3293,6 +3322,9 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zmij"

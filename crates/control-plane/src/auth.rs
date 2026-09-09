@@ -71,6 +71,9 @@ enum AuthMode {
     Provider(Arc<dyn AuthProvider>),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuthenticatedRole(pub CallerRole);
+
 #[derive(Clone)]
 pub struct ControlPlaneAuthInterceptor {
     auth: ControlPlaneAuth,
@@ -252,10 +255,15 @@ impl ControlPlaneAuth {
 }
 
 impl Interceptor for ControlPlaneAuthInterceptor {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         self.auth
             .authorize(request.metadata(), self.service_name, self.required_role)
-            .map(|_| request)
+            .map(|role| {
+                if matches!(self.auth.mode, AuthMode::Provider(_)) {
+                    request.extensions_mut().insert(AuthenticatedRole(role));
+                }
+                request
+            })
             .map_err(auth_failure_to_status)
     }
 }

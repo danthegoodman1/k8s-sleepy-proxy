@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/lib/kind-image.sh"
+source "${repo_root}/scripts/lib/native-tls-fixture.sh"
 cluster_name="${SLEEPYPODS_KIND_CLUSTER:-sleepypods-e2e-tls-test}"
 namespace="${SLEEPYPODS_KIND_E2E_NAMESPACE:-sleepypods-e2e-tls}"
 keep_cluster="${SLEEPYPODS_KIND_KEEP_CLUSTER:-0}"
@@ -10,11 +11,16 @@ keep_namespace="${SLEEPYPODS_KIND_E2E_KEEP_NAMESPACE:-0}"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-kind-e2e-tls}"
 app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/tls-app:${image_tag}}"
+protocol_app_image="${SLEEPYPODS_KIND_E2E_PROTOCOL_APP_IMAGE:-${image_prefix}/protocol-app:${image_tag}}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19351}"
 tls_termination_port="${SLEEPYPODS_KIND_E2E_TLS_TERMINATION_PORT:-19443}"
 tls_passthrough_port="${SLEEPYPODS_KIND_E2E_TLS_PASSTHROUGH_PORT:-19444}"
 kubeconfig="$(mktemp)"
+security_dir="$(mktemp -d)"
+artifact_dir="${SLEEPYPODS_E2E_ARTIFACT_DIR:-${repo_root}/.generated/test-kind-e2e-tls-$(date -u +%Y%m%dT%H%M%SZ)}"
+mkdir -p "${artifact_dir}"
+namespace_created=0
 control_plane_pf_log="$(mktemp)"
 frontline_pf_log="$(mktemp)"
 created_cluster=0
@@ -43,11 +49,57 @@ stop_port_forwards() {
   fi
 }
 
+capture_failure_details() {
+  # Only this fixture's public status and bounded logs; never Pod specs/env.
+  python3 - "${kubeconfig}" "${namespace}" "${artifact_dir}" <<'PY'
+import json, pathlib, subprocess, sys
+kubeconfig, namespace, directory = sys.argv[1:]
+directory = pathlib.Path(directory)
+pods = json.loads((directory / "pod-identities.json").read_text())
+if len(pods) > 8:
+    raise SystemExit("unexpected fixture pod inventory; skipping diagnostic collection")
+for pod in pods:
+    name = pod["name"]
+    commands = [
+        ("status", ["get", "pod", name, "-o=jsonpath={.metadata.uid}{'\\n'}{.status}{'\\n'}"]),
+        ("current", ["logs", name, "--all-containers=true", "--timestamps", "--tail=80", "--limit-bytes=16384"]),
+        ("previous", ["logs", name, "--all-containers=true", "--previous", "--timestamps", "--tail=80", "--limit-bytes=16384"]),
+        ("events", ["get", "events", "--field-selector", f"involvedObject.name={name}", "-o=custom-columns=TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message", "--no-headers"]),
+    ]
+    for label, arguments in commands:
+        path = directory / f"pod-{name}-{label}.log"
+        with path.open("w+b") as output:
+            try:
+                result = subprocess.run(
+                    ["kubectl", "--kubeconfig", kubeconfig, "--request-timeout=3s", "-n", namespace, *arguments],
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=4,
+                )
+                output.write(f"\ncollector_exit={result.returncode}\n".encode())
+            except subprocess.TimeoutExpired:
+                output.write(b"\ncollector_timeout=4s\n")
+            length = output.tell()
+            output.seek(max(0, length - 65536))
+            tail = output.read(65536)
+            output.seek(0)
+            output.write(tail)
+            output.truncate()
+PY
+}
+
 cleanup() {
   local status=$?
 
   stop_port_forwards
+  if [[ "${namespace_created}" == "1" ]]; then
+    if ! capture_native_tls_pods "${kubeconfig}" "${namespace}" "${artifact_dir}/pod-identities.json"; then
+      echo "failed to retain exact deployed pod identities" >&2
+      if [[ "${status}" == "0" ]]; then status=1; fi
+    fi
+  fi
   if [[ "${status}" != "0" ]]; then
+    if [[ "${namespace_created}" == "1" ]]; then
+      capture_failure_details || echo "failed to retain bounded fixture failure details" >&2
+    fi
     if [[ -s "${control_plane_pf_log}" ]]; then
       echo "==> Last control-plane port-forward log lines (${control_plane_pf_log})" >&2
       tail -n 80 "${control_plane_pf_log}" >&2 || true
@@ -65,11 +117,12 @@ cleanup() {
   fi
 
   rm -f "${kubeconfig}" "${control_plane_pf_log}" "${frontline_pf_log}"
+  rm -rf -- "${security_dir}"
   exit "${status}"
 }
 trap cleanup EXIT
 
-for command in kind kubectl docker cargo; do
+for command in kind kubectl docker cargo openssl python3; do
   require_command "${command}"
 done
 
@@ -80,6 +133,7 @@ else
   kind get kubeconfig --name "${cluster_name}" >"${kubeconfig}"
 fi
 
+if [[ "${SLEEPYPODS_KIND_E2E_SKIP_BUILD:-0}" != "1" ]]; then
 components=(control-plane frontline sidecar)
 for component in "${components[@]}"; do
   image="${image_prefix}/${component}:${image_tag}"
@@ -97,14 +151,23 @@ docker build \
   --file "${repo_root}/scripts/Dockerfile.kind-tls-app" \
   "${repo_root}"
 
+echo "==> Building ${protocol_app_image}"
+docker build \
+  --tag "${protocol_app_image}" \
+  --file "${repo_root}/scripts/Dockerfile.kind-protocol-app" \
+  "${repo_root}"
+
 echo "==> Pulling ${postgres_image}"
 docker pull "${postgres_image}"
+
+fi
 
 for image in \
   "${image_prefix}/control-plane:${image_tag}" \
   "${image_prefix}/frontline:${image_tag}" \
   "${image_prefix}/sidecar:${image_tag}" \
   "${app_image}" \
+  "${protocol_app_image}" \
   "${postgres_image}"; do
   echo "==> Loading ${image} into kind/${cluster_name}"
   kind_load_image "${cluster_name}" "${image}"
@@ -113,10 +176,22 @@ done
 echo "==> Recreating namespace ${namespace}"
 KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-found --wait=true
 KUBECONFIG="${kubeconfig}" kubectl create namespace "${namespace}"
+namespace_created=1
 KUBECONFIG="${kubeconfig}" kubectl label namespace "${namespace}" \
   sleepypods.io/kind-e2e=tls --overwrite
 
-echo "==> Creating deterministic TLS certificate secret"
+generate_native_tls_fixture "${security_dir}/platform" "sleepypods-control-plane.${namespace}.svc.cluster.local"
+KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" create secret generic sleepypods-native-control-plane \
+  --from-file="${security_dir}/platform/cp.crt" \
+  --from-file="${security_dir}/platform/cp.key" \
+  --from-file="${security_dir}/platform/sealing.json" \
+  --from-file="${security_dir}/platform/operator.token" \
+  --from-file="${security_dir}/platform/proxy.token" \
+  --from-file="${security_dir}/platform/sidecar.token"
+platform_ca="$(cat "${security_dir}/platform/cp.crt")"
+operator_token="$(cat "${security_dir}/platform/operator.token")"
+
+echo "==> Creating backend-only passthrough TLS fixture secret"
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" create secret generic sleepypods-kind-e2e-tls \
   --from-file=tls.crt="${repo_root}/scripts/kind-e2e-tls-cert.pem" \
   --from-file=tls.key="${repo_root}/scripts/kind-e2e-tls-key.pem" \
@@ -201,7 +276,7 @@ metadata:
     app.kubernetes.io/name: sleepypods-frontline
     sleepypods.io/kind-e2e: tls
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: sleepypods-frontline
@@ -211,6 +286,7 @@ spec:
         app.kubernetes.io/name: sleepypods-frontline
         sleepypods.io/kind-e2e: tls
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: frontline
           image: ${image_prefix}/frontline:${image_tag}
@@ -222,6 +298,8 @@ spec:
               containerPort: 8443
             - name: tls-pass
               containerPort: 9443
+            - name: metrics
+              containerPort: 9090
           readinessProbe:
             tcpSocket:
               port: http
@@ -230,22 +308,20 @@ spec:
           env:
             - name: SLEEPYPODS_FRONTLINE_LISTEN_ADDR
               value: 0.0.0.0:8080
+            - name: SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR
+              value: 0.0.0.0:9090
             - name: SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR
               value: 0.0.0.0:8443
-            - name: SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS
-              value: terminate.sleepypods.test|/etc/sleepypods/tls/tls.crt|/etc/sleepypods/tls/tls.key
             - name: SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR
               value: 0.0.0.0:9443
             - name: SLEEPYPODS_CONTROL_PLANE_ENDPOINT
-              value: http://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
-          volumeMounts:
-            - name: tls
-              mountPath: /etc/sleepypods/tls
-              readOnly: true
-      volumes:
-        - name: tls
-          secret:
-            secretName: sleepypods-kind-e2e-tls
+              value: https://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: cp.crt}
+            - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: proxy.token}
 ---
 apiVersion: v1
 kind: Service
@@ -324,7 +400,7 @@ metadata:
     app.kubernetes.io/name: sleepypods-control-plane
     sleepypods.io/kind-e2e: tls
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: sleepypods-control-plane
@@ -351,7 +427,27 @@ spec:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
-              value: no-auth
+              value: static-bearer-token
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE
+              value: /etc/sleepypods/platform/cp.crt
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE
+              value: /etc/sleepypods/platform/cp.key
+            - name: SLEEPYPODS_CERTIFICATE_SEALING_KEYS_FILE
+              value: /etc/sleepypods/platform/sealing.json
+            - name: SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT
+              value: https://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: cp.crt}
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: operator.token}
+            - name: SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: proxy.token}
+            - name: SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: sidecar.token}
             - name: SLEEPYPODS_STORE_PROVIDER
               value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
@@ -360,6 +456,18 @@ spec:
               value: kind-e2e-tls
             - name: SLEEPYPODS_NAMESPACE
               value: ${namespace}
+          volumeMounts:
+            - name: platform
+              mountPath: /etc/sleepypods/platform
+              readOnly: true
+      volumes:
+        - name: platform
+          secret:
+            secretName: sleepypods-native-control-plane
+            items:
+              - {key: cp.crt, path: cp.crt}
+              - {key: cp.key, path: cp.key}
+              - {key: sealing.json, path: sealing.json}
 ---
 apiVersion: v1
 kind: Service
@@ -399,10 +507,14 @@ run_tls_driver() {
   KUBECONFIG="${kubeconfig}" \
     SLEEPYPODS_KIND_E2E_TLS=1 \
     SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
-    SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
+    SLEEPYPODS_E2E_OPERATOR_ENDPOINT="https://localhost:${operator_port}" \
+    SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM="${platform_ca}" \
+    SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \
+    SLEEPYPODS_E2E_ARTIFACT_DIR="${artifact_dir}" \
     SLEEPYPODS_E2E_TLS_TERMINATION_ADDR="127.0.0.1:${tls_termination_port}" \
     SLEEPYPODS_E2E_TLS_PASSTHROUGH_ADDR="127.0.0.1:${tls_passthrough_port}" \
     SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
+    SLEEPYPODS_E2E_PROTOCOL_APP_IMAGE="${protocol_app_image}" \
     SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
     cargo test -p control-plane --test kind_e2e_tls "${test_name}" -- --ignored --nocapture
 }
@@ -412,5 +524,6 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 start_port_forwards
 run_tls_driver tls_termination_through_deployed_platform
 run_tls_driver sni_passthrough_through_deployed_platform
+run_tls_driver dynamic_certificate_lifecycle_through_exact_replicas
 
 echo "TLS full-platform kind E2E completed"

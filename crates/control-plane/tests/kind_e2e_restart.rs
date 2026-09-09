@@ -847,7 +847,8 @@ async fn http01_challenges_survive_restart_and_cleanup(
 
     restart_control_plane_pod(kube.clone(), &config.namespace, &config.operator_endpoint).await?;
     let mut operator = connect_operator(&config.operator_endpoint).await?;
-    let resolved = operator
+    let resolved = ProxyControlPlaneClient::connect(config.operator_endpoint.clone())
+        .await?
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(HTTP01_HOST, HTTP01_TOKEN)),
         })
@@ -930,7 +931,8 @@ async fn http01_challenges_survive_restart_and_cleanup(
         renewed_expiry,
     )
     .await?;
-    let renewed = operator
+    let renewed = ProxyControlPlaneClient::connect(config.operator_endpoint.clone())
+        .await?
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(HTTP01_HOST, HTTP01_EXPIRING_TOKEN)),
         })
@@ -959,7 +961,8 @@ async fn http01_challenges_survive_restart_and_cleanup(
     {
         return Err("expired HTTP-01 key authorization was still served after restart".into());
     }
-    if operator
+    if ProxyControlPlaneClient::connect(config.operator_endpoint.clone())
+        .await?
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(HTTP01_HOST, HTTP01_EXPIRING_TOKEN)),
         })

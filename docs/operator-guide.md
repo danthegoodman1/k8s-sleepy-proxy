@@ -6,8 +6,10 @@ execution substrate, but operators create and change user resources through
 
 The protobuf source of truth is
 `crates/sleepypods-api/proto/sleepypods/controlplane/v1/control_plane.proto`.
-Generated native gRPC clients and gRPC-Web clients use the same unary operator
-RPCs. There is no stable operator CLI yet, so examples below use request shapes.
+Generated native gRPC clients and gRPC-Web clients share the ordinary unary
+operator RPCs. Certificate operations require authenticated native TLS and are
+not exposed through gRPC-Web. There is no stable operator CLI yet, so examples
+below use request shapes.
 
 ## Resource Model
 
@@ -24,6 +26,11 @@ RPCs. There is no stable operator CLI yet, so examples below use request shapes.
   prefixes are first-class resources.
 - `Http01Challenge`: ACME HTTP-01 token keyed by `(host, token)`. The frontline
   checks challenge paths before normal route resolution.
+- `Certificate`: a versioned, validated leaf-first certificate chain and an
+  encrypted private key. It is independent of application routing and lifecycle.
+- `TlsBinding`: an exact canonical DNS hostname mapped to a certificate ID, with
+  its own revision. Several hostnames may share a certificate, and path routes
+  for one hostname may refer to different instances.
 - `Materialization`: transient Kubernetes projection of an active instance
   generation. Its persisted `projection_generation` is an immutable Kubernetes
   ownership and sidecar incarnation stamp, separate from the instance CAS
@@ -47,13 +54,15 @@ The V1 operator service is unary-only:
 - `CreateWorkloadClassVersion`, `GetWorkloadClassVersion`
 - `CreateInstance`, `GetInstance`, `DeleteInstance`
 - `CreateRouteBinding`, `GetRouteBinding`, `DeleteRouteBinding`
-- `PutHttp01Challenge`, `ResolveHttp01Challenge`,
-  `DeleteHttp01Challenge`, `ExpireHttp01Challenges`
+- `PutHttp01Challenge`, `DeleteHttp01Challenge`, `ExpireHttp01Challenges`
+- `PublishCertificate`, `GetCertificateMetadata`, `RemoveCertificate`,
+  `ReencryptCertificate`, `SetTlsBinding`, `GetTlsBinding` (native TLS only)
 - `ReconcileMaterialization`, `ForceDeleteMaterialization`,
   `ForceReleaseExclusivityKey`
 
-`WakeInstance`, `Subscribe`, and `ReportIdle` are runtime services for proxies
-and sidecars. They are not operator or gRPC-Web APIs.
+`WakeInstance`, `Subscribe`, `ResolveHttp01Challenge`, `ResolveTlsCertificate`,
+`WatchTlsCertificates`, and `ReportIdle` are runtime services for proxies and sidecars. They are not
+operator or gRPC-Web APIs.
 
 Control-plane authentication is caller authentication at this API boundary. It
 does not authenticate application end users and it does not replace network
@@ -62,18 +71,17 @@ Native gRPC operator, proxy, and sidecar services and the gRPC-Web operator
 listener use the same role policy:
 
 - Operator credentials call `OperatorControlPlane`.
-- Proxy credentials call `ProxyControlPlane/WakeInstance` and
-  `ProxyControlPlane/Subscribe`.
+- Proxy credentials call `ProxyControlPlane`, including HTTP-01 lookup and
+  certificate resolution and watches.
 - Sidecar credentials call `SidecarControlPlane/ReportIdle`.
 
 The first provider is static bearer tokens. Configure it with
 `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=static-bearer-token` plus distinct
 `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`,
 `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, and
-`SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` values. Frontlines need
-`SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN` for wake/subscribe traffic and
-`SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN` when HTTP-01 challenge serving is
-enabled. The control plane injects `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN`
+`SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` values. Frontlines use only
+`SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, including for HTTP-01 lookup. The control
+plane injects `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN`
 into rendered sidecars from runtime config; operators do not put this token in
 WorkloadClass templates. Browser/gRPC-Web and native operator clients send
 `Authorization: Bearer <operator-token>`.
@@ -81,10 +89,223 @@ WorkloadClass templates. Browser/gRPC-Web and native operator clients send
 `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` is for local development and tests
 only. It is explicit; omitting the auth mode or configuring malformed, missing,
 or duplicate static tokens fails startup instead of silently disabling auth.
+Certificate operations remain unavailable in no-auth mode and over plaintext,
+including when a client supplies forwarding headers claiming HTTPS. The current
+role model is shared operator/proxy/sidecar authentication, not tenant isolation.
 Rotate static tokens by updating the control-plane token set and rolling
 callers with the corresponding new role token. During rotation, keep exposure
 behind trusted network boundaries because static bearer tokens are shared
 secrets.
+
+## Certificate publication and bindings
+
+For a first deployment:
+
+1. Provision independent native platform TLS identity/trust, role credentials and
+   the external sealing key ring. Start the control plane against the current
+   PostgreSQL schema before configuring its callers.
+2. Configure Frontline's verified HTTPS endpoint, public CA trust when needed,
+   and proxy credential. Its certificate cache may start empty. HTTP-01
+   resolution uses `ProxyControlPlane` and the proxy role; operators publish
+   challenge state, so HTTP-01 can work before a certificate exists.
+3. Publish the issued application bundle and bind each exact hostname before
+   expecting successful application TLS handshakes. Configure the control-plane
+   endpoint and trust before materializing workloads and their sidecars.
+
+Deploy matching control-plane and caller protocol versions. Mixed old/new
+certificate-delivery callers are not an upgrade guarantee; no compatibility
+adapter or static-certificate import path is provided.
+
+Publish an already-issued certificate through authenticated native TLS. Supply
+the chain as leaf-first DER bytes and the matching private key as unencrypted
+PKCS#8 DER bytes. The complete bundle is limited to 128 KiB, 16 chain entries and
+100 SANs. The control plane validates the key, server-auth use, chain validity
+and hostname coverage before committing any replacement. Privately issued
+certificates are accepted; issuance and ACME renewal are external tooling.
+
+```text
+PublishCertificate({
+  certificate_id: "customer-example",
+  expected_version: 0,
+  bundle: {chain_der: [<leaf DER>, <intermediate DER>, <root DER>],
+           private_key_pkcs8_der: <PKCS#8 DER>}
+})
+
+SetTlsBinding({
+  hostname: "app.example.com",
+  expected_revision: 0,
+  certificate_id: "customer-example"
+})
+```
+
+Expected version/revision fields are required, including zero for a never-used
+resource. Use the returned certificate version to rotate the bundle, and use the
+binding's revision to change its certificate or unbind it. An unbind omits
+`certificate_id`; the hostname retains its revision. Binding keys are exact DNS
+names, normalized to lowercase without a terminal dot. Ports, URLs, IP literals
+and wildcard binding keys are rejected. A wildcard SAN can cover explicitly
+bound hostnames according to normal certificate hostname rules.
+
+A rotation must cover every hostname currently bound to that certificate; one
+certificate can have at most 1,024 bindings. Invalid publication leaves the active
+version unchanged. `GetCertificateMetadata` returns validity, DNS names,
+fingerprint, version and sealing identity, with no private-key readback. Proxy
+resolution atomically returns a complete current view, an unchanged matching
+view, or an authoritative miss. Storage and decryption failures remain errors.
+
+`RemoveCertificate` requires the current version, erases its stored material and
+unbinds every referencing hostname atomically. The certificate ID remains retired
+and cannot be reused. A hostname can subsequently bind to a different certificate
+using its current binding revision. These writes do not change application
+routes or wake instances.
+
+Certificate writes are not automatically replayed after an ambiguous connection
+failure. Read current metadata/binding state and compare versions and the desired
+certificate fingerprint before attempting another conditional write.
+
+Private keys are encrypted in Postgres using deployment-provided sealing keys.
+Back up those keys separately from the database. When changing sealing keys,
+first distribute the new read key to every control-plane replica, then switch
+every writer to the new active key. Use `ReencryptCertificate` with the current
+certificate version and sealing revision for each live certificate. Verify all
+live rows use the new key before retiring the old read key. Before that final
+check, settle in-flight and ambiguous database writes from old-key writers;
+disconnecting a caller or stopping its transport alone does not prove that a
+queued commit cannot still finish. Keep old read keys available through this
+settlement and retain keys required to restore older backups. Re-encryption
+preserves certificate versions and hostname views.
+
+## Frontline certificate cache
+
+Enable `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` and configure a verified
+HTTPS control-plane endpoint with the proxy bearer token. Frontline starts with
+an empty certificate cache. It fetches the exact SNI binding on the first TLS
+connection, validates the returned bundle, and keeps the result in memory.
+Warm handshakes perform no certificate RPC or certificate parsing. HTTP-01 works
+through the proxy API before publication and does not require an application
+certificate.
+
+Frontline loads no application certificates from files and writes no certificate
+cache to disk. Restarting loses the cache; a subsequent TLS connection needs a
+successful resolution. The existing bounded control-plane connection setup still
+applies at startup. An empty cache alone does not prevent listener readiness.
+
+The cache admits at most 1,024 hostname entries, including misses and pending
+lookups, with 64 MiB of accounted memory and at most three simultaneous fetches.
+Memory accounting includes fetch scratch space and configurations still retained
+by handshakes or other references after cache eviction. It is an admission budget, not a
+process RSS limit; connection buffers and the runtime have separate costs.
+The worker reserves four MiB for structures, 32 MiB for watch decoding/state and
+eight MiB for each outstanding fetch. These conservative reservations cover
+malformed repeated protobuf fields as well as valid bundles; they do not imply
+that an idle process allocates that much physical memory. Entry and byte pressure
+can evict cached views before their leases expire.
+Identical misses share one fetch. Lookup has a three-second deadline within the
+overall five-second TLS setup bound; capacity exhaustion fails the handshake.
+
+Positive views refresh after approximately 60 seconds with hostname jitter, or
+half the granted lease when that is sooner. The worker polls once per second;
+leases shorter than a poll or lookup cannot promise a completed refresh before
+expiry, and selection still fails closed at the original deadline.
+Each successful authoritative resolution grants at most five minutes of service,
+capped by the effective validity of the entire chain and measured conservatively
+from the start of the RPC. Failed refreshes never extend that deadline. An
+unchanged response can renew only the exact certificate view still held locally.
+Authoritative misses are cached for at most one second. During a control-plane
+outage, an existing valid view remains usable only until its original deadline.
+
+Frontline opens one native certificate watch when its cache first has interests.
+The watch pushes complete binding snapshots containing metadata only. Each
+registration supplies an ID and exact hostname list; the server acknowledges it
+with an atomic current snapshot. Eviction releases the hostname's interest;
+updates coalesce into a bounded complete replacement set. Reconnects synchronize
+all current interests through either control-plane replica.
+
+The server checks a private global revision and reads the requested bindings only
+when it changes, or when a new registration requires a snapshot. There is no
+certificate event history or resume cursor. Each binding carries its view revision
+and last-invalidating revision. Binding changes and removal advance both;
+ordinary rotation advances only the view revision.
+
+A rotation prompts a refresh while an already valid configuration may remain
+usable within its existing lease. If a snapshot's last-invalidating revision is
+newer than the retained configuration's actual view revision, that configuration
+is discarded before another handshake. This also covers unbind/rebind/rotation
+coalesced between polls. Per-host floors, local generations and cache incarnations
+fence stale responses; a global revision never authorizes a hostname. Snapshots,
+reconnects and failed lookups cannot extend a lease. During a partition, delivery
+can be delayed until the original lease expires.
+
+Each control plane admits at most 16 certificate streams. Interests are limited
+to 1,024 exact hosts per stream, messages to 512 KiB, and queued responses to two.
+Initial registration has a three-second setup bound. A registration or snapshot
+poll runs at most once per 250 ms per stream; streams renew after at most 60
+seconds. Database watch reads wait in a bounded FIFO queue; a waiting read uses
+no ordinary database slot. One watch read or its protocol cleanup owns the watch
+database slot at a time. These are local admission bounds, not a database
+throughput promise.
+
+TLS 1.2 and 1.3 use full handshakes. Server session storage, session tickets and
+early data are disabled, so an attempted resumption cannot bypass current SNI
+authorization. Already established connections continue under their existing
+connection and drain policy.
+
+## Control-plane transport and sealing configuration
+
+Provision the control plane's native TLS identity independently of application
+certificates. Set `SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE` and
+`SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` to its PEM certificate chain and matching
+private key. These bootstrap files let proxies establish trust before any
+application certificate exists. The identity chain is limited to 64 KiB and its
+key file to 16 KiB.
+
+Set `SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT` to the verified `https://` endpoint
+that rendered sidecars should use. Frontlines use
+`SLEEPYPODS_CONTROL_PLANE_ENDPOINT`. HTTPS clients verify the endpoint hostname
+and certificate chain against public roots. For a private platform CA, configure
+`SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM` with its public PEM trust material (at most
+64 KiB); the control plane includes this public trust in rendered sidecars.
+The CA setting is rejected with a plaintext endpoint. Application TLS bindings
+never provide this bootstrap identity or trust.
+
+Frontline gives each native TCP connection attempt and platform TLS handshake
+a two-second timeout, including background reconnects on its shared channel.
+These stage deadlines are separate from overall RPC and startup deadlines.
+Sidecars use their configured TCP setup timeout and the same two-second TLS
+handshake timeout. Canceling an async caller does not stop an operating-system
+DNS lookup already running on a blocking worker.
+
+The control plane applies `SLEEPYPODS_CONTROL_PLANE_SETUP_TIMEOUT_MS` (five
+seconds by default) to the complete server-side TLS handshake as well as initial
+request setup. An incomplete handshake closes at that deadline even if the peer
+continues to make slow progress receiving the server's output. The existing
+accepted-connection limit bounds concurrent socket ownership.
+
+Configure platform TLS before creating workloads. Sidecars receive their endpoint
+and public CA when the control plane materializes them; existing Pods do not
+reload those values. A later endpoint or embedded-CA change requires a coordinated
+cutover: stop accepting new lifecycle mutations, settle pending work under the
+old configuration, and let affected instances complete their normal sleep and
+cleanup. Change the control plane and caller configuration once those instances
+are Cold, then recreate their sidecars through normal wakes. Keep pending
+projections on their original configuration until settled; never rewrite a live
+Pod template to bypass its generation or desired-hash fence. Rotating the native
+server leaf under the same trusted CA does not itself change sidecar trust.
+
+Set `SLEEPYPODS_CERTIFICATE_SEALING_KEYS_FILE` to a restricted deployment file
+containing the following JSON shape. Each key is 32 random bytes encoded as
+64 hexadecimal characters; generate it using deployment secret tooling.
+
+```json
+{"active_id":"key-2026-09","keys":[{"id":"key-2026-09","key_hex":"<64 hexadecimal characters>"}]}
+```
+
+The file is limited to 8 KiB and the key ring to eight distinct IDs. The active
+ID must exist in that ring. All other entries remain available for decryption
+during a coordinated key rotation. Sealing keys require authenticated native
+TLS. Do not put them in application templates, database rows, logs or source
+control. Database backups without the corresponding sealing keys cannot restore
+certificate service.
 
 ## Common Tasks
 
@@ -524,6 +745,9 @@ Important environment variables:
 | control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR` optional |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` for local tests, or `static-bearer-token` for configured auth |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE`, `SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` for native platform TLS |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT` verified HTTPS endpoint for rendered sidecars when native TLS is enabled |
+| control plane | `SLEEPYPODS_CERTIFICATE_SEALING_KEYS_FILE` external key ring for certificate storage |
 | control plane | `SLEEPYPODS_STORE_PROVIDER=postgres` |
 | control plane | `SLEEPYPODS_POSTGRES_URL` |
 | control plane | `SLEEPYPODS_CLUSTER_ID`, `SLEEPYPODS_NAMESPACE` |
@@ -531,11 +755,10 @@ Important environment variables:
 | frontline | `SLEEPYPODS_FRONTLINE_LISTEN_ADDR` |
 | frontline | `SLEEPYPODS_CONTROL_PLANE_ENDPOINT` |
 | frontline | `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN` when control-plane static auth is enabled |
-| frontline | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN` when HTTP-01 challenge serving is enabled under static auth |
+| control plane / frontline / sidecar | `SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM` optional public trust for a private platform CA; control plane injects it into rendered sidecars |
 | frontline | `SLEEPYPODS_ROUTE_CACHE_CAPACITY` optional, default `1024` |
 | frontline | `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS` optional, default `30000` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
-| frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS` as `sni|cert|key;...` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 | sidecar | rendered by the control plane: listen address, app port, instance ID, generation, downward-API `SLEEPYPODS_POD_UID`, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |

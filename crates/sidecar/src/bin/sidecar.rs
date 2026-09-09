@@ -16,7 +16,6 @@ use sleepypods_api::{
     OptionalBearerTokenInterceptor,
 };
 use sleepypods_types::{Generation, InstanceId};
-use tonic::transport::Endpoint;
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -43,8 +42,11 @@ fn run_with_runtime(
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let env = EnvConfig::from_env()?;
     let setup_timeout = env.runtime.admission().config().setup_timeout();
-    let endpoint =
-        Endpoint::from_shared(env.control_plane_endpoint.clone())?.connect_timeout(setup_timeout);
+    let endpoint = sleepypods_api::transport::native_endpoint(
+        env.control_plane_endpoint.clone(),
+        env.control_plane_ca_pem.as_deref(),
+    )?
+    .connect_timeout(setup_timeout);
     let shutdown = Shutdown::new();
     let shutdown_task = spawn_shutdown_signal(shutdown.clone())?;
     let result = run_with_connection(env, async move { endpoint.connect().await }, shutdown).await;
@@ -213,6 +215,7 @@ struct EnvConfig {
     runtime_mode: SidecarRuntimeMode,
     pod_uid: String,
     control_plane_endpoint: String,
+    control_plane_ca_pem: Option<String>,
     control_plane_sidecar_token: Option<BearerToken>,
     metrics_listen_addr: Option<SocketAddr>,
     readiness_listen_addr: Option<SocketAddr>,
@@ -229,6 +232,8 @@ impl EnvConfig {
             return Err(Box::new(MissingEnvVar("SLEEPYPODS_POD_UID")));
         }
         let control_plane_endpoint = required_env("SLEEPYPODS_CONTROL_PLANE_ENDPOINT")?;
+        let control_plane_ca_pem =
+            env::var(sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV).ok();
         let control_plane_sidecar_token =
             optional_bearer_token("SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN")?;
         let idle_timeout = duration_from_env_ms("SLEEPYPODS_IDLE_TIMEOUT_MS", 300_000)?;
@@ -266,6 +271,7 @@ impl EnvConfig {
             runtime_mode,
             pod_uid,
             control_plane_endpoint,
+            control_plane_ca_pem,
             control_plane_sidecar_token,
             metrics_listen_addr,
             readiness_listen_addr,

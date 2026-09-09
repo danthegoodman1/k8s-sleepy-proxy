@@ -43,6 +43,12 @@ use super::template::{
 pub const OPERATOR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.OperatorControlPlane";
 
 pub const OPERATOR_UNARY_METHODS: &[&str] = &[
+    "ReencryptCertificate",
+    "RemoveCertificate",
+    "GetTlsBinding",
+    "SetTlsBinding",
+    "GetCertificateMetadata",
+    "PublishCertificate",
     "CreateWorkloadClassVersion",
     "GetWorkloadClassVersion",
     "CreateInstance",
@@ -52,7 +58,6 @@ pub const OPERATOR_UNARY_METHODS: &[&str] = &[
     "GetRouteBinding",
     "DeleteRouteBinding",
     "PutHttp01Challenge",
-    "ResolveHttp01Challenge",
     "DeleteHttp01Challenge",
     "ExpireHttp01Challenges",
     "ReconcileMaterialization",
@@ -220,6 +225,54 @@ fn placeholder_status(method: &'static str) -> Status {
 
 #[tonic::async_trait]
 impl OperatorControlPlane for OperatorApiPlaceholder {
+    async fn publish_certificate(
+        &self,
+        request: Request<pb::PublishCertificateRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
+        Err(placeholder_status("publish_certificate"))
+    }
+
+    async fn get_certificate_metadata(
+        &self,
+        request: Request<pb::GetCertificateMetadataRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
+        Err(placeholder_status("get_certificate_metadata"))
+    }
+
+    async fn set_tls_binding(
+        &self,
+        request: Request<pb::SetTlsBindingRequest>,
+    ) -> Result<Response<pb::TlsBinding>, Status> {
+        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
+        Err(placeholder_status("set_tls_binding"))
+    }
+
+    async fn get_tls_binding(
+        &self,
+        request: Request<pb::GetTlsBindingRequest>,
+    ) -> Result<Response<pb::TlsBinding>, Status> {
+        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
+        Err(placeholder_status("get_tls_binding"))
+    }
+
+    async fn remove_certificate(
+        &self,
+        request: Request<pb::RemoveCertificateRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
+        Err(placeholder_status("remove_certificate"))
+    }
+
+    async fn reencrypt_certificate(
+        &self,
+        request: Request<pb::ReencryptCertificateRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
+        Err(placeholder_status("reencrypt_certificate"))
+    }
+
     async fn create_workload_class_version(
         &self,
         _request: Request<pb::CreateWorkloadClassVersionRequest>,
@@ -283,13 +336,6 @@ impl OperatorControlPlane for OperatorApiPlaceholder {
         Err(placeholder_status("PutHttp01Challenge"))
     }
 
-    async fn resolve_http01_challenge(
-        &self,
-        _request: Request<pb::ResolveHttp01ChallengeRequest>,
-    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
-        Err(placeholder_status("ResolveHttp01Challenge"))
-    }
-
     async fn delete_http01_challenge(
         &self,
         _request: Request<pb::DeleteHttp01ChallengeRequest>,
@@ -331,6 +377,48 @@ impl<C> OperatorControlPlane for StoreBackedOperatorApi<C>
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    async fn publish_certificate(
+        &self,
+        request: Request<pb::PublishCertificateRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::publish(self.store.as_ref(), request).await
+    }
+
+    async fn get_certificate_metadata(
+        &self,
+        request: Request<pb::GetCertificateMetadataRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::get_metadata(self.store.as_ref(), request).await
+    }
+
+    async fn set_tls_binding(
+        &self,
+        request: Request<pb::SetTlsBindingRequest>,
+    ) -> Result<Response<pb::TlsBinding>, Status> {
+        super::certificates::set_binding(self.store.as_ref(), request).await
+    }
+
+    async fn get_tls_binding(
+        &self,
+        request: Request<pb::GetTlsBindingRequest>,
+    ) -> Result<Response<pb::TlsBinding>, Status> {
+        super::certificates::get_binding(self.store.as_ref(), request).await
+    }
+
+    async fn remove_certificate(
+        &self,
+        request: Request<pb::RemoveCertificateRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::remove(self.store.as_ref(), request).await
+    }
+
+    async fn reencrypt_certificate(
+        &self,
+        request: Request<pb::ReencryptCertificateRequest>,
+    ) -> Result<Response<pb::CertificateMetadata>, Status> {
+        super::certificates::reencrypt(self.store.as_ref(), request).await
+    }
+
     async fn create_workload_class_version(
         &self,
         request: Request<pb::CreateWorkloadClassVersionRequest>,
@@ -497,28 +585,6 @@ where
             .map_err(store_error_to_status)?;
 
         Ok(Response::new(http01_to_proto(challenge)?))
-    }
-
-    async fn resolve_http01_challenge(
-        &self,
-        request: Request<pb::ResolveHttp01ChallengeRequest>,
-    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
-        let key = request
-            .into_inner()
-            .key
-            .ok_or_else(|| Status::invalid_argument("key is required"))
-            .and_then(http01_key_from_proto)?;
-        let challenge = self
-            .store
-            .resolve_http01_challenge(key)
-            .await
-            .map_err(store_error_to_status)?
-            .map(http01_to_proto)
-            .transpose()?;
-
-        Ok(Response::new(pb::ResolveHttp01ChallengeResponse {
-            challenge,
-        }))
     }
 
     async fn delete_http01_challenge(
@@ -896,7 +962,7 @@ fn put_http01_request_from_proto(
     .map_err(invalid_argument_status)
 }
 
-fn http01_key_from_proto(
+pub(super) fn http01_key_from_proto(
     key: pb::Http01ChallengeKey,
 ) -> Result<domain_http01::Http01ChallengeKey, Status> {
     domain_http01::Http01ChallengeKey::new(key.host, key.token).map_err(invalid_argument_status)
@@ -1116,7 +1182,7 @@ fn instance_state_to_proto(state: InstanceState) -> pb::InstanceState {
     }
 }
 
-fn http01_to_proto(
+pub(super) fn http01_to_proto(
     challenge: domain_http01::Http01ChallengeRecord,
 ) -> Result<pb::Http01Challenge, Status> {
     Ok(pb::Http01Challenge {
@@ -1186,7 +1252,7 @@ fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
     Status::invalid_argument(error.to_string())
 }
 
-fn store_error_to_status(error: StoreError) -> Status {
+pub(super) fn store_error_to_status(error: StoreError) -> Status {
     match error {
         StoreError::SleepDeferred { retry_after } => {
             let mut status = Status::failed_precondition(format!(

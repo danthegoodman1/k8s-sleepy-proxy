@@ -3,6 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PROTOC", protoc);
 
     tonic_prost_build::configure()
+        .skip_debug([".sleepypods.controlplane.v1.CertificateBundle"])
         .type_attribute(
             ".sleepypods.controlplane.v1.PersistentVolumeSourceTemplate.kind",
             "#[allow(clippy::large_enum_variant)]",

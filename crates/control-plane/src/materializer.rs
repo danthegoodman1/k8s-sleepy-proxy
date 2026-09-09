@@ -124,6 +124,8 @@ pub trait KubernetesMaterializerClient: Send + Sync {
 pub struct KubernetesMaterializer<C> {
     client: C,
     sidecar_control_plane_token: Option<BearerToken>,
+    sidecar_control_plane_endpoint: Option<String>,
+    sidecar_control_plane_ca: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +181,25 @@ where
         Self {
             client,
             sidecar_control_plane_token: None,
+            sidecar_control_plane_endpoint: None,
+            sidecar_control_plane_ca: None,
+        }
+    }
+
+    pub(crate) fn with_sidecar_control_plane_transport(
+        mut self,
+        endpoint: Option<String>,
+        ca: Option<String>,
+    ) -> Self {
+        self.sidecar_control_plane_endpoint = endpoint;
+        self.sidecar_control_plane_ca = ca;
+        self
+    }
+    pub(crate) fn render_options(&self) -> crate::manifest::RenderManifestOptions<'_> {
+        crate::manifest::RenderManifestOptions {
+            sidecar_control_plane_token: self.sidecar_control_plane_token.as_ref(),
+            sidecar_control_plane_endpoint: self.sidecar_control_plane_endpoint.as_deref(),
+            sidecar_control_plane_ca: self.sidecar_control_plane_ca.as_deref(),
         }
     }
 
@@ -191,6 +212,7 @@ where
         &self.client
     }
 
+    #[cfg(test)]
     pub(crate) fn sidecar_control_plane_token(&self) -> Option<&BearerToken> {
         self.sidecar_control_plane_token.as_ref()
     }

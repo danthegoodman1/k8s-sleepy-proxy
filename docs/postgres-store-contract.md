@@ -64,7 +64,7 @@ to its retry policy.
 
 ## Required capabilities and automatic retries
 
-`ControlPlaneStore` requires all 44 persistence capabilities at compile time.
+`ControlPlaneStore` requires every persistence capability at compile time.
 PostgreSQL and `RetryingControlPlaneStore` implement every method explicitly;
 production implementations cannot inherit runtime "unsupported" behavior.
 
@@ -87,6 +87,9 @@ The following mutations run once and return uncertain errors to their caller:
   incarnation/attempt fence for replay after another worker advances the row.
 - Beginning a Kubernetes effect: an uncertain durable begin must not authorize
   another dispatch. Exact effect acknowledgement remains safe to retry.
+- Certificate publication/removal, hostname binding changes and key
+  re-encryption: an uncertain response requires reading current metadata and
+  deciding whether another conditional mutation is appropriate.
 
 Callers must inspect current state before deciding how to resolve these uncertain
 outcomes. A one-shot mutation can consequently report `Unavailable` after it
@@ -198,3 +201,109 @@ failed cleanup and unresolved effects keep inventory/exclusivity. Admin enqueue
 uses the same state/barrier/grace rules. The operation deadline is persisted at
 phase entry using the connection's validated `SLEEPYPODS_OPERATION_TIMEOUT_MS`
 (default 600000); restarting or renewing a lease does not extend it.
+
+Status reads sample the remaining operation duration with the database clock.
+The worker deducts monotonic elapsed time from the start of that status request,
+including pool wait, retries and response delivery. It does not subtract a
+process wall clock from a database timestamp. This can cancel work conservatively
+early; local cancellation may remain a transient failure until database time
+reaches the persisted deadline. Failure publication compares the deadline and
+lease against fresh database time after acquiring its row locks, so a lock wait
+cannot preserve an obsolete pre-deadline classification.
+
+## Certificate resources and ordered changes (migration 11)
+
+Application certificates and exact hostname TLS bindings are separate from
+routes and lifecycle state. Publication accepts a bounded, leaf-first DER chain
+and PKCS#8 private key. Validation checks current chain validity, TLS server-auth
+usage, matching key, ordered signatures and standards-based DNS SAN coverage.
+The supplied terminal certificate is a private trust anchor; publication does
+not require a public CA. Usable validity is the intersection of the validated
+chain's intervals. Exact binding names use canonical ASCII DNS/A-label syntax;
+wildcard certificates may cover explicitly bound names, but wildcard binding
+lookup is unsupported.
+
+All certificate-domain mutations first acquire the
+`tls_certificate_revision` singleton row lock, then read or change resource
+rows. The lock remains held until commit or rollback. This deliberately
+serializes infrequent certificate administration, closes rotation-versus-binding
+SAN races, and establishes commit-ordered change visibility independently of
+route/lifecycle transactions. Resolve reads binding, certificate and observation
+time in one joined statement. Subsequent changes are handled by the certificate
+notification/freshness contract; a snapshot cannot promise future authorization.
+
+Certificate versions are conditional mutation fences. Version zero creates a
+never-used ID; removal permanently retires the ID and atomically erases its
+stored chain and private-key envelope. Hostname rows and their revisions survive
+unbinding. Rotation, removal and rebinding advance affected hostname revisions,
+so a lower certificate version on a different resource cannot be mistaken for an
+older view. Rotation validates every current binding before changing anything.
+At most 1,024 hostnames may reference one certificate, bounding validation and
+binding updates. A failed mutation rolls back its revision changes too.
+
+Each binding also retains a `last_invalidating_revision`. Binding mutations
+(including same-ID binding) and removal advance it atomically with the view
+revision; ordinary publication/rotation preserves it. It records the most recent
+destructive transition even when several mutations occur between watch polls.
+A proxy compares it against its retained configuration's actual view revision,
+not its possibly newer notification floor.
+
+`snapshot_tls_bindings` reads up to 1,024 requested bindings and a private global
+revision in one SQL snapshot, without loading or decrypting bundles. The optional
+known global revision skips the scoped hostname query only on equality; a forced
+registration always returns a complete snapshot. Native watches periodically
+perform this conditional read and push changed snapshots. The global revision
+stays on the server as a read optimization; per-host revisions alone fence views.
+There is no certificate event outbox, history retention, pagination or reset path.
+Snapshots and operator metadata contain no private key material.
+
+Private keys use a versioned AES-256-GCM envelope. Associated data includes the
+certificate ID/version, sealing key ID and a digest of the complete chain.
+Deployment-provided active/read keys remain outside PostgreSQL; there is no
+default sealing key. Re-encryption handles one certificate per call and requires
+both its logical version and sealing revision. It changes only the envelope and
+sealing revision, preserving the logical certificate and hostname view. Old
+sealing keys remain read-capable while every control-plane writer is rolled to
+the new active key ID. Only then re-encrypt/check live records; an old-configured
+writer could otherwise publish new material under the old key after that check.
+Settle in-flight or ambiguous database writes from old-key writers before the
+final check and key retirement; a disconnected caller or stopped transport alone
+does not rule out a queued commit completing later.
+Keep each old key available for as long as required live records or retained
+backups need it. The store's row CAS does not coordinate deployment keyring
+configuration. An unavailable key or failed authentication is an error, never
+an authoritative certificate miss.
+
+Certificate writes are one-shot through the retry wrapper. Callers inspect
+metadata after an uncertain outcome before choosing a new conditional write.
+Certificate metadata, bindings, resolution and snapshot reads retain bounded
+read retries. Certificate operations have their own local admission limit of
+`min(4, pool_capacity - 1)` and two blocking-crypto slots, preserving an ordinary
+pool slot. Sealing-enabled runtime configuration requires at least two pool
+connections. Cancellation retains the operation permit during blocking work and
+while a checked-out session drains sent SQL and queued rollback. The drain has a
+five-second local timeout; only a successful protocol round trip returns the
+session to the pool. Failure, timeout or task cancellation discards its transport.
+This bounds admitted local work and session reuse; remote statement termination
+still depends on PostgreSQL and its configured statement timeout.
+
+Certificate snapshot reads have an additional one-slot watch limit per
+store. Admission allows at most 17 active or queued calls: 16 native producer
+calls plus one previous logical read whose detached protocol drain still owns
+the watch slot. A producer can queue its next poll before that drain finishes.
+The 17-call bound includes that overlap without admitting another concurrent
+watch SQL operation.
+
+Admitted calls wait in Tokio's FIFO semaphore under a three-second bound, then
+acquire ordinary certificate and database capacity. Queued calls own no ordinary
+operation permit or database connection; cancellation removes their queued
+ownership. The producer's fixed setup/query deadline still bounds the whole
+operation and is not renewed by admission or retries. The active call retains
+its admission, watch and operation permits together through connection checkout,
+SQL, protocol drain and discard. Canceling it cannot release capacity while
+SQL/session cleanup remains outstanding. Ordinary certificate operations retain
+the other default slots; the two-connection minimum still preserves one ordinary
+route/lifecycle connection.
+
+The [dynamic certificate plan](dynamic-certificates-plan.md) tracks
+the implementation and actual database validation evidence.

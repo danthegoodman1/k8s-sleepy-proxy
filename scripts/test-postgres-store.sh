@@ -4,12 +4,17 @@ set -euo pipefail
 postgres_image="${SLEEPYPODS_POSTGRES_IMAGE:-postgres:17-alpine}"
 ready_timeout="${SLEEPYPODS_POSTGRES_READY_TIMEOUT:-60}"
 container_id=""
+postgres_log=""
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 postgres_url="${SLEEPYPODS_POSTGRES_URL:-}"
 
 cleanup() {
   local status=$?
   if [[ -n "${container_id}" ]]; then
     docker rm -f "${container_id}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${postgres_log}" ]]; then
+    rm -f "${postgres_log}"
   fi
   exit "${status}"
 }
@@ -60,4 +65,6 @@ else
 fi
 
 echo "Running Postgres store conformance against a real database"
-SLEEPYPODS_POSTGRES_URL="${postgres_url}" cargo test -p control-plane --test postgres_store -- --nocapture
+postgres_log="$(mktemp "${TMPDIR:-/tmp}/sleepypods-postgres-store.XXXXXX")"
+SLEEPYPODS_POSTGRES_URL="${postgres_url}" cargo test --locked -p control-plane --test postgres_store -- --nocapture --color never 2>&1 | tee "${postgres_log}"
+python3 "${script_dir}/check-postgres-execution.py" "${postgres_log}"

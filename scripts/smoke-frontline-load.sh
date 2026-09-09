@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/lib/load-budget.sh"
+source "${repo_root}/scripts/lib/native-tls-fixture.sh"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-dev}"
 frontline_image="${SLEEPYPODS_FRONTLINE_IMAGE:-${image_prefix}/frontline:${image_tag}}"
@@ -116,6 +117,7 @@ require_route_path() {
 }
 
 require_command awk
+require_command openssl
 require_command cargo
 require_command curl
 require_command docker
@@ -178,7 +180,7 @@ tls_key_path="${tls_cert_dir}/frontline-load-smoke.key"
 
 cleanup() {
   rm -f "${direct_output_file}" "${frontline_output_file}" "${grpc_direct_output_file}" "${grpc_frontline_output_file}" "${h2_tls_grpc_direct_output_file}" "${h2_tls_grpc_frontline_output_file}" "${real_grpc_direct_output_file}" "${real_grpc_frontline_output_file}" "${websocket_direct_output_file}" "${websocket_frontline_output_file}" "${cold_frontline_output_file}" "${tls_cert_path}" "${tls_key_path}"
-  rmdir "${tls_cert_dir}" >/dev/null 2>&1 || true
+  rm -rf -- "${tls_cert_dir}"
   docker rm -f "${frontline_name}" "${helper_name}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -371,7 +373,10 @@ read_backend_http_requests() {
 echo "Building local frontline load-smoke client"
 cargo build -p frontline --example frontline_load_smoke
 
-echo "Generating temporary frontline TLS certificate"
+generate_native_tls_fixture "${tls_cert_dir}/platform" "load-control-plane.test"
+proxy_token="$(cat "${tls_cert_dir}/platform/proxy.token")"
+platform_ca="$(cat "${tls_cert_dir}/platform/cp.crt")"
+echo "Generating application material for the native certificate-delivery fixture"
 "${client_bin}" cert \
   --host "${route_host}" \
   --cert-path "${tls_cert_path}" \
@@ -398,6 +403,13 @@ fi
 echo "Starting frontline load-smoke helper"
 docker run -d \
   --name "${helper_name}" \
+  --user "$(id -u):$(id -g)" \
+  --volume "${tls_cert_dir}:/control-plane-fixture:ro" \
+  --env "SLEEPYPODS_LOAD_SMOKE_CP_CERT_FILE=/control-plane-fixture/platform/cp.crt" \
+  --env "SLEEPYPODS_LOAD_SMOKE_CP_KEY_FILE=/control-plane-fixture/platform/cp.key" \
+  --env "SLEEPYPODS_LOAD_SMOKE_APP_CERT_FILE=/control-plane-fixture/$(basename "${tls_cert_path}")" \
+  --env "SLEEPYPODS_LOAD_SMOKE_APP_KEY_FILE=/control-plane-fixture/$(basename "${tls_key_path}")" \
+  --env "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN=${proxy_token}" \
   --publish "127.0.0.1::${backend_container_port}" \
   --publish "127.0.0.1::${grpc_backend_container_port}" \
   --publish "127.0.0.1::${frontline_container_port}" \
@@ -432,11 +444,11 @@ echo "Starting ${frontline_image}"
 docker run -d \
   --name "${frontline_name}" \
   --network "container:${helper_name}" \
-  --volume "${tls_cert_dir}:/load-smoke-tls:ro" \
   --env "SLEEPYPODS_FRONTLINE_LISTEN_ADDR=0.0.0.0:${frontline_container_port}" \
   --env "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR=0.0.0.0:${frontline_tls_container_port}" \
-  --env "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS=${route_host}|/load-smoke-tls/$(basename "${tls_cert_path}")|/load-smoke-tls/$(basename "${tls_key_path}")" \
-  --env "SLEEPYPODS_CONTROL_PLANE_ENDPOINT=http://127.0.0.1:${control_plane_container_port}" \
+  --env "SLEEPYPODS_CONTROL_PLANE_ENDPOINT=https://127.0.0.1:${control_plane_container_port}" \
+  --env "SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM=${platform_ca}" \
+  --env "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN=${proxy_token}" \
   --env "SLEEPYPODS_ROUTE_CACHE_CAPACITY=32" \
   --env "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS=5000" \
   "${frontline_image}" >/dev/null

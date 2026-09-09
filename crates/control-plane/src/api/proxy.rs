@@ -146,7 +146,7 @@ where
         ObservabilityRecorder::global(),
         route_events,
     ))
-    .max_decoding_message_size(256 * 1024)
+    .max_decoding_message_size(512 * 1024)
     .max_encoding_message_size(1024 * 1024)
 }
 
@@ -156,6 +156,43 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     type SubscribeStream = ProxySubscribeResponseStream;
+    type WatchTlsCertificatesStream = super::certificate_watch::WatchStream;
+    async fn watch_tls_certificates(
+        &self,
+        request: Request<tonic::Streaming<pb::WatchTlsCertificatesRequest>>,
+    ) -> Result<Response<Self::WatchTlsCertificatesStream>, Status> {
+        super::certificate_watch::watch(self.store.clone(), self.route_events.clone(), request)
+            .await
+    }
+
+    async fn resolve_http01_challenge(
+        &self,
+        request: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("key is required"))
+            .and_then(super::server::http01_key_from_proto)?;
+        let challenge = self
+            .store
+            .resolve_http01_challenge(key)
+            .await
+            .map_err(super::server::store_error_to_status)?
+            .map(super::server::http01_to_proto)
+            .transpose()?;
+
+        Ok(Response::new(pb::ResolveHttp01ChallengeResponse {
+            challenge,
+        }))
+    }
+
+    async fn resolve_tls_certificate(
+        &self,
+        request: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        super::certificates::resolve(self.store.as_ref(), request).await
+    }
 
     async fn wake_instance(
         &self,

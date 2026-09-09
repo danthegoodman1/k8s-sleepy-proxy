@@ -3,22 +3,16 @@ use std::{
     env,
     error::Error,
     fmt,
-    fs::File,
-    io::{self, BufReader},
     net::{AddrParseError, SocketAddr},
     num::ParseIntError,
-    path::{Path, PathBuf},
     time::Duration,
 };
-
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use sleepypods_api::{BearerToken, InvalidBearerToken};
 
 use crate::{
     FrontlineHttpListenerConfig, FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
-    FrontlineTlsTerminationListenerConfig, RequestIdentityError, TlsCertificateError,
-    TlsCertificateStore,
+    FrontlineTlsTerminationListenerConfig,
 };
 
 const DEFAULT_ROUTE_CACHE_CAPACITY: usize = 1024;
@@ -29,34 +23,24 @@ const ROUTE_TIMEOUT_MS: &str = "SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS";
 const FRONTLINE_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_LISTEN_ADDR";
 const CONTROL_PLANE_ENDPOINT: &str = "SLEEPYPODS_CONTROL_PLANE_ENDPOINT";
 const CONTROL_PLANE_PROXY_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN";
-const CONTROL_PLANE_OPERATOR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN";
 const ROUTE_CACHE_CAPACITY: &str = "SLEEPYPODS_ROUTE_CACHE_CAPACITY";
 const DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const WAKE_INSTANCE_TIMEOUT_MS: &str = "SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS";
 const TLS_TERMINATION_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR";
-const TLS_TERMINATION_CERTS: &str = "SLEEPYPODS_FRONTLINE_TLS_TERMINATION_CERTS";
 const TLS_PASSTHROUGH_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR";
 const METRICS_LISTEN_ADDR: &str = "SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontlineEnvConfig {
     listeners: FrontlineListenersConfig,
-    tls_certificates: Vec<FrontlineTlsCertificateConfig>,
     control_plane_endpoint: String,
     control_plane_proxy_token: Option<BearerToken>,
-    control_plane_operator_token: Option<BearerToken>,
+    control_plane_ca_pem: Option<String>,
     route_cache_capacity: usize,
     drain_grace_timeout: Duration,
     wake_instance_timeout: Duration,
     route_timeout: Duration,
     metrics_listen_addr: Option<SocketAddr>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrontlineTlsCertificateConfig {
-    sni: String,
-    certificate_path: PathBuf,
-    private_key_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -81,44 +65,10 @@ pub enum FrontlineEnvConfigError {
         value: String,
         source: ParseIntError,
     },
-    InvalidTlsCertificates {
-        name: &'static str,
-        value: String,
-        reason: String,
-    },
+    InvalidCertificateDelivery,
     InvalidControlPlaneBearerToken {
         name: &'static str,
         source: InvalidBearerToken,
-    },
-}
-
-#[derive(Debug)]
-pub enum FrontlineTlsCertificateLoadError {
-    OpenCertificate {
-        path: PathBuf,
-        source: io::Error,
-    },
-    ParseCertificate {
-        path: PathBuf,
-        source: io::Error,
-    },
-    MissingCertificate {
-        path: PathBuf,
-    },
-    OpenPrivateKey {
-        path: PathBuf,
-        source: io::Error,
-    },
-    ParsePrivateKey {
-        path: PathBuf,
-        source: io::Error,
-    },
-    MissingPrivateKey {
-        path: PathBuf,
-    },
-    Store {
-        sni: String,
-        source: TlsCertificateError,
     },
 }
 
@@ -148,8 +98,9 @@ impl FrontlineEnvConfig {
         })?;
         let control_plane_endpoint = required(&vars, CONTROL_PLANE_ENDPOINT)?;
         let control_plane_proxy_token = optional_bearer_token(&vars, CONTROL_PLANE_PROXY_TOKEN)?;
-        let control_plane_operator_token =
-            optional_bearer_token(&vars, CONTROL_PLANE_OPERATOR_TOKEN)?;
+        let control_plane_ca_pem = vars
+            .get(sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV)
+            .cloned();
         let route_cache_capacity =
             optional_usize(&vars, ROUTE_CACHE_CAPACITY, DEFAULT_ROUTE_CACHE_CAPACITY)?;
         let drain_grace_timeout = optional_duration_ms(
@@ -170,7 +121,17 @@ impl FrontlineEnvConfig {
             .map(|listener| FrontlineTlsPassthroughListenerConfig::new(listener.listen_addr()));
         let metrics_listen_addr = optional_listener_config(&vars, METRICS_LISTEN_ADDR)?
             .map(|listener| listener.listen_addr());
-        let tls_certificates = optional_tls_certificates(&vars, tls_termination.is_some())?;
+        if tls_termination.is_some()
+            && (!control_plane_endpoint.starts_with("https://")
+                || control_plane_proxy_token.is_none()
+                || sleepypods_api::transport::native_endpoint(
+                    control_plane_endpoint.clone(),
+                    control_plane_ca_pem.as_deref(),
+                )
+                .is_err())
+        {
+            return Err(FrontlineEnvConfigError::InvalidCertificateDelivery);
+        }
         let listeners = FrontlineListenersConfig::new(
             FrontlineHttpListenerConfig::new(listen_addr).with_resource_config(
                 proxy_core::ProxyResourceConfig::from_vars(|name| vars.get(name).cloned())
@@ -187,10 +148,9 @@ impl FrontlineEnvConfig {
 
         Ok(Self {
             listeners,
-            tls_certificates,
             control_plane_endpoint,
             control_plane_proxy_token,
-            control_plane_operator_token,
+            control_plane_ca_pem,
             route_cache_capacity,
             drain_grace_timeout,
             wake_instance_timeout,
@@ -215,34 +175,6 @@ impl FrontlineEnvConfig {
         self.listeners.tls_passthrough()
     }
 
-    pub fn tls_certificates(&self) -> &[FrontlineTlsCertificateConfig] {
-        &self.tls_certificates
-    }
-
-    pub fn load_tls_certificate_store(
-        &self,
-    ) -> Result<Option<TlsCertificateStore>, FrontlineTlsCertificateLoadError> {
-        if self.tls_certificates.is_empty() {
-            return Ok(None);
-        }
-
-        let store = TlsCertificateStore::new();
-        for certificate in &self.tls_certificates {
-            store
-                .upsert(
-                    &certificate.sni,
-                    load_certificate_chain(&certificate.certificate_path)?,
-                    load_private_key(&certificate.private_key_path)?,
-                )
-                .map_err(|source| FrontlineTlsCertificateLoadError::Store {
-                    sni: certificate.sni.clone(),
-                    source,
-                })?;
-        }
-
-        Ok(Some(store))
-    }
-
     pub fn control_plane_endpoint(&self) -> &str {
         &self.control_plane_endpoint
     }
@@ -251,8 +183,8 @@ impl FrontlineEnvConfig {
         self.control_plane_proxy_token.as_ref()
     }
 
-    pub fn control_plane_operator_token(&self) -> Option<&BearerToken> {
-        self.control_plane_operator_token.as_ref()
+    pub fn control_plane_ca_pem(&self) -> Option<&str> {
+        self.control_plane_ca_pem.as_deref()
     }
 
     pub fn route_cache_capacity(&self) -> usize {
@@ -273,35 +205,6 @@ impl FrontlineEnvConfig {
 
     pub fn metrics_listen_addr(&self) -> Option<SocketAddr> {
         self.metrics_listen_addr
-    }
-}
-
-impl FrontlineTlsCertificateConfig {
-    pub fn new(
-        sni: impl Into<String>,
-        certificate_path: impl Into<PathBuf>,
-        private_key_path: impl Into<PathBuf>,
-    ) -> Result<Self, RequestIdentityError> {
-        let sni = sni.into();
-        crate::RouteRequestIdentity::sni(&sni)?;
-
-        Ok(Self {
-            sni,
-            certificate_path: certificate_path.into(),
-            private_key_path: private_key_path.into(),
-        })
-    }
-
-    pub fn sni(&self) -> &str {
-        &self.sni
-    }
-
-    pub fn certificate_path(&self) -> &Path {
-        &self.certificate_path
-    }
-
-    pub fn private_key_path(&self) -> &Path {
-        &self.private_key_path
     }
 }
 
@@ -358,63 +261,6 @@ fn optional_tls_termination_listener_config(
     })
 }
 
-fn optional_tls_certificates(
-    vars: &HashMap<String, String>,
-    tls_termination_enabled: bool,
-) -> Result<Vec<FrontlineTlsCertificateConfig>, FrontlineEnvConfigError> {
-    match (vars.get(TLS_TERMINATION_CERTS), tls_termination_enabled) {
-        (None, false) => Ok(Vec::new()),
-        (None, true) => Err(FrontlineEnvConfigError::Missing {
-            name: TLS_TERMINATION_CERTS,
-        }),
-        (Some(_), false) => Err(FrontlineEnvConfigError::Missing {
-            name: TLS_TERMINATION_LISTEN_ADDR,
-        }),
-        (Some(value), true) => parse_tls_certificates(value),
-    }
-}
-
-fn parse_tls_certificates(
-    value: &str,
-) -> Result<Vec<FrontlineTlsCertificateConfig>, FrontlineEnvConfigError> {
-    let mut certificates = Vec::new();
-    for raw_entry in value.split(';') {
-        let entry = raw_entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<&str> = entry.split('|').map(str::trim).collect();
-        if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
-            return Err(invalid_tls_certificates(
-                value,
-                "entries must use sni|certificate_path|private_key_path",
-            ));
-        }
-
-        let certificate = FrontlineTlsCertificateConfig::new(parts[0], parts[1], parts[2])
-            .map_err(|error| invalid_tls_certificates(value, error.to_string()))?;
-        certificates.push(certificate);
-    }
-
-    if certificates.is_empty() {
-        return Err(invalid_tls_certificates(
-            value,
-            "at least one TLS certificate entry is required",
-        ));
-    }
-
-    Ok(certificates)
-}
-
-fn invalid_tls_certificates(value: &str, reason: impl Into<String>) -> FrontlineEnvConfigError {
-    FrontlineEnvConfigError::InvalidTlsCertificates {
-        name: TLS_TERMINATION_CERTS,
-        value: value.to_owned(),
-        reason: reason.into(),
-    }
-}
-
 fn optional_duration_ms(
     vars: &HashMap<String, String>,
     name: &'static str,
@@ -448,52 +294,6 @@ fn optional_bearer_token(
         .map_err(|source| FrontlineEnvConfigError::InvalidControlPlaneBearerToken { name, source })
 }
 
-fn load_certificate_chain(
-    path: &Path,
-) -> Result<Vec<CertificateDer<'static>>, FrontlineTlsCertificateLoadError> {
-    let file =
-        File::open(path).map_err(|source| FrontlineTlsCertificateLoadError::OpenCertificate {
-            path: path.to_owned(),
-            source,
-        })?;
-    let mut reader = BufReader::new(file);
-    let certificates = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(
-            |source| FrontlineTlsCertificateLoadError::ParseCertificate {
-                path: path.to_owned(),
-                source,
-            },
-        )?;
-    if certificates.is_empty() {
-        return Err(FrontlineTlsCertificateLoadError::MissingCertificate {
-            path: path.to_owned(),
-        });
-    }
-
-    Ok(certificates)
-}
-
-fn load_private_key(
-    path: &Path,
-) -> Result<PrivateKeyDer<'static>, FrontlineTlsCertificateLoadError> {
-    let file =
-        File::open(path).map_err(|source| FrontlineTlsCertificateLoadError::OpenPrivateKey {
-            path: path.to_owned(),
-            source,
-        })?;
-    let mut reader = BufReader::new(file);
-
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|source| FrontlineTlsCertificateLoadError::ParsePrivateKey {
-            path: path.to_owned(),
-            source,
-        })?
-        .ok_or_else(|| FrontlineTlsCertificateLoadError::MissingPrivateKey {
-            path: path.to_owned(),
-        })
-}
-
 impl fmt::Display for FrontlineEnvConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -514,46 +314,9 @@ impl fmt::Display for FrontlineEnvConfigError {
                     "{name} must be a duration in milliseconds, got {value:?}"
                 )
             }
-            Self::InvalidTlsCertificates {
-                name,
-                value,
-                reason,
-            } => {
-                write!(
-                    f,
-                    "{name} must be TLS certificate entries, got {value:?}: {reason}"
-                )
-            }
+            Self::InvalidCertificateDelivery => f.write_str("TLS termination requires verified HTTPS control-plane delivery and a proxy credential"),
             Self::InvalidControlPlaneBearerToken { name, source } => {
                 write!(f, "{name} is not a valid bearer token: {source}")
-            }
-        }
-    }
-}
-
-impl fmt::Display for FrontlineTlsCertificateLoadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OpenCertificate { path, source } => {
-                write!(f, "failed to open TLS certificate {:?}: {source}", path)
-            }
-            Self::ParseCertificate { path, source } => {
-                write!(f, "failed to parse TLS certificate {:?}: {source}", path)
-            }
-            Self::MissingCertificate { path } => {
-                write!(f, "TLS certificate file {:?} has no certificate", path)
-            }
-            Self::OpenPrivateKey { path, source } => {
-                write!(f, "failed to open TLS private key {:?}: {source}", path)
-            }
-            Self::ParsePrivateKey { path, source } => {
-                write!(f, "failed to parse TLS private key {:?}: {source}", path)
-            }
-            Self::MissingPrivateKey { path } => {
-                write!(f, "TLS private key file {:?} has no private key", path)
-            }
-            Self::Store { sni, source } => {
-                write!(f, "failed to store TLS certificate for {sni:?}: {source}")
             }
         }
     }
@@ -570,20 +333,7 @@ impl Error for FrontlineEnvConfigError {
             Self::InvalidControlPlaneBearerToken { source, .. } => Some(source),
             Self::InitialActivationBudgetExceeded
             | Self::Missing { .. }
-            | Self::InvalidTlsCertificates { .. } => None,
-        }
-    }
-}
-
-impl Error for FrontlineTlsCertificateLoadError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::OpenCertificate { source, .. }
-            | Self::ParseCertificate { source, .. }
-            | Self::OpenPrivateKey { source, .. }
-            | Self::ParsePrivateKey { source, .. } => Some(source),
-            Self::Store { source, .. } => Some(source),
-            Self::MissingCertificate { .. } | Self::MissingPrivateKey { .. } => None,
+            | Self::InvalidCertificateDelivery => None,
         }
     }
 }
@@ -605,10 +355,6 @@ pub(crate) fn initial_activation_budget_valid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        sync::atomic::{AtomicU64, Ordering},
-    };
 
     #[test]
     fn initial_activation_budget_checks_route_and_both_setup_bounds() {
@@ -655,7 +401,7 @@ mod tests {
         );
         assert_eq!(config.control_plane_endpoint(), "http://127.0.0.1:50051");
         assert!(config.control_plane_proxy_token().is_none());
-        assert!(config.control_plane_operator_token().is_none());
+        assert!(config.control_plane_ca_pem().is_none());
         assert_eq!(config.route_cache_capacity(), DEFAULT_ROUTE_CACHE_CAPACITY);
         assert_eq!(
             config.drain_grace_timeout(),
@@ -668,11 +414,6 @@ mod tests {
         assert!(config.tls_termination_listener().is_none());
         assert!(config.tls_passthrough_listener().is_none());
         assert_eq!(config.metrics_listen_addr(), None);
-        assert!(config.tls_certificates().is_empty());
-        assert!(config
-            .load_tls_certificate_store()
-            .expect("disabled TLS certificate store loads")
-            .is_none());
     }
 
     #[test]
@@ -681,7 +422,6 @@ mod tests {
             (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
             (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
             (CONTROL_PLANE_PROXY_TOKEN, "proxy-secret"),
-            (CONTROL_PLANE_OPERATOR_TOKEN, "operator-secret"),
             (ROUTE_CACHE_CAPACITY, "17"),
             (DRAIN_GRACE_TIMEOUT_MS, "250"),
             (WAKE_INSTANCE_TIMEOUT_MS, "750"),
@@ -698,16 +438,6 @@ mod tests {
                 .to_str()
                 .expect("ascii"),
             "Bearer proxy-secret"
-        );
-        assert_eq!(
-            config
-                .control_plane_operator_token()
-                .expect("operator token")
-                .authorization_header_value()
-                .expect("header value")
-                .to_str()
-                .expect("ascii"),
-            "Bearer operator-secret"
         );
         assert_eq!(config.route_cache_capacity(), 17);
         assert_eq!(config.drain_grace_timeout(), Duration::from_millis(250));
@@ -770,184 +500,36 @@ mod tests {
     }
 
     #[test]
-    fn tls_listener_values_parse_when_enabled() {
-        let config = FrontlineEnvConfig::from_vars([
-            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
-            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
-            (TLS_TERMINATION_LISTEN_ADDR, "127.0.0.1:8443"),
-            (
-                TLS_TERMINATION_CERTS,
-                " App.Example.COM. | /tmp/app-cert.pem | /tmp/app-key.pem ; db.example.com | /tmp/db-cert.pem | /tmp/db-key.pem ",
-            ),
-            (TLS_PASSTHROUGH_LISTEN_ADDR, "127.0.0.1:15432"),
-        ])
-        .expect("config parses");
-
-        assert_eq!(
-            config
-                .tls_termination_listener()
-                .expect("TLS termination listener")
-                .listen_addr(),
-            "127.0.0.1:8443".parse().unwrap()
-        );
-        assert_eq!(
-            config
-                .tls_passthrough_listener()
-                .expect("TLS passthrough listener")
-                .listen_addr(),
-            "127.0.0.1:15432".parse().unwrap()
-        );
-        assert_eq!(config.tls_certificates().len(), 2);
-        assert_eq!(config.tls_certificates()[0].sni(), "App.Example.COM.");
-        assert_eq!(
-            config.tls_certificates()[0].certificate_path(),
-            Path::new("/tmp/app-cert.pem")
-        );
-        assert_eq!(
-            config.tls_certificates()[0].private_key_path(),
-            Path::new("/tmp/app-key.pem")
-        );
+    fn empty_dynamic_cache_configuration_requires_verified_delivery() {
+        let parse = |endpoint, token| {
+            FrontlineEnvConfig::from_vars([
+                (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
+                (CONTROL_PLANE_ENDPOINT, endpoint),
+                (CONTROL_PLANE_PROXY_TOKEN, token),
+                (TLS_TERMINATION_LISTEN_ADDR, "127.0.0.1:8443"),
+            ])
+        };
+        let config = parse("https://control-plane.example:50051", "proxy-secret").unwrap();
+        assert!(config.tls_termination_listener().is_some());
+        assert!(parse("http://control-plane.example:50051", "proxy-secret").is_err());
+        assert!(parse("https://control-plane.example:50051", "").is_err());
+        assert!(parse("https://", "proxy-secret").is_err());
     }
 
     #[test]
-    fn tls_termination_listener_requires_certificate_entries() {
+    fn invalid_passthrough_address_is_reported() {
         let error = FrontlineEnvConfig::from_vars([
-            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
-            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
-            (TLS_TERMINATION_LISTEN_ADDR, "127.0.0.1:8443"),
-        ])
-        .expect_err("TLS certs are required when TLS termination is enabled");
-
-        assert!(matches!(
-            error,
-            FrontlineEnvConfigError::Missing {
-                name: TLS_TERMINATION_CERTS
-            }
-        ));
-    }
-
-    #[test]
-    fn tls_certificate_entries_require_tls_termination_listener() {
-        let error = FrontlineEnvConfig::from_vars([
-            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
-            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
-            (
-                TLS_TERMINATION_CERTS,
-                "app.example.com|/tmp/app-cert.pem|/tmp/app-key.pem",
-            ),
-        ])
-        .expect_err("TLS certs without listener are invalid");
-
-        assert!(matches!(
-            error,
-            FrontlineEnvConfigError::Missing {
-                name: TLS_TERMINATION_LISTEN_ADDR
-            }
-        ));
-    }
-
-    #[test]
-    fn invalid_tls_values_are_reported() {
-        let invalid_addr = FrontlineEnvConfig::from_vars([
             (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
             (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
             (TLS_PASSTHROUGH_LISTEN_ADDR, "not-an-addr"),
         ])
-        .expect_err("TLS passthrough addr is invalid");
+        .unwrap_err();
         assert!(matches!(
-            invalid_addr,
+            error,
             FrontlineEnvConfigError::InvalidSocketAddr {
                 name: TLS_PASSTHROUGH_LISTEN_ADDR,
                 ..
             }
         ));
-
-        let invalid_certs = FrontlineEnvConfig::from_vars([
-            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080"),
-            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051"),
-            (TLS_TERMINATION_LISTEN_ADDR, "127.0.0.1:8443"),
-            (TLS_TERMINATION_CERTS, "app.example.com|/tmp/app-cert.pem"),
-        ])
-        .expect_err("TLS certificate entry is invalid");
-        assert!(matches!(
-            invalid_certs,
-            FrontlineEnvConfigError::InvalidTlsCertificates {
-                name: TLS_TERMINATION_CERTS,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn tls_certificate_store_loads_from_pem_files() {
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec!["app.example.com".to_owned()])
-                .expect("cert generates");
-        let cert_path = unique_temp_path("cert.pem");
-        let key_path = unique_temp_path("key.pem");
-        fs::write(&cert_path, cert.pem()).expect("cert file writes");
-        fs::write(&key_path, signing_key.serialize_pem()).expect("key file writes");
-
-        let certs = format!(
-            "app.example.com|{}|{}",
-            cert_path.display(),
-            key_path.display()
-        );
-        let config = FrontlineEnvConfig::from_vars(vec![
-            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080".to_owned()),
-            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051".to_owned()),
-            (TLS_TERMINATION_LISTEN_ADDR, "127.0.0.1:8443".to_owned()),
-            (TLS_TERMINATION_CERTS, certs),
-        ])
-        .expect("config parses");
-
-        let store = config
-            .load_tls_certificate_store()
-            .expect("store loads")
-            .expect("store is enabled");
-        assert!(store
-            .resolve("app.example.com")
-            .expect("store lookup succeeds")
-            .is_some());
-
-        let _ = fs::remove_file(cert_path);
-        let _ = fs::remove_file(key_path);
-    }
-
-    #[test]
-    fn tls_certificate_store_reports_missing_files() {
-        let cert_path = unique_temp_path("missing-cert.pem");
-        let key_path = unique_temp_path("missing-key.pem");
-        let certs = format!(
-            "app.example.com|{}|{}",
-            cert_path.display(),
-            key_path.display()
-        );
-        let config = FrontlineEnvConfig::from_vars(vec![
-            (FRONTLINE_LISTEN_ADDR, "127.0.0.1:8080".to_owned()),
-            (CONTROL_PLANE_ENDPOINT, "http://127.0.0.1:50051".to_owned()),
-            (TLS_TERMINATION_LISTEN_ADDR, "127.0.0.1:8443".to_owned()),
-            (TLS_TERMINATION_CERTS, certs),
-        ])
-        .expect("config parses");
-
-        let error = config
-            .load_tls_certificate_store()
-            .expect_err("missing cert file is reported");
-        assert!(matches!(
-            error,
-            FrontlineTlsCertificateLoadError::OpenCertificate { path, .. }
-                if path == cert_path
-        ));
-    }
-
-    fn unique_temp_path(name: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        std::env::temp_dir().join(format!(
-            "frontline-config-test-{}-{}-{name}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ))
     }
 }

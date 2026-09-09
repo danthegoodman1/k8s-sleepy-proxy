@@ -1,3 +1,5 @@
+#[path = "frontline_load_smoke/certificates.rs"]
+mod certificates;
 use std::{
     convert::Infallible,
     env,
@@ -217,15 +219,22 @@ async fn run_server(config: ServerConfig) -> Result<(), BoxError> {
             stats.clone(),
         )))
         .serve(grpc_backend_addr);
+    let delivery = certificates::Delivery::from_env(&config.route_host)?;
+    let mut service = FakeProxyControlPlane::new(
+        config.route_host,
+        config.route_path,
+        config.cold_route_path,
+        config.backend_uri,
+        config.grpc_backend_uri,
+        stats,
+    );
+    service.certificates = Some(Arc::new(delivery));
     let control_plane = Server::builder()
-        .add_service(ProxyControlPlaneServer::new(FakeProxyControlPlane::new(
-            config.route_host,
-            config.route_path,
-            config.cold_route_path,
-            config.backend_uri,
-            config.grpc_backend_uri,
-            stats,
-        )))
+        .tls_config(certificates::tls()?)?
+        .add_service(ProxyControlPlaneServer::with_interceptor(
+            service,
+            certificates::auth()?,
+        ))
         .serve(config.control_plane_addr);
 
     tokio::select! {
@@ -554,11 +563,12 @@ fn is_websocket_upgrade_candidate<B>(request: &HttpRequest<B>) -> bool {
 fn stats_response(stats: &SmokeStats) -> HttpResponse<BackendBody> {
     let snapshot = stats.snapshot();
     let body = format!(
-        "subscribe_route_calls={} wake_instance_calls={} backend_http_requests={} backend_websocket_sessions={}\n",
+        "subscribe_route_calls={} wake_instance_calls={} backend_http_requests={} backend_websocket_sessions={} resolve_certificate_calls={}\n",
         snapshot.subscribe_route_calls,
         snapshot.wake_instance_calls,
         snapshot.backend_http_requests,
-        snapshot.backend_websocket_sessions
+        snapshot.backend_websocket_sessions,
+        stats.resolve_certificate_calls.load(Ordering::Relaxed)
     );
 
     HttpResponse::builder()
@@ -576,6 +586,7 @@ fn boxed_body(bytes: Bytes) -> BackendBody {
 
 #[derive(Clone, Debug, Default)]
 struct SmokeStats {
+    resolve_certificate_calls: Arc<AtomicU64>,
     subscribe_route_calls: Arc<AtomicU64>,
     wake_instance_calls: Arc<AtomicU64>,
     backend_http_requests: Arc<AtomicU64>,
@@ -626,6 +637,7 @@ struct FakeProxyControlPlane {
     backend_uri: Arc<str>,
     grpc_backend_uri: Arc<str>,
     stats: SmokeStats,
+    certificates: Option<Arc<certificates::Delivery>>,
 }
 
 impl FakeProxyControlPlane {
@@ -644,6 +656,7 @@ impl FakeProxyControlPlane {
             backend_uri: backend_uri.into(),
             grpc_backend_uri: grpc_backend_uri.into(),
             stats,
+            certificates: None,
         }
     }
 
@@ -826,6 +839,46 @@ impl FakeProxyControlPlane {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for FakeProxyControlPlane {
+    type WatchTlsCertificatesStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<sleepypods_api::pb::WatchTlsCertificatesResponse, tonic::Status>,
+                > + Send,
+        >,
+    >;
+    async fn watch_tls_certificates(
+        &self,
+        request: tonic::Request<tonic::Streaming<sleepypods_api::pb::WatchTlsCertificatesRequest>>,
+    ) -> Result<tonic::Response<Self::WatchTlsCertificatesStream>, tonic::Status> {
+        Ok(Response::new(
+            self.certificates
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("fixture certificate delivery not configured"))?
+                .watch(request.into_inner()),
+        ))
+    }
+
+    async fn resolve_http01_challenge(
+        &self,
+        _: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        panic!("unexpected HTTP01")
+    }
+    async fn resolve_tls_certificate(
+        &self,
+        request: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        self.stats
+            .resolve_certificate_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Response::new(
+            self.certificates
+                .as_ref()
+                .ok_or_else(|| Status::unavailable("fixture certificate delivery not configured"))?
+                .resolve(request.into_inner()),
+        ))
+    }
+
     type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
 
     async fn wake_instance(
@@ -895,6 +948,35 @@ impl GeneratedGrpcBackend {
 
 #[tonic::async_trait]
 impl ProxyControlPlane for GeneratedGrpcBackend {
+    type WatchTlsCertificatesStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<sleepypods_api::pb::WatchTlsCertificatesResponse, tonic::Status>,
+                > + Send,
+        >,
+    >;
+    async fn watch_tls_certificates(
+        &self,
+        _: tonic::Request<tonic::Streaming<sleepypods_api::pb::WatchTlsCertificatesRequest>>,
+    ) -> Result<tonic::Response<Self::WatchTlsCertificatesStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "unexpected test certificate watch",
+        ))
+    }
+
+    async fn resolve_http01_challenge(
+        &self,
+        _: Request<pb::ResolveHttp01ChallengeRequest>,
+    ) -> Result<Response<pb::ResolveHttp01ChallengeResponse>, Status> {
+        panic!("unexpected HTTP01")
+    }
+    async fn resolve_tls_certificate(
+        &self,
+        _: Request<pb::ResolveTlsCertificateRequest>,
+    ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
+        panic!("unexpected certificate")
+    }
+
     type SubscribeStream = ReceiverStream<Result<pb::ProxySubscribeResponse, Status>>;
 
     async fn wake_instance(

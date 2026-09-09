@@ -45,6 +45,12 @@ jobs:
       - name: Test fail-closed soak inventory
         run: python3 scripts/test-full-wake-sleep-inventory.py
 
+      - name: Test PostgreSQL execution checker
+        run: python3 scripts/test-postgres-execution.py
+
+      - name: Test protocol fixture over HTTP/2 and WebSocket
+        run: cargo test --locked -p proxy-core --example kind_protocol_app
+
       - name: Check load helpers with isolated package features
         run: |
           cargo check --locked -p frontline --example frontline_load_smoke
@@ -55,12 +61,5 @@ jobs:
           SLEEPYPODS_POSTGRES_URL: postgres://sleepypods:sleepypods@localhost:5432/sleepypods
         run: |
           set -o pipefail
-          cargo test -p control-plane --test postgres_store -- --nocapture 2>&1 | tee postgres-store.out
-          if grep -q "skipping Postgres store conformance" postgres-store.out; then
-            echo "Postgres conformance self-skipped" >&2
-            exit 1
-          fi
-          if ! grep -Eq "test result: ok\. [1-9][0-9]* passed" postgres-store.out; then
-            echo "Postgres conformance executed zero tests" >&2
-            exit 1
-          fi
+          cargo test --locked -p control-plane --test postgres_store -- --nocapture --color never 2>&1 | tee postgres-store.out
+          python3 scripts/check-postgres-execution.py postgres-store.out

@@ -9,6 +9,7 @@ const ROUTE_EVENT_BUFFER: usize = 1024;
 pub struct RouteSubscriptionBroker {
     sender: broadcast::Sender<RouteBindingChange>,
     pub(crate) streams: Arc<Semaphore>,
+    pub(crate) certificate_streams: Arc<Semaphore>,
     pub(crate) admission: super::admission::RpcAdmissionLayer,
     pub(crate) limits: ApiLimits,
     pub(crate) cancellation: crate::runtime_work::Cancellation,
@@ -39,6 +40,7 @@ impl RouteSubscriptionBroker {
                 limits.unary_delivery_timeout,
             ),
             streams: Arc::new(Semaphore::new(limits.subscription_streams)),
+            certificate_streams: Arc::new(Semaphore::new(super::certificate_watch::WATCH_STREAMS)),
             limits,
             cancellation: crate::runtime_work::Cancellation::new(),
         }

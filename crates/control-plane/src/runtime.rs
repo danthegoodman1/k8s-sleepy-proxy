@@ -72,10 +72,12 @@ pub struct RuntimeConfig {
     pub control_plane: ControlPlaneConfig,
     pub target: MaterializationTarget,
     pub api_limits: crate::api::admission::ApiLimits,
+    pub security: crate::runtime_security::RuntimeSecurityConfig,
 }
 
 #[derive(Debug)]
 pub enum RuntimeConfigError {
+    InvalidSecurity(&'static str),
     MissingEnv {
         name: &'static str,
     },
@@ -171,6 +173,19 @@ impl RuntimeConfig {
             }
         };
         let auth = parse_auth_config(&values)?;
+        let security = crate::runtime_security::RuntimeSecurityConfig::parse(
+            &values,
+            !matches!(auth, AuthConfig::NoAuth),
+        )
+        .map_err(RuntimeConfigError::InvalidSecurity)?;
+        if security.sealing_keys_file.is_some() {
+            let StoreProviderConfig::Postgres(pg) = &store;
+            if pg.max_connections < 2 {
+                return Err(RuntimeConfigError::InvalidSecurity(
+                    "certificate delivery requires at least two PostgreSQL connections",
+                ));
+            }
+        }
         let target = MaterializationTarget::new(
             required_value(&values, CLUSTER_ID_ENV)?,
             required_value(&values, NAMESPACE_ENV)?,
@@ -241,6 +256,7 @@ impl RuntimeConfig {
             }
         }
         Ok(Self {
+            security,
             api_limits,
             listen_addr,
             operator_grpc_web_listen_addr,
@@ -279,8 +295,34 @@ fn native_control_plane_router_with_route_events<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
+    native_control_plane_router_with_tls(
+        store,
+        materializer,
+        target,
+        auth_config,
+        route_events,
+        None,
+    )
+    .expect("plaintext server configuration")
+}
+
+pub fn native_control_plane_router_with_tls<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    auth_config: AuthConfig,
+    route_events: RouteSubscriptionBroker,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+) -> RuntimeResult<NativeControlPlaneRouter>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
-    tonic::transport::Server::builder()
+    let mut server = tonic::transport::Server::builder();
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    Ok(server
         .timeout(std::time::Duration::from_secs(10))
         .max_concurrent_streams(32)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
@@ -321,7 +363,7 @@ where
                 crate::api::SIDECAR_SERVICE_NAME,
                 crate::auth::CallerRole::Sidecar,
             ),
-        ))
+        )))
 }
 
 pub fn operator_grpc_web_router<C>(
@@ -386,7 +428,7 @@ pub(crate) fn admitted_grpc_web_server_builder(
 pub async fn run_from_env() -> RuntimeResult<()> {
     let config = RuntimeConfig::from_env()?;
     let prometheus = install_runtime_observability(config.metrics_listen_addr.is_some());
-    let store = connect_store(&config.control_plane.store).await?;
+    let store = connect_store(&config.control_plane.store, config.security.sealer()?).await?;
     let kube_client = KubeMaterializerClient::try_default().await?;
     let materializer = KubernetesMaterializer::new(
         RetryingKubernetesMaterializerClient::with_default_policy(kube_client),
@@ -429,15 +471,20 @@ where
     } else {
         None
     };
-    let materializer = materializer_with_runtime_auth(materializer, &config.control_plane.auth);
+    let materializer = materializer_with_runtime_auth(materializer, &config.control_plane.auth)
+        .with_sidecar_control_plane_transport(
+            config.security.public_endpoint.clone(),
+            config.security.ca_pem.clone(),
+        );
     let route_events = RouteSubscriptionBroker::with_limits(config.api_limits.clone());
-    let native_router = native_control_plane_router_with_route_events(
+    let native_router = native_control_plane_router_with_tls(
         Arc::clone(&store),
         materializer.clone(),
         config.target.clone(),
         config.control_plane.auth.clone(),
         route_events.clone(),
-    );
+        config.security.tls(config.api_limits.setup_timeout)?,
+    )?;
     let (shutdown_tx, _) = watch::channel(false);
     let native_shutdown = shutdown_tx.subscribe();
     let reconciler_shutdown = shutdown_tx.subscribe();
@@ -728,10 +775,14 @@ where
 
 async fn connect_store(
     config: &StoreProviderConfig,
+    sealer: Option<Arc<crate::certificate::CertificateSealer>>,
 ) -> Result<Arc<dyn ControlPlaneStore>, crate::StoreError> {
     match config {
         StoreProviderConfig::Postgres(config) => {
-            let store = PostgresStore::connect(config).await?;
+            let mut store = PostgresStore::connect(config).await?;
+            if let Some(sealer) = sealer {
+                store = store.with_certificate_sealer(sealer);
+            }
             let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
             Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
                 store,
@@ -830,6 +881,7 @@ fn parse_auth_config(values: &HashMap<String, String>) -> Result<AuthConfig, Run
 impl fmt::Display for RuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSecurity(reason) => f.write_str(reason),
             Self::MissingEnv { name } => write!(f, "{name} is required"),
             Self::InvalidListenAddr {
                 name,
@@ -866,7 +918,8 @@ impl Error for RuntimeConfigError {
             Self::MissingEnv { .. }
             | Self::InvalidPostgresSetting { .. }
             | Self::InvalidStoreProvider { .. }
-            | Self::InvalidAuthMode { .. } => None,
+            | Self::InvalidAuthMode { .. }
+            | Self::InvalidSecurity(_) => None,
         }
     }
 }
@@ -1321,6 +1374,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn certificate_runtime_requires_tls_auth_and_reserved_database_capacity() {
+        let extra = [
+            (
+                "SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE",
+                "/test/identity.pem",
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE",
+                "/test/identity.key",
+            ),
+            (
+                "SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT",
+                "https://cp.platform.example:50051",
+            ),
+            (
+                "SLEEPYPODS_CERTIFICATE_SEALING_KEYS_FILE",
+                "/test/sealing.json",
+            ),
+        ];
+        let mut values = static_auth_env();
+        values.extend(extra);
+        assert!(RuntimeConfig::from_key_values(values.clone()).is_ok());
+        values.push(("SLEEPYPODS_POSTGRES_MAX_CONNECTIONS", "1"));
+        assert!(matches!(
+            RuntimeConfig::from_key_values(values),
+            Err(RuntimeConfigError::InvalidSecurity(_))
+        ));
+        for omitted in [
+            "SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE",
+            "SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT",
+        ] {
+            let mut values = static_auth_env();
+            values.extend(extra.into_iter().filter(|(k, _)| *k != omitted));
+            assert!(matches!(
+                RuntimeConfig::from_key_values(values),
+                Err(RuntimeConfigError::InvalidSecurity(_))
+            ));
+        }
+        let mut values = valid_env();
+        values.extend(extra);
+        assert!(matches!(
+            RuntimeConfig::from_key_values(values),
+            Err(RuntimeConfigError::InvalidSecurity(_))
+        ));
+    }
+
     fn valid_env() -> Vec<(&'static str, &'static str)> {
         vec![
             (CONTROL_PLANE_LISTEN_ADDR_ENV, "127.0.0.1:50051"),
@@ -1449,6 +1549,14 @@ mod tests {
 
     impl ControlPlaneStore for OperationalMetricsStore {
         unexpected_store_methods!(
+            publish_certificate,
+            get_certificate_metadata,
+            set_tls_binding,
+            get_tls_binding,
+            remove_certificate,
+            resolve_tls_certificate,
+            reencrypt_certificate,
+            snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
             load_materialization_work_status,
@@ -1529,6 +1637,14 @@ mod tests {
 
     impl ControlPlaneStore for NoopStore {
         unexpected_store_methods!(
+            publish_certificate,
+            get_certificate_metadata,
+            set_tls_binding,
+            get_tls_binding,
+            remove_certificate,
+            resolve_tls_certificate,
+            reencrypt_certificate,
+            snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
             load_materialization_work_status,

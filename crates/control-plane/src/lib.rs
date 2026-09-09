@@ -9,6 +9,7 @@ mod unexpected_store;
 
 pub mod api;
 pub mod auth;
+pub mod certificate;
 pub mod config;
 pub mod http01;
 mod idle;
@@ -111,3 +112,5 @@ pub use workload::{
     WorkloadExclusivityKeyError, WorkloadExclusivityKeyTemplate, WorkloadValueFieldRule,
     WorkloadValueSchema,
 };
+
+pub mod runtime_security;

@@ -1,3 +1,4 @@
+use crate::certificate::*;
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
@@ -47,6 +48,38 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// impl ControlPlaneStore for IncompleteStore {}
 /// ```
 pub trait ControlPlaneStore: Send + Sync {
+    fn publish_certificate(
+        &self,
+        request: PublishCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>>;
+    fn get_certificate_metadata(
+        &self,
+        id: CertificateId,
+    ) -> StoreFuture<'_, StoreResult<Option<CertificateMetadata>>>;
+    fn set_tls_binding(
+        &self,
+        request: SetTlsBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsBinding>>;
+    fn get_tls_binding(&self, hostname: TlsHostname) -> StoreFuture<'_, StoreResult<TlsBinding>>;
+    fn remove_certificate(
+        &self,
+        request: RemoveCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>>;
+    fn resolve_tls_certificate(
+        &self,
+        request: ResolveTlsCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsCertificateResolution>>;
+    fn reencrypt_certificate(
+        &self,
+        request: ReencryptCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>>;
+
+    fn snapshot_tls_bindings(
+        &self,
+        hostnames: Vec<TlsHostname>,
+        known_revision: Option<CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>>;
+
     fn load_route_changes(
         &self,
         cursor: u64,
@@ -360,6 +393,63 @@ impl fmt::Debug for RetryingControlPlaneStore {
 }
 
 impl ControlPlaneStore for RetryingControlPlaneStore {
+    // Certificate mutations are one-shot: an unavailable response can follow commit.
+    fn publish_certificate(
+        &self,
+        request: PublishCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        self.inner.publish_certificate(request)
+    }
+    fn get_certificate_metadata(
+        &self,
+        id: CertificateId,
+    ) -> StoreFuture<'_, StoreResult<Option<CertificateMetadata>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.get_certificate_metadata(id.clone())
+        })
+    }
+    fn set_tls_binding(
+        &self,
+        request: SetTlsBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+        self.inner.set_tls_binding(request)
+    }
+    fn get_tls_binding(&self, hostname: TlsHostname) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.get_tls_binding(hostname.clone())
+        })
+    }
+    fn remove_certificate(
+        &self,
+        request: RemoveCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        self.inner.remove_certificate(request)
+    }
+    fn resolve_tls_certificate(
+        &self,
+        request: ResolveTlsCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<TlsCertificateResolution>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.resolve_tls_certificate(request.clone())
+        })
+    }
+    fn reencrypt_certificate(
+        &self,
+        request: ReencryptCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+        self.inner.reencrypt_certificate(request)
+    }
+
+    fn snapshot_tls_bindings(
+        &self,
+        hostnames: Vec<TlsHostname>,
+        known_revision: Option<CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>> {
+        retry_store_operation(&self.inner, self.policy, move |store| {
+            store.snapshot_tls_bindings(hostnames.clone(), known_revision)
+        })
+    }
+
     fn load_route_changes(
         &self,
         cursor: u64,
@@ -924,6 +1014,14 @@ mod tests {
 
     impl ControlPlaneStore for FakeRetryStore {
         unexpected_store_methods!(
+            publish_certificate,
+            get_certificate_metadata,
+            set_tls_binding,
+            get_tls_binding,
+            remove_certificate,
+            resolve_tls_certificate,
+            reencrypt_certificate,
+            snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
             load_materialization_work_status,

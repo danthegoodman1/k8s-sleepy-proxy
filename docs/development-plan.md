@@ -5,6 +5,11 @@ milestones. Each milestone should have integration coverage, and Kubernetes
 behavior should be verified with kind-based end-to-end tests before it is
 considered done.
 
+Dynamic certificate delivery is planned separately in the
+[dynamic certificate delivery plan](dynamic-certificates-plan.md). Its phased
+ledgers track the dynamic-only implementation and replacement of static
+application certificate loading.
+
 Milestone statuses, test names and gate results below are historical checkpoints,
 not fresh validation or the current recovery contract. For current architecture,
 correctness and performance, follow the [codebase review plan](review-remediation-plan.md)

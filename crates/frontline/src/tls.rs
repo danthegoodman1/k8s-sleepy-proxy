@@ -1,9 +1,7 @@
 use std::{
-    collections::HashMap,
     error::Error,
     fmt, io,
     pin::Pin,
-    sync::{Arc, RwLock},
     task::{Context, Poll},
 };
 
@@ -14,20 +12,13 @@ use proxy_core::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{
-    rustls::{
-        self,
-        pki_types::{CertificateDer, PrivateKeyDer},
-        ServerConfig,
-    },
+    rustls::{self},
     LazyConfigAcceptor,
 };
 
 use crate::{ReadyBackend, RequestIdentityError, RouteRequestIdentity};
 
-#[derive(Clone, Debug, Default)]
-pub struct TlsCertificateStore {
-    configs: Arc<RwLock<HashMap<String, Arc<ServerConfig>>>>,
-}
+pub use crate::certificates::TlsCertificateStore;
 
 #[derive(Clone, Debug)]
 pub struct FrontlineTlsAdapter {
@@ -54,18 +45,12 @@ pub struct TlsPassthroughClientHello {
 }
 
 #[derive(Debug)]
-pub enum TlsCertificateError {
-    InvalidSni(RequestIdentityError),
-    InvalidCertificate(rustls::Error),
-    StorePoisoned,
-}
-
-#[derive(Debug)]
 pub enum TlsTerminationError {
     ClientHello(io::Error),
     MissingSni,
     InvalidSni(RequestIdentityError),
     UnknownCertificate,
+    Certificate(crate::certificates::CertificateLookupError),
     Handshake(io::Error),
 }
 
@@ -89,48 +74,6 @@ pub enum TlsPassthroughBackendError {
     InvalidAuthority(String),
 }
 
-impl TlsCertificateStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn upsert(
-        &self,
-        sni: impl AsRef<str>,
-        cert_chain: Vec<CertificateDer<'static>>,
-        private_key: PrivateKeyDer<'static>,
-    ) -> Result<(), TlsCertificateError> {
-        let key = canonical_sni_key(sni.as_ref()).map_err(TlsCertificateError::InvalidSni)?;
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, private_key)
-            .map_err(TlsCertificateError::InvalidCertificate)?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-        self.configs
-            .write()
-            .map_err(|_| TlsCertificateError::StorePoisoned)?
-            .insert(key, Arc::new(config));
-
-        Ok(())
-    }
-
-    pub fn resolve(
-        &self,
-        sni: impl AsRef<str>,
-    ) -> Result<Option<Arc<ServerConfig>>, TlsCertificateError> {
-        let key = canonical_sni_key(sni.as_ref()).map_err(TlsCertificateError::InvalidSni)?;
-        let config = self
-            .configs
-            .read()
-            .map_err(|_| TlsCertificateError::StorePoisoned)?
-            .get(&key)
-            .cloned();
-
-        Ok(config)
-    }
-}
-
 impl FrontlineTlsAdapter {
     pub fn new(certificates: TlsCertificateStore) -> Self {
         Self {
@@ -152,6 +95,20 @@ impl FrontlineTlsAdapter {
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
+        tokio::time::timeout(
+            crate::certificates::CERTIFICATE_HANDSHAKE_TIMEOUT,
+            self.terminate_inner(io),
+        )
+        .await
+        .map_err(|_| {
+            TlsTerminationError::Certificate(crate::certificates::CertificateLookupError::Deadline)
+        })?
+    }
+
+    async fn terminate_inner<IO>(&self, io: IO) -> Result<TerminatedTls<IO>, TlsTerminationError>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
         let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io);
         let start = acceptor.await.map_err(TlsTerminationError::ClientHello)?;
         let client_hello = start.client_hello();
@@ -162,15 +119,8 @@ impl FrontlineTlsAdapter {
         let config = self
             .certificates
             .resolve(sni)
-            .map_err(|error| match error {
-                TlsCertificateError::InvalidSni(error) => TlsTerminationError::InvalidSni(error),
-                TlsCertificateError::InvalidCertificate(error) => TlsTerminationError::Handshake(
-                    io::Error::new(io::ErrorKind::InvalidData, error),
-                ),
-                TlsCertificateError::StorePoisoned => TlsTerminationError::Handshake(
-                    io::Error::other("TLS certificate store lock is poisoned"),
-                ),
-            })?
+            .await
+            .map_err(TlsTerminationError::Certificate)?
             .ok_or(TlsTerminationError::UnknownCertificate)?;
         let stream = start
             .into_stream(config)
@@ -284,13 +234,6 @@ pub fn passthrough_backend_addr(
     Ok(authority.as_str().to_owned())
 }
 
-fn canonical_sni_key(sni: &str) -> Result<String, RequestIdentityError> {
-    match RouteRequestIdentity::sni(sni)?.into_identity() {
-        sleepypods_api::RouteIdentity::Sni { host } => Ok(host.as_str().to_owned()),
-        sleepypods_api::RouteIdentity::Http { .. } => unreachable!("SNI constructor returns SNI"),
-    }
-}
-
 struct PrefixedStream<IO> {
     prefix: Vec<u8>,
     prefix_pos: usize,
@@ -355,33 +298,14 @@ impl From<TlsPassthroughBackendError> for TlsPassthroughError {
     }
 }
 
-impl fmt::Display for TlsCertificateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidSni(error) => write!(f, "invalid certificate SNI: {error}"),
-            Self::InvalidCertificate(error) => write!(f, "invalid TLS certificate: {error}"),
-            Self::StorePoisoned => f.write_str("TLS certificate store lock is poisoned"),
-        }
-    }
-}
-
-impl Error for TlsCertificateError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::InvalidSni(error) => Some(error),
-            Self::InvalidCertificate(error) => Some(error),
-            Self::StorePoisoned => None,
-        }
-    }
-}
-
 impl fmt::Display for TlsTerminationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ClientHello(error) => write!(f, "TLS ClientHello read failed: {error}"),
             Self::MissingSni => f.write_str("TLS ClientHello is missing SNI"),
             Self::InvalidSni(error) => write!(f, "TLS SNI is invalid: {error}"),
-            Self::UnknownCertificate => f.write_str("no TLS certificate is configured for SNI"),
+            Self::UnknownCertificate => f.write_str("no TLS certificate is authorized for SNI"),
+            Self::Certificate(error) => write!(f, "TLS certificate lookup failed: {error}"),
             Self::Handshake(error) => write!(f, "TLS handshake failed: {error}"),
         }
     }
@@ -393,6 +317,7 @@ impl Error for TlsTerminationError {
             Self::ClientHello(error) | Self::Handshake(error) => Some(error),
             Self::InvalidSni(error) => Some(error),
             Self::MissingSni | Self::UnknownCertificate => None,
+            Self::Certificate(error) => Some(error),
         }
     }
 }

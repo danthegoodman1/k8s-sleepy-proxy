@@ -49,6 +49,8 @@ pub struct RenderManifestRequest<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RenderManifestOptions<'a> {
     pub sidecar_control_plane_token: Option<&'a crate::auth::BearerToken>,
+    pub sidecar_control_plane_endpoint: Option<&'a str>,
+    pub sidecar_control_plane_ca: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

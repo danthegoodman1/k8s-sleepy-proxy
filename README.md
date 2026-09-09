@@ -6,15 +6,19 @@ a workload-local sidecar proxies application traffic and reports idleness.
 Postgres stores durable lifecycle intent so accepted work survives client loss
 and controller restart.
 
-The required implementation and production validation gates are complete within
-the documented operating contract. See the
-[validation and independent review](docs/review-evidence/final-integration/README.md)
-for measured workloads, recovery guarantees and remaining capacity limits.
+The [original validation and independent review](docs/review-evidence/final-integration/README.md)
+records measured lifecycle/proxy workloads, recovery guarantees and capacity limits.
+[Dynamic certificate delivery](docs/dynamic-certificates-plan.md) uses encrypted
+Postgres storage, bounded in-memory proxy caches and change notifications for
+rotation and removal. Frontline loads application certificates only from the
+control plane. The [certificate validation results](docs/review-evidence/dynamic-certificates/phase7/README.md)
+record the deployed behavior, outage limits and measured resource/performance scope.
 
 Start here:
 
 - [Production north star](docs/production-north-star.md)
 - [Development plan](docs/development-plan.md)
+- [Dynamic certificate delivery plan](docs/dynamic-certificates-plan.md)
 - [Codebase review and remediation plan](docs/review-remediation-plan.md)
 - [Operator guide](docs/operator-guide.md)
 - [Operator runbook](docs/operator-runbook.md)

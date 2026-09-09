@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/control-plane", "crates/frontline", "crates/proxy-core", "crates/sidecar", "crates/sleepypods-api", "crates/sleepypods-observability", "crates/sleepypods-types"]
+members = ["crates/control-plane", "crates/frontline", "crates/proxy-core", "crates/sidecar", "crates/sleepypods-api", "crates/sleepypods-certificate", "crates/sleepypods-observability", "crates/sleepypods-types"]
 resolver = "2"
 
 [workspace.package]

@@ -437,3 +437,7 @@ fn hex(bytes: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+#[path = "kind_protocol_app/tests.rs"]
+mod tests;

@@ -37,6 +37,14 @@ impl AcceptanceStore {
 }
 impl ControlPlaneStore for AcceptanceStore {
     unexpected_store_methods!(
+        publish_certificate,
+        get_certificate_metadata,
+        set_tls_binding,
+        get_tls_binding,
+        remove_certificate,
+        resolve_tls_certificate,
+        reencrypt_certificate,
+        snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,
         load_materialization_work_status,

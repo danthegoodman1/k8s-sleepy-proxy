@@ -17,7 +17,11 @@ status when a documented gap actually closes.
 - `crates/proxy-core`: shared proxy primitives, TLS ClientHello/SNI parsing,
   accounting, drain, shutdown, timeout, proxy-specific metrics adapters, and hot-path benches.
 - `crates/sleepypods-api`: generated protobuf clients/services, shared routing and
-  HTTP-01 contracts, state/backend/target values, and client bearer authentication.
+  HTTP-01/certificate contracts, state/backend/target values, and native transport
+  and client bearer authentication.
+- `crates/sleepypods-certificate`: maintained-library certificate/key/chain and
+  hostname validation shared by publication and Frontline installation, without
+  persistence or sealing dependencies.
 - `crates/sleepypods-observability`: metric and tracing vocabulary, the single
   process-wide recorder, sinks, and Prometheus exporter.
 - `crates/sleepypods-types`: shared ID/value types.
@@ -44,6 +48,10 @@ status when a documented gap actually closes.
 - Frontline route cache/resolver:
   `crates/frontline/src/cache.rs`, `matcher.rs`, `resolver.rs`, `route.rs`,
   `subscription.rs`
+- Certificate delivery: `crates/frontline/src/certificates/`; shared validation:
+  `crates/sleepypods-certificate/src/lib.rs`; encrypted persistence and native
+  management/resolution APIs: `crates/control-plane/src/certificate/`,
+  `postgres/certificate_ops.rs` and `api/certificates.rs`.
 - Sidecar idle: `crates/sidecar/src/idle.rs` and
   `crates/sidecar/src/idle/control_plane.rs`
 - Observability: `crates/sleepypods-observability/src/metrics.rs`,
@@ -80,6 +88,7 @@ or cross-component contracts move.
 | Proxy-core primitives | `cargo test -p proxy-core` and, for hot paths, `cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Frontline route/cache/listener | `cargo test -p frontline`; route lookup changes also run `cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Control-plane API/store/lifecycle | `cargo test -p control-plane`; Postgres-backed store work also run `./scripts/test-postgres-store.sh` |
+| PostgreSQL execution gate | `python3 scripts/test-postgres-execution.py`; CI and `test-postgres-store.sh` use the same complete-target skip/count checker |
 | Sidecar runtime/idle | `cargo test -p sidecar` |
 | API/observability crate boundaries | `./scripts/test-dependency-boundaries.py`, `cargo test -p sleepypods-api -p sleepypods-observability -p proxy-core -p frontline -p sidecar` |
 | Production images | `./scripts/smoke-images.sh` |
@@ -87,11 +96,18 @@ or cross-component contracts move.
 | Benchmark regression review | `./scripts/check-criterion-regressions.py` after collecting local Criterion baselines |
 | Kubernetes materializer | `./scripts/test-kind-materializer.sh` |
 | Full platform behavior | the targeted `./scripts/test-kind-e2e-*.sh` gate |
+| Protocol fixture | `cargo test --locked -p proxy-core --example kind_protocol_app` executes direct HTTP/2, two-proxy-hop and WebSocket fixture regressions |
 | Soak inventory reader/polling | `python3 scripts/test-full-wake-sleep-inventory.py` (mocked Kubernetes; no cluster) |
 | Repeated wake/sleep leaks | `./scripts/soak-kind-full-wake-sleep.sh` or `./scripts/soak-kind-materializer.sh` |
 
 No cargo tests are required for docs-only changes unless the docs edit also
 changes code.
+
+An ordinary workspace run may self-skip optional database wrappers when no
+PostgreSQL URL is set. It is not actual store conformance. The separate database
+gate requires a complete unfiltered `postgres_store` target, including certificate
+store, native API and watch tests, and rejects skips, ignored cases and incomplete
+output. Its checker supplements Cargo's exit status; callers must preserve both.
 
 ## kind And Smoke Scripts
 
@@ -102,7 +118,11 @@ Targeted gates live in `scripts/`:
   continuity.
 - `test-kind-e2e-routing.sh`: exact/wildcard HTTP route and HTTP-01 behavior.
 - `test-kind-e2e-protocols.sh`: HTTP/2, h2c gRPC-shaped, and WebSockets.
-- `test-kind-e2e-tls.sh`: TLS termination and SNI passthrough.
+- `test-kind-e2e-tls.sh`: native certificate publication, TLS termination and SNI
+  passthrough, plus exact-replica certificate rotation/removal, live protocols,
+  lifecycle, outage and restart checks. This explicit release gate includes real
+  sleep-floor and five-minute lease waits. Local ignored tests are not deployed
+  execution evidence.
 - `test-kind-e2e-grpc-web.sh`: deployed browser-shaped gRPC-Web operator path.
 - `test-kind-e2e-libpq-sni.sh`: real PostgreSQL/libpq 17 direct SNI
   passthrough.
@@ -115,8 +135,9 @@ Targeted gates live in `scripts/`:
 ## Invariants
 
 - The control-plane API is the only public write path for workload classes,
-  instances, routes, HTTP-01 tokens, lifecycle state, and materialization
-  intent. Do not introduce a direct user-facing Kubernetes manifest workflow.
+  instances, routes, certificates, TLS hostname bindings, HTTP-01 tokens,
+  lifecycle state, and materialization intent. Do not introduce a direct
+  user-facing Kubernetes manifest workflow.
 - The database is the source of truth. Proxies, sidecars, and users do not write
   it directly.
 - Keep provider-specific semantics behind traits such as `ControlPlaneStore`

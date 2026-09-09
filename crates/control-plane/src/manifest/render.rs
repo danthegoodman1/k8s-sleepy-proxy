@@ -189,6 +189,7 @@ pub(crate) fn render_manifests_with_options(
                     request.namespace,
                     request.sleep_policy,
                     sidecar_token_secret_name.as_deref(),
+                    options,
                 )?,
             ],
             volumes: rendered_volumes
@@ -967,6 +968,7 @@ fn render_sidecar_container(
     namespace: &str,
     sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
     sidecar_token_secret_name: Option<&str>,
+    options: super::RenderManifestOptions<'_>,
 ) -> Result<Container, ManifestRenderError> {
     let mut env = vec![
         EnvVar {
@@ -1006,9 +1008,9 @@ fn render_sidecar_container(
         },
         EnvVar {
             name: ENV_CONTROL_PLANE_ENDPOINT.to_owned(),
-            value: format!(
+            value: options.sidecar_control_plane_endpoint.map(str::to_owned).unwrap_or_else(||format!(
                 "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
-            ),
+            )),
             value_from: None,
         },
         EnvVar {
@@ -1027,6 +1029,13 @@ fn render_sidecar_container(
             value_from: None,
         },
     ];
+    if let Some(ca) = options.sidecar_control_plane_ca {
+        env.push(EnvVar {
+            name: sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV.to_owned(),
+            value: ca.to_owned(),
+            value_from: None,
+        });
+    }
     if let Some(mode) = &config.mode {
         env.push(EnvVar {
             name: ENV_SIDECAR_MODE.to_owned(),

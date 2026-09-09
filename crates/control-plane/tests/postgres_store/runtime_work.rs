@@ -199,8 +199,16 @@ struct SchedulerKubernetes {
     inner: LifecycleKubernetes,
     behavior: Arc<std::sync::Mutex<BTreeMap<String, &'static str>>>,
     waiting: Arc<std::sync::atomic::AtomicUsize>,
+    readiness_cancelled: Arc<std::sync::atomic::AtomicUsize>,
     operation_gate: Option<Arc<tokio::sync::Semaphore>>,
     cleanup_gate: Option<Arc<SupersessionCleanupGate>>,
+}
+
+struct ReadinessCancellation(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ReadinessCancellation {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 struct SupersessionCleanupGate {
@@ -286,6 +294,7 @@ impl control_plane::KubernetesMaterializerClient for SchedulerKubernetes {
             });
             let behavior = id.and_then(|id| self.behavior.lock().unwrap().get(&id).copied());
             if behavior == Some("hang") {
+                let _cancelled = ReadinessCancellation(self.readiness_cancelled.clone());
                 self.waiting
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
@@ -621,8 +630,64 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
         .unwrap()
         .insert("failure-deadline".into(), "hang");
     let deadline = accept("failure-deadline".into(), deadline_target.clone()).await?;
-    raw.execute("UPDATE materializations SET operation_deadline_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + 50 WHERE materialization_id = $1", &[&deadline.id.as_str()]).await?;
-    driver(deadline_target.clone()).run_once().await;
+    // Readiness must actually start before this test can claim that deadline
+    // cancellation is read-only. A fixed one-second horizon permits setup; the
+    // held row delays only failure publication until that same DB deadline.
+    let (mut publication_blocker, blocker_connection) =
+        tokio_postgres::connect(config.connection_url(), NoTls).await?;
+    let mut deadline_connections = tokio::task::JoinSet::new();
+    deadline_connections.spawn(blocker_connection);
+    let original_deadline:i64=raw.query_one("UPDATE materializations SET operation_deadline_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + 1000 WHERE materialization_id = $1 RETURNING operation_deadline_unix_millis", &[&deadline.id.as_str()]).await?.get(0);
+    let waiting_before = client.waiting.load(std::sync::atomic::Ordering::SeqCst);
+    let cancelled_before = client
+        .readiness_cancelled
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let deadline_driver = driver(deadline_target.clone());
+    let mut deadline_jobs = tokio::task::JoinSet::new();
+    deadline_jobs.spawn(async move { deadline_driver.run_once().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.waiting.load(std::sync::atomic::Ordering::SeqCst) == waiting_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let publication_lock = publication_blocker.transaction().await?;
+    let locked_at:i64=publication_lock.query_one("SELECT (extract(epoch from clock_timestamp())*1000)::bigint FROM materializations WHERE materialization_id=$1 FOR UPDATE",&[&deadline.id.as_str()]).await?.get(0);
+    assert!(
+        locked_at < original_deadline,
+        "readiness and publication barrier must precede the fixed deadline"
+    );
+    let expired_at = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let now: i64 = raw
+                .query_one(
+                    "SELECT (extract(epoch from clock_timestamp())*1000)::bigint",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if now >= original_deadline {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    publication_lock.rollback().await?;
+    tokio::time::timeout(Duration::from_secs(3), deadline_jobs.join_next())
+        .await?
+        .expect("deadline job")?;
+    assert_eq!(
+        client
+            .readiness_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst),
+        cancelled_before + 1,
+        "the admitted readiness read is cancelled before terminal publication completes"
+    );
+    deadline_connections.abort_all();
+    while deadline_connections.join_next().await.is_some() {}
+    eprintln!("causal readiness deadline: locked_at={locked_at} original_deadline={original_deadline} publication_released_at={expired_at}");
     let diagnostics = control_plane::api::StoreBackedOperatorApi::new(
         store.clone(),
         materializer.clone(),
@@ -1186,5 +1251,180 @@ async fn wait_for_named_database_lock(client: &tokio_postgres::Client, name: &st
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_failure_deadline_classification_uses_post_lock_database_time() -> TestResult {
+    let Ok(base) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let schema = unique_schema_name();
+    let (admin, connection) = tokio_postgres::connect(&base, NoTls).await?;
+    let mut connections = tokio::task::JoinSet::new();
+    connections.spawn(connection);
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
+    let store = PostgresStore::connect(&config).await?;
+    let mut owned = tokio::task::JoinSet::new();
+    owned.spawn(async move { failure_deadline_lock_boundary(store, config).await });
+    let result = tokio::time::timeout(Duration::from_secs(10), owned.join_next()).await;
+    owned.abort_all();
+    while owned.join_next().await.is_some() {}
+    let cleanup = admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await;
+    drop(admin);
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    cleanup?;
+    result?.expect("owned deadline regression")?
+}
+
+async fn failure_deadline_lock_boundary(
+    store: PostgresStore,
+    config: PostgresStoreConfig,
+) -> TestResult {
+    use control_plane::{
+        api::{pb, StoreBackedProxyApi},
+        KubernetesMaterializer,
+    };
+    use pb::proxy_control_plane_server::ProxyControlPlane;
+    let class = workload_class("lock-deadline", 1);
+    store
+        .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
+        .await?;
+    let cold = store
+        .create_instance(create_instance_request(
+            "lock-deadline",
+            "lock-deadline",
+            class.reference,
+            vec![],
+        ))
+        .await?
+        .instance;
+    let target = MaterializationTarget::new("lock-deadline", "apps")?;
+    let store = Arc::new(store);
+    StoreBackedProxyApi::new(
+        store.clone(),
+        KubernetesMaterializer::new(SchedulerKubernetes::default()),
+        target.clone(),
+    )
+    .wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
+        instance_id: cold.id.as_str().into(),
+        expected_generation: cold.generation.get(),
+        backend_generation: None,
+    }))
+    .await?;
+    let pending = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(cold.id, target))
+        .await?
+        .unwrap();
+    let claimed = store
+        .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
+            pending.id.clone(),
+            "deadline-lock-owner",
+            SystemTime::now(),
+            SystemTime::now() + Duration::from_secs(30),
+        ))
+        .await?
+        .unwrap();
+    let (raw, raw_conn) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
+    let (mut blocker, blocker_conn) =
+        tokio_postgres::connect(config.connection_url(), NoTls).await?;
+    let mut connections = tokio::task::JoinSet::new();
+    connections.spawn(raw_conn);
+    connections.spawn(blocker_conn);
+    let original_deadline:i64=raw.query_one("UPDATE materializations SET operation_deadline_unix_millis=(extract(epoch from clock_timestamp())*1000)::bigint+250 WHERE materialization_id=$1 RETURNING operation_deadline_unix_millis",&[&pending.id.as_str()]).await?.get(0);
+    let initial_status = store
+        .load_materialization_work_status(pending.id.clone())
+        .await?
+        .unwrap();
+    assert_eq!(
+        initial_status.operation_deadline_unix_millis,
+        original_deadline
+    );
+    assert!(initial_status.operation_remaining.is_some_and(
+        |remaining| remaining > Duration::ZERO && remaining <= Duration::from_millis(250)
+    ));
+    let blocker_pid: i32 = blocker
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await?
+        .get(0);
+    let transaction = blocker.transaction().await?;
+    transaction.query_one("SELECT materialization_id FROM materializations WHERE materialization_id=$1 FOR UPDATE",&[&pending.id.as_str()]).await?;
+    let writer = store.clone();
+    let id = pending.id.clone();
+    let attempt = claimed.reconciliation_lease.unwrap().attempt;
+    let mut writers = tokio::task::JoinSet::new();
+    writers.spawn(async move {
+        writer
+            .record_materialization_failure(
+                control_plane::runtime_work::RecordMaterializationFailure {
+                    expected_state: MaterializationState::Pending,
+                    materialization_id: id,
+                    owner: "deadline-lock-owner".into(),
+                    attempt,
+                    generation: pending.instance_generation,
+                    permanent: false,
+                    message: "controlled transient failure waits across deadline".into(),
+                },
+            )
+            .await
+    });
+    let queued_at=tokio::time::timeout(Duration::from_secs(2),async {
+        loop {
+            let row=raw.query_one("SELECT (extract(epoch from clock_timestamp())*1000)::bigint, EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",&[&blocker_pid]).await.unwrap();
+            if row.get::<_,bool>(1) {break row.get::<_,i64>(0);}
+            tokio::task::yield_now().await;
+        }
+    }).await?;
+    assert!(
+        queued_at < original_deadline,
+        "failure SELECT must begin before original deadline"
+    );
+    let released_at = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let now: i64 = raw
+                .query_one(
+                    "SELECT (extract(epoch from clock_timestamp())*1000)::bigint",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if now > original_deadline {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    let expired_status = store
+        .load_materialization_work_status(pending.id.clone())
+        .await?
+        .unwrap();
+    assert_eq!(
+        expired_status.operation_deadline_unix_millis,
+        original_deadline
+    );
+    assert_eq!(
+        expired_status.operation_remaining,
+        Some(Duration::ZERO),
+        "expired is explicit zero, never the missing-budget fallback"
+    );
+    transaction.rollback().await?;
+    assert!(writers.join_next().await.unwrap()??);
+    let status = store
+        .load_materialization_work_status(pending.id.clone())
+        .await?
+        .unwrap();
+    eprintln!("deadline lock boundary: queued_at={queued_at} original_deadline={original_deadline} released_at={released_at} persisted_kind={:?} persisted_message={:?}",status.failure_kind,status.failure_message);
+    assert_eq!(status.failure_kind.as_deref(), Some("deadline"));
+    assert!(status.uncertain_effect.is_none());
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     Ok(())
 }

@@ -12,10 +12,7 @@ use sleepypods_observability::{
 use crate::{
     ids::{BackendGeneration, Generation, InstanceId},
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
-    manifest::{
-        render_manifests_with_options, ManifestRenderError, RenderManifestOptions,
-        RenderManifestRequest,
-    },
+    manifest::{render_manifests_with_options, ManifestRenderError, RenderManifestRequest},
     materialization::{
         LoadActiveMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
         MaterializationState, MaterializationTarget, RecordMaterializationRequest,
@@ -213,9 +210,7 @@ where
             namespace: request.target.namespace(),
             template_generation: Some(class.template_generation),
         },
-        RenderManifestOptions {
-            sidecar_control_plane_token: materializer.sidecar_control_plane_token(),
-        },
+        materializer.render_options(),
     )
     .map_err(|source| WakeInstanceError::Render {
         instance: Box::new(instance.clone()),

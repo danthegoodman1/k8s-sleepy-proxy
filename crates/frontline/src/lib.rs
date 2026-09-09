@@ -5,6 +5,7 @@
 //! binary.
 
 pub mod cache;
+pub mod certificates;
 pub mod config;
 pub mod control_plane;
 pub mod control_plane_transport;
@@ -24,18 +25,15 @@ pub use cache::{
     CacheInsertResult, CacheLookup, CacheLookupHit, CacheLookupStatus, NegativeCacheEntry,
     PositiveCacheEntry, RouteCache,
 };
-pub use config::{
-    FrontlineEnvConfig, FrontlineEnvConfigError, FrontlineTlsCertificateConfig,
-    FrontlineTlsCertificateLoadError,
-};
+pub use config::{FrontlineEnvConfig, FrontlineEnvConfigError};
 pub use control_plane::{
     http01_challenge_key_to_proto, http01_challenge_record_from_proto,
     proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
     proxy_wake_response_from_proto, wake_instance_request_to_proto, ProxyProtocolAdapterError,
 };
 pub use control_plane_transport::{
-    GrpcOperatorHttp01Resolver, GrpcOperatorHttp01ResolverError, GrpcProxyControlPlaneClient,
-    GrpcProxyControlPlaneError,
+    GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError, GrpcProxyHttp01Resolver,
+    GrpcProxyHttp01ResolverError,
 };
 pub use forward::{
     http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardContext,
@@ -71,9 +69,9 @@ pub use subscription::{
     UnsubscribeOutcome,
 };
 pub use tls::{
-    passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateError,
-    TlsCertificateStore, TlsPassthrough, TlsPassthroughBackendError, TlsPassthroughClientHello,
-    TlsPassthroughError, TlsTerminationError,
+    passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateStore,
+    TlsPassthrough, TlsPassthroughBackendError, TlsPassthroughClientHello, TlsPassthroughError,
+    TlsTerminationError,
 };
 pub use wake::{
     route_wake_decision, validate_route_update, validate_wake_response, ReadyBackend,

@@ -1,16 +1,18 @@
+#[path = "support/native_operator.rs"]
+mod native_operator;
+use native_operator::{connect as connect_operator, Operator};
 use std::{collections::HashMap, env, error::Error, time::Duration};
 
 use control_plane::api::pb::{
-    operator_control_plane_client::OperatorControlPlaneClient, route_identity, template_text_part,
-    ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
-    CreateWorkloadClassVersionRequest, EnvVarTemplate, GetInstanceRequest, Instance,
-    InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity,
-    TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueSchema,
+    route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
+    CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
+    EnvVarTemplate, GetInstanceRequest, Instance, InstanceState as PbInstanceState,
+    ManifestTemplate, ProtocolRoute, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText, TemplateTextPart,
+    WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueSchema,
 };
 use tokio::time::{sleep, Instant};
-use tonic::transport::{Channel, Endpoint};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -58,7 +60,7 @@ impl E2eConfig {
     fn from_env() -> TestResult<Self> {
         Ok(Self {
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:19751".to_owned()),
+                .unwrap_or_else(|_| "https://127.0.0.1:19751".to_owned()),
             route_host: env::var("SLEEPYPODS_E2E_LIBPQ_SNI_HOST")
                 .unwrap_or_else(|_| "exact.sni.sleepypods.test".to_owned()),
             postgres_image: env::var("SLEEPYPODS_E2E_LIBPQ_SNI_IMAGE")
@@ -69,29 +71,7 @@ impl E2eConfig {
     }
 }
 
-async fn connect_operator(endpoint: &str) -> TestResult<OperatorControlPlaneClient<Channel>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let channel = Endpoint::from_shared(endpoint.to_owned())?
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(10))
-            .connect()
-            .await;
-        match channel {
-            Ok(channel) => return Ok(OperatorControlPlaneClient::new(channel)),
-            Err(error) if Instant::now() < deadline => {
-                eprintln!("waiting for operator gRPC endpoint {endpoint}: {error}");
-                sleep(Duration::from_secs(1)).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-async fn create_operator_resources(
-    operator: &mut OperatorControlPlaneClient<Channel>,
-    config: &E2eConfig,
-) -> TestResult<()> {
+async fn create_operator_resources(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
             idempotency_key: "kind-e2e-libpq-sni-create-class".to_owned(),
@@ -147,7 +127,7 @@ async fn create_operator_resources(
 }
 
 async fn wait_for_instance_state(
-    operator: &mut OperatorControlPlaneClient<Channel>,
+    operator: &mut Operator,
     expected: PbInstanceState,
     timeout: Duration,
 ) -> TestResult<Instance> {

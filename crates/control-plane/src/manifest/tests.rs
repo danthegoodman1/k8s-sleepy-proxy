@@ -224,6 +224,8 @@ fn private_render_options_inject_sidecar_control_plane_token() {
         },
         RenderManifestOptions {
             sidecar_control_plane_token: Some(&token),
+            sidecar_control_plane_endpoint: Some("https://cp.platform.example:50051"),
+            sidecar_control_plane_ca: Some("PUBLIC-CA-ONLY"),
         },
     )
     .expect("deployment renders");
@@ -249,6 +251,24 @@ fn private_render_options_inject_sidecar_control_plane_token() {
         })
         .expect("Deployment renders");
 
+    let env = &deployment.spec.template.spec.containers[1].env;
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "SLEEPYPODS_CONTROL_PLANE_ENDPOINT")
+            .unwrap()
+            .value,
+        "https://cp.platform.example:50051"
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV)
+            .unwrap()
+            .value,
+        "PUBLIC-CA-ONLY"
+    );
+    assert!(!env
+        .iter()
+        .any(|e| e.name.contains("SEALING") || e.name.contains("TLS_KEY")));
     let token_env = deployment.spec.template.spec.containers[1]
         .env
         .iter()
