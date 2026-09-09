@@ -34,14 +34,7 @@ fn registration(cache: &TlsCertificateStore, id: u64) -> Registration {
             .collect(),
         request: pb::WatchTlsCertificatesRequest {
             registration: id,
-            interests: state
-                .entries
-                .iter()
-                .map(|(h, e)| pb::TlsCertificateInterest {
-                    hostname: h.clone(),
-                    known_view_revision: e.floor,
-                })
-                .collect(),
+            hostnames: state.entries.keys().cloned().collect(),
         },
     }
 }
@@ -115,7 +108,6 @@ async fn session(
         .await
         .map_err(|_| CertificateLookupError::Deadline)??;
     let mut registered = HashMap::new();
-    let mut cursor = 0;
     let mut next_registration = Instant::now() + REGISTRATION_INTERVAL;
     loop {
         tokio::select! {
@@ -170,7 +162,6 @@ async fn session(
                             )?;
                         }
                         registered = sent.incarnations;
-                        cursor = snapshot.cursor;
                         cache.event(Operation::CertificateWatch, Outcome::Updated);
                     }
                     pb::watch_tls_certificates_response::Value::Changes(changes) => {
@@ -198,7 +189,6 @@ async fn session(
                                 event.invalidate,
                             )?;
                         }
-                        cursor = cursor.max(changes.cursor);
                     }
                     pb::watch_tls_certificates_response::Value::Reset(reset) => {
                         if CertificateRevision::new(reset.cursor).is_err() {

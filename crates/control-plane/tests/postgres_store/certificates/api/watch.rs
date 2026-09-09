@@ -2,16 +2,10 @@ use super::*;
 use tokio::sync::mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 type Events = tonic::Streaming<pb::WatchTlsCertificatesResponse>;
-fn registration(number: u64, hosts: &[(&str, u64)]) -> pb::WatchTlsCertificatesRequest {
+fn registration(number: u64, hosts: &[&str]) -> pb::WatchTlsCertificatesRequest {
     pb::WatchTlsCertificatesRequest {
         registration: number,
-        interests: hosts
-            .iter()
-            .map(|(h, v)| pb::TlsCertificateInterest {
-                hostname: (*h).into(),
-                known_view_revision: *v,
-            })
-            .collect(),
+        hostnames: hosts.iter().map(|h| (*h).into()).collect(),
     }
 }
 async fn watch(
@@ -62,7 +56,7 @@ async fn postgres_tls_watch_two_replicas_registration_shared_rotation_rebind_and
             let a = store
                 .set_tls_binding(bind("app.example", rev(0), Some("A")))
                 .await?;
-            let shared = store
+            store
                 .set_tls_binding(bind("shared.example", rev(0), Some("A")))
                 .await?;
             let resolved = first
@@ -78,10 +72,7 @@ async fn postgres_tls_watch_two_replicas_registration_shared_rotation_rebind_and
                 &mut first,
                 Some(registration(
                     1,
-                    &[
-                        ("app.example", a.revision.get()),
-                        ("shared.example", shared.revision.get()),
-                    ],
+                    &["app.example", "shared.example"],
                 )),
             )
             .await?;
@@ -89,10 +80,7 @@ async fn postgres_tls_watch_two_replicas_registration_shared_rotation_rebind_and
                 &mut other,
                 Some(registration(
                     1,
-                    &[
-                        ("app.example", a.revision.get()),
-                        ("shared.example", shared.revision.get()),
-                    ],
+                    &["app.example", "shared.example"],
                 )),
             )
             .await?;
@@ -183,7 +171,7 @@ async fn postgres_tls_watch_two_replicas_registration_shared_rotation_rebind_and
             // much newer global cursor without decrypting to discover the view.
             let (_send, mut events) = watch(
                 &mut other,
-                Some(registration(1, &[("app.example", rebound.revision.get())])),
+                Some(registration(1, &["app.example"])),
             )
             .await?;
             let snapshot = match next(&mut events).await? {
@@ -300,13 +288,7 @@ async fn postgres_tls_watch_native_role_size_initial_timeout_and_capacity() -> T
                 .collect();
             let request = pb::WatchTlsCertificatesRequest {
                 registration: 1,
-                interests: names
-                    .iter()
-                    .map(|h| pb::TlsCertificateInterest {
-                        hostname: h.clone(),
-                        known_view_revision: 0,
-                    })
-                    .collect(),
+                hostnames: names,
             };
             let (send, mut events) = watch(&mut client, Some(request)).await?;
             let snapshot = match next(&mut events).await? {
@@ -320,10 +302,7 @@ async fn postgres_tls_watch_native_role_size_initial_timeout_and_capacity() -> T
                 .all(|b| b.revision == 0 && b.certificate_id.is_none()));
             let oversized = pb::WatchTlsCertificatesRequest {
                 registration: 2,
-                interests: vec![pb::TlsCertificateInterest {
-                    hostname: "a".repeat(512 * 1024 + 1),
-                    known_view_revision: 0,
-                }],
+                hostnames: vec!["a".repeat(512 * 1024 + 1)],
             };
             send.send(oversized).await?;
             assert!(!matches!(
@@ -383,7 +362,7 @@ async fn postgres_sixteen_registered_watches_poll_with_two_connection_pool_and_o
             let mut watches = Vec::new();
             for index in 0..16 {
                 let (send, mut events) =
-                    watch(&mut proxy, Some(registration(1, &[("live.example", 0)]))).await?;
+                    watch(&mut proxy, Some(registration(1, &["live.example"]))).await?;
                 let pb::watch_tls_certificates_response::Value::Snapshot(snapshot) =
                     next(&mut events)
                         .await
@@ -472,12 +451,7 @@ async fn postgres_sixteen_registered_watches_poll_with_two_connection_pool_and_o
             for _ in 0..16 {
                 let pair = tokio::time::timeout_at(deadline, async {
                     loop {
-                        match watch(
-                            &mut proxy,
-                            Some(registration(1, &[("live.example", binding_revision.get())])),
-                        )
-                        .await
-                        {
+                        match watch(&mut proxy, Some(registration(1, &["live.example"]))).await {
                             Ok(pair) => break Ok(pair),
                             Err(error)
                                 if error

@@ -146,7 +146,7 @@ impl WatchState {
                 "certificate registration must increase",
             ));
         }
-        let hosts = interests(request.interests)?;
+        let hosts = interests(request.hostnames)?;
         self.registration = request.registration;
         self.pending = Some(hosts);
         Ok(())
@@ -233,7 +233,7 @@ impl WatchState {
         )
     }
 }
-fn interests(values: Vec<pb::TlsCertificateInterest>) -> Result<Vec<TlsHostname>, Status> {
+fn interests(values: Vec<String>) -> Result<Vec<TlsHostname>, Status> {
     if values.len() > MAX_CERTIFICATE_BINDINGS {
         return Err(Status::resource_exhausted(
             "certificate interests exceed 1024 hosts",
@@ -242,12 +242,9 @@ fn interests(values: Vec<pb::TlsCertificateInterest>) -> Result<Vec<TlsHostname>
     let mut unique = HashSet::new();
     let mut names = Vec::with_capacity(values.len());
     for value in values {
-        let name = TlsHostname::new(&value.hostname)
+        let name = TlsHostname::new(&value)
             .map_err(|_| Status::invalid_argument("invalid certificate interest"))?;
-        if name.as_str() != value.hostname
-            || !unique.insert(name.clone())
-            || CertificateRevision::new(value.known_view_revision).is_err()
-        {
+        if name.as_str() != value || !unique.insert(name.clone()) {
             return Err(Status::invalid_argument("invalid certificate interest"));
         }
         names.push(name);

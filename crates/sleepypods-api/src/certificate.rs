@@ -333,33 +333,35 @@ mod watch_decode_tests {
         assert!(event_bytes + 2 * 512 * 1024 < 24 * 1024 * 1024);
         let input = pb::WatchTlsCertificatesRequest {
             registration: 1,
-            interests: vec![pb::TlsCertificateInterest::default(); n],
+            hostnames: vec![String::new(); n],
         }
         .encode_to_vec();
         assert!(input.len() <= 512 * 1024);
         let decoded_input = pb::WatchTlsCertificatesRequest::decode(input.as_slice()).unwrap();
-        let request_bytes =
-            decoded_input.interests.capacity() * std::mem::size_of::<pb::TlsCertificateInterest>();
-        assert!(request_bytes + 2 * 512 * 1024 <= 12 * 1024 * 1024);
+        let request_bytes = decoded_input.hostnames.capacity() * std::mem::size_of::<String>();
+        // A moving Vec reallocation can retain its previous half-capacity.
+        // Also allow two wire buffers and a full wire-sized string payload;
+        // these conservative terms do not all maximize simultaneously.
+        let request_envelope = request_bytes + request_bytes / 2 + 3 * 512 * 1024;
+        assert!(request_envelope <= 12 * 1024 * 1024);
         let valid = pb::WatchTlsCertificatesRequest {
             registration: u64::MAX,
-            interests: (0..1024)
-                .map(|i| pb::TlsCertificateInterest {
-                    hostname: format!(
+            hostnames: (0..1024)
+                .map(|i| {
+                    format!(
                         "{:063}.{}.{}.{}",
                         i,
                         "b".repeat(63),
                         "c".repeat(63),
                         "d".repeat(61)
-                    ),
-                    known_view_revision: i64::MAX as u64,
+                    )
                 })
                 .collect(),
         };
         assert!(valid
-            .interests
+            .hostnames
             .iter()
-            .all(|i| super::TlsHostname::new(&i.hostname).is_ok()));
+            .all(|i| super::TlsHostname::new(i).is_ok()));
         assert!(valid.encoded_len() > 256 * 1024);
         assert!(valid.encoded_len() <= 512 * 1024);
         // Empty repeated DER and DNS fields likewise allocate before the
@@ -507,6 +509,6 @@ mod watch_decode_tests {
             4 * super::MAX_CERTIFICATE_BUNDLE_BYTES + 2 * 256 * 1024 + 1024 * 1024;
         assert!(decode_envelope.max(validation_envelope) < 8 * 1024 * 1024);
         println!("unary_oneof_replacement wire_bytes={} moving_growth_peak_bytes={} decode_envelope={} valid_domain_validation_envelope={}",combined.len(),unary_peak,decode_envelope,validation_envelope);
-        println!("bounded_decode event_struct={} event_capacity_bytes={event_bytes} request_struct={} request_capacity_bytes={request_bytes} unary_capacity_bytes={unary_bytes} valid_interests_wire_bytes={}",std::mem::size_of::<pb::TlsCertificateEvent>(),std::mem::size_of::<pb::TlsCertificateInterest>(),valid.encoded_len());
+        println!("bounded_decode event_struct={} event_capacity_bytes={event_bytes} request_struct={} request_capacity_bytes={request_bytes} request_envelope_bytes={request_envelope} unary_capacity_bytes={unary_bytes} valid_interests_wire_bytes={}",std::mem::size_of::<pb::TlsCertificateEvent>(),std::mem::size_of::<String>(),valid.encoded_len());
     }
 }

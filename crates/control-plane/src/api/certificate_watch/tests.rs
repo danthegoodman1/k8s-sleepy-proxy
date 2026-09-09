@@ -109,10 +109,7 @@ impl ControlPlaneStore for TestStore {
 fn input(id: u64, host: &str) -> pb::WatchTlsCertificatesRequest {
     pb::WatchTlsCertificatesRequest {
         registration: id,
-        interests: vec![pb::TlsCertificateInterest {
-            hostname: host.into(),
-            known_view_revision: 0,
-        }],
+        hostnames: vec![host.into()],
     }
 }
 async fn until(mut condition: impl FnMut() -> bool) {
@@ -130,18 +127,16 @@ fn registration_rejects_invalid_replacement_without_changing_accepted_state() {
     let mut state = WatchState::default();
     state.register(input(1, "valid.example")).unwrap();
     let mut duplicate = input(2, "valid.example");
-    duplicate.interests.push(duplicate.interests[0].clone());
+    duplicate.hostnames.push(duplicate.hostnames[0].clone());
     let mut excessive = input(2, "valid.example");
-    excessive.interests = vec![excessive.interests[0].clone(); 1025];
-    let mut invalid_revision = input(2, "valid.example");
-    invalid_revision.interests[0].known_view_revision = u64::MAX;
+    excessive.hostnames = vec![excessive.hostnames[0].clone(); 1025];
     for request in [
         input(1, "valid.example"),
         input(0, "valid.example"),
         input(2, "Invalid.Example"),
         duplicate,
         excessive,
-        invalid_revision,
+        input(2, ""),
     ] {
         assert!(state.register(request).is_err());
         assert_eq!(state.registration, 1);

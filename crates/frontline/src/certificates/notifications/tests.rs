@@ -180,7 +180,7 @@ async fn sync(open: &mut Opened, cursor: u64, bindings: Vec<(&str, u64, Option<&
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(request.interests.len(), bindings.len());
+    assert_eq!(request.hostnames.len(), bindings.len());
     open.events
         .send(Ok(pb::WatchTlsCertificatesResponse {
             value: Some(pb::watch_tls_certificates_response::Value::Snapshot(
@@ -464,7 +464,7 @@ async fn eviction_incarnation_fences_old_snapshot_and_releases_interest_stream()
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(next.interests[0].known_view_revision, 1);
+    assert_eq!(next.hostnames, ["app.example"]);
     assert_eq!(revision(&rig, "app.example"), Some(1));
     assert_eq!(
         rig.cache.shared.state.lock().unwrap().entries["app.example"].incarnation,

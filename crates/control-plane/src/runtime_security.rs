@@ -6,6 +6,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use zeroize::Zeroizing;
 
@@ -56,6 +57,7 @@ impl RuntimeSecurityConfig {
     }
     pub(crate) fn tls(
         &self,
+        setup_timeout: Duration,
     ) -> Result<Option<tonic::transport::ServerTlsConfig>, Box<dyn std::error::Error + Send + Sync>>
     {
         match (&self.certificate_file, &self.private_key_file) {
@@ -63,9 +65,14 @@ impl RuntimeSecurityConfig {
             (Some(cert), Some(key)) => {
                 let cert = read_bounded(cert, 64 * 1024)?;
                 let key = read_bounded(key, 16 * 1024)?;
-                Ok(Some(tonic::transport::ServerTlsConfig::new().identity(
-                    tonic::transport::Identity::from_pem(cert.as_slice(), key.as_slice()),
-                )))
+                Ok(Some(
+                    tonic::transport::ServerTlsConfig::new()
+                        .timeout(setup_timeout)
+                        .identity(tonic::transport::Identity::from_pem(
+                            cert.as_slice(),
+                            key.as_slice(),
+                        )),
+                ))
             }
             _ => Err("native TLS requires both identity files".into()),
         }

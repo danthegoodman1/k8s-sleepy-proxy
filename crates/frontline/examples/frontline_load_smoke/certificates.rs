@@ -90,7 +90,7 @@ impl Delivery {
                     Ok(Err(error)) => return Some((Err(error), (requests, host))),
                     Err(_) => return None,
                 };
-                let response = if request.interests.len() > 1024 {
+                let response = if request.hostnames.len() > 1024 {
                     Err(Status::resource_exhausted(
                         "fixture watch interests exceeded",
                     ))
@@ -101,12 +101,12 @@ impl Delivery {
                                 registration: request.registration,
                                 cursor: 1,
                                 bindings: request
-                                    .interests
+                                    .hostnames
                                     .into_iter()
                                     .map(|interest| {
-                                        let found = interest.hostname == host;
+                                        let found = interest == host;
                                         pb::TlsBinding {
-                                            hostname: interest.hostname,
+                                            hostname: interest,
                                             revision: u64::from(found),
                                             certificate_id: found.then(|| "load-fixture".into()),
                                         }
@@ -265,10 +265,7 @@ mod tests {
             let mut request = Request::new(tonic::codegen::tokio_stream::iter([
                 pb::WatchTlsCertificatesRequest {
                     registration: 1,
-                    interests: vec![pb::TlsCertificateInterest {
-                        hostname: "app.example.test".into(),
-                        known_view_revision: 1,
-                    }],
+                    hostnames: vec!["app.example.test".into()],
                 },
             ]));
             request

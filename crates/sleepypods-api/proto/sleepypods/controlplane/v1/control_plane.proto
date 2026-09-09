@@ -697,11 +697,7 @@ message MissingTlsCertificate {}
 // outbox and are NEVER a hostname view revision.
 message WatchTlsCertificatesRequest {
   uint64 registration = 1;
-  repeated TlsCertificateInterest interests = 2;
-}
-message TlsCertificateInterest {
-  string hostname = 1;
-  uint64 known_view_revision = 2;
+  repeated string hostnames = 2;
 }
 message TlsCertificateSnapshot {
   uint64 registration = 1;

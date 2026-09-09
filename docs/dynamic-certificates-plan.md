@@ -23,9 +23,11 @@ Implementation is active on `dynamic-certificates`, starting from merged main
 `456d37e`. Phases 1–4 have reviewed stage commits `f138053`, `4688c23`, `9d0cfa9` and
 `5a337f3`. Phase 5 has independent source, deployed and performance approval;
 watch-admission correction `004505f` also passes hosted CI, closing 4G through 5C.
-Phase 6 integration and the fresh whole-feature review are active. Prior TLS and
-routing evidence retains its original scope. Execute phases in order, preserving a reviewable commit and
-independent review at each completed boundary.
+Phase 5 is complete at `e1db93d`, with successful hosted CI. Phase 6 resolves all
+three findings from the fresh whole-feature review; final release and hosted
+validation are being closed. Prior evidence retains its recorded source and
+workload scope. Each completed phase has a reviewable commit and independent
+review.
 
 ## Implementation Principles
 
@@ -251,9 +253,9 @@ Goal: promptly update active proxies without letting ordering gaps restore stale
 certificates or leave removals unenforced beyond the authorization lease.
 
 Scope: implement the bounded certificate watch protocol and feed it from durable
-Postgres changes across control-plane replicas. Register interests with the
-client's observed view revision and synchronize current state before relying on
-live events; this closes the resolve-then-watch race. Reconnect/resets synchronize
+Postgres changes across control-plane replicas. Register the complete exact
+hostname set and atomically synchronize current state before relying on live
+events; this closes the resolve-then-watch race. Reconnect/resets synchronize
 all current interests, including bounded cached misses. Metadata notifications
 trigger authoritative resolution; they do not themselves renew leases.
 
@@ -365,10 +367,10 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Doc | 6A: Current operator/security/failure contract | Missing: reviewed guide, runbook, store contract and examples. |
-| Incomplete | Work | 6B: Required CI and release gate wiring | Missing: automated certificate/store tests and fail-closed skip/count checks. |
-| Incomplete | Work | 6C: Final skeptical review and simplification pass | Missing: independent full-feature findings, resolved simplifications and affected regression gates. |
-| Incomplete | Test | 6T: Final workspace, store, images and hosted checks | Missing: passing exact-revision commands and CI links. |
+| Complete | Doc | 6A: Current operator/security/failure contract | Independent audit approves the guide, runbook, store contract, configuration and first-deployment sequence; 41 local links resolve. Runtime/final evidence closure remains 6T/6G. |
+| Complete | Work | 6B: Required CI and release gate wiring | Independently approved shared actual-PostgreSQL checker: nine checker/composition tests, two protocol example tests and all 24 target cases pass without skips, ignores or filters. Checkpoint `0e77279` passes hosted CI 34305141692; final implementation CI remains 6T. |
+| Complete | Work | 6C: Final skeptical review and simplification pass | Fresh full-feature reviewer approves all three corrections: total native TLS setup deadline, removal of unused local cursor, and hostname-only watch registration. Identical paired TLS regression proves old failure/new success; 37 focused tests and strict affected checks pass. Final integration evidence remains 6T/6G. |
+| In Progress | Test | 6T: Final workspace, store, images and hosted checks | All twelve local checks pass at frozen 274-file source with independent verification. Final production images, packaging, deployed lifecycle/RSS and strict comparative load pass. Routing, protocols, restart, libpq and matched TLS timing also pass; final hosted CI remains. |
 | Incomplete | Gate | 6G: Implementation complete | Missing: independent final review, all prior gates and a clean final diff. |
 
 ## Starting Points

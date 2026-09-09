@@ -8,9 +8,11 @@ and controller restart.
 
 The [original validation and independent review](docs/review-evidence/final-integration/README.md)
 records measured lifecycle/proxy workloads, recovery guarantees and capacity limits.
-[Dynamic certificate delivery](docs/dynamic-certificates-plan.md) is being added
-with separate deployment, outage, resource and final review gates; the historical
-results do not establish those new guarantees.
+[Dynamic certificate delivery](docs/dynamic-certificates-plan.md) uses encrypted
+Postgres storage, bounded in-memory proxy caches and change notifications for
+rotation and removal. Frontline loads application certificates only from the
+control plane. The [certificate validation results](docs/review-evidence/dynamic-certificates/phase6/README.md)
+record the deployed behavior, outage limits and measured resource/performance scope.
 
 Start here:
 

@@ -6,6 +6,13 @@ Phase 6 retains final integration, hosted CI and the fresh whole-feature review.
 process-level results do not establish production-image, Kubernetes lifecycle,
 default-lease outage or load behavior.
 
+The approved checkpoint `e1db93d3ce75ecabcef3483131a52ae00112428a` also passes
+[hosted CI 34304098281](https://github.com/danthegoodman1/sleepypods/actions/runs/34304098281).
+Its actual PostgreSQL target executes all 24 cases with no failures, skips,
+ignores or filters in 72.23 seconds. The raw job log and exact-SHA metadata are
+retained under `phase5/hosted-ci-34304098281.{log,json}`. Final integration checks
+will run on the subsequent Phase 6 implementation commit.
+
 The three existing TLS/libpq/load fixtures use native verified
 certificate delivery. Frontline receives a proxy credential and public platform
 trust, with no application certificate/key mount. Platform control-plane TLS

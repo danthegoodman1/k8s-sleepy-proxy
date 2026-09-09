@@ -790,3 +790,7 @@ mod tests {
         assert_eq!(capacity.available_permits(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_io/tls_setup_tests.rs"]
+mod tls_setup_tests;

@@ -99,6 +99,23 @@ secrets.
 
 ## Certificate publication and bindings
 
+For a first deployment:
+
+1. Provision independent native platform TLS identity/trust, role credentials and
+   the external sealing key ring. Start the control plane against the current
+   PostgreSQL schema before configuring its callers.
+2. Configure Frontline's verified HTTPS endpoint, public CA trust when needed,
+   and proxy credential. Its certificate cache may start empty. HTTP-01
+   resolution uses `ProxyControlPlane` and the proxy role; operators publish
+   challenge state, so HTTP-01 can work before a certificate exists.
+3. Publish the issued application bundle and bind each exact hostname before
+   expecting successful application TLS handshakes. Configure the control-plane
+   endpoint and trust before materializing workloads and their sidecars.
+
+Deploy matching control-plane and caller protocol versions. Mixed old/new
+certificate-delivery callers are not an upgrade guarantee; no compatibility
+adapter or static-certificate import path is provided.
+
 Publish an already-issued certificate through authenticated native TLS. Supply
 the chain as leaf-first DER bytes and the matching private key as unencrypted
 PKCS#8 DER bytes. The complete bundle is limited to 128 KiB, 16 chain entries and
@@ -204,6 +221,11 @@ changes, including changes made through another control-plane replica. Eviction
 releases the hostname's interest; input updates coalesce into a bounded complete
 replacement set.
 
+A registration supplies its ID and exact hostname list. The server always
+acknowledges it with the complete current snapshot; registration has no client
+revision or resume cursor. Conditional revisions belong to certificate fetches,
+and the proxy retains per-host floors locally to reject stale responses.
+
 A rotation prompts a refresh while an already valid view may remain usable within
 its existing lease. Received removal, unbind or rebind events invalidate the
 affected view before another handshake can select it. A history gap resets and
@@ -250,6 +272,12 @@ These stage deadlines are separate from overall RPC and startup deadlines.
 Sidecars use their configured TCP setup timeout and the same two-second TLS
 handshake timeout. Canceling an async caller does not stop an operating-system
 DNS lookup already running on a blocking worker.
+
+The control plane applies `SLEEPYPODS_CONTROL_PLANE_SETUP_TIMEOUT_MS` (five
+seconds by default) to the complete server-side TLS handshake as well as initial
+request setup. An incomplete handshake closes at that deadline even if the peer
+continues to make slow progress receiving the server's output. The existing
+accepted-connection limit bounds concurrent socket ownership.
 
 Configure platform TLS before creating workloads. Sidecars receive their endpoint
 and public CA when the control plane materializes them; existing Pods do not

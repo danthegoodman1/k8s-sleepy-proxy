@@ -483,7 +483,7 @@ where
         config.target.clone(),
         config.control_plane.auth.clone(),
         route_events.clone(),
-        config.security.tls()?,
+        config.security.tls(config.api_limits.setup_timeout)?,
     )?;
     let (shutdown_tx, _) = watch::channel(false);
     let native_shutdown = shutdown_tx.subscribe();
